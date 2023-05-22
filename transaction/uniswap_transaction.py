@@ -747,7 +747,7 @@ class UniswapTransaction(Transaction):
             )
             token_out_quantity = params["amountOut"]
 
-            recipient = params["to"]            
+            recipient = params["to"]
 
             # work through the pools backwards, since the swap will execute at a defined output, with input floating
             for i, v2_pool in enumerate(pool_objects[::-1]):
