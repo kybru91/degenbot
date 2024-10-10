@@ -28,8 +28,11 @@ class Publisher(Protocol):
 
     _subscribers: set["Subscriber"]
 
-    def subscribe(self, subscriber: "Subscriber") -> None: ...
-    def unsubscribe(self, subscriber: "Subscriber") -> None: ...
+    def subscribe(self, subscriber: "Subscriber") -> None:
+        pass
+
+    def unsubscribe(self, subscriber: "Subscriber") -> None:
+        pass
 
 
 class Subscriber(Protocol):
@@ -214,6 +217,9 @@ class AbstractErc20Token:
 
     def __str__(self) -> str:
         return self.symbol
+
+
+class AbstractRegistry: ...
 
 
 class AbstractTransaction: ...

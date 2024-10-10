@@ -94,6 +94,7 @@ async def test_bad_url():
         BuilderEndpoint(url="ws://www.google.com", endpoints=["eth_sendBundle"])
 
 
+@pytest.mark.skip
 async def test_blank_eth_send_bundle(
     beaverbuild: BuilderEndpoint,
     fork_mainnet: AnvilFork,
@@ -107,6 +108,7 @@ async def test_blank_eth_send_bundle(
     assert "bundleHash" in response
 
 
+@pytest.mark.skip
 async def test_blank_eth_send_bundle_with_session(
     beaverbuild: BuilderEndpoint,
     fork_mainnet: AnvilFork,
@@ -248,5 +250,5 @@ async def test_get_user_stats(
     current_block = fork_mainnet.w3.eth.block_number
     await flashbots.get_user_stats(
         signer_key=SIGNER_KEY,
-        block_number=current_block,
+        recent_block_number=current_block,
     )

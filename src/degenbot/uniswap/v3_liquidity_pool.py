@@ -3,17 +3,19 @@ import dataclasses
 from bisect import bisect_left
 from fractions import Fraction
 from threading import Lock
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import eth_abi.abi
+from eth_abi.exceptions import DecodingError
 from eth_typing import ChecksumAddress
 from eth_utils.address import to_checksum_address
 from hexbytes import HexBytes
+from typing_extensions import Self
 from web3 import Web3
+from web3.exceptions import ContractLogicError
 from web3.types import BlockIdentifier
 
-from .. import config
-from ..constants import ZERO_ADDRESS
+from ..config import web3_connection_manager
 from ..erc20_token import Erc20Token
 from ..exceptions import (
     AddressMismatch,
@@ -28,7 +30,7 @@ from ..exceptions import (
 from ..functions import encode_function_calldata, raw_call
 from ..logging import logger
 from ..managers.erc20_token_manager import Erc20TokenManager
-from ..registry.all_pools import AllPools
+from ..registry.all_pools import pool_registry
 from ..types import AbstractLiquidityPool
 from ..uniswap.deployments import UniswapV3ExchangeDeployment
 from .deployments import FACTORY_DEPLOYMENTS
@@ -49,9 +51,7 @@ from .v3_libraries.functions import to_int256
 
 
 class UniswapV3Pool(AbstractLiquidityPool):
-    from .types import UniswapV3PoolState as state_constructor
-
-    PoolStateType: TypeAlias = state_constructor
+    from .types import UniswapV3PoolState as PoolState
 
     UNISWAP_V3_MAINNET_POOL_INIT_HASH = (
         "0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54"
@@ -105,13 +105,12 @@ class UniswapV3Pool(AbstractLiquidityPool):
         address: str,
         exchange: UniswapV3ExchangeDeployment,
         **kwargs: Any,
-    ) -> "UniswapV3Pool":
+    ) -> Self:
         """
         Create a new `UniswapV3Pool` with exchange information taken from the provided deployment.
         """
 
         for key in [
-            "factory_address",
             "deployer_address",
             "init_hash",
         ]:  # pragma: no cover
@@ -123,7 +122,6 @@ class UniswapV3Pool(AbstractLiquidityPool):
 
         return cls(
             address=address,
-            # factory_address=exchange.factory.address,
             deployer_address=exchange.factory.deployer,
             init_hash=exchange.factory.pool_init_hash,
             **kwargs,
@@ -133,6 +131,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
         self,
         address: str,
         *,
+        chain_id: int | None = None,
         deployer_address: str | None = None,
         init_hash: str | None = None,
         tick_data: dict[int, dict[str, Any] | UniswapV3LiquidityAtTick] | None = None,
@@ -142,13 +141,17 @@ class UniswapV3Pool(AbstractLiquidityPool):
         verify_address: bool = True,
         silent: bool = False,
     ):
-        if address == ZERO_ADDRESS:
-            raise LiquidityPoolError("Invalid pool address")
-
         self.address = to_checksum_address(address)
+        self.factory: ChecksumAddress
+
+        self._chain_id = (
+            chain_id if chain_id is not None else web3_connection_manager.default_chain_id
+        )
+        w3 = web3_connection_manager.get_web3(self.chain_id)
+        self._update_block = state_block if state_block is not None else w3.eth.block_number
 
         self._state_lock = Lock()
-        self._state = self.state_constructor(
+        self._state = self.PoolState(
             pool=self.address,
             liquidity=0,
             sqrt_price_x96=0,
@@ -157,30 +160,31 @@ class UniswapV3Pool(AbstractLiquidityPool):
             tick_data={},
         )
 
-        w3 = config.get_web3()
-        chain_id = w3.eth.chain_id
-        self._update_block = state_block if state_block is not None else w3.eth.block_number
+        try:
+            (
+                factory,
+                (token0, token1),
+                self.fee,
+                self.tick_spacing,
+                self.sqrt_price_x96,
+                self.tick,
+                self.liquidity,
+            ) = self.get_factory_tokens_liquidity_price_tick_batched(
+                w3=w3, state_block=self._update_block
+            )
+        except (ContractLogicError, DecodingError) as exc:
+            # Contracts differ slightly across Uniswap V3 forks, so decoding may fail. Catch this
+            # here and raise as a pool-specific exception
+            raise LiquidityPoolError("Could not decode contract data") from exc
 
-        (
-            factory,
-            (token0, token1),
-            self.fee,
-            self.tick_spacing,
-            self.sqrt_price_x96,
-            self.tick,
-            self.liquidity,
-        ) = self.get_factory_tokens_liquidity_price_tick_batched(
-            w3=w3, state_block=self._update_block
-        )
         self.factory = to_checksum_address(factory)
-
         self.deployer_address = (
             to_checksum_address(deployer_address) if deployer_address is not None else self.factory
         )
 
         try:
             # Use degenbot deployment values if available
-            factory_deployment = FACTORY_DEPLOYMENTS[chain_id][self.factory]
+            factory_deployment = FACTORY_DEPLOYMENTS[self.chain_id][self.factory]
             self.init_hash = factory_deployment.pool_init_hash
             if factory_deployment.deployer is not None:
                 self.deployer_address = factory_deployment.deployer
@@ -191,7 +195,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
                 init_hash if init_hash is not None else self.UNISWAP_V3_MAINNET_POOL_INIT_HASH
             )
 
-        token_manager = Erc20TokenManager(chain_id)
+        token_manager = Erc20TokenManager(chain_id=self.chain_id)
         self.token0, self.token1 = (
             token_manager.get_erc20token(
                 address=token0,
@@ -264,7 +268,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
 
         self._pool_state_archive = {self.update_block: self.state} if archive_states else None
 
-        AllPools(chain_id)[self.address] = self
+        pool_registry.add(pool_address=self.address, chain_id=self.chain_id, pool=self)
 
         self._subscribers = set()
 
@@ -313,7 +317,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
         zero_for_one: bool,
         amount_specified: int,
         sqrt_price_limit_x96: int,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> tuple[int, int, int, int, int]:
         """
         This function is ported and adapted from the UniswapV3Pool.sol contract at
@@ -525,7 +529,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
         256 ticks, spaced per the tickSpacing interval.
         """
 
-        w3 = config.get_web3()
+        w3 = web3_connection_manager.get_web3(self.chain_id)
 
         if block_number is None:
             block_number = w3.eth.get_block_number()
@@ -669,13 +673,17 @@ class UniswapV3Pool(AbstractLiquidityPool):
         )
 
     @property
+    def chain_id(self) -> int:
+        return self._chain_id
+
+    @property
     def liquidity(self) -> int:
         return self.state.liquidity
 
     @liquidity.setter
     def liquidity(self, new_liquidity: int) -> None:
         current_state = self.state
-        self._state = self.state_constructor(
+        self._state = self.PoolState(
             pool=current_state.pool,
             liquidity=new_liquidity,
             sqrt_price_x96=current_state.sqrt_price_x96,
@@ -691,7 +699,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
     @sqrt_price_x96.setter
     def sqrt_price_x96(self, new_sqrt_price_x96: int) -> None:
         current_state = self.state
-        self._state = self.state_constructor(
+        self._state = self.PoolState(
             pool=current_state.pool,
             liquidity=current_state.liquidity,
             sqrt_price_x96=new_sqrt_price_x96,
@@ -701,7 +709,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
         )
 
     @property
-    def state(self) -> PoolStateType:
+    def state(self) -> PoolState:
         return self._state
 
     @property
@@ -711,7 +719,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
     @tick.setter
     def tick(self, new_tick: int) -> None:
         current_state = self.state
-        self._state = self.state_constructor(
+        self._state = self.PoolState(
             pool=current_state.pool,
             liquidity=current_state.liquidity,
             sqrt_price_x96=current_state.sqrt_price_x96,
@@ -730,7 +738,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
     @tick_bitmap.setter
     def tick_bitmap(self, new_tick_bitmap: dict[int, UniswapV3BitmapAtWord]) -> None:
         current_state = self.state
-        self._state = self.state_constructor(
+        self._state = self.PoolState(
             pool=current_state.pool,
             liquidity=current_state.liquidity,
             sqrt_price_x96=current_state.sqrt_price_x96,
@@ -749,7 +757,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
     @tick_data.setter
     def tick_data(self, new_tick_data: dict[int, UniswapV3LiquidityAtTick]) -> None:
         current_state = self.state
-        self._state = self.state_constructor(
+        self._state = self.PoolState(
             pool=current_state.pool,
             liquidity=current_state.liquidity,
             sqrt_price_x96=current_state.sqrt_price_x96,
@@ -787,8 +795,9 @@ class UniswapV3Pool(AbstractLiquidityPool):
 
             state_updated = False
 
-            w3 = config.get_web3()
-            block_number = w3.eth.get_block_number() if block_number is None else block_number
+            w3 = web3_connection_manager.get_web3(self.chain_id)
+            if block_number is None:
+                block_number = w3.eth.get_block_number()
 
             with w3.batch_requests() as batch:
                 batch.add(
@@ -863,7 +872,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
         self,
         token_in: Erc20Token,
         token_in_quantity: int,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> int:
         """
         This function implements the common degenbot interface `calculate_tokens_out_from_tokens_in`
@@ -909,7 +918,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
         self,
         token_out: Erc20Token,
         token_out_quantity: int,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> int:
         """
         This function implements the common degenbot interface `calculate_tokens_in_from_tokens_out`
@@ -1088,7 +1097,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
     def get_absolute_price(
         self,
         token: Erc20Token,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> Fraction:
         """
         Get the absolute price for the given token, expressed in units of the other.
@@ -1099,7 +1108,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
     def get_absolute_rate(
         self,
         token: Erc20Token,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> Fraction:
         """
         Get the absolute rate of exchange for the given token, expressed in units of the other.
@@ -1117,7 +1126,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
     def get_nominal_price(
         self,
         token: Erc20Token,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> Fraction:
         """
         Get the nominal price for the given token, expressed in units of the other, corrected for
@@ -1128,7 +1137,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
     def get_nominal_rate(
         self,
         token: Erc20Token,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> Fraction:
         """
         Get the nominal rate for the given token, expressed in units of the other, corrected for
@@ -1222,7 +1231,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
         token_in: Erc20Token,
         token_in_quantity: int,
         sqrt_price_limit_x96: int | None = None,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> UniswapV3PoolSimulationResult:
         """
         Simulate an exact input swap.
@@ -1261,7 +1270,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
                 amount0_delta=amount0_delta,
                 amount1_delta=amount1_delta,
                 initial_state=self.state.copy(),
-                final_state=self.state_constructor(
+                final_state=self.PoolState(
                     pool=self.address,
                     liquidity=end_liquidity,
                     sqrt_price_x96=end_sqrt_price_x96,
@@ -1274,7 +1283,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
         token_out: Erc20Token,
         token_out_quantity: int,
         sqrt_price_limit_x96: int | None = None,
-        override_state: PoolStateType | None = None,
+        override_state: PoolState | None = None,
     ) -> UniswapV3PoolSimulationResult:
         """
         Simulate an exact output swap.
@@ -1313,7 +1322,7 @@ class UniswapV3Pool(AbstractLiquidityPool):
                 amount0_delta=amount0_delta,
                 amount1_delta=amount1_delta,
                 initial_state=self.state.copy(),
-                final_state=self.state_constructor(
+                final_state=self.PoolState(
                     pool=self.address,
                     liquidity=end_liquidity,
                     sqrt_price_x96=end_sqrtprice,
