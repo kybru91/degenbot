@@ -741,6 +741,11 @@ impl BlockPump {
             // .instrument (no enter guard across an await — TQ7PD6).
             let verify_span =
                 tracing::info_span!("degenbot.solver.verify", block, paths = path_refs.len(),);
+            // Trace continuity: the verifier runs on a DETACHED task, so the
+            // span would export as a root. Pin the published block's span as
+            // the remote parent (same bridge as the simulate fan-out) so the
+            // verify renders inside the block's Jaeger trace.
+            crate::telemetry::attach_published_parent(&verify_span, block);
             if let Some(p) = crate::instruments::pipeline() {
                 p.count_solver_verify_block();
             }

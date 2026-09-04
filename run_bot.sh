@@ -80,12 +80,12 @@ export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-1}"
 # settle tax. 15 ms cuts ~33 ms/block with no extra solve cycles observed.
 # Code default stays 50 ms; invalid/zero env values fall back to 50 ms.
 export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
-# Solver-state verification policy: the CODE default stays ON (loud fail-stop),
-# but this script defaults the per-publish chain-diff verifier OFF so the bot
-# runs the fast "solve against possibly-stale state, invalidate later" path.
-# DEGENBOT_ASSERT_SOLVER_STATE=1 re-enables the hard gate for audits. A
-# sampling-based silent-decay detector is the planned replacement.
-export DEGENBOT_ASSERT_SOLVER_STATE="${DEGENBOT_ASSERT_SOLVER_STATE:-0}"
+# Solver-state verification policy: ON (loud fail-stop tripwire, ADR-021) —
+# every published block is judged against chain state on the detached verifier
+# task; a divergence quarantines the pool (or aborts, per failure_policy).
+# DEGENBOT_ASSERT_SOLVER_STATE=0 returns to the fast "solve against possibly-
+# stale state, invalidate later" path. Opt-out for benchmarking runs only.
+export DEGENBOT_ASSERT_SOLVER_STATE="${DEGENBOT_ASSERT_SOLVER_STATE:-1}"
 
 # The actual bot invocation (uv rebuilds the Rust extension if any rust
 # source / Cargo.toml is newer than the installed build).

@@ -154,6 +154,56 @@ fn simulate_dispatch_span_carries_published_block_parent() {
 
 /// The attribute-key comparison used above relies on `Key` equality by static
 /// str — pin it so an `OTel` bump can't silently weaken the content assertion.
+/// The verifier task (ADR-021) creates its span on a DETACHED tokio task —
+/// the simulate_dispatch_span constructor form does not apply there. The
+/// attach helper must parent an EXISTING span to the published block's span,
+/// with the nearest-previous fallback (the judged block can trail the newest
+/// published one, and unrelated blocks may sit in between).
+#[test]
+fn attach_published_parent_parents_a_detached_task_span() {
+    use degenbot_bot::telemetry;
+
+    let exporter = InMemorySpanExporter::default();
+    let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+    let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    {
+        let block_span = tracing::info_span!("degenbot.pump.block", block.number = 91);
+        let _entered = block_span.enter();
+        telemetry::publish_block_context(91);
+    }
+
+    // Detached-task semantics: no active parent, judged block 92 where the
+    // last published context is 91 (exact miss -> nearest-previous fallback).
+    {
+        let verify_span = tracing::info_span!("degenbot.solver.verify", block = 92, paths = 4);
+        telemetry::attach_published_parent(&verify_span, 92);
+        let _entered = verify_span.enter();
+    } // span handle + guard drop here — the exporter only sees closed spans
+
+    provider.force_flush().expect("flush");
+    let spans = exporter.get_finished_spans().expect("spans");
+    let block = spans
+        .iter()
+        .find(|s| s.name.as_ref() == "degenbot.pump.block")
+        .expect("pump.block span must be exported");
+    let verify = spans
+        .iter()
+        .find(|s| s.name.as_ref() == "degenbot.solver.verify")
+        .expect("solver.verify span must be exported");
+    assert_eq!(
+        verify.parent_span_id,
+        block.span_context.span_id(),
+        "detached verify span must parent to the published block span"
+    );
+    assert_eq!(
+        verify.span_context.trace_id(),
+        block.span_context.trace_id(),
+        "verify span must share the block trace"
+    );
+}
+
 #[test]
 fn key_value_lookup_roundtrip() {
     let kv = KeyValue::new("probe.kind", "plumbing");

@@ -331,6 +331,44 @@ pub fn publish_block_context(block: u64) {
 #[cfg(not(feature = "otel"))]
 pub fn publish_block_context(_block: u64) {}
 
+/// Exporter-visible context for `block`: exact hit first, then the nearest
+/// previous block — consumers' notion of "current block" can be one ahead
+/// (a batch is dispatched / a block judged after the next header arrives),
+/// and parenting to the closest earlier block span is the correct lineage
+/// either way. Bounded-ring insert order makes the scan trivially cheap.
+#[cfg(feature = "otel")]
+fn published_parent_for(current_block: u64) -> Option<opentelemetry::trace::SpanContext> {
+    let map = PUBLISHED_BLOCK_CONTEXTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.get(&current_block).cloned().or_else(|| {
+        map.keys()
+            .filter(|&&b| b <= current_block)
+            .max()
+            .and_then(|b| map.get(b).cloned())
+    })
+}
+
+/// Re-attach the published block's span context as a remote parent on an
+/// EXISTING span. For spans created on detached tasks (the ADR-021 verifier
+/// loop) where the constructor form of [`simulate_dispatch_span`] does not
+/// apply: the task has no ambient context, so the parent is pinned explicitly
+/// after span creation. Best-effort / never blocks the caller's logic.
+#[cfg(feature = "otel")]
+pub fn attach_published_parent(span: &tracing::Span, current_block: u64) {
+    if let Some(sc) = published_parent_for(current_block) {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let cx = opentelemetry::Context::new().with_remote_span_context(sc);
+        // Best-effort: a rejected parent propagation degrades to a root
+        // span, never blocks the caller.
+        let _ = span.set_parent(cx);
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn attach_published_parent(_span: &tracing::Span, _current_block: u64) {}
+
 /// Build the `degenbot.simulate.dispatch` span for the Python simulate fan-
 /// out, re-attaching the published block's span context as a remote parent
 /// when one is registered for `current_block` (f701ccd3 bridge). Attribute
@@ -344,29 +382,7 @@ pub fn simulate_dispatch_span(current_block: u64, candidate_count: usize) -> tra
         current_block,
         phase_candidate_count = candidate_count
     );
-    let parent = {
-        let map = PUBLISHED_BLOCK_CONTEXTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Exact block first (the batch's solve block); then the nearest
-        // previous block — Python's `current_block` can be one ahead (the
-        // batch is dispatched after the next header arrives), and parenting
-        // to the closest earlier block span is the correct lineage either way.
-        map.get(&current_block).cloned().or_else(|| {
-            map.keys()
-                .filter(|&&b| b <= current_block)
-                .max()
-                .and_then(|b| map.get(b).cloned())
-        })
-    };
-    if let Some(sc) = parent {
-        use opentelemetry::trace::TraceContextExt as _;
-        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
-        let cx = opentelemetry::Context::new().with_remote_span_context(sc);
-        // Best-effort: a rejected parent propagation degrades to today's
-        // behaviour (root span), never blocks the hot path.
-        let _ = span.set_parent(cx);
-    }
+    attach_published_parent(&span, current_block);
     span
 }
 

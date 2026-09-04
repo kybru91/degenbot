@@ -69,6 +69,19 @@ seam call regressed; the continuity test
 (`otel_plumbing::simulate_dispatch_span_carries_published_block_parent`)
 covers the contract end to end on the InMemory exporter.
 
+The ADR-021 verifier's `degenbot.solver.verify` span rides the same bridge
+via `telemetry::attach_published_parent` (pinned AFTER span creation — the
+verifier runs on a detached task with no ambient context, so the constructor
+form does not apply). Test:
+`otel_plumbing::attach_published_parent_parents_a_detached_task_span`.
+The verify span judges the whole registered set against chain state
+(O(registered x hops x RPC), tens of seconds at scale) and is inherently
+BEHIND the block loop — the latest-wins watch skips stale requests, so
+expect one verify span per-judged-block, not per-block, always parented to
+its judged block's trace. Exporter caveat: a span only exports when ALL
+handles drop — a test holding a `tracing::Span` (or an `enter()` guard)
+across `force_flush` will not see it.
+
 Derived quantities (compute these on every investigation):
 
 | Quantity | Formula | Healthy |
