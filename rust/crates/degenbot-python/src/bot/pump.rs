@@ -150,7 +150,7 @@ impl PumpState {
     /// # Errors
     /// `PyRuntimeError` if the pump is already started/subscribed, or the WS
     /// subscribe fails.
-    #[tracing::instrument(skip(self, py), fields(rpc_url = %rpc_url))]
+    #[tracing::instrument(name = "degenbot.pump.subscribe", skip(self, py), fields(rpc_url = %rpc_url))]
     pub(crate) fn subscribe(&self, py: Python<'_>, rpc_url: &str) -> PyResult<u64> {
         let phase = self.current_phase();
         phase
@@ -221,7 +221,7 @@ impl PumpState {
     ///
     /// # Errors
     /// `PyRuntimeError` if the phase is wrong or subscribe wasn't called.
-    #[tracing::instrument(skip(self, py))]
+    #[tracing::instrument(name = "degenbot.pump.resume", skip(self, py))]
     pub(crate) fn resume(&self, py: Python<'_>) -> PyResult<()> {
         let phase = self.current_phase();
         phase

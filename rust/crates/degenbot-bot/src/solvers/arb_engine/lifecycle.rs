@@ -343,7 +343,7 @@ impl ArbitrageEngine {
     /// Callers read results via `latest_results()`; none reads a dispatched
     /// `ResultBatch` from this entry (grep-verified across `tests/`, `examples/`,
     /// and `src/degenbot/`).
-    #[tracing::instrument(skip(self), fields(block_number, path_count = self.path_pools.len()))]
+    #[tracing::instrument(name = "degenbot.arb.solve_all", skip(self), fields(block_number, path_count = self.path_pools.len()))]
     pub fn solve_all_paths(&mut self, block_number: u64) {
         // Resolve all paths under the core lock (single consistent snapshot of
         // all family state — ADR-003).

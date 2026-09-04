@@ -189,8 +189,14 @@ Known incident class, not a bot bug:
 
 Jaeger spans: `degenbot.pump.block` (root, per drained block),
 `degenbot.arb.solve` (child, per solve cycle), `degenbot.path.register`
-(registration worker). Span events carry `code.line.number` — use it to
-confirm binary freshness against current source.
+(registration worker). Lifecycle tier (once per run / per log, named via
+`#[tracing::instrument(name = ...)]` — the pre-convention tier kept on bare
+function names before the 2026-09-04 rename):
+`degenbot.pump.subscribe`+`degenbot.pump.resume` (WS handshake + snapshot-
+to-live handoff), `degenbot.log.dispatch` (PER WS LOG: decode → apply →
+dirty-mark; the hottest lifecycle span), `degenbot.arb.solve_all` (cold-start
+full sweep). Span events carry `code.line.number` — use it to confirm binary
+freshness against current source.
 
 Key Prometheus families (`instruments.rs`): `degenbot_solve_duration_seconds`,
 `degenbot_header_to_solved_seconds`, `degenbot_drain_queue_wait_seconds` /
