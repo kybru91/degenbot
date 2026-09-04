@@ -163,9 +163,11 @@ impl ArbitrageEngine {
         self.path_pools
             .insert(path_id, MixedPath { pools: pool_refs });
 
-        // Store the resolve snapshot + drive the state machine.
+        // Store the resolve snapshot + drive the state machine. Arc-shared:
+        // the solve dispatch stages Arc clones (f701ccd3 staging fix).
         let path_valid = resolved.valid;
-        self.path_resolved.insert(path_id, resolved);
+        self.path_resolved
+            .insert(path_id, std::sync::Arc::new(resolved));
         self.path_status
             .entry(path_id)
             .or_default()
@@ -357,7 +359,8 @@ impl ArbitrageEngine {
                     Some(&mut self.hop_projection_count),
                     self.cl_projection_memo,
                 );
-                self.path_resolved.insert(path_id, resolved);
+                self.path_resolved
+                    .insert(path_id, std::sync::Arc::new(resolved));
                 // R522XA: cold-start full sweep also refreshes the state machine.
                 self.path_status
                     .entry(path_id)

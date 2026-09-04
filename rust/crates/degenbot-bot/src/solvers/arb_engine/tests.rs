@@ -2085,7 +2085,9 @@ mod tests {
                     None,
                     engine.cl_projection_memo,
                 );
-                engine.path_resolved.insert(path_id, resolved);
+                engine
+                    .path_resolved
+                    .insert(path_id, std::sync::Arc::new(resolved));
             }
         }
         let results_map = engine.solve_all();
@@ -5532,6 +5534,91 @@ mod tests {
         assert!(
             expire_spans.is_empty(),
             "max_age=None expiry is a no-op - must not take the core write; got {expire_spans:?}"
+        );
+    }
+
+    /// Resolve->LPT staging trace (f701ccd36f4ecf80d671e798df218fa4, block
+    /// 25906841): between the close of `arb.resolve` and the open of
+    /// `arb.lpt` sat 647 ms of uninstrumented wall time — the results sweep
+    /// + resolved-snapshot staging (`to_solve`) that makes the engine
+    /// borrow-free for the parallel dispatch. That phase must emit its own
+    /// `degenbot.arb.stage` phase span carrying `paths.staged`, so the
+    /// staging cost is attributable in Jaeger like its fanout/resolve/lpt/
+    /// merge siblings (MQUKB6-T2 pattern). RED before the span existed.
+    #[cfg(feature = "otel")]
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn rebuild_and_solve_affected_emits_stage_span_with_paths_staged() {
+        use crate::otel;
+        use hashbrown::HashSet;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+
+        let mut engine = ArbitrageEngine::new();
+        let a = engine.register_v2_pool(
+            Address::from([0x11u8; 20]),
+            usdc(1_000_000),
+            weth(500),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let a2 = engine.register_v2_pool(
+            Address::from([0x13u8; 20]),
+            usdc(1_100_000),
+            weth(510),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let _path_id = engine
+            .register_path(vec![
+                PoolHop {
+                    pool_id: a,
+                    zero_for_one: true,
+                },
+                PoolHop {
+                    pool_id: a2,
+                    zero_for_one: true,
+                },
+            ])
+            .expect("path registers");
+
+        tracing::subscriber::with_default(subscriber, || {
+            engine.rebuild_and_solve_affected(
+                &HashSet::from([a]),
+                &HashSet::new(),
+                &HashSet::new(),
+                5,
+                &BlockMetadata::default(),
+            );
+        });
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let stage_spans: Vec<_> = spans
+            .iter()
+            .filter(|sp| sp.name.as_ref() == "degenbot.arb.stage")
+            .collect();
+        assert_eq!(
+            stage_spans.len(),
+            1,
+            "expected exactly one degenbot.arb.stage span per solve cycle; got names: {:?}",
+            spans.iter().map(|sp| sp.name.as_ref()).collect::<Vec<_>>()
+        );
+        // Dual-representation check (u64 fields map to String or I64 under
+        // tracing-opentelemetry 0.33; mirrors the MQUKB6 pump test).
+        const PATH_COUNT: u64 = 1;
+        assert!(
+            stage_spans[0].attributes.iter().any(|kv| {
+                kv.key == opentelemetry::Key::from_static_str("paths.staged")
+                    && (matches!(kv.value, opentelemetry::Value::I64(v) if v as u64 == PATH_COUNT)
+                        || matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == PATH_COUNT.to_string().as_str()))
+            }),
+            "stage span must carry paths.staged={PATH_COUNT}; got {:?}",
+            stage_spans[0].attributes
         );
     }
 

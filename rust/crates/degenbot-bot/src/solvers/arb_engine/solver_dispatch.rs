@@ -1338,7 +1338,8 @@ impl ArbitrageEngine {
                         "[resolve] path invalid at resolve"
                     );
                 }
-                self.path_resolved.insert(path_id, resolved);
+                self.path_resolved
+                    .insert(path_id, std::sync::Arc::new(resolved));
                 // R522XA: drive the path state machine from the full deficit set.
                 self.path_status
                     .entry(path_id)
@@ -1361,6 +1362,22 @@ impl ArbitrageEngine {
         );
         drop(resolve_ctx);
 
+        // MQUKB6-T2 follow (trace f701ccd36f4ecf80d671e798df218fa4, block
+        // 25906841): the window between the close of `arb.resolve` and the
+        // open of `arb.lpt` was uninstrumented — 647 ms of wall time on that
+        // cold-ramp cycle, ~25 µs/path steady state. The work (results sweep
+        // + resolved-snapshot staging) now runs under its own phase span so
+        // the pre-LPT cost stays attributable in Jaeger like its fanout/
+        // resolve/lpt/merge siblings.
+        let stage_span = tracing::info_span!(
+            target: "degenbot::solver",
+            "degenbot.arb.stage",
+            block.number = solve_block,
+            paths.affected = affected_path_ids.len(),
+            paths.staged = tracing::field::Empty,
+        );
+        let stage_ctx = stage_span.enter();
+
         // Remove old results for affected paths (they'll be re-solved below).
         // A deferred path's result is dropped too: it is excluded from this
         // live solve (its pool is stale, so its prior result is stale as well).
@@ -1379,23 +1396,28 @@ impl ArbitrageEngine {
         //
         // ADR-005 slice 15b-1: rayon `par_iter` parallelizes the solve across
         // the affected-path set. `Self::solve_path` is a free-standing dispatch
-        // (no `&self` read); each work item takes the `path_id` + a CLONED
-        // `ResolvedMixedPath` (the `Clone` derive is cheap; the V3-V4 path
-        // math reads only immutable statics), then writes — under the parallel
-        // closure — into the engine-level result-set via a `Mutex`-free
-        // pattern: collect `(path_id, SolvePathResult)` pairs into a Vec, then
-        // merge sequentially into `self.results`. The parallel workers touch
-        // NO engine state and NO core.lock — engine-then-core lock ordering is
-        // preserved unchanged (rayon's internal thread pool never re-enters the
-        // engine `Mutex`). For tiny batches the par_iter dispatch overhead is
-        // bounded by rayon's lazy split (see `par_iter` docs); the sequential
-        // cost dominates below the rayon internal cutoff.
+        // (no `&self` read); each work item takes the `path_id` + an **Arc-
+        // shared** `ResolvedMixedPath` snapshot (f701ccd3 staging fix: the
+        // former per-path deep clone copied every CL
+        // `IntV3TickRangeSequence` every cycle — the "clone is cheap" claim
+        // was disproven by telemetry at ~25 µs/path steady state, 150-420
+        // µs/path on the cold-heap ramp), `path_resolved` entries being
+        // immutable between resolve passes. Workers then write — under the
+        // parallel closure — into the engine-level result-set via a
+        // `Mutex`-free pattern: collect `(path_id, SolvePathResult)` pairs
+        // into a Vec, then merge sequentially into `self.results`. The
+        // parallel workers touch NO engine state and NO core.lock —
+        // engine-then-core lock ordering is preserved unchanged (rayon's
+        // internal thread pool never re-enters the engine `Mutex`). For tiny
+        // batches the par_iter dispatch overhead is bounded by rayon's lazy
+        // split (see `par_iter` docs); the sequential cost dominates below
+        // the rayon internal cutoff.
         //
-        // Pre-collect the work items (path_id + resolved-snapshot). The clone
-        // drops the immutable borrow on `self.path_resolved` that would block
-        // parallel dispatch.
+        // Pre-collect the work items (path_id + resolved-snapshot). The Arc
+        // clones drop the immutable borrow on `self.path_resolved` that
+        // would block parallel dispatch.
         let mut invalid_count: u64 = 0;
-        let to_solve: Vec<(u64, ResolvedMixedPath)> = solve_path_ids
+        let to_solve: Vec<(u64, std::sync::Arc<ResolvedMixedPath>)> = solve_path_ids
             .iter()
             .filter_map(|&pid| {
                 let resolved = self.path_resolved.get(&pid)?;
@@ -1411,9 +1433,13 @@ impl ArbitrageEngine {
                 // solve_block`) is already rejected by the U6RNHH T1 belt-and-
                 // suspenders guard in the gate loop above, which removes the
                 // path from `solve_path_ids` entirely.
-                Some((pid, resolved.clone()))
+                Some((pid, std::sync::Arc::clone(resolved)))
             })
             .collect();
+
+        drop(stage_ctx);
+        stage_span.record("paths.staged", to_solve.len());
+        drop(stage_span);
 
         // Filter out empty/profitless results in the same pass that produces
         // them — the contract is identical to the prior serial loop.
@@ -1963,14 +1989,16 @@ impl ArbitrageEngine {
         // MQUKB6-T0: same rayon context re-entry as rebuild_and_solve_affected.
         let solve_span = tracing::Span::current();
 
-        // Pre-collect work items (path_id + cloned resolved). The clone
-        // drops the immutable borrow on self.path_resolved so the LPT
-        // scoped threads don't borrow &self during the parallel solve.
-        let to_solve: Vec<(u64, ResolvedMixedPath)> = self
+        // Pre-collect work items (path_id + Arc-shared resolved). The Arc
+        // clones drop the immutable borrow on self.path_resolved so the LPT
+        // scoped threads don't borrow &self during the parallel solve
+        // (f701ccd3 staging fix: deep clones copied the CL tick-range
+        // sequences per path).
+        let to_solve: Vec<(u64, std::sync::Arc<ResolvedMixedPath>)> = self
             .path_resolved
             .iter()
             .filter(|(_, r)| r.valid)
-            .map(|(&pid, r)| (pid, r.clone()))
+            .map(|(&pid, r)| (pid, std::sync::Arc::clone(r)))
             .collect();
 
         // RAYPAR T3: LPT-pre-balanced partition on rayons persistent pool.

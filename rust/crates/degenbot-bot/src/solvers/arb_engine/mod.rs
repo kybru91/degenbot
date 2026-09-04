@@ -318,8 +318,11 @@ pub struct ArbitrageEngine {
     /// the immutable [`ArbitrageEngine::path_pools`] accessor — no mutable
     /// access, so the reverse index can never be desynced externally.
     pub(crate) path_pools: HashMap<u64, MixedPath>,
-    /// Resolved path states (mutated on each solve).
-    path_resolved: HashMap<u64, ResolvedMixedPath>,
+    /// Resolved path states (mutated on each solve). Entries are Arc-shared
+    /// into the parallel solve dispatch (f701ccd3 staging fix) — immutable
+    /// between resolve passes, so staging is refcount bumps, not deep clones
+    /// of the CL tick-range sequences.
+    path_resolved: HashMap<u64, std::sync::Arc<ResolvedMixedPath>>,
     /// Path solve-eligibility state machine (R522XA): per registered path the
     /// `PathSolveStatus` that decides whether a dirty-pool fan-out must
     /// (re)resolve it. Replaces the scattered `valid` bool + ad-hoc skip rules.
