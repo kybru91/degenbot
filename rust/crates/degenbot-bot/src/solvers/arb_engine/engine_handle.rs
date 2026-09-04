@@ -280,7 +280,30 @@ impl Engine for EngineHandle {
 
     #[hotpath::measure(label = "EngineHandle::finalize_block")]
     fn finalize_block(&self, block: u64, metadata: &BlockMetadata) {
-        self.engine.lock().finalize_block(block, metadata);
+        // Trace 91a4a776 (block 25907035, session f701ccd3): the tombstone-
+        // driven Finalize crossed a still-running burst and its inner
+        // `solve_dirty` ran a REAL solve cycle without the span gate (the
+        // gate lived only in this handle's Drain arm) — the phase spans
+        // orphaned under the captured block span and the cycle dropped its
+        // solve_duration sample. Mirror solve_dirty's gate here: probe the
+        // same conditions the inner finalize checks, and when the finalize
+        // will solve, run it under `degenbot.arb.solve` with full metric
+        // parity (K4ETHF invariant: every fanout's parent is an arb.solve
+        // span; no solve without its histogram sample + counter).
+        let mut engine = self.engine.lock();
+        let will_solve = engine.has_dirty_paths() || engine.has_logs_this_block();
+        let span =
+            will_solve.then(|| tracing::info_span!("degenbot.arb.solve", block.number = block));
+        let _guard = span.as_ref().map(tracing::Span::enter);
+        let solve_start = std::time::Instant::now();
+        engine.finalize_block(block, metadata);
+        drop(engine);
+        if will_solve {
+            if let Some(p) = crate::instruments::pipeline() {
+                p.observe_solve_duration(solve_start.elapsed().as_secs_f64());
+                p.count_solves_executed();
+            }
+        }
     }
 
     fn set_last_solved_block(&self, block: u64) {

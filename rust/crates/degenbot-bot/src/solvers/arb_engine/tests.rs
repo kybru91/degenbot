@@ -5444,6 +5444,99 @@ mod tests {
         );
     }
 
+    /// Trace 91a4a776 (block 25907035, session f701ccd3): the tombstone-driven
+    /// `DrainWork::Finalize` raced a still-running burst; its inner
+    /// `solve_dirty` ran a REAL solve cycle (fanout 701 paths -> resolve ->
+    /// stage -> lpt -> merge) WITHOUT a `degenbot.arb.solve` span — the span
+    /// gate lives only in `EngineHandle::solve_dirty`'s Drain arm, and
+    /// `finalize_block` calls the inner method directly. The phase spans
+    /// orphaned under the captured block span (first set parented to
+    /// `pump.block`, second set under `arb.solve` in the same trace), and the
+    /// cycle dropped its `solve_duration` sample + `solves_executed` count.
+    /// K4ETHF-family invariant: every fanout span's parent is an `arb.solve`
+    /// span regardless of which entry drives the solve. RED before the
+    /// finalize-side gate existed.
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn finalize_block_solve_runs_under_arb_solve_span() {
+        use crate::bot_core::engine::Engine;
+        use crate::solvers::arb_engine::engine_handle::EngineHandle;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let capture = SpanParentCapture::default();
+        let log = Arc::clone(&capture.spans);
+        let subscriber = tracing_subscriber::registry().with(capture);
+
+        // Real pools + path so the finalize solve does genuine fan-out work
+        // (mirrors the tombstone-adjacent dirt crossing the burst boundary).
+        let mut engine = ArbitrageEngine::new();
+        let a = engine.register_v2_pool(
+            Address::from([0x21u8; 20]),
+            usdc(1_500_000),
+            weth(800),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let b = engine.register_v2_pool(
+            Address::from([0x22u8; 20]),
+            weth(800),
+            usdc(1_600_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let _pid = engine
+            .register_path(vec![
+                PoolHop {
+                    pool_id: a,
+                    zero_for_one: true,
+                },
+                PoolHop {
+                    pool_id: b,
+                    zero_for_one: true,
+                },
+            ])
+            .expect("path registers");
+        engine.dirty_sets.insert(a, HopType::V2);
+        let handle = EngineHandle::new(Arc::new(parking_lot::Mutex::new(engine)));
+
+        tracing::subscriber::with_default(subscriber, || {
+            handle.finalize_block(5, &BlockMetadata::default());
+        });
+
+        let spans = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let solve_ids: HashSet<u64> = spans
+            .iter()
+            .filter(|(name, _, _)| name == "degenbot.arb.solve")
+            .map(|(_, id, _)| *id)
+            .collect();
+        assert!(
+            !solve_ids.is_empty(),
+            "finalize with dirt must emit exactly the arb.solve span; got {:?}",
+            spans.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+        );
+        let fanouts: Vec<_> = spans
+            .iter()
+            .filter(|(name, _, _)| name == "degenbot.arb.fanout")
+            .collect();
+        assert!(
+            !fanouts.is_empty(),
+            "fixture must produce a fanout span (dirty pool drives a real cycle)"
+        );
+        let orphaned = fanouts
+            .iter()
+            .filter(|(_, _, parent)| parent.is_none_or(|p| !solve_ids.contains(&p)))
+            .count();
+        assert!(
+            orphaned == 0,
+            "finalize-driven fanout spans orphaned outside an arb.solve parent: {orphaned}"
+        );
+    }
+
     // P5FEOI (epic 2LXPPV): original span test, otel-gated like its harness.
     #[cfg(feature = "otel")]
     #[test]
