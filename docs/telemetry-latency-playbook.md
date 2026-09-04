@@ -30,12 +30,29 @@ span start
   │  (activation scan — no event until fan-out; its cost = fanout.phase_us)
   ├─[solve-phase] fanned out to affected paths   {paths.affected, dirty.v2/v3/v4}
   ├─[solve-phase] resolved hop snapshots         {paths.resolved, invalid.reasons}
+  │  (resolve→LPT staging sits in its own child span — MQUKB6-T2 follow)
+  ├─ degenbot.arb.stage                          {paths.staged}
   ├─[solve-phase] rayon solve complete           {paths.solved, paths.invalid,
   │                                               solve.cpu_us, profitable,
   │                                               slowest.paths}
   ├─[solve-phase] cycle complete (clamp done)    {clamp.twins, clamp.phase_us,
   └─ span end                                     total_us}
 ```
+
+Span children of `degenbot.arb.solve` (phase spans, MQUKB6-T2 pattern):
+`degenbot.arb.fanout`, `degenbot.arb.resolve`, `degenbot.arb.stage`,
+`degenbot.arb.lpt`, `degenbot.arb.merge`. Time between two adjacent child
+spans is a regression signal — on trace `f701ccd3` (block 25906841,
+2026-09-04) 647 ms sat unattributed between resolve and lpt (per-path deep
+clones of the resolved CL tick-range sequences during staging). Fixed by
+Arc-sharing the resolved snapshots into the dispatch (staging is refcount
+bumps; measured 0.3–0.5 µs/path vs 25-30 µs/path steady-state before, and the
+cold-ramp 150-420 µs/path pathology eliminated). If a resolve→lpt gap reappears
+larger than `degenbot.arb.stage`, suspect new per-path work added between the
+stage span close and `compute_bins`.
+
+Incident shorthand: `f701ccd3` = trace `f701ccd36f4ecf80d671e798df218fa4`
+(block 25906841, 2026-09-04 session).
 
 Derived quantities (compute these on every investigation):
 
@@ -125,6 +142,30 @@ state apply (each has a Prometheus histogram: `degenbot_log_decode`,
 `degenbot_state_apply`), or queue wait (`degenbot_drain_queue_wait`). Cross-
 check the matching metric histogram percentiles in Prometheus before adding
 new spans.
+
+### S7. header_to_solved dominated by a flat settle wait
+
+Decompose the pump-side gap first — `degenbot.pump.block` fields:
+`header_to_first_log_us` (header → first relevant log), `log_burst_us`
+(first → last relevant log, i.e. the apply work), `settle_wait_us` (last log →
+settle decision). The settle wait is the publish debounce — it costs roughly
+`DEBOUNCE_MS` (the full window) on every block; it buys coalescing of
+same-block log bursts at the price of that fixed tail.
+
+2026-09-04 baseline (block-25906841 session): `settle_wait_us` pinned at
+~51 ms on 24 of 28 blocks while `log_burst_us` spanned 1.3–27.5 ms — the 50 ms
+debounce fired long after each burst was fully applied, making it a fixed
+~50 ms per-block tax on header_to_solved. The window is operator-tunable via
+`DEGENBOT_PUMP_DEBOUNCE_MS` (parse contract `BlockPump::debounce_ms_cfg`:
+unset/zero/invalid falls back to 50 ms, so a bad value can never collapse the
+window to zero). Live A/B at 15 ms settled the same bursts at ~16 ms with no
+change in bursts and still exactly one solve cycle per block.
+
+Trade-off when lowering: a same-block log straggling past the window starts a
+second solve cycle for that block (extra solve cost + an extra publish). The
+truth condition for publication (ADR-008 D2: all dispatched logs applied) is
+unchanged — check solve-cycles-per-block in Jaeger if raising throughput
+suspiciously.
 
 ### S6. Missing events / silent spans (exporter-side data loss)
 

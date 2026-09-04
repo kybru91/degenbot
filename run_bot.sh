@@ -74,6 +74,12 @@ export DEGENBOT_DEBUG="${DEGENBOT_DEBUG:-1}"
 export DEGENBOT_OTEL="${DEGENBOT_OTEL:-1}"
 export DEGENBOT_SIM_EXIT_ON_FAIL="${DEGENBOT_SIM_EXIT_ON_FAIL:-0}"
 export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-1}"
+# Publish-debounce window (ms), last dirty log -> settle decision. A/B'd on
+# 2026-09-04 (telemetry-latency-playbook S7): bursts complete in 1.3-27.5 ms
+# while the 50 ms code default settled full-length on ~every block — a fixed
+# settle tax. 15 ms cuts ~33 ms/block with no extra solve cycles observed.
+# Code default stays 50 ms; invalid/zero env values fall back to 50 ms.
+export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
 # Solver-state verification policy: the CODE default stays ON (loud fail-stop),
 # but this script defaults the per-publish chain-diff verifier OFF so the bot
 # runs the fast "solve against possibly-stale state, invalidate later" path.

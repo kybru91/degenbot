@@ -71,6 +71,12 @@ const BACKFILL_TIMEOUT_SECS: u64 = 60;
 /// before solving and dispatching results to Python. Each new log resets
 /// the timer. This debouncing ensures one dispatch per burst of logs
 /// rather than one per individual log.
+///
+/// Default window, overridable per-process via `DEGENBOT_PUMP_DEBOUNCE_MS`
+/// (f701ccd3 lead-2: live runs settle at the full 50 ms on ~every block while
+/// log bursts complete in 1.3-27.5 ms — an operator lowering the window with a
+/// quiet straggler distribution trades a shorter settle tax for occasional
+/// extra same-block publishes; parse contract in `debounce_ms_cfg`).
 const DEBOUNCE_MS: u64 = 50;
 
 /// If no block header arrives within this window, poll `eth_blockNumber`
@@ -218,6 +224,12 @@ pub struct BlockPump {
     /// Z4KQXF). When OFF the `ws_delivered` index-tracking map is not populated
     /// (no work on the hot loop).
     ws_completeness_enabled: bool,
+    /// Publish-debounce window (ms): after a dirty log, wait this long for a
+    /// straggler before settling the block (solve + dispatch). Default is the
+    /// historical 50 ms; operator-tunable via `DEGENBOT_PUMP_DEBOUNCE_MS`
+    /// (f701ccd3 lead-2: the window fired full-length on ~every block while
+    /// log bursts spaned 1.3-27.5 ms, making it a fixed per-block settle-tax).
+    debounce_ms: u64,
 }
 
 /// State held between `subscribe()` and `resume()` calls.
@@ -254,6 +266,19 @@ impl BlockPump {
     #[must_use]
     fn delivery_lag_trip_threshold(raw: Option<&str>) -> Option<u64> {
         raw?.trim().parse::<u64>().ok().filter(|n| *n > 0)
+    }
+
+    /// Publish-debounce window parse (f701ccd3 lead-2, pure): unset/empty/
+    /// unparseable/zero/negative/overflow fall back to the historical
+    /// [`DEBOUNCE_MS`] so a bad env var can never collapse the settle window
+    /// to zero (one publish per log) or stall the pump.
+    #[must_use]
+    fn debounce_ms_cfg(raw: Option<&str>) -> u64 {
+        raw.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEBOUNCE_MS)
     }
 
     #[expect(clippy::missing_errors_doc)]
@@ -318,6 +343,9 @@ impl BlockPump {
             },
             ws_completeness_enabled: crate::bot_core::bot_env_flag_default_on(
                 "DEGENBOT_WS_COMPLETENESS",
+            ),
+            debounce_ms: Self::debounce_ms_cfg(
+                std::env::var("DEGENBOT_PUMP_DEBOUNCE_MS").ok().as_deref(),
             ),
         };
 
@@ -1249,7 +1277,7 @@ impl BlockPump {
             // inactivity backfill window. A new event arriving before the
             // window elapses cancels the flush (the burst is still in flight).
             let wait_timeout = if fsm.publish_pending() {
-                Duration::from_millis(DEBOUNCE_MS)
+                Duration::from_millis(self.debounce_ms)
             } else {
                 Duration::from_secs(BACKFILL_TIMEOUT_SECS)
             };
@@ -1937,7 +1965,7 @@ impl BlockPump {
                 // adding latency to streams with ready events.
                 use std::pin::Pin;
                 match tokio::time::timeout(
-                    Duration::from_millis(DEBOUNCE_MS),
+                    Duration::from_millis(self.debounce_ms),
                     Pin::new(&mut combined).peek(),
                 )
                 .await
@@ -2368,6 +2396,10 @@ impl BlockPump {
             // synthetic log streams (which use relevant-topic logs as pure block
             // tombstones) never trip a spurious eth_getLogs comparison/abort.
             ws_completeness_enabled: false,
+            // Historical default: tests exercise the shared window (a per-
+            // pump override seam exists via the field, not env, so tests stay
+            // immune to the global environment).
+            debounce_ms: DEBOUNCE_MS,
         }
     }
 
@@ -2666,6 +2698,33 @@ mod tests {
         let sink = Arc::new(FakeDrainSink::new(last_processed));
         let pump = BlockPump::for_test(bot, sink.clone(), reorg, provider, shutdown);
         (pump, sink)
+    }
+
+    /// Session lead-2 (trace f701ccd3, block 25906841 + the 2026-09-04
+    /// settle-wait survey): `settle_wait_us` pinned at ~51 ms on 24 of 28 live
+    /// blocks while `log_burst_us` spans 1.3-27.5 ms — the 50 ms publish
+    /// debounce always fires long after the block's log burst is fully
+    /// applied, so it is a fixed per-block latency tax, not a real quiesce
+    /// wait. Make it operator-tunable (pure parse contract; invalid input
+    /// keeps the historical default so a bad env var can never zero the
+    /// window or stall the pump).
+    #[test]
+    fn pump_debounce_ms_cfg_defaults_to_50_and_parses_override() {
+        // Unset / empty / junk / zero / overflow => historical default 50 ms.
+        assert_eq!(BlockPump::debounce_ms_cfg(None), DEBOUNCE_MS);
+        assert_eq!(BlockPump::debounce_ms_cfg(Some("")), DEBOUNCE_MS);
+        assert_eq!(BlockPump::debounce_ms_cfg(Some("junk")), DEBOUNCE_MS);
+        assert_eq!(BlockPump::debounce_ms_cfg(Some("0")), DEBOUNCE_MS);
+        assert_eq!(BlockPump::debounce_ms_cfg(Some("-1")), DEBOUNCE_MS);
+        assert_eq!(
+            BlockPump::debounce_ms_cfg(Some("99999999999999999999")),
+            DEBOUNCE_MS
+        );
+        // Operator override: lower debounce = lower per-block settle tax.
+        assert_eq!(BlockPump::debounce_ms_cfg(Some("15")), 15);
+        assert_eq!(BlockPump::debounce_ms_cfg(Some(" 15 ")), 15);
+        // Allow raising the window for stragglers too.
+        assert_eq!(BlockPump::debounce_ms_cfg(Some("120")), 120);
     }
 
     #[test]

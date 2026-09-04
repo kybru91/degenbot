@@ -122,6 +122,7 @@ code, not by the tracing filter.
 | `DEGENBOT_WS_COMPLETENESS` | ON | per-block `eth_getLogs` vs WS delivery cross-check (aborts loudly on a live WS drop) |
 | `DEGENBOT_DRAIN_DBG` | **OFF** | per-event debug-drain log for a specific pool address (opt-in) |
 | `DEGENBOT_TRACE_REGISTER_SEED` | **OFF** | registration-seed trace (opt-in) |
+| `DEGENBOT_PUMP_DEBOUNCE_MS` | 50 | publish-debounce window (ms) — last dirty log → settle decision. Invalid/zero/empty falls back to 50. Lower to cut the per-block settle tax (see S7 in `docs/telemetry-latency-playbook.md`); the 2026-09-04 A/B at 15 ms cut ~33 ms/block with no extra solve cycles |
 
 `run_bot.sh` documents this set in its header. To run a long-lived soak that
 trades through the routine thin-margin/no-profit reverts (instead of trapping on
