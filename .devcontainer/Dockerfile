@@ -67,8 +67,9 @@ RUN printf '\nPS1="${PS1//@\\\\h/}"\n' >> /etc/bashrc
 # .envrc is a deliberate no-op inside the container (it is guarded on
 # /run/.containerenv and containerEnv in devcontainer.json owns those vars
 # here); the hook exists so the bind-mounted .envrc is safe to load from
-# either side of the boundary.
-RUN printf '\neval "$(direnv hook bash)"\n' >> /etc/bashrc
+# either side of the boundary. DIRENV_QUIET=1 silences the loading/unload
+# chatter (errors still print) — matches the host-side .bashrc setting.
+RUN printf '\nexport DIRENV_QUIET=1\neval "$(direnv hook bash)"\n' >> /etc/bashrc
 
 USER ${USERNAME}
 ENV HOME=/home/${USERNAME}
