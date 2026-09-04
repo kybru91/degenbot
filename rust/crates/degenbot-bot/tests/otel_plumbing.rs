@@ -90,6 +90,68 @@ fn layer_builds_on_bare_registry() {
     let _subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 }
 
+/// f701ccd3 session: the block→simulate handoff broke the OTel context at
+/// the Rust→Python bridge — `degenbot.simulate.dispatch` exported as a ROOT
+/// span, uncorrelated with `degenbot.pump.block` (two trace families joined
+/// only by the `current_block` tag). The block-context bridge
+/// (`telemetry::publish_block_context` when a batch is sent +
+/// `telemetry::simulate_dispatch_span` re-attaching the remote parent at the
+/// Python seam) must make the simulate dispatch a CHILD of the published
+/// block span so the full chain renders as ONE Jaeger trace.
+#[test]
+fn simulate_dispatch_span_carries_published_block_parent() {
+    use degenbot_bot::telemetry;
+
+    let exporter = InMemorySpanExporter::default();
+    let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+    let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    {
+        let block_span = tracing::info_span!("degenbot.pump.block", block.number = 77);
+        let _entered = block_span.enter();
+        // Production call site: `compute_diff_and_send` under the settle-
+        // entered block span.
+        telemetry::publish_block_context(77);
+        let _ = block_span; // guard order: publish inside the block span
+    }
+
+    {
+        let dispatch_span = telemetry::simulate_dispatch_span(77, 3);
+        let _entered = dispatch_span.enter();
+    }
+
+    provider.force_flush().expect("flush");
+    let spans = exporter.get_finished_spans().expect("spans");
+    // Assert against the EXPORTED spans — the Jaeger semantics. (A span's
+    // pre-close `context()` materializes an ephemeral span id: the batch
+    // exporter assigns the final id at close, so expectations must come from
+    // exported data, not from a live handle.)
+    let block = spans
+        .iter()
+        .find(|s| s.name.as_ref() == "degenbot.pump.block")
+        .expect("pump.block span must be exported");
+    let child = spans
+        .iter()
+        .find(|s| s.name.as_ref() == "degenbot.simulate.dispatch")
+        .expect("simulate.dispatch span must be exported");
+    assert_ne!(
+        child.span_context.span_id(),
+        block.span_context.span_id(),
+        "sanity: parent and child are distinct spans"
+    );
+    assert_eq!(
+        child.span_context.trace_id(),
+        block.span_context.trace_id(),
+        "simulate.dispatch must share the pump.block trace"
+    );
+    assert_eq!(
+        child.parent_span_id,
+        block.span_context.span_id(),
+        "simulate.dispatch must parent to the published block span"
+    );
+}
+
 /// The attribute-key comparison used above relies on `Key` equality by static
 /// str — pin it so an `OTel` bump can't silently weaken the content assertion.
 #[test]

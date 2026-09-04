@@ -270,6 +270,116 @@ mod otel_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Block-context propagation bridge (session f701ccd3).
+//
+// The Rust→Python handoff broke the OTel context: the batch leaves the
+// engine under the settle-entered block span, but the Python-driven simulate
+// future (`degenbot.simulate.dispatch`) created a FRESH root span — two
+// disconnected Jaeger trace families correlated only by the `current_block`
+// tag. The bridge: capture the exporter-visible span context at batch-send
+// time (`publish_block_context`, keyed by the batch's solve block), and
+// re-attach it as a REMOTE parent when the Python seam builds its dispatch
+// span (`simulate_dispatch_span`). Same trace id + block span id as parent —
+// Jaeger renders the full chain (pump.block → arb.solve → simulate.dispatch
+// → bundle.*) as ONE trace. Remote (not in-process) semantics is correct:
+// the block span is usually already closed when the future starts.
+// ---------------------------------------------------------------------------
+
+/// Live block-span contexts, keyed by the batch's `solve_block`. Bounded at
+/// the last 8 settle points (publish → Python simulate latency is < 1 block;
+/// older entries are dead weight). Lock hold is nanoseconds — no I/O, no
+/// await; safe for the hot path.
+#[cfg(feature = "otel")]
+static PUBLISHED_BLOCK_CONTEXTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<u64, opentelemetry::trace::SpanContext>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(feature = "otel")]
+const PUBLISHED_BLOCK_CONTEXTS_CAPACITY: usize = 8;
+
+/// Capture the CURRENT span's exporter context as the propagation parent for
+/// `block`. Call at result batch send time (with the block span entered by
+/// the settle gate — see `DeliveryPolicy::diff_and_send`). No-op when the
+/// active span has no `OTel` context (layer not installed / disabled span) so
+/// callers never gate their logic on telemetry.
+///
+/// Runs with the block span entered by the settle gate in production.
+#[cfg(feature = "otel")]
+pub fn publish_block_context(block: u64) {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let sc = tracing::Span::current()
+        .context()
+        .span()
+        .span_context()
+        .clone();
+    if !sc.is_valid() {
+        return;
+    }
+    let mut map = PUBLISHED_BLOCK_CONTEXTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if map.len() >= PUBLISHED_BLOCK_CONTEXTS_CAPACITY {
+        if let Some(&oldest) = map.keys().min() {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(block, sc);
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn publish_block_context(_block: u64) {}
+
+/// Build the `degenbot.simulate.dispatch` span for the Python simulate fan-
+/// out, re-attaching the published block's span context as a remote parent
+/// when one is registered for `current_block` (f701ccd3 bridge). Attribute
+/// parity with the historical inline span is exact (`current_block`,
+/// `phase_candidate_count`).
+#[cfg(feature = "otel")]
+#[must_use]
+pub fn simulate_dispatch_span(current_block: u64, candidate_count: usize) -> tracing::Span {
+    let span = tracing::info_span!(
+        "degenbot.simulate.dispatch",
+        current_block,
+        phase_candidate_count = candidate_count
+    );
+    let parent = {
+        let map = PUBLISHED_BLOCK_CONTEXTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Exact block first (the batch's solve block); then the nearest
+        // previous block — Python's `current_block` can be one ahead (the
+        // batch is dispatched after the next header arrives), and parenting
+        // to the closest earlier block span is the correct lineage either way.
+        map.get(&current_block).cloned().or_else(|| {
+            map.keys()
+                .filter(|&&b| b <= current_block)
+                .max()
+                .and_then(|b| map.get(b).cloned())
+        })
+    };
+    if let Some(sc) = parent {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let cx = opentelemetry::Context::new().with_remote_span_context(sc);
+        // Best-effort: a rejected parent propagation degrades to today's
+        // behaviour (root span), never blocks the hot path.
+        let _ = span.set_parent(cx);
+    }
+    span
+}
+
+#[cfg(not(feature = "otel"))]
+#[must_use]
+pub fn simulate_dispatch_span(current_block: u64, candidate_count: usize) -> tracing::Span {
+    tracing::info_span!(
+        "degenbot.simulate.dispatch",
+        current_block,
+        phase_candidate_count = candidate_count
+    )
+}
+
 /// Best-effort flush of the `OTel` span exporter.
 ///
 /// `std::process::abort()` skips destructors, so the batched span processor

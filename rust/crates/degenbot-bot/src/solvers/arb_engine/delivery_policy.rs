@@ -308,6 +308,11 @@ impl ArbitrageEngine {
     /// net) if no anchor has been seeded yet.
     pub fn compute_diff_and_send(&mut self, metadata: &BlockMetadata) {
         let results_block = self.results_block;
+        // f701ccd3 bridge: capture the settle-entered block span as the
+        // propagation parent for `results_block` — the Python simulate seam
+        // re-attaches it (telemetry::simulate_dispatch_span) so the whole
+        // block chain renders as one Jaeger trace.
+        crate::telemetry::publish_block_context(results_block);
         let results_snapshot: HashMap<u64, SolvePathResult> = self
             .results
             .iter()

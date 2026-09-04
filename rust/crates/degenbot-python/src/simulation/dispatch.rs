@@ -299,11 +299,11 @@ pub fn dispatch_profitable_py<'py>(
     // hops tokio workers, and a thread-local guard would strand the span
     // context on the wrong thread. The GIL-probe phase markers ride it as
     // events on the degenbot::diag target (capped off the console sinks).
-    let dispatch_span = tracing::info_span!(
-        "degenbot.simulate.dispatch",
-        current_block,
-        phase_candidate_count
-    );
+    // f701ccd3 bridge: the span is built by `degenbot-bot::telemetry`, which
+    // re-attaches the published block's span context as a remote parent so
+    // the Rust→Python handoff stays trace-continuous.
+    let dispatch_span =
+        degenbot_bot::telemetry::simulate_dispatch_span(current_block, phase_candidate_count);
     future_into_py(py, dispatch_body.instrument(dispatch_span))
 }
 

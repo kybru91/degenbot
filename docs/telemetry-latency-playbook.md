@@ -54,6 +54,21 @@ stage span close and `compute_bins`.
 Incident shorthand: `f701ccd3` = trace `f701ccd36f4ecf80d671e798df218fa4`
 (block 25906841, 2026-09-04 session).
 
+### Trace continuity across the Python handoff
+
+The Rust→Python bridge (batch → `simulate.dispatch` fan-out) used to snap the
+OTel context: simulate/bundle spans exported as ROOT traces, correlated only
+by the `current_block` tag. The bridge (`telemetry::publish_block_context` at
+batch send + `telemetry::simulate_dispatch_span` at the Python seam) parents
+the dispatch fan-out to the published block's span, so ONE Jaeger trace now
+carries `pump.block → arb.solve → simulate.dispatch → bundle.*`. The lookup
+falls back to the closest earlier block because Python's `current_block` can
+be one ahead (the batch is dispatched after the next header arrives). If
+simulate spans reappear as roots, the registry capture (batch send) or the
+seam call regressed; the continuity test
+(`otel_plumbing::simulate_dispatch_span_carries_published_block_parent`)
+covers the contract end to end on the InMemory exporter.
+
 Derived quantities (compute these on every investigation):
 
 | Quantity | Formula | Healthy |
