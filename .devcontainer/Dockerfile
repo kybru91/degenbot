@@ -73,8 +73,11 @@ RUN printf '\neval "$(direnv hook bash)"\n' >> /etc/bashrc
 # Silence direnv's loading/unload/export chatter (direnv.toml(5)): log_filter
 # is a REGEX ALLOWLIST on status lines — a never-matching pattern drops them;
 # logError bypasses the filter, so real errors still print.
+# Whitelist the bind-mounted repo so a container rebuild (which wipes the dev
+# user's home, including direnv's allow records) does not re-prompt: the .envrc
+# is a no-op in-container (guarded on /run/.containerenv) and first-party.
 RUN mkdir -p /home/dev/.config/direnv && \
-    printf 'hide_env_diff = true\nlog_filter = "error"\n' \
+    printf 'hide_env_diff = true\nlog_filter = "error"\n\n[whitelist]\nprefix = [ "/workspaces/degenbot" ]\n' \
         > /home/dev/.config/direnv/direnv.toml && \
     chown -R dev:dev /home/dev/.config/direnv
 
