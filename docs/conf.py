@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import tomllib
 from pathlib import Path
 
@@ -20,6 +21,27 @@ except Exception:
     version = release = "unknown"
 
 copyright = f"{datetime.date.today().year}, degenbot contributors"
+
+# -- Docs channel banner ------------------------------------------------------
+# Build context decides which banner Furo's announcement strip shows. RTD
+# sets READTHEDOCS_VERSION ("latest" = main, "stable" = newest release tag,
+# branch names for preview builds); local builds have it unset and show none.
+_docs_site = "https://degenbot.readthedocs.io"
+_rtd_version = os.environ.get("READTHEDOCS_VERSION", "")
+if _rtd_version == "stable":
+    _announcement = (
+        "📖 Released docs. In-progress work lives in the "
+        f'<a href="{_docs_site}/en/latest/">development docs</a>.'
+    )
+elif _rtd_version:  # "latest", feature-branch builds, PR previews
+    _announcement = (
+        "🚧 Development docs — they may describe unreleased work. "
+        f'For the installed package, see the <a href="{_docs_site}/en/stable/">stable docs</a>.'
+    )
+else:
+    _announcement = None
+
+html_theme_options = {"announcement": _announcement} if _announcement else {}
 
 # -- General configuration ---------------------------------------------------
 
