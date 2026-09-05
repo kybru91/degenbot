@@ -1243,6 +1243,11 @@ impl BlockPump {
         // `degenbot.arb.solve` instead of an empty stretch.
         let mut log_wait_span: Option<tracing::Span> = None;
         let mut apply_span: Option<tracing::Span> = None;
+        // REMED1 T3: per-block phase attribution - the apply-stream start
+        // (first relevant log) vs the settle point, recorded on the block
+        // span + the throttled diag line so slow-block serialization between
+        // the WS log wait and the solve is visible from the console.
+        let mut apply_started_at: Option<std::time::Instant> = None;
         loop {
             // Span lifecycle (TQ7PD6 fix): an enter guard must never outlive a
             // single poll. This task runs on a multi-threaded tokio runtime and
@@ -1432,6 +1437,43 @@ impl BlockPump {
                                 if let Some(ap) = apply_span.take() {
                                     ap.record("logs.n", pregap.logs);
                                     drop(ap);
+                                    // REMED1 T3: attribute the apply-stream
+                                    // wall (log arrival + applies + quiesce)
+                                    // on the block span next to the pregap
+                                    // fields; the slow-block scan showed this
+                                    // phase is the larger half of p95 blocks.
+                                    if let Some(span_ref) = block_span.as_ref() {
+                                        if let Some(apply_start) = apply_started_at {
+                                            span_ref.record(
+                                                "apply_stream_us",
+                                                apply_start.elapsed().as_micros() as u64,
+                                            );
+                                        }
+                                    }
+                                }
+                                // REMED1 T3: throttled per-block phase
+                                // attribution on the console (every 20th block
+                                // - the Jaeger span carries all blocks).
+                                static DIAG_ATTEMPT: std::sync::atomic::AtomicU32 =
+                                    std::sync::atomic::AtomicU32::new(0);
+                                let nth =
+                                    DIAG_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if nth % 20 == 0 {
+                                    let apply_us = apply_started_at
+                                        .map(|t| t.elapsed().as_micros() as u64)
+                                        .unwrap_or(0);
+                                    let (hw, lw) = (pregap.header_at, pregap.first_log);
+                                    tracing::info!(
+                                        target: "degenbot::diag",
+                                        block_number = open,
+                                        sequence = nth,
+                                        logs = pregap.logs,
+                                        header_to_first_log_us = lw.map(|t| {
+                                            t.saturating_duration_since(hw).as_micros() as u64
+                                        }),
+                                        apply_stream_us = apply_us,
+                                        "[pump-overlap] per-block phase attribution (throttled)"
+                                    );
                                 }
                                 let change_set = self.sink.take_solver_path_pool_refs_change_set();
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
@@ -1648,6 +1690,7 @@ impl BlockPump {
                         drop(wait);
                     }
                     if apply_span.is_none() {
+                        apply_started_at = Some(std::time::Instant::now());
                         apply_span = Some(tracing::info_span!(
                             parent:
                                 block_span.clone().unwrap_or_else(tracing::Span::none),
