@@ -54,6 +54,6 @@ pub use sim::evm::{
     apply_simulation_overrides, divergence_probe, emit_access_list_from_state, AccessListCollector,
     BlockEvm, BlockSimHandle, BotStateDb, CallFrame, CallTrace, CallTraceHandle,
     CallTraceInspector, CapturedSwap, FrameOutcome, ProductionBlockDb, SimInspector,
-    SimulationOverrideParams, SwapEventCaptureHandle, SwapEventCaptureInspector, SwapFamily,
-    WarmCodeCache, WarmCodeCacheInner, WARM_CODE_CACHE_TTL_BLOCKS,
+    SimulationOverrideParams, StorageMemo, SwapEventCaptureHandle, SwapEventCaptureInspector,
+    SwapFamily, WarmCodeCache, WarmCodeCacheInner, WARM_CODE_CACHE_TTL_BLOCKS,
 };

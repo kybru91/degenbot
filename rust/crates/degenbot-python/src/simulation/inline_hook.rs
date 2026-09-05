@@ -71,6 +71,10 @@ pub(crate) struct InlineSimHook {
     /// The dedicated multi-thread sim runtime (the T4 body note — see the
     /// module doc). Built once, shared for the hook's lifetime.
     sim_runtime: Arc<tokio::runtime::Runtime>,
+    /// SIMPIPE2 M2: per-block storage memo shared by every payload sim of
+    /// the same sim height (recreated on block advance). Collapses the
+    /// ~20-cold-storage-RPC-per-sim into ~per-pool-unique per cycle.
+    storage_memo: std::sync::Mutex<(u64, Arc<degenbot_simulation::StorageMemo>)>,
 }
 
 fn outputs_vec(req: &InlineSimRequest) -> Vec<u128> {
@@ -113,6 +117,10 @@ impl InlineSimHook {
             erc6909_profit,
             bot_state,
             warm_cache,
+            storage_memo: std::sync::Mutex::new((
+                0,
+                Arc::new(degenbot_simulation::StorageMemo::new()),
+            )),
             sim_runtime: Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     // M2 soak sizing (2026-09-05): with the hard-coded 2
@@ -307,6 +315,23 @@ impl InlineSimulator for InlineSimHook {
         let base_fee_next = self.next_base_fee(&req);
         let provider = Arc::clone(&self.provider);
         let warm_cache = Arc::clone(&self.warm_cache);
+        // M2: the cycle-scoped storage memo - one per sim block; sims at a
+        // new block recreate it (pre-state differs across heights).
+        let storage_memo = {
+            // A poisoned memo lock is recoverable: the memo is block-scoped
+            // and purely advisory (the fallback path re-fetches on a miss).
+            let mut guard = match self.storage_memo.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.0 != req.sim_block {
+                *guard = (
+                    req.sim_block,
+                    Arc::new(degenbot_simulation::StorageMemo::new()),
+                );
+            }
+            Arc::clone(&guard.1)
+        };
         let executor_owner = self.executor_owner;
         let executor_address = self.executor_address;
         let weth_address = self.weth_address;
@@ -364,6 +389,7 @@ impl InlineSimulator for InlineSimHook {
                         &ctx.override_params(),
                         &anchor,
                         &warm_cache,
+                        Some(&storage_memo),
                     ) {
                         Some(mut handle) => {
                             let mut buckets = FailBuckets::new();

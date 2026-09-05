@@ -687,6 +687,10 @@ pub fn dispatch_profitable_results(
                 .map(|c| c.solve_block)
                 .max()
                 .unwrap_or(ctx.current_block);
+            // SIMPIPE2 M2: the fanout's own storage memo - the handle is
+            // per-fanout already, but the memo costs nothing and covers any
+            // handle re-arms inside this fanout (same-height pre-state).
+            let storage_memo = std::sync::Arc::new(degenbot_simulation::StorageMemo::new());
             match BlockSimHandle::build(
                 ctx.provider,
                 ctx.base_fee_next,
@@ -695,6 +699,7 @@ pub fn dispatch_profitable_results(
                 &ctx.override_params(),
                 &anchor,
                 &warm_cache,
+                Some(&storage_memo),
             ) {
                 Some(mut handle) => candidates
                     .into_iter()

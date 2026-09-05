@@ -181,6 +181,7 @@ impl<'a> BlockSimHandle<'a> {
         override_params: &SimulationOverrideParams,
         anchor: &'a SimAnchorState,
         warm_cache: &Arc<RwLock<super::WarmCodeCacheInner>>,
+        storage_memo: Option<&std::sync::Arc<super::StorageMemo>>,
     ) -> Option<Self> {
         // SIMPIPE T1 lab: build cost (the M1 amortization target — today the
         // build re-arms per 1-candidate dispatch, M1 builds K per cycle).
@@ -193,6 +194,7 @@ impl<'a> BlockSimHandle<'a> {
                 override_params,
                 anchor,
                 warm_cache,
+                storage_memo,
             )
         });
         super::sim_metrics::record_handle_build(build_dur);
@@ -208,6 +210,7 @@ impl<'a> BlockSimHandle<'a> {
         override_params: &SimulationOverrideParams,
         anchor: &'a SimAnchorState,
         warm_cache: &Arc<RwLock<super::WarmCodeCacheInner>>,
+        storage_memo: Option<&std::sync::Arc<super::StorageMemo>>,
     ) -> Option<Self> {
         // type-erased `Arc<dyn Provider>` from `provider_arc()` does NOT satisfy
         // it (Alloy's auto-impl covers `Arc<T: Provider + Sized>`, not
@@ -228,7 +231,8 @@ impl<'a> BlockSimHandle<'a> {
             wrap_db,
             provider.rpc_url(),
             current_block,
-        );
+        )
+        .with_storage_memo_opt(storage_memo);
         let warm_code_cache =
             super::WarmCodeCache::with_owner(Arc::clone(warm_cache), current_block, bot_state_db);
         let mut cache_db = CacheDB::new(warm_code_cache);

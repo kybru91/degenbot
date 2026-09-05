@@ -87,6 +87,11 @@ where
     /// these `None` → probe off; `new_with_code_probe` arms it.
     code_probe_rpc: Option<String>,
     code_probe_block: Option<u64>,
+    /// Optional PER-CYCLE storage memo (SIMPIPE2 M2): when present, storage
+    /// reads consult it before the fallback and real fetches populate it.
+    /// Values are the fallback's own answers at one block height - never the
+    /// engine's slots - so the refuted partial-serve hazard does not apply.
+    pub storage_memo: Option<std::sync::Arc<super::StorageMemo>>,
 }
 
 impl<'bot, ExtDb> BotStateDb<'bot, ExtDb>
@@ -102,7 +107,27 @@ where
             fallback,
             code_probe_rpc: None,
             code_probe_block: None,
+            storage_memo: None,
         }
+    }
+
+    /// Attach the per-cycle storage memo (builder form - the cycle owner
+    /// creates the memo and hands the same Arc to every handle built within
+    /// the block).
+    #[must_use]
+    pub fn with_storage_memo(mut self, memo: std::sync::Arc<super::StorageMemo>) -> Self {
+        self.storage_memo = Some(memo);
+        self
+    }
+
+    /// Same but the caller may hold `None` (memo off).
+    #[must_use]
+    pub fn with_storage_memo_opt(
+        mut self,
+        memo: Option<&std::sync::Arc<super::StorageMemo>>,
+    ) -> Self {
+        self.storage_memo = memo.cloned();
+        self
     }
 
     /// Like [`Self::new`] but arms the false-empty provenance probe: on the
@@ -123,6 +148,7 @@ where
             fallback,
             code_probe_rpc: Some(rpc_url.to_string()),
             code_probe_block: Some(sim_block),
+            storage_memo: None,
         }
     }
 
@@ -253,7 +279,19 @@ where
         address: Address,
         index: StorageKey,
     ) -> Result<StorageValue, Self::Error> {
+        // M2: per-cycle memo FIRST - a hit is the same block's own earlier
+        // RPC answer (the fallback remains the authority; the memo never
+        // serves engine slots, so the K-invariant / LOK partial-serve hazard
+        // does not apply). The owner recreates the memo per block.
+        if let Some(memo) = self.storage_memo.as_ref() {
+            if let Some(v) = memo.get(address, index) {
+                return Ok(v);
+            }
+        }
         let rpc_value = self.fallback.storage_ref(address, index)?;
+        if let Some(memo) = self.storage_memo.as_ref() {
+            memo.put(address, index, rpc_value);
+        }
         // Observation first (env-gated, pure — compares engine vs RPC, logs
         // divergence, never changes what the sim reads). Independent of the
         // serving gate below.

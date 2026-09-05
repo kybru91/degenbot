@@ -81,6 +81,7 @@ pub mod bot_state_db;
 /// gap (the spike-checkpoint answer that picks fix path A/B/C).
 pub mod divergence_probe;
 pub mod serving;
+mod storage_memo;
 
 /// LAB (SIMPIPE T1): cold-fetch + handle-build counters — see the module doc.
 pub mod sim_metrics;
@@ -132,4 +133,5 @@ pub use inspectors::{
 /// live in `degenbot-arbitrage`.
 pub use simulator::{BlockEvm, BlockSimHandle, ProductionBlockDb};
 pub use state_override::{apply_simulation_overrides, SimulationOverrideParams};
+pub use storage_memo::StorageMemo;
 pub use warm_code_cache::{WarmCodeCache, WarmCodeCacheInner, WARM_CODE_CACHE_TTL_BLOCKS};
