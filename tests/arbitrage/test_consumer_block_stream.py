@@ -174,7 +174,28 @@ async def _run(
     from degenbot.runner.config import ArbitrageConfig
 
     orig = _runner_consume._dispatch_profitable
+    orig_pipe = _runner_consume.SimSubmitPipeline
     _runner_consume._dispatch_profitable = _fake_dispatch  # type: ignore[assignment]
+
+    # SIMPIPE option A: the default consumer path routes batches through the
+    # pipeline; the fake pipeline records the dispatch clock the same way the
+    # serial-leaf fake above does (both seams share the session owner).
+    class _StubPipeline:
+        def __init__(self, session: Any, **kwargs: Any) -> None:
+            self._session = session
+
+        async def enqueue(
+            self, results: Any, *, block_timestamp: int, base_fee_next: int
+        ) -> None:
+            dispatched.append(self._session.dispatcher.current_block)
+
+        def raise_if_failed(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+    _runner_consume.SimSubmitPipeline = _StubPipeline  # type: ignore[misc-assignment]
     owner = _SessionState(
         engine_registry=object(),  # type: ignore[arg-type] — not read (streams injected)
         async_w3=w3,  # type: ignore[arg-type]
@@ -204,6 +225,7 @@ async def _run(
         )
     finally:
         _runner_consume._dispatch_profitable = orig  # type: ignore[assignment]
+        _runner_consume.SimSubmitPipeline = orig_pipe  # type: ignore[assignment]
     return dispatcher, w3, dispatched
 
 

@@ -25,6 +25,7 @@ from degenbot.dispatch import fetch_fee_history
 from degenbot.logging import logger as bot_logger
 from degenbot.runner._dispatch import _dispatch_profitable
 from degenbot.runner._driver_constants import FEE_PERCENTILES
+from degenbot.runner._sim_submit_pipeline import SimSubmitPipeline
 
 if TYPE_CHECKING:
     from degenbot.runner.bot_runner import _SessionState
@@ -44,13 +45,19 @@ async def consume_result_batches(
     result batch's ``solve_block`` lagged by the send debounce + only advanced
     when a batch was actually sent, so the bot's ``[block: N]`` froze behind
     the pump's ``current_block``. The block stream ticks once per accepted
-    ``WsEvent::BlockHeader`` — the authoritative clock.
+    ``WsEvent::BlockHeader`` - the authoritative clock.
 
-    The block stream is always injected — the coordinator owns the once-only
+    The block stream is always injected - the coordinator owns the once-only
     ``Bot.block_stream()`` handle (ADR-027) and passes it in. The result
     iterator is injectable for testing; production pulls it from the engine.
     """
-    bot_logger.info("[consumer] Starting — block stream + result batches from Rust pump")
+    bot_logger.info("[consumer] Starting - block stream + result batches from Rust pump")
+    # SIMPIPE option A: K-way concurrent sims + single ordered submitter
+    # (created here - the session owns the instance lifetime).
+    pipeline = session.sim_submit_pipeline
+    if pipeline is None:
+        pipeline = SimSubmitPipeline(session)
+        session.sim_submit_pipeline = pipeline
 
     if result_iter is None:
         result_iter = aiter(session.engine_registry.engine)
@@ -74,7 +81,11 @@ async def consume_result_batches(
                 await _apply_block_if_ready(fut, session)
             elif fut is result_fut:
                 result_fut, result_ended = _reprime(result_iter, fut, "result stream")
-                await _apply_result_if_ready(fut, session)
+                await _apply_result_if_ready(fut, session, pipeline)
+        # SIMPIPE loud-abort: a failed sim/submit leaf surfaces here (the
+        # same kernel the consumer loop already brings down the run with).
+        if pipeline is not None:
+            pipeline.raise_if_failed()
         # ergo 66H3KJ: mark main-loop forward progress for the Rust stuck-
         # watchdog (start_gil_probe). A stale timestamp here means the loop
         # is parked mid-`_apply_result_if_ready` (the dispatch deadlock site).
@@ -173,9 +184,18 @@ async def _apply_block_if_ready(fut: asyncio.Task[dict[str, int]], session: _Ses
 
 
 async def _apply_result_if_ready(
-    fut: asyncio.Task[dict[str, object]], session: _SessionState
+    fut: asyncio.Task[dict[str, object]],
+    session: _SessionState,
+    pipeline: SimSubmitPipeline | None = None,
 ) -> None:
-    """Dispatch profitable results from a solver result batch if fut resolved."""
+    """Dispatch profitable results from a solver result batch if fut resolved.
+
+    SIMPIPE option A: with a pipeline attached, the batch's sim work is
+    backgrounded K-way concurrent and submission happens on the SINGLE ordered
+    submitter (FIFO in batch arrival order - the nonce-serialization contract
+    the serial loop had). Without a pipeline (legacy A/B arm), the serial leaf
+    awaits inline exactly as before.
+    """
     if fut.cancelled() or fut.exception() is not None:
         return
     try:
@@ -184,7 +204,6 @@ async def _apply_result_if_ready(
         return
 
     current_block = session.dispatcher.current_block
-    operator_nonce = await session.async_w3.get_transaction_count(session.cfg.operator_address)
     solve_block = int(cast("Any", batch["solve_block"]))
 
     results: list[tuple[int, int, int, tuple[int, ...], tuple[int, ...], int, tuple[int, ...]]] = []
@@ -215,14 +234,28 @@ async def _apply_result_if_ready(
         session.dispatcher.discard_path(int(path_id))
 
     if results:
-        await _dispatch_profitable(
-            session,
-            results,
-            block_timestamp=session.dispatcher.block_timestamp_for(current_block) or 0,
-            base_fee_next=next_base_fee(
-                parent_base_fee=int(cast("Any", batch.get("base_fee_per_gas") or 0)),
-                parent_gas_used=int(cast("Any", batch["gas_used"])),
-                parent_gas_limit=int(cast("Any", batch["gas_limit"])),
-            ),
-            operator_nonce=operator_nonce,
-        )
+        if pipeline is not None:
+            await pipeline.enqueue(
+                results,
+                block_timestamp=session.dispatcher.block_timestamp_for(current_block) or 0,
+                base_fee_next=next_base_fee(
+                    parent_base_fee=int(cast("Any", batch.get("base_fee_per_gas") or 0)),
+                    parent_gas_used=int(cast("Any", batch["gas_used"])),
+                    parent_gas_limit=int(cast("Any", batch["gas_limit"])),
+                ),
+            )
+        else:
+            operator_nonce = await session.async_w3.get_transaction_count(
+                session.cfg.operator_address
+            )
+            await _dispatch_profitable(
+                session,
+                results,
+                block_timestamp=session.dispatcher.block_timestamp_for(current_block) or 0,
+                base_fee_next=next_base_fee(
+                    parent_base_fee=int(cast("Any", batch.get("base_fee_per_gas") or 0)),
+                    parent_gas_used=int(cast("Any", batch["gas_used"])),
+                    parent_gas_limit=int(cast("Any", batch["gas_limit"])),
+                ),
+                operator_nonce=operator_nonce,
+            )

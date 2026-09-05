@@ -53,6 +53,7 @@ from degenbot.runner._driver_constants import (
     UNISWAP_V4_POOL_MANAGER_ADDRESS,
     WETH_ADDRESS,
 )
+from degenbot.runner._sim_submit_pipeline import SimSubmitPipeline
 from degenbot.runner.build_paths import ConstructionContext, PathRegistrationPipeline, build_paths
 from degenbot.runner.config import ArbitrageConfig
 from degenbot.uniswap.deployments import EthereumMainnetUniswapV4
@@ -142,6 +143,10 @@ class _SessionState:
     dispatcher: Dispatcher
     cfg: ArbitrageConfig
     current_block: int
+    #: SIMPIPE option A (lazily attached at consumer start - the concurrent
+    #: sim fan-out + single ordered submitter; ``None`` runs the legacy
+    #: serial leaf for A/B).
+    sim_submit_pipeline: SimSubmitPipeline | None = None
 
 
 class BotRunner:

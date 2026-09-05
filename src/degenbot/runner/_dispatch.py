@@ -33,7 +33,13 @@ from degenbot.runner.config import ArbitrageConfig
 
 if TYPE_CHECKING:
     from degenbot.runner.bot_runner import _SessionState
-from degenbot.runner._driver_constants import (
+
+#: One raw engine-result row (path_id, optimal_input, profit, hop_outputs,
+#: consumed_inputs, solve_block, state_nonces) - the tuple shape the result
+#: batch stream delivers.
+_RawResult = tuple[int, int, int, tuple[int, ...], tuple[int, ...], int, tuple[int, ...]]
+
+from degenbot.runner._driver_constants import (  # ruff: ignore[module-import-not-at-top-of-file] - after the type alias block
     ERC6909_PROFIT,
     INJECT_EXECUTOR_CODE,
     MIN_PROFIT_MARGIN_BPS,
@@ -95,29 +101,51 @@ def _load_executor_runtime_bytecode(cfg: ArbitrageConfig) -> str:
 
 async def _dispatch_profitable(
     session: _SessionState,
-    results: list[tuple[int, int, int, tuple[int, ...], tuple[int, ...], int, tuple[int, ...]]],
+    results: list[_RawResult],
     *,
     block_timestamp: int,
     base_fee_next: int,
     operator_nonce: int,
 ) -> None:
-    """Encode → simulate → submit a batch of profitable results via the Rust seam.
+    """Encode - simulate - submit one batch of profitable results serially.
 
-    The A5 cutover: replaces the Python ``dispatch_profitable_results`` chain
-    with ``dispatch_profitable`` (simulate) → ``dispatch_and_submit``
-    (submit). The sim fan-out, profit arithmetic, market-aware priority fee,
-    path suppression, and thin-margin pre-filter run in the Rust core; Python
-    only builds the candidate list, renders the summaries, and chains to the
-    submit seam. All session coordination state is read from the single
+    The A5 cutover LEAF, kept as the serial composition for the pipeline A/B
+    arm. Production drives :mod:`degenbot.runner._sim_submit_pipeline` (SIMPIPE
+    option A: K-way concurrent sims over the same seam contracts, ordered
+    submit fan-in). All session coordination state is read from the single
     ``session`` owner (CONTEXT.md: *session state*), never re-passed.
     """
-    engine_registry = session.engine_registry
-    async_w3 = session.async_w3
-    dispatcher = session.dispatcher
-    sim_ctx = session.sim_ctx
+    candidates = _build_dispatch_candidates(session, results)
+    if not candidates:
+        return
     current_block = session.dispatcher.current_block
-    dry_run = session.cfg.dry_run
-    operator_private_key = session.cfg.operator_private_key
+    outcome = await _simulate_batch(
+        session,
+        candidates,
+        block_timestamp=block_timestamp,
+        base_fee_next=base_fee_next,
+        current_block=current_block,
+    )
+    _render_outcome(session, outcome, current_block)
+    await _submit_batch_records(
+        session,
+        outcome,
+        operator_nonce=operator_nonce,
+    )
+
+
+def _build_dispatch_candidates(
+    session: _SessionState,
+    results: list[_RawResult],
+) -> list[DispatchCandidate]:
+    """Shape a batch of raw engine results into Rust-seam candidates.
+
+    Shared by the serial leaf (:func:`_dispatch_profitable`) and the concurrent
+    pipeline (``_sim_submit_pipeline``): the GIL-held candidate construction +
+    the empty-hop skip (``[sim-none]``). Returns an EMPTY list when nothing is
+    dispatchable (the caller skips sim + submit).
+    """
+    engine_registry = session.engine_registry
     candidates: list[DispatchCandidate] = []
     for pid, inp, prof, ho, ci, sb, sn in results:
         if not ho:
@@ -133,50 +161,76 @@ async def _dispatch_profitable(
                 consumed_inputs=list(ci),
                 solve_block=sb,
                 state_nonces=list(sn),
-                # SMOZG3: the operator's ERC6909 vault-capture toggle — the
+                # SMOZG3: the operator's ERC6909 vault-capture toggle - the
                 # Rust seam defaults it to False (custody capture, the
                 # long-standing production behavior); env-gated opt-in.
                 erc6909_profit=ERC6909_PROFIT,
             ),
         )
+    return candidates
 
-    if not candidates:
-        return
 
-    if sim_ctx is None:
+async def _simulate_batch(
+    session: _SessionState,
+    candidates: list[DispatchCandidate],
+    *,
+    block_timestamp: int,
+    base_fee_next: int,
+    current_block: int,
+) -> object:
+    """Run the Rust simulate fan-out for a candidate batch (one DispatchOutcome)."""
+    if session.sim_ctx is None:
         msg = "SimulateContext is required to dispatch (non-Alloy provider or sim context unbuilt)"
         raise RuntimeError(msg)
-
-    outcome = await dispatch_profitable(
+    return await dispatch_profitable(
         candidates=candidates,
-        context=sim_ctx,
-        dispatcher=dispatcher,
+        context=session.sim_ctx,
+        dispatcher=session.dispatcher,
         base_fee_next=base_fee_next,
         current_block=current_block,
         block_timestamp=block_timestamp,
         min_profit_net=MIN_PROFIT_NET,
         min_profit_margin_bps=MIN_PROFIT_MARGIN_BPS,
-        engine=engine_registry.engine,
+        engine=session.engine_registry.engine,
     )
+
+
+def _render_outcome(
+    session: _SessionState,
+    outcome: object,
+    current_block: int,
+) -> None:
+    """The display-only renderers over a sim outcome (D4 stays-python)."""
     _render_sim_summary(outcome)
     _render_sim_failures(outcome, current_block=current_block)
-    _render_fot_tokens(dispatcher, current_block)
+    _render_fot_tokens(session.dispatcher, current_block)
     _render_profit_logs(outcome)
 
-    # ── Submit gas-profitable via the Rust submit leaf ───
-    async_alloy = async_w3.as_async_alloy()
+
+async def _submit_batch_records(
+    session: _SessionState,
+    outcome: object,
+    *,
+    operator_nonce: int,
+) -> None:
+    """Submit gas-profitable candidates via the Rust submit leaf + render records.
+
+    Shared by the serial leaf and the pipeline's ordered submitter. Expects
+    the operator nonce fetched AT submit time (serialized consumers only).
+    """
+    async_alloy = session.async_w3.as_async_alloy()
     if async_alloy is None:
         bot_logger.error("[dispatch] async_w3 is not an Alloy-backed provider; cannot submit")
         return
-    signer = TxSigner(key=operator_private_key, chain_id=1)
+    signer = TxSigner(key=session.cfg.operator_private_key, chain_id=1)
     records = await dispatch_and_submit(
         candidates=outcome.gas_profitable,
-        dispatcher=dispatcher,
+        dispatcher=session.dispatcher,
         provider=async_alloy,
         signer=signer,
         operator_nonce=operator_nonce,
-        current_block=current_block,
-        dry_run=dry_run,
+        current_block=session.dispatcher.current_block,
+        dry_run=session.cfg.dry_run,
         inject_code=INJECT_EXECUTOR_CODE,
     )
     for record in records:
@@ -191,7 +245,7 @@ async def _dispatch_profitable(
             pass  # dry_run skip already logged above
         elif record["reason"] == "inject_code":
             bot_logger.warning(
-                f"[dispatch] path={record['path_id']}: skipping submission — "
+                f"[dispatch] path={record.get('path_id')}: skipping submission - "
                 "INJECT_EXECUTOR_CODE is active",
             )
         elif record["reason"] == "broadcast_failed":
