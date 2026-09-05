@@ -17,6 +17,7 @@
 
 mod errors;
 mod path_info;
+mod payload_path_info;
 mod register;
 mod result_channel;
 mod snapshot;

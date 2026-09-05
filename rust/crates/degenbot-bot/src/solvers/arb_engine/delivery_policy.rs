@@ -26,6 +26,7 @@ use tokio::sync::mpsc;
 
 use super::delivery_lifecycle::DeliveryLifecycle;
 use super::{ArbitrageEngine, BlockMetadata, ResultBatch};
+use crate::solvers::arb_engine::inline_sim::SimulatedPathResult;
 use ::degenbot_solvers::mixed::SolvePathResult;
 
 /// The delivery policy: filters the engine's solve output by the profit
@@ -137,6 +138,7 @@ impl DeliveryPolicy {
         results: &HashMap<u64, SolvePathResult>,
         results_block: u64,
         metadata: &BlockMetadata,
+        inline_payloads: &HashMap<u64, SimulatedPathResult>,
     ) {
         // A non-zero `results_block` is the invariant that a batch's candidates
         // are dispatchable: the strategy sims each candidate at its
@@ -222,6 +224,14 @@ impl DeliveryPolicy {
         // Always send a batch even if empty — Python needs the block
         // metadata and solve_block to drive its main loop. Quiet no-op when
         // no channel is open (standalone consumer) or after close.
+        // SIMPIPE2 T3: ship the payload for every delivered entry; stale
+        // payload ids (expired/removed, or a path that re-solved without a
+        // payload) drop here — presence decides per entry Python-side.
+        let payloads: HashMap<u64, SimulatedPathResult> = fresh
+            .iter()
+            .chain(updated.iter())
+            .filter_map(|(id, _)| inline_payloads.get(id).map(|p| (*id, p.clone())))
+            .collect();
         let batch = ResultBatch {
             solve_block: results_block,
             timestamp: metadata.timestamp,
@@ -232,6 +242,7 @@ impl DeliveryPolicy {
             updated,
             expired,
             removed,
+            payloads,
         };
         self.lifecycle.send_batch(batch);
     }
@@ -253,6 +264,7 @@ impl DeliveryPolicy {
         metadata: &BlockMetadata,
         path_id: u64,
         result: &SolvePathResult,
+        payload: Option<&SimulatedPathResult>,
     ) {
         let anchored = results_block != 0;
         let above_threshold = result.profit > self.min_profit && result.profit <= self.max_profit;
@@ -268,6 +280,10 @@ impl DeliveryPolicy {
             }
         }
 
+        // SIMPIPE2 T3: a streamed entry carries its own payload.
+        let payloads: HashMap<u64, SimulatedPathResult> = payload
+            .map(|p| HashMap::from([(path_id, p.clone())]))
+            .unwrap_or_default();
         let batch = ResultBatch {
             solve_block: results_block,
             timestamp: metadata.timestamp,
@@ -278,6 +294,7 @@ impl DeliveryPolicy {
             updated,
             expired: Vec::new(),
             removed: Vec::new(),
+            payloads,
         };
         self.lifecycle.send_batch(batch);
     }
@@ -318,8 +335,20 @@ impl ArbitrageEngine {
             .iter()
             .map(|r| (*r.key(), r.value().clone()))
             .collect();
+        // SIMPIPE2 T3: drain the worker-resolved inline payloads for this
+        // publish; the delivery ships the entries for the delivered paths and
+        // drops the rest.
+        let inline_payloads: HashMap<
+            u64,
+            crate::solvers::arb_engine::inline_sim::SimulatedPathResult,
+        > = self
+            .inline_payloads
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect();
+        self.inline_payloads.clear();
         self.delivery
-            .diff_and_send(&results_snapshot, results_block, metadata);
+            .diff_and_send(&results_snapshot, results_block, metadata, &inline_payloads);
     }
 
     /// De-register a path from the engine.
@@ -403,7 +432,7 @@ mod tests {
         // Pretend Python already saw path 3 at an older value.
         policy.delivered.insert(3, solve_result(700));
 
-        policy.diff_and_send(&results, 42, &BlockMetadata::default());
+        policy.diff_and_send(&results, 42, &BlockMetadata::default(), &Default::default());
 
         let batch = rx.try_recv().expect("diff_and_send with a channel sends");
         assert_eq!(batch.solve_block, 42);
@@ -431,7 +460,7 @@ mod tests {
         let mut policy = DeliveryPolicy::default();
         let mut results: HashMap<u64, SolvePathResult> = HashMap::new();
         results.insert(1, solve_result(500));
-        policy.diff_and_send(&results, 7, &BlockMetadata::default());
+        policy.diff_and_send(&results, 7, &BlockMetadata::default(), &Default::default());
         assert!(policy.delivered.contains_key(&1));
     }
 
@@ -453,7 +482,7 @@ mod tests {
         results.insert(1, solve_result(500)); // above threshold, would be fresh if anchored
 
         // results_block == 0 (cold start, no solve yet): batch is EMPTY.
-        policy.diff_and_send(&results, 0, &BlockMetadata::default());
+        policy.diff_and_send(&results, 0, &BlockMetadata::default(), &Default::default());
         let batch = rx
             .try_recv()
             .expect("zero-anchor still sends metadata batch");
@@ -473,7 +502,7 @@ mod tests {
 
         // First real solve advances results_block to 42: the deferred candidate
         // is now delivered as fresh at a valid anchor.
-        policy.diff_and_send(&results, 42, &BlockMetadata::default());
+        policy.diff_and_send(&results, 42, &BlockMetadata::default(), &Default::default());
         let batch = rx.try_recv().expect("anchored solve delivers");
         assert!(
             batch.fresh.iter().any(|(id, _)| *id == 1),

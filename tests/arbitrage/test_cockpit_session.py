@@ -231,7 +231,12 @@ class TestSessionOwner:
                 captured_pipelines.append(session)
 
             async def enqueue(
-                self, results: object, *, block_timestamp: int, base_fee_next: int
+                self,
+                results: object,
+                *,
+                block_timestamp: int,
+                base_fee_next: int,
+                payloads: dict[int, dict] | None = None,
             ) -> None:
                 return None
 
@@ -288,7 +293,12 @@ class TestSessionOwner:
                 return None
 
             async def enqueue(
-                self, results: object, *, block_timestamp: int, base_fee_next: int
+                self,
+                results: object,
+                *,
+                block_timestamp: int,
+                base_fee_next: int,
+                payloads: dict[int, dict] | None = None,
             ) -> None:
                 return None
 

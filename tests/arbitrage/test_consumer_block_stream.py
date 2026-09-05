@@ -185,7 +185,12 @@ async def _run(
             self._session = session
 
         async def enqueue(
-            self, results: Any, *, block_timestamp: int, base_fee_next: int
+            self,
+            results: Any,
+            *,
+            block_timestamp: int,
+            base_fee_next: int,
+            payloads: dict[int, dict] | None = None,
         ) -> None:
             dispatched.append(self._session.dispatcher.current_block)
 

@@ -6359,6 +6359,7 @@ mod tests {
         let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
@@ -6386,6 +6387,7 @@ mod tests {
         // The unchanged-intake twin APPLIES (apply-if-unchanged).
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
@@ -6430,6 +6432,7 @@ mod tests {
 
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
@@ -6489,6 +6492,7 @@ mod tests {
             {
                 let _guard = solve_span.enter();
                 tx.send(DetachedMergeItem::Solved {
+                    payload: None,
                     worker_clamp_twins: 0,
                     cycle_seq: 1,
                     solve_block: 42,
@@ -6579,6 +6583,7 @@ mod tests {
         // the next publish's verifier diff covers it — no bypass.
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
@@ -6601,6 +6606,7 @@ mod tests {
         let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,

@@ -9,7 +9,17 @@ use super::{
     mpsc, Address, Arc, BlockNotification, HopType, PyArbitrageEngine, PyDict, PyList,
     PyStopAsyncIteration, ResultBatch, SolvePathResult, U256,
 };
+use crate::conversion::alloy::{PyI256, PyU256};
 use crate::prelude::*;
+use degenbot_bot::solvers::arb_engine::inline_sim::{InlineSwapFamily, SimulatedPathResult};
+use pyo3::types::{PyBytes, PyString};
+
+fn address_to_checksum<'py>(py: Python<'py>, a: &Address) -> PyResult<Bound<'py, PyString>> {
+    Ok(PyString::new(
+        py,
+        &degenbot_core::address_utils::address_to_checksum_string(a),
+    ))
+}
 
 #[pymethods]
 impl PyArbitrageEngine {
@@ -374,7 +384,89 @@ fn batch_to_py_dict(batch: &ResultBatch, py: Python<'_>) -> PyResult<Py<PyDict>>
     }
     dict.set_item("removed", removed_list)?;
 
+    // SIMPIPE2 T3: payloads — dict[path_id -> payload dict] for the entries
+    // the engine simulated inline. Empty = the legacy FFI-sim path for every
+    // entry (per-entry presence decides, so a mixed batch degrades cleanly).
+    let payloads_dict = PyDict::new(py);
+    for (path_id, payload) in &batch.payloads {
+        payloads_dict.set_item(path_id, simulated_path_result_to_py_dict(payload, py)?)?;
+    }
+    dict.set_item("payloads", payloads_dict)?;
+
     Ok(dict.unbind())
+}
+
+/// Convert an inline-sim payload to a plain Python dict (all PRIMITIVE —
+/// the same field-set the FFI `SimResult`/`SubmitCandidate` join exposes).
+fn simulated_path_result_to_py_dict<'py>(
+    payload: &SimulatedPathResult,
+    py: Python<'py>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("path_id", payload.path_id)?;
+    d.set_item("gross_profit", PyU256(payload.gross_profit))?;
+    d.set_item("net_profit", PyU256(payload.net_profit))?;
+    d.set_item("gas_used", payload.gas_used)?;
+    d.set_item("priority_fee", payload.priority_fee)?;
+    d.set_item("base_fee_next", payload.base_fee_next)?;
+    d.set_item(
+        "execute_calldata",
+        PyBytes::new(py, &payload.execute_calldata),
+    )?;
+    match &payload.access_list {
+        Some(rows) => {
+            let list = PyList::empty(py);
+            for row in rows {
+                let rd = PyDict::new(py);
+                rd.set_item("address", address_to_checksum(py, &row.address)?)?;
+                // EIP-2930 JSON shape — `parse_access_list` reads this key.
+                let keys = PyList::empty(py);
+                for k in &row.storage_keys {
+                    keys.append(PyU256(*k))?;
+                }
+                rd.set_item("storageKeys", keys)?;
+                list.append(rd)?;
+            }
+            d.set_item("access_list", list)?;
+        }
+        None => d.set_item("access_list", py.None())?,
+    }
+    let swaps = PyList::empty(py);
+    for s in &payload.captured_swaps {
+        let sd = PyDict::new(py);
+        sd.set_item("emitter", address_to_checksum(py, &s.emitter)?)?;
+        sd.set_item(
+            "family",
+            match s.family {
+                InlineSwapFamily::V2 => "V2",
+                InlineSwapFamily::V3 => "V3",
+                InlineSwapFamily::V4 => "V4",
+            },
+        )?;
+        sd.set_item("amount0", PyI256(s.amount0))?;
+        sd.set_item("amount1", PyI256(s.amount1))?;
+        sd.set_item("sqrt_price_x96", PyU256(s.sqrt_price_x96))?;
+        sd.set_item("liquidity", PyU256(s.liquidity))?;
+        sd.set_item("tick", s.tick)?;
+        swaps.append(sd)?;
+    }
+    d.set_item("captured_swaps", swaps)?;
+    d.set_item("hop_count", payload.hop_count)?;
+    match &payload.failure {
+        Some(f) => {
+            let fd = PyDict::new(py);
+            fd.set_item("fail_index", f.fail_index)?;
+            // Hex string — the FFI SimFailure getter emits the same shape.
+            fd.set_item(
+                "revert_data",
+                degenbot_core::hex_utils::encode_hex(&f.revert_data),
+            )?;
+            fd.set_item("bucket", &f.bucket)?;
+            d.set_item("failure", fd)?;
+        }
+        None => d.set_item("failure", py.None())?,
+    }
+    Ok(d)
 }
 /// Convert a (`path_id`, `SolvePathResult`) to a Python tuple.
 fn solve_result_to_py_tuple<'py>(

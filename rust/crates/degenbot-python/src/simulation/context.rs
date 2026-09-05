@@ -156,4 +156,13 @@ impl PySimulateContext {
     fn rpc_url(&self) -> &str {
         self.provider.rpc_url()
     }
+
+    /// The executor contract address (checksummed hex) — SIMPIPE2 T3: the
+    /// Python payload path constructs `SubmitCandidate`s directly for
+    /// inline-simulated entries, and the submit leaf needs the same
+    /// session-static `executor_address` the FFI join stamps onto each one.
+    #[getter]
+    fn executor_address(&self) -> String {
+        crate::address_utils::address_to_checksum_string(&self.executor_address)
+    }
 }

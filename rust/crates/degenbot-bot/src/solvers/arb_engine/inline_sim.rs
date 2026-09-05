@@ -111,6 +111,9 @@ pub struct InlineSimFailure {
     pub fail_index: Option<usize>,
     /// The raw revert data bytes (empty for orchestration-only failures).
     pub revert_data: Vec<u8>,
+    /// The bucket label for the `[sim] by reason` breakdown + the
+    /// `[sim-fail]` render (the `fail_buckets` key parity).
+    pub bucket: String,
 }
 
 /// The inline simulation result — THE primitive payload (module doc has the

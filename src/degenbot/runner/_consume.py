@@ -233,6 +233,12 @@ async def _apply_result_if_ready(
     for path_id in cast("Any", batch["removed"]):
         session.dispatcher.discard_path(int(path_id))
 
+    # SIMPIPE2 T3: the engine's inline-sim payloads (empty dict = the legacy
+    # FFI-sim path for every entry — per-entry presence decides).
+    payloads: dict[int, dict] = {
+        int(pid): payload for pid, payload in cast("Any", batch.get("payloads") or {}).items()
+    }
+
     if results:
         if pipeline is not None:
             await pipeline.enqueue(
@@ -243,6 +249,7 @@ async def _apply_result_if_ready(
                     parent_gas_used=int(cast("Any", batch["gas_used"])),
                     parent_gas_limit=int(cast("Any", batch["gas_limit"])),
                 ),
+                payloads=payloads,
             )
         else:
             operator_nonce = await session.async_w3.get_transaction_count(
@@ -258,4 +265,5 @@ async def _apply_result_if_ready(
                     parent_gas_limit=int(cast("Any", batch["gas_limit"])),
                 ),
                 operator_nonce=operator_nonce,
+                payloads=payloads,
             )

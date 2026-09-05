@@ -41,7 +41,7 @@ Symbol map (FFI name → stable companion name):
 
 from degenbot._ffi.simulation import DispatchCandidate, DispatchOutcome, SimulateContext
 from degenbot._ffi.simulation import dispatch_profitable_py as dispatch_profitable
-from degenbot._ffi.submission import Dispatcher, TxSigner
+from degenbot._ffi.submission import Dispatcher, SubmitCandidate, TxSigner
 from degenbot._ffi.submission import dispatch_and_submit_py as dispatch_and_submit
 from degenbot._ffi.submission import fetch_fee_history_py as fetch_fee_history
 
@@ -50,6 +50,7 @@ __all__ = [
     "DispatchOutcome",
     "Dispatcher",
     "SimulateContext",
+    "SubmitCandidate",
     "TxSigner",
     "dispatch_and_submit",
     "dispatch_profitable",

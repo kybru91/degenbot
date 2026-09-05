@@ -108,6 +108,7 @@ mod tests {
             updated: Vec::new(),
             expired: Vec::new(),
             removed: Vec::new(),
+            payloads: Default::default(),
         };
         assert!(
             !lc.send_batch(batch),
@@ -131,6 +132,7 @@ mod tests {
             updated: Vec::new(),
             expired: Vec::new(),
             removed: Vec::new(),
+            payloads: Default::default(),
         };
         assert!(lc.send_batch(batch));
         let got = rx.try_recv().expect("batch delivered");

@@ -349,7 +349,10 @@ impl PyDispatchOutcome {
 /// `path_type` is the combined pool-type label (`"V2-V3"`, `"V4-V2"`, …);
 /// `hops` is a list of per-hop dicts built by [`hop_to_py_dict`]. No Python
 /// dataclass is reconstructed — the cockpit reads the dict fields directly.
-fn path_info_to_py_dict<'py>(py: Python<'py>, path: &PathInfo) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn path_info_to_py_dict<'py>(
+    py: Python<'py>,
+    path: &PathInfo,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     let mut type_names: Vec<&'static str> = Vec::with_capacity(path.hops.len());
     let hops_list = PyList::empty(py);

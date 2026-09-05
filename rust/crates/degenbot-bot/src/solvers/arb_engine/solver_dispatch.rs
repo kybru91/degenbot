@@ -27,6 +27,7 @@ use super::{ArbitrageEngine, BlockMetadata, HashMap, HashSet};
 
 use crate::bot_core::resolve::resolve_hops;
 use crate::bot_core::BotState;
+use crate::solvers::arb_engine::inline_sim::SimulatedPathResult;
 use ::degenbot_solvers::mixed::{
     HopType, MixedPoolRef, ResolvedHop, ResolvedMixedPath, SolvePathResult,
 };
@@ -39,6 +40,11 @@ const SLOWEST_PATHS_K: usize = 5;
 /// walk reports `WalkStats::max_dense_words`; this logs once per process.
 static WALK_DENSE_ALERTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// One solved path's arm tuple: `(path_id, result, worker clamp twins, the
+/// worker-resolved inline-sim payload)`. The solve arms hand these to the
+/// merge (`merge_one_result`); `None` payload = stance off / hook silence.
+type SolveArmOutcome = (u64, SolvePathResult, u64, Option<SimulatedPathResult>);
 
 // ---------------------------------------------------------------------------
 // RAYPAR T3: LPT-pre-balanced scoped-thread partition
@@ -566,6 +572,30 @@ fn clamp_result_in_worker(
     ArbitrageEngine::clamp_result_with_state(&core, pid, &ctx.pool_refs[idx], result)
 }
 
+/// SIMPIPE2 T3: the WORKER-side inline sim — resolve the per-path payload
+/// from the clamp-committed result on the SAME worker context the T2 clamp
+/// opened (shared core + to_solve-aligned pool refs; stance + hook gated).
+/// The payload rides the result handoff so the merge never calls out — the
+/// merge only stores/forwards. `None` = stance off, no hook, or the hook
+/// reported failure-without-payload.
+fn inline_sim_payload(
+    ctx: &SolveCycleShared,
+    idx: usize,
+    pid: u64,
+    result: &SolvePathResult,
+) -> Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult> {
+    if !ctx.worker_clamp || idx >= ctx.pool_refs.len() {
+        return None;
+    }
+    let sim = ctx.inline_sim.as_ref()?;
+    sim.simulate_path(crate::solvers::arb_engine::inline_sim::InlineSimRequest {
+        path_id: pid,
+        hops: ::std::clone::Clone::clone(&ctx.pool_refs[idx]),
+        optimal_input: result.optimal_input,
+        consumed_inputs: ::std::clone::Clone::clone(&result.consumed_inputs),
+    })
+}
+
 /// Per-cycle shared solve context (epic BXUSGL T1): everything the
 /// per-path dispatch touches besides the resolved snapshot. Bundled once
 /// per cycle so a worker handle is static for the dedicated-executor
@@ -605,6 +635,10 @@ pub(crate) struct SolveCycleShared {
     pool_refs: Vec<Vec<MixedPoolRef>>,
     /// The stance copy (construction-time static read at cycle build).
     worker_clamp: bool,
+    /// SIMPIPE2 T3: the engine's inline-sim hook snapshot. `Some` + stance ON
+    /// → the worker resolves the per-path payload right after the clamp (no
+    /// engine lock — the same off-lock seam the worker clamp opened).
+    inline_sim: Option<std::sync::Arc<dyn crate::solvers::arb_engine::inline_sim::InlineSimulator>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +686,9 @@ pub(crate) enum DetachedMergeItem {
         /// SIMPIPE2 T2: twins from the WORKER-side clamp (stance-gated);
         /// > 0 tells the merge the result is already clamp-committed.
         worker_clamp_twins: u64,
+        /// SIMPIPE2 T3: the WORKER-side inline-sim payload (None = stance
+        /// off / no hook / hook failure-without-payload).
+        payload: Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult>,
         /// The solve-cycle span at ENQUEUE time (MQUKB6-T2). The sidecar
         /// std-thread has NO ambient tracing context, so the item carries
         /// the issuing `degenbot.arb.solve` span and the merge enters it
@@ -725,7 +762,7 @@ impl ArbitrageEngine {
     /// SIMPIPE2 T2: `worker_clamp_twins > 0` means the solving worker
     /// ALREADY ran the clamp (`clamp_result_in_worker`) - the merge skips its
     /// own pass (a second clip would re-apply the 1-wei margin and corrupt
-    /// the committed inputs) and just reports the twins for telemetry.
+    /// count (clamp.twins).
     fn merge_one_result(
         &mut self,
         solve_block: u64,
@@ -733,6 +770,7 @@ impl ArbitrageEngine {
         pid: u64,
         result: SolvePathResult,
         worker_clamp_twins: u64,
+        payload: Option<SimulatedPathResult>,
     ) -> u64 {
         let mut result = result;
         let twins = if worker_clamp_twins > 0 {
@@ -751,14 +789,45 @@ impl ArbitrageEngine {
             path.hops = %self.describe_path_cached(pid),
             "[path] profitable solve"
         );
+        // SIMPIPE2 T3: the inline-sim payload — store it so the delivery
+        // diff ships it with the batch (`None` = the path re-solved without a
+        // payload this cycle — stance off or hook failure — so any stale
+        // entry MUST drop). G6HSIS parity: the engine emits the per-candidate
+        // `degenbot.bundle.simulate` span here with the terminal verdict;
+        // the FFI seam's span becomes render-only under the stance.
+        match payload {
+            Some(p) => {
+                let span = tracing::info_span!(
+                    "degenbot.bundle.simulate",
+                    path_id = pid,
+                    simulate.verdict = if p.failure.is_some() {
+                        "not_profitable"
+                    } else {
+                        "profitable"
+                    },
+                    simulate.expected_profit = %result.profit,
+                );
+                let _enter = span.enter();
+                self.inline_payloads.insert(pid, p);
+            }
+            None => {
+                self.inline_payloads.remove(&pid);
+            }
+        }
         // T3 (epic BXUSGL): DEGENBOT_STREAMING_DELIVERY - each above-threshold
         // merged result is emitted IMMEDIATELY (before the slowest path can
         // possibly delay it). The per-entry emission composes with the
         // debounce sweep, which still owns expired/removed + the end-of-cycle
         // metadata batch.
+        let payload_now = self.inline_payloads.get(&pid).map(|e| e.value().clone());
         if self.streaming_delivery {
-            self.delivery
-                .emit_single_result_batch(solve_block, metadata, pid, &result);
+            self.delivery.emit_single_result_batch(
+                solve_block,
+                metadata,
+                pid,
+                &result,
+                payload_now.as_ref(),
+            );
         }
         self.results.insert(pid, result);
         #[cfg(test)]
@@ -792,6 +861,7 @@ impl ArbitrageEngine {
             update_stamp,
             result,
             worker_clamp_twins,
+            payload,
             solve_span,
         } = item;
         // MQUKB6-T2: re-enter the enqueue-time cycle span for the whole
@@ -851,7 +921,14 @@ impl ArbitrageEngine {
             detached_age_cycles = age_cycles,
             "[detached] straggler merged (unchanged intake)"
         );
-        self.merge_one_result(solve_block, &metadata, pid, result, worker_clamp_twins);
+        self.merge_one_result(
+            solve_block,
+            &metadata,
+            pid,
+            result,
+            worker_clamp_twins,
+            payload,
+        );
         // ADR-021 publish-verifier scoping (epic SRQEK5 T2): a straggler that
         // lands AFTER a publish consumed its cycle's change set must still be
         // covered by the NEXT publish's verifier diff — re-add it here, so a
@@ -1607,6 +1684,7 @@ impl ArbitrageEngine {
             core: std::sync::Arc::clone(self.core()),
             pool_refs,
             worker_clamp: INLINE_SIM_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+            inline_sim: self.inline_sim.clone(),
         });
         // The LPT bins need Arc-shared access in the tokio arm; the rayon
         // arms index through the same deref (byte-identical semantics).
@@ -1736,7 +1814,7 @@ impl ArbitrageEngine {
                                 // — the profit-clamp recompute can zero a
                                 // candidate) so the committed inputs are
                                 // merge-ready with no sidecar round-trip.
-                                let Some((pid, result, worker_clamp_twins)) =
+                                let Some((pid, result, worker_clamp_twins, payload)) =
                                     solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved)
                                         .map(|(pid, mut r)| {
                                             let twins = clamp_result_in_worker(
@@ -1745,9 +1823,11 @@ impl ArbitrageEngine {
                                                 pid,
                                                 &mut r,
                                             );
-                                            (pid, r, twins)
+                                            let payload =
+                                                inline_sim_payload(&shared_bin, idx, pid, &r);
+                                            (pid, r, twins, payload)
                                         })
-                                        .filter(|(_, r, _)| {
+                                        .filter(|(_, r, _, _)| {
                                             !r.optimal_input.is_zero() && !r.profit.is_zero()
                                         })
                                 else {
@@ -1770,6 +1850,7 @@ impl ArbitrageEngine {
                                         update_stamp,
                                         result,
                                         worker_clamp_twins,
+                                        payload,
                                         solve_span: solve_span_bin.clone(),
                                     })
                                     .is_ok()
@@ -1822,7 +1903,7 @@ impl ArbitrageEngine {
         let streaming_merge: bool;
         let mut clamp_twin_count: u64 = 0;
         let mut solved_count: usize = 0;
-        let mut solved: Vec<(u64, SolvePathResult, u64)> = Vec::new();
+        let mut solved: Vec<SolveArmOutcome> = Vec::new();
         if tokio_solve_mode {
             streaming_merge = true;
             hotpath::measure_block!("arb_solve.tokio_solve", {
@@ -1837,8 +1918,7 @@ impl ArbitrageEngine {
                 // calling thread (T2 moves it to spawn_blocking for the
                 // async seam).
                 let executor = crate::solvers::arb_engine::solve_executor::global_solve_executor();
-                let (res_tx, res_rx) =
-                    std::sync::mpsc::channel::<Option<(u64, SolvePathResult, u64)>>();
+                let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<SolveArmOutcome>>();
                 let bins = compute_bins();
                 for bin in &bins {
                     let bin = bin.clone();
@@ -1864,10 +1944,14 @@ impl ArbitrageEngine {
                                 // the commit-ready values.
                                 let twins =
                                     clamp_result_in_worker(&shared_bin, i, pid, &mut result);
-                                (pid, result, twins)
+                                // SIMPIPE2 T3: the inline payload rides the
+                                // same handoff (resolved on the worker, off
+                                // the engine lock).
+                                let payload = inline_sim_payload(&shared_bin, i, pid, &result);
+                                (pid, result, twins, payload)
                             });
                             // Same profitless filter the rayon arm applies.
-                            let _ = res_tx.send(outcome.filter(|(_, r, _)| {
+                            let _ = res_tx.send(outcome.filter(|(_, r, _, _)| {
                                 !r.optimal_input.is_zero() && !r.profit.is_zero()
                             }));
                         }
@@ -1886,7 +1970,7 @@ impl ArbitrageEngine {
                 );
                 let merge_ctx = merge_span.enter();
                 while let Ok(item) = res_rx.recv() {
-                    let Some((pid, solve_result, worker_clamp_twins)) = item else {
+                    let Some((pid, solve_result, worker_clamp_twins, payload)) = item else {
                         continue;
                     };
                     if !solve_result.solver_pool_states.is_empty() {
@@ -1901,6 +1985,7 @@ impl ArbitrageEngine {
                         pid,
                         solve_result,
                         worker_clamp_twins,
+                        payload,
                     );
                     solved_count += 1;
                 }
@@ -1918,10 +2003,11 @@ impl ArbitrageEngine {
                 let solve_fn = |pid: u64,
                                 idx: usize,
                                 resolved: &ResolvedMixedPath|
-                 -> Option<(u64, SolvePathResult, u64)> {
+                 -> Option<SolveArmOutcome> {
                     solve_one_path(&shared, &solve_span, pid, resolved).map(|(pid, mut r)| {
                         let twins = clamp_result_in_worker(&shared, idx, pid, &mut r);
-                        (pid, r, twins)
+                        let payload = inline_sim_payload(&shared, idx, pid, &r);
+                        (pid, r, twins, payload)
                     })
                 };
 
@@ -1952,13 +2038,12 @@ impl ArbitrageEngine {
                         }
                     });
                     drop(tx);
-                    let per_bin: Vec<Vec<Option<(u64, SolvePathResult, u64)>>> =
-                        rx.into_iter().collect();
+                    let per_bin: Vec<Vec<Option<SolveArmOutcome>>> = rx.into_iter().collect();
                     per_bin
                         .into_iter()
                         .flatten()
                         .flatten()
-                        .inspect(|(pid, r, _)| {
+                        .inspect(|(pid, r, _, _)| {
                             if !r.solver_pool_states.is_empty() {
                                 tracing::debug!(
                                     "[solver-st] path_id={pid} hops=[{}]",
@@ -1966,14 +2051,14 @@ impl ArbitrageEngine {
                                 );
                             }
                         })
-                        .filter(|(_, r, _)| !r.optimal_input.is_zero() && !r.profit.is_zero())
+                        .filter(|(_, r, _, _)| !r.optimal_input.is_zero() && !r.profit.is_zero())
                         .collect()
                 } else {
                     to_solve
                         .par_iter()
                         .enumerate()
                         .filter_map(|(i, (pid, resolved))| solve_fn(*pid, i, resolved))
-                        .inspect(|(pid, r, _)| {
+                        .inspect(|(pid, r, _, _)| {
                             if !r.solver_pool_states.is_empty() {
                                 tracing::debug!(
                                     "[solver-st] path_id={pid} hops=[{}]",
@@ -1981,7 +2066,7 @@ impl ArbitrageEngine {
                                 );
                             }
                         })
-                        .filter(|(_, r, _)| !r.optimal_input.is_zero() && !r.profit.is_zero())
+                        .filter(|(_, r, _, _)| !r.optimal_input.is_zero() && !r.profit.is_zero())
                         .collect()
                 }
             });
@@ -2085,13 +2170,14 @@ impl ArbitrageEngine {
             );
             let _merge_ctx = merge_span.enter();
             hotpath::measure_block!("arb_solve.clamp_merge", {
-                for (pid, solve_result, worker_clamp_twins) in solved {
+                for (pid, solve_result, worker_clamp_twins, payload) in solved {
                     clamp_twin_count += self.merge_one_result(
                         solve_block,
                         metadata,
                         pid,
                         solve_result,
                         worker_clamp_twins,
+                        payload,
                     );
                 }
             });
@@ -2738,6 +2824,7 @@ mod profit_clamp_recompute_tests {
             core,
             pool_refs,
             worker_clamp: true,
+            inline_sim: None,
             solve_block: 0,
             epoch: 0,
             gate_capture: None,
@@ -2798,6 +2885,64 @@ mod profit_clamp_recompute_tests {
     /// The merge honors the worker's twin report: twins > 0 = the result is
     /// already clamp-committed (no second clip); twins = 0 = the merge clips
     /// the over-fed input itself (the legacy path — bit-identical).
+
+    /// SIMPIPE2 T3: a payload riding `merge_one_result` is stored at the
+    /// engine (`inline_payloads`) and a re-merge WITHOUT the payload drops the
+    /// stale entry — per-entry presence decides Python-side. (The delivery
+    /// drain into `ResultBatch.payloads` is covered by the delivery_policy
+    /// tests + the FFI conversion; this pins the merge-site store/drop.)
+    #[test]
+    fn merge_stores_payload_and_drops_it_without_one() {
+        use crate::solvers::arb_engine::inline_sim::{InlineSwapFamily, SimulatedPathResult};
+        use alloy::primitives::{Address, I256, U256};
+
+        let (mut engine, path_id, _pool_refs) = overfed_v4_engine();
+        let metadata = BlockMetadata::default();
+        let mk = || SolvePathResult {
+            optimal_input: U256::from(1_000_000_000u64),
+            profit: U256::from(1_000u64),
+            hop_outputs: vec![U256::from(1u64)],
+            consumed_inputs: vec![U256::from(1u64)],
+            state_nonces: vec![0],
+            solver_pool_states: Vec::new(),
+        };
+        let payload = SimulatedPathResult {
+            path_id,
+            gross_profit: U256::from(1_000u64),
+            net_profit: U256::from(900u64),
+            gas_used: 300_000,
+            priority_fee: 2,
+            base_fee_next: 30,
+            execute_calldata: vec![1, 2, 3],
+            access_list: None,
+            captured_swaps: vec![crate::solvers::arb_engine::inline_sim::CapturedSwapRow {
+                emitter: Address::from([0x11u8; 20]),
+                family: InlineSwapFamily::V4,
+                amount0: I256::MINUS_ONE,
+                amount1: I256::ONE,
+                sqrt_price_x96: U256::ZERO,
+                liquidity: U256::ZERO,
+                tick: 0,
+            }],
+            hop_count: 1,
+            failure: None,
+        };
+
+        engine.merge_one_result(42, &metadata, path_id, mk(), 0, Some(payload));
+        assert!(
+            engine.inline_payloads.contains_key(&path_id),
+            "the payload must be stored at merge"
+        );
+
+        // The path re-solves WITHOUT a payload (stance off or hook silence):
+        // the stale entry must drop — presence decides per entry.
+        engine.merge_one_result(43, &metadata, path_id, mk(), 0, None);
+        assert!(
+            !engine.inline_payloads.contains_key(&path_id),
+            "a payload-less re-merge must drop the stale payload"
+        );
+    }
+
     #[test]
     fn merge_reports_worker_twins_and_never_reclips() {
         let (mut engine, path_id, pool_refs) = overfed_v4_engine();
@@ -2821,7 +2966,7 @@ mod profit_clamp_recompute_tests {
         let twins = clamp_result_in_worker(&ctx, 0, path_id, &mut worker_result);
         assert!(twins > 0, "premise: worker clamp fired");
         let committed = worker_result.clone();
-        engine.merge_one_result(42, &metadata, path_id, worker_result, twins);
+        engine.merge_one_result(42, &metadata, path_id, worker_result, twins, None);
         {
             let stored = engine.results.get(&path_id).expect("worker-merged");
             assert_eq!(
@@ -2835,7 +2980,7 @@ mod profit_clamp_recompute_tests {
         // itself (index 1 — the V2 hop has no input clamp by design).
         let legacy = overfed();
         let pre = legacy.consumed_inputs[1];
-        engine.merge_one_result(42, &metadata, path_id, legacy, 0);
+        engine.merge_one_result(42, &metadata, path_id, legacy, 0, None);
         let stored = engine.results.get(&path_id).expect("legacy-merged");
         assert_ne!(
             stored.consumed_inputs[1], pre,
@@ -3187,6 +3332,7 @@ mod executor_ab_probe {
             core: Arc::new(crate::bot_core::state_lock::StateLock::new(BotState::new())),
             pool_refs: Vec::new(),
             worker_clamp: false,
+            inline_sim: None,
             #[cfg(test)]
             test_solve_delay: None,
         })

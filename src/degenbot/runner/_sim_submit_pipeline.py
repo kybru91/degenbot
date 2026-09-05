@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 from degenbot.logging import logger as bot_logger
 from degenbot.runner._dispatch import (
     _build_dispatch_candidates,
+    _merge_payload_outcome,
     _render_outcome,
     _submit_batch_records,
     dispatch_profitable,
@@ -73,6 +74,9 @@ class _BatchWork:
     block_timestamp: int
     base_fee_next: int
     current_block: int
+    # SIMPIPE2 T3: the engine's inline-sim payloads (empty = legacy FFI sim
+    # for every entry — per-entry presence decides).
+    payloads: dict[int, dict] | None = None
     sim_task: asyncio.Task[object] | None = None
 
 
@@ -81,22 +85,26 @@ async def _run_sim(session: _SessionState, work: _BatchWork, sem: asyncio.Semaph
     async with sem:
         # Candidate shaping runs under the GIL on this task (same engine lock
         # order as the legacy serial path - engine-then-core via
-        # path_info_for_core).
-        candidates = _build_dispatch_candidates(session, work.results)
-        if not candidates:
+        # path_info_for_core). SIMPIPE2 T3: payload entries skip the FFI sim
+        # (already simulated inline in the engine).
+        candidates = _build_dispatch_candidates(session, work.results, payloads=work.payloads)
+        outcome: object | None = None
+        if candidates:
+            outcome = await dispatch_profitable(
+                candidates=candidates,
+                context=session.sim_ctx,
+                dispatcher=session.dispatcher,
+                base_fee_next=work.base_fee_next,
+                current_block=work.current_block,
+                block_timestamp=work.block_timestamp,
+                min_profit_net=MIN_PROFIT_NET,
+                min_profit_margin_bps=MIN_PROFIT_MARGIN_BPS,
+                engine=session.engine_registry.engine,
+            )
+        merged = _merge_payload_outcome(session, outcome, work.payloads)
+        if not merged:
             bot_logger.debug("[sim-none] batch produced no dispatchable candidates")
-            return None
-        return await dispatch_profitable(
-            candidates=candidates,
-            context=session.sim_ctx,
-            dispatcher=session.dispatcher,
-            base_fee_next=work.base_fee_next,
-            current_block=work.current_block,
-            block_timestamp=work.block_timestamp,
-            min_profit_net=MIN_PROFIT_NET,
-            min_profit_margin_bps=MIN_PROFIT_MARGIN_BPS,
-            engine=session.engine_registry.engine,
-        )
+        return merged
 
 
 async def _submit_ordered(
@@ -182,6 +190,7 @@ class SimSubmitPipeline:
         *,
         block_timestamp: int,
         base_fee_next: int,
+        payloads: dict[int, dict] | None = None,
     ) -> None:
         """Spawn this batch's sim + register it in the FIFO submit queue.
 
@@ -194,6 +203,7 @@ class SimSubmitPipeline:
             block_timestamp=block_timestamp,
             base_fee_next=base_fee_next,
             current_block=self._session.dispatcher.current_block,
+            payloads=payloads,
         )
         self._enqueued += 1
         self._queue.put_nowait(work)

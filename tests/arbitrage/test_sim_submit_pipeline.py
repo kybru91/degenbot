@@ -90,7 +90,7 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> _Harness:
     monkeypatch.setattr(
         mod,
         "_build_dispatch_candidates",
-        lambda session, results: [_FakeCandidate(path_id=results[0][0])],
+        lambda session, results, **kwargs: [_FakeCandidate(path_id=results[0][0])],
     )
     return h
 

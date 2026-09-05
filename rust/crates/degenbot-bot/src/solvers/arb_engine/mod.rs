@@ -285,6 +285,10 @@ pub struct ResultBatch {
     pub expired: Vec<u64>,
     /// Path IDs that were de-registered (permanently gone)
     pub removed: Vec<u64>,
+    /// SIMPIPE2 T3: the inline-sim payloads for the `fresh`/`updated` paths
+    /// (SIMPIPE stance `DEGENBOT_SOLVE_INLINE_SIM`). Absent (empty map) = the
+    /// legacy FFI-sim path for every entry — per-entry presence decides.
+    pub payloads: HashMap<u64, inline_sim::SimulatedPathResult>,
 }
 
 /// The unified Uniswap engine — owns V2, V3, and V4 pool state and solves
@@ -502,6 +506,11 @@ pub struct ArbitrageEngine {
     /// [`ArbitrageEngine::set_inline_simulator`]; `None` = stance-relevant
     /// callers fall back to the batch FFI sim (module `inline_sim` doc).
     inline_sim: Option<std::sync::Arc<dyn inline_sim::InlineSimulator>>,
+    /// SIMPIPE2 T3: the per-path inline payloads resolved in the solve
+    /// workers (SIMPIPE2 T2's off-lock seam). Keyed by path id; the delivery
+    /// drains the entries for the paths it delivers and the map drops the
+    /// rest (a payload for an expired/removed path is stale by definition).
+    inline_payloads: DashMap<u64, inline_sim::SimulatedPathResult>,
 }
 
 impl ArbitrageEngine {
@@ -591,6 +600,7 @@ impl ArbitrageEngine {
             detached_dropped_stale: std::sync::atomic::AtomicU64::new(0),
             detached_dropped_deregistered: std::sync::atomic::AtomicU64::new(0),
             inline_sim: None,
+            inline_payloads: DashMap::new(),
         }
     }
 }
