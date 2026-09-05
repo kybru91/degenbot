@@ -150,6 +150,46 @@ impl crate::liquidity_event::LiquidityEvent for BufferedV3PoolEvent {
 // Registration params
 // ---------------------------------------------------------------------------
 
+/// The EVM storage-slot layout a concentrated-liquidity (V3-style) pool
+/// contract uses. The `PancakeSwap` V3 fork diverges from canonical Uniswap
+/// V3 (W32CAU): `slot0` spans TWO words, shifting every following slot by
+/// one (liquidity@5, ticks@6). Reads of a fork pool through the Uniswap
+/// indices misread the contract (the false [sim-divergence] on pool
+/// 0x1ac1A8FE, VERIFY2 T4).
+///
+/// The layout is immutable per pool → carried on [`V3PoolIdentity`].
+/// Defaults to [`ClSlotLayout::UniswapV3`] (the canonical mainnet layout;
+/// also the right default for test fixtures). Slot constants single-source
+/// the fork table in [`crate::v3_pancakeswap_storage_slots`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClSlotLayout {
+    /// Canonical Uniswap V3 — one-word slot0, liquidity@4, ticks@5.
+    #[default]
+    UniswapV3,
+    /// `PancakeSwap` V3 fork — two-word slot0, liquidity@5, ticks@6.
+    PancakeV3,
+}
+
+impl ClSlotLayout {
+    /// The `liquidity` (uint128) storage slot number.
+    #[must_use]
+    pub const fn liquidity_slot(self) -> u64 {
+        match self {
+            Self::UniswapV3 => 4,
+            Self::PancakeV3 => crate::v3_pancakeswap_storage_slots::PANCAKE_V3_LIQUIDITY_SLOT,
+        }
+    }
+
+    /// The `ticks(int24)` mapping base slot number.
+    #[must_use]
+    pub const fn ticks_mapping_slot(self) -> u64 {
+        match self {
+            Self::UniswapV3 => crate::v3_storage_slots::V3_TICKS_MAPPING_SLOT,
+            Self::PancakeV3 => crate::v3_pancakeswap_storage_slots::PANCAKE_V3_TICKS_MAPPING_SLOT,
+        }
+    }
+}
+
 /// Parameters for registering a V3 pool with `BotState`.
 ///
 /// Bundles all fields to satisfy `clippy::too_many_arguments`.
@@ -197,6 +237,10 @@ pub struct RegisterV3PoolParams {
     /// `UNISWAP_V3_MAINNET_INIT_HASH` fallback (the retired Python `ClassVar`'s
     /// documented default for non-JSON V3 pools).
     pub init_hash: B256,
+    /// The pool contract's storage-slot layout family (VERIFY2 T4). Defaults
+    /// to [`ClSlotLayout::UniswapV3`]; the Rust builder + the FFI register
+    /// resolve it from the deployment table / an explicit override.
+    pub slot_layout: ClSlotLayout,
 }
 
 /// Typed rejection from [`crate::BotState::register_v3_pool`] (the
@@ -294,6 +338,10 @@ pub struct V3PoolIdentity {
     /// when shipped, else the Uniswap V3 mainnet fallback const. Off the
     /// handle, not the retired Python `ClassVar`.
     pub init_hash: B256,
+    /// The pool contract's storage-slot layout family (VERIFY2 T4) — drives
+    /// every slot-index consumer (divergence probe, sim-anchor projection,
+    /// any direct slot serve). Immutable per pool.
+    pub slot_layout: ClSlotLayout,
 }
 
 /// V3 concentrated-liquidity pool state owned by [`crate::BotState`].
@@ -680,6 +728,7 @@ impl V3PoolState {
             factory: params.factory,
             deployer: params.deployer,
             init_hash: params.init_hash,
+            slot_layout: params.slot_layout,
         };
         // CBCH6H: pin the snapshot seed for Tracked pools so step-1 verify
         // compares the seed (not pump-mutated `tick_data`) against
@@ -2248,6 +2297,7 @@ mod tests {
                 factory: Address::ZERO,
                 deployer: Address::ZERO,
                 init_hash: alloy::primitives::B256::ZERO,
+                slot_layout: ClSlotLayout::UniswapV3,
             },
             V3PoolState {
                 sqrt_price_x96: sp_0,

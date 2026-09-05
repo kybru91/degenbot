@@ -42,6 +42,7 @@ from degenbot.database.session_manager import DatabaseSessionManager
 from degenbot.exceptions.base import DegenbotValueError
 from degenbot.exceptions.pool import BrokenPool, TrackerAlreadyInitialized
 from degenbot.logging import logger
+from degenbot.pancakeswap.pools import PancakeswapV3Pool
 from degenbot.provider import (
     AlloyProvider,  # ruff:ignore[typing-only-first-party-import]
     AsyncAlloyProvider,  # ruff:ignore[typing-only-first-party-import]
@@ -771,8 +772,17 @@ class Bot:
             # The legacy web3-sync fetcher factory, relocated off the retired
             # V3 builder (4GQWZ4 deletion).
             fetcher = self._make_v3_tick_data_fetcher(address, chain_id)
+            # CL slot layout (VERIFY2 T4 / W32CAU): the PancakeSwap V3 fork
+            # has a divergent storage layout — pass the family explicitly so
+            # the engine's slot-index consumers (divergence probe, sim-anchor
+            # projection) never misread a fork pool.
+            slot_layout = "pancakeswap" if issubclass(pool_class, PancakeswapV3Pool) else "uniswap"
             b_res = self._py_bot.build_v3_pool(
-                address, block=block, db=True, tick_data_fetcher=fetcher
+                address,
+                block=block,
+                db=True,
+                tick_data_fetcher=fetcher,
+                slot_layout=slot_layout,
             )
             pool_id = b_res[0]
             builder_identity = b_res

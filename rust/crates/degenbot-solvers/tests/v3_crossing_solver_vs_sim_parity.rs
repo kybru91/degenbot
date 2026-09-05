@@ -152,6 +152,7 @@ fn build_multi_tick_v3_state(
         fetcher: None,
         deployer: alloy::primitives::Address::ZERO,
         init_hash: B256::ZERO,
+        slot_layout: degenbot_pools::ClSlotLayout::UniswapV3,
     };
     let (_identity, state) = V3PoolState::from_params(params, 8);
     state
@@ -412,6 +413,7 @@ fn build_sparse_tick_v3_state(
         fetcher: None,
         deployer: alloy::primitives::Address::ZERO,
         init_hash: alloy::primitives::B256::ZERO,
+        slot_layout: degenbot_pools::ClSlotLayout::UniswapV3,
     };
     let (_identity, state) = V3PoolState::from_params(params, 8);
     state
@@ -599,6 +601,7 @@ fn build_real_position_v3_state(base_liquidity: u128, tick_spacing: i32, fee: u3
         fetcher: None,
         deployer: alloy::primitives::Address::ZERO,
         init_hash: B256::ZERO,
+        slot_layout: degenbot_pools::ClSlotLayout::UniswapV3,
     };
     let (_identity, state) = V3PoolState::from_params(params, 8);
     state

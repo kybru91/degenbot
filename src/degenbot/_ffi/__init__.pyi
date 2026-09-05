@@ -781,6 +781,7 @@ class Bot:
         block: int | None = None,
         db: bool = True,
         tick_data_fetcher: Callable | None = None,
+        slot_layout: str | None = None,
     ) -> tuple[int, str, str, str, str]: ...
     def resolve_v4_identity(
         self,
@@ -857,6 +858,7 @@ class Bot:
         tick_data_fetcher: Callable[[int, int], dict[int, tuple[int, int, int]] | None]
         | None = None,
         tick_data_block: int | None = None,
+        slot_layout: str | None = None,
     ) -> int: ...
     def update_v3_pool(
         self,

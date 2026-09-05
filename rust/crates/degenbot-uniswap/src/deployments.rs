@@ -148,6 +148,12 @@ struct RawRecord {
     /// `name` is the single complete per-row DEX discriminator.
     #[serde(default)]
     name: Option<String>,
+    /// The JSON `pool_type` label (`"uniswap-v2"`, `"pancakeswap-v3"`,
+    /// …). Needed by the CL slot-layout discriminator (VERIFY2 T4): its
+    /// V2 rows collapse to `"uniswap-v2"`-style slugs, so the slug carries
+    /// the V2-vs-V3 distinction the `name` label alone cannot.
+    #[serde(default)]
+    pool_type: Option<String>,
     /// The EIP-1167 master implementation contract Aerodrome factories
     /// clone (V2 `stable`/volatile + V3 Slipstream). Absent for V2/V3
     /// rows that use the standard init-hash CREATE2 path. Aerodrome-only
@@ -193,6 +199,10 @@ pub struct DeploymentRecord {
     /// The resolved DEX name for this deployment (derived from the JSON
     /// `name` label). `None` if the label names no known DEX.
     pub dex: Option<DexName>,
+    /// The JSON `pool_type` slug (`"uniswap-v3"`, `"pancakeswap-v3"`,
+    /// …) — the V2/V3 structural discriminator, exactly what the Python
+    /// `pool_type_registry` keys on.
+    pub pool_type: Option<&'static str>,
 }
 
 /// Map a `deployments.json` `name` label to a [`DexName`].
@@ -280,6 +290,11 @@ fn table() -> &'static Table {
                 .as_deref()
                 .filter(|s| !s.is_empty())
                 .and_then(dex_name_from_label);
+            // Leak the slug per distinct row (bounded by the shipped table).
+            let pool_type: Option<&'static str> = raw
+                .pool_type
+                .filter(|s| !s.is_empty())
+                .map(|s| &*Box::leak(s.into_boxed_str()));
             let chain_id = raw.chain_id;
             map.insert(
                 (chain_id, factory),
@@ -290,6 +305,7 @@ fn table() -> &'static Table {
                     init_hash,
                     implementation_address,
                     dex,
+                    pool_type,
                 },
             );
         }
@@ -344,6 +360,20 @@ pub fn lookup(chain_id: u64, factory: Address) -> Option<&'static DeploymentReco
 #[must_use]
 pub fn resolve_dex_name(chain_id: u64, factory: Address) -> Option<DexName> {
     lookup(chain_id, factory).and_then(|rec| rec.dex)
+}
+
+/// Whether the `(chain, factory)` deployment row names a Pancakes V3
+/// deployment — the CL slot-layout discriminator (VERIFY2 T4 / W32CAU).
+/// Unknown deployments (not in the shipped JSON) return `false`; callers
+/// degrade to the canonical Uniswap layout unless the driver passes an
+/// explicit layout override. Only meaningful for V3 pools (the V2 pancake
+/// pools share the `DexName::PancakeSwap` label).
+#[must_use]
+pub fn is_pancakeswap_v3_factory(chain_id: u64, factory: Address) -> bool {
+    matches!(
+        lookup(chain_id, factory),
+        Some(rec) if rec.pool_type == Some("pancakeswap-v3")
+    )
 }
 
 /// A CREATE2 address mismatch reported by [`verify_v2_pool_address`] /
@@ -668,6 +698,31 @@ mod tests {
         let balancer = address!("8E9aa87E45e92bad84D5F8DD1bff34Fb92637dE9");
         let rec = lookup(1, balancer).expect("Balancer weighted mainnet present");
         assert!(rec.init_hash.is_none());
+    }
+
+    // --- CL slot-layout discriminator (VERIFY2 T4 / W32CAU) -----------------
+
+    #[test]
+    fn pancake_v3_factories_discriminate_from_uniswap_and_unknown() {
+        // Shipped pancake V3 rows (chains 1 + 8453, same factory address).
+        assert!(is_pancakeswap_v3_factory(
+            1,
+            address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865")
+        ));
+        assert!(is_pancakeswap_v3_factory(
+            8453,
+            address!("0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865")
+        ));
+
+        // The Uniswap V3 mainnet factory is NOT pancake.
+        let uni_v3 = address!("1F98431c8aD98523631AE4a59f267346ea31F984");
+        assert!(!is_pancakeswap_v3_factory(1, uni_v3));
+
+        // A pancake V2 row shares the DexName label — the discriminator is
+        // only consulted on the V3 registration path, and an unknown (chain,
+        // factory) degrades to the canonical layout.
+        let pancake_v2_factory = address!("1097053Fd2ea711dad45caCcc45EfF7548fCB362");
+        assert!(!is_pancakeswap_v3_factory(1, pancake_v2_factory));
     }
 
     // --- Registration-time verification (JC6OFG) ----------------------------

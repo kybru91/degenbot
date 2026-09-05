@@ -61,8 +61,9 @@ pub use ::degenbot_pools::spec_bounds::{SpecValue, SpecViolation, UINT112_MAX};
 pub use ::degenbot_pools::state_history::BalancesBlockDelta;
 pub use ::degenbot_pools::v3_state::{
     v3_simulate_swap, BufferedV3LiquidityUpdate, BufferedV3PoolEvent, BufferedV3SwapEvent,
-    PoolTickCoverage, RegisterV3PoolError, RegisterV3PoolParams, RegistrationLifecycle,
-    SimulateSwapError, V3PoolIdentity, V3PoolState, V3SwapOutcome, V3SwapUpdate,
+    ClSlotLayout, PoolTickCoverage, RegisterV3PoolError, RegisterV3PoolParams,
+    RegistrationLifecycle, SimulateSwapError, V3PoolIdentity, V3PoolState, V3SwapOutcome,
+    V3SwapUpdate,
 };
 pub use balancer_stable_state::{
     BalancerStablePoolIdentity, BalancerStablePoolState, RegisterBalancerStablePoolParams,

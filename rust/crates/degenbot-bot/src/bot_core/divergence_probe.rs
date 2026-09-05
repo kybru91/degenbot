@@ -64,6 +64,8 @@
 
 use alloy::primitives::{keccak256, Address, B256, U256};
 
+use degenbot_pools::{ClSlotLayout, V3PoolState};
+
 use crate::bot_core::{BotState, PoolEntry};
 
 /// Which tracked-pool scalar storage slot the probe packed.
@@ -171,6 +173,75 @@ pub struct TrackedSlotProbe {
     pub update_block: u64,
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// The family verification-shape layer (VERIFY2 T4).
+//
+// The tracked-slot knowledge — WHICH slots a pool family tracks, at WHICH
+// storage indices, packing WHICH fields — is a per-family invariant that
+// must live in ONE place. Both consumers on this surface (the env-gated
+// point probe, `probe_tracked_storage_slot`, and the enumerated sim-anchor
+// projection, `project_sim_anchor_scalars`) delegate to the row tables
+// below; a new fork layout extends `ClSlotLayout` + one row arm + its test
+// and every consumer picks it up. Never re-derive slot indices at a call
+// site (that drift is how the pancake-slot classification bug arose).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One enumerated tracked-scalar-slot row: the storage index + kind + the
+/// packed engine word (untracked bits zeroed). The shape layer's unit.
+#[derive(Clone, Debug)]
+pub(crate) struct ScalarSlotRow {
+    pub index: U256,
+    pub kind: TrackedSlotKind,
+    pub engine_word: B256,
+}
+
+/// The CL (V3) family's tracked scalar rows, enumerated in family-aware slot
+/// order. Slot0 word 0 (index 0) packs the same low-184 tracked shape on
+/// both layouts; `liquidity` sits at the layout's slot (Uniswap 4 / pancake
+/// 5). Two rows always (the surface the sim consults is fixed per layout).
+fn cl_scalar_rows(layout: ClSlotLayout, state: &V3PoolState) -> [ScalarSlotRow; 2] {
+    [
+        ScalarSlotRow {
+            index: U256::ZERO,
+            kind: TrackedSlotKind::V3Slot0,
+            engine_word: pack_cl_slot0_word(state.sqrt_price_x96, state.tick),
+        },
+        ScalarSlotRow {
+            index: U256::from(layout.liquidity_slot()),
+            kind: TrackedSlotKind::V3Liquidity,
+            engine_word: pack_cl_liquidity_word(state.liquidity),
+        },
+    ]
+}
+
+/// Reverse-map an SLOAD'd index to a CL tracked row: the scalar pair, else
+/// the per-tick `ticks(tick)` slot at the layout's ticks base.
+fn cl_row_for_index(
+    layout: ClSlotLayout,
+    state: &V3PoolState,
+    index: U256,
+) -> Option<ScalarSlotRow> {
+    if let Some(row) = cl_scalar_rows(layout, state)
+        .into_iter()
+        .find(|row| row.index == index)
+    {
+        return Some(row);
+    }
+    // Per-tick `ticks(tick)` slot = keccak256(sign_extend_24(tick) . base).
+    probe_tick_slot(
+        state.tick_data.iter(),
+        U256::from(layout.ticks_mapping_slot()),
+        index,
+        state.update_block,
+        TrackedSlotKind::V3TickInfo,
+    )
+    .map(|probe| ScalarSlotRow {
+        index,
+        kind: probe.kind,
+        engine_word: probe.engine_word,
+    })
+}
+
 impl BotState {
     /// If `address` + `index` (a storage slot the sim just SLOAD'd) maps to a
     /// **tracked pool's scalar storage slot** the engine carries
@@ -205,23 +276,16 @@ impl BotState {
                     },
                 )),
                 Some(PoolEntry::V3(p)) => {
-                    let state = &p.1;
-                    out.push((
-                        (address, U256::ZERO),
-                        TrackedSlotProbe {
-                            kind: TrackedSlotKind::V3Slot0,
-                            engine_word: pack_cl_slot0_word(state.sqrt_price_x96, state.tick),
-                            update_block: state.update_block,
-                        },
-                    ));
-                    out.push((
-                        (address, U256::from(4u64)),
-                        TrackedSlotProbe {
-                            kind: TrackedSlotKind::V3Liquidity,
-                            engine_word: pack_cl_liquidity_word(state.liquidity),
-                            update_block: state.update_block,
-                        },
-                    ));
+                    for row in cl_scalar_rows(p.0.slot_layout, &p.1) {
+                        out.push((
+                            (address, row.index),
+                            TrackedSlotProbe {
+                                kind: row.kind,
+                                engine_word: row.engine_word,
+                                update_block: p.1.update_block,
+                            },
+                        ));
+                    }
                 }
                 // V4 is (PoolManager, pool_id)-keyed, not address-keyed;
                 // Aerodrome V2-style pools sit at different slots (no probe).
@@ -289,30 +353,15 @@ impl BotState {
                     }
                 }
                 PoolEntry::V3(p) => {
-                    let state = &p.1;
-                    // V3 slot0 = 0; liquidity = 4; ticks base = 5.
-                    if index.is_zero() {
-                        return Some(TrackedSlotProbe {
-                            kind: TrackedSlotKind::V3Slot0,
-                            engine_word: pack_cl_slot0_word(state.sqrt_price_x96, state.tick),
-                            update_block: state.update_block,
-                        });
-                    }
-                    if index == U256::from(4u64) {
-                        return Some(TrackedSlotProbe {
-                            kind: TrackedSlotKind::V3Liquidity,
-                            engine_word: pack_cl_liquidity_word(state.liquidity),
-                            update_block: state.update_block,
-                        });
-                    }
-                    // Per-tick `ticks(tick)` slot = keccak256(sign_extend_24(tick) . 5).
-                    probe_tick_slot(
-                        state.tick_data.iter(),
-                        U256::from(5u64),
-                        index,
-                        state.update_block,
-                        TrackedSlotKind::V3TickInfo,
-                    )
+                    // Family-aware (VERIFY2 T4 / W32CAU) — the row table owns
+                    // the per-layout slot indices; probing a pancake pool at
+                    // the canonical Uni indices reads a NON-tracked field and
+                    // would fabricate a divergence (pool 0x1ac1A8FE, 19:03).
+                    cl_row_for_index(p.0.slot_layout, &p.1, index).map(|row| TrackedSlotProbe {
+                        kind: row.kind,
+                        engine_word: row.engine_word,
+                        update_block: p.1.update_block,
+                    })
                 }
                 // V2-style Aerodrome pools are NOT V2-slot-8 pools (their
                 // reserves live at a different slot — the V2 reserves junction
@@ -691,6 +740,91 @@ mod tests {
         let word = U256::from_be_bytes(probe.engine_word.0);
         assert_eq!(word, U256::from(0x0000_0000_006b_5d49_e99f_8835u128));
         assert_eq!(word >> 128, U256::ZERO, "high 128 bits zero");
+    }
+
+    // ── PancakeSwap V3 fork layout (liquidity@5, ticks@6) ───────────────
+
+    #[test]
+    fn pancake_v3_probe_at_canonical_uni_liquidity_slot4_is_none() {
+        // The W32CAU / VERIFY2-T4 contract: a PancakeSwap V3 pool probed with
+        // the canonical Uniswap liquidity slot (4) must NOT classify — slot 4
+        // holds a different field on the fork, and comparing it fabricated the
+        // bogus [sim-divergence] on pool 0x1ac1A8FE.
+        let mut core = BotState::new();
+        let mut params = v3_pool_params();
+        params.slot_layout = degenbot_pools::ClSlotLayout::PancakeV3;
+        let _id = core.register_v3_pool(&params).expect("V3 registration");
+
+        assert!(
+            core.probe_tracked_storage_slot(V3_ADDR, U256::from(4u64))
+                .is_none(),
+            "pancake slot 4 is not liquidity — must not classify as V3Liquidity"
+        );
+    }
+
+    #[test]
+    fn pancake_v3_liquidity_probes_at_slot5_and_ticks_at_base_6() {
+        let mut core = BotState::new();
+        let mut params = v3_pool_params();
+        params.slot_layout = degenbot_pools::ClSlotLayout::PancakeV3;
+        v3_pool_with_tick(&mut params, -100, 1_000, -500);
+        let _id = core.register_v3_pool(&params).expect("V3 registration");
+
+        let probe = core
+            .probe_tracked_storage_slot(V3_ADDR, U256::from(5u64))
+            .expect("pancake liquidity lives at slot 5");
+        assert_eq!(probe.kind, TrackedSlotKind::V3Liquidity);
+        let word = U256::from_be_bytes(probe.engine_word.0);
+        assert_eq!(word, U256::from(0x0000_0000_006b_5d49_e99f_8835u128));
+
+        // Slot 0 (word 0) packs the same low-184 tracked shape on the fork.
+        let slot0 = core
+            .probe_tracked_storage_slot(V3_ADDR, U256::ZERO)
+            .expect("pancake slot0 word 0 carries price+tick");
+        assert_eq!(slot0.kind, TrackedSlotKind::V3Slot0);
+
+        // The per-tick mapping base is 6 on the fork (5 on Uniswap).
+        let tick_slot = derive_tick_storage_slot(-100, U256::from(6u64));
+        let tick_probe = core
+            .probe_tracked_storage_slot(V3_ADDR, tick_slot)
+            .expect("pancake ticks base is slot 6");
+        assert_eq!(tick_probe.kind, TrackedSlotKind::V3TickInfo);
+
+        // The Uniswap tick slot (base 5) must NOT match on the fork.
+        let uni_tick_slot = derive_tick_storage_slot(-100, U256::from(5u64));
+        assert!(core
+            .probe_tracked_storage_slot(V3_ADDR, uni_tick_slot)
+            .is_none());
+    }
+
+    #[test]
+    fn pancake_v3_anchor_projection_uses_fork_slot_indices() {
+        // The enumerated sim-anchor surface must emit the fork's liquidity
+        // slot (5), never the canonical slot 4 — the serving seam reads this
+        // projection, so a slot-4 anchor on a pancake pool would serve a
+        // non-liquidity field.
+        let mut core = BotState::new();
+        let mut params = v3_pool_params();
+        params.slot_layout = degenbot_pools::ClSlotLayout::PancakeV3;
+        let _id = core.register_v3_pool(&params).expect("V3 registration");
+
+        let anchors = core.project_sim_anchor_scalars();
+        let mut slots: Vec<U256> = Vec::new();
+        for ((a, slot), _) in &anchors {
+            if *a == V3_ADDR {
+                slots.push(*slot);
+            }
+        }
+        assert_eq!(slots.len(), 2, "slot0 + liquidity only");
+        assert!(slots.contains(&U256::ZERO), "slot0 word 0 anchored");
+        assert!(
+            slots.contains(&U256::from(5u64)),
+            "liquidity anchored at the fork's slot 5"
+        );
+        assert!(
+            !slots.contains(&U256::from(4u64)),
+            "canonical slot 4 must NOT be anchored for pancake"
+        );
     }
 
     #[test]

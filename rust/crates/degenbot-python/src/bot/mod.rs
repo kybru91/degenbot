@@ -864,7 +864,7 @@ impl PyBot {
     /// # Errors
     ///
     /// As [`Self::build_v2_pool`].
-    #[pyo3(signature = (address, block=None, db=true, tick_data_fetcher=None))]
+    #[pyo3(signature = (address, block=None, db=true, tick_data_fetcher=None, slot_layout=None))]
     fn build_v3_pool(
         &self,
         py: Python<'_>,
@@ -872,6 +872,7 @@ impl PyBot {
         block: Option<u64>,
         db: bool,
         tick_data_fetcher: Option<Bound<'_, PyAny>>,
+        slot_layout: Option<&str>,
     ) -> PyResult<(u64, String, String, String, String)> {
         use degenbot_bot::bot_core::pool_builder::builder;
         use degenbot_core::runtime::get_runtime;
@@ -900,6 +901,23 @@ impl PyBot {
         // the asyncio runtime (a Rust `block_on` fetcher would deadlock).
         if let Some(fetcher) = tick_data_fetcher.filter(|f| !f.is_none()) {
             params.fetcher = Some(crate::bot::pool::make_tick_fetcher(fetcher.unbind()));
+        }
+        // CL slot layout (VERIFY2 T4 / W32CAU): explicit override (the Python
+        // driver knows the pool class for non-JSON deployments) wins over the
+        // builder's deployment-table resolution.
+        match slot_layout {
+            None => {}
+            Some("pancakeswap") => {
+                params.slot_layout = degenbot_pools::v3_state::ClSlotLayout::PancakeV3;
+            }
+            Some("uniswap") => {
+                params.slot_layout = degenbot_pools::v3_state::ClSlotLayout::UniswapV3;
+            }
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "build_v3_pool: slot_layout must be 'uniswap' or 'pancakeswap', got {other:?}"
+                )));
+            }
         }
         // TF7RZB-S1 (builder return surface): return the core-computed identity
         // alongside the pool_id. V3 has no per-pool `DexVariant`; the family is
@@ -1763,7 +1781,7 @@ impl PyBot {
     /// (symmetric with ``PyLiquidityPool.tick_data_snapshot``).
     /// `coverage` is ``"tracked"`` (complete DB snapshot) or ``"sparse"``
     /// (RPC-fetched active word only / no snapshot).
-    #[pyo3(signature = (address, token0, token1, fee, tick_spacing, factory, sqrt_price_x96, liquidity, tick, tick_data=None, update_block=0, coverage="sparse", tick_data_fetcher=None, tick_data_block=None))]
+    #[pyo3(signature = (address, token0, token1, fee, tick_spacing, factory, sqrt_price_x96, liquidity, tick, tick_data=None, update_block=0, coverage="sparse", tick_data_fetcher=None, tick_data_block=None, slot_layout=None))]
     fn register_v3_pool(
         &self,
         py: Python<'_>,
@@ -1781,6 +1799,7 @@ impl PyBot {
         coverage: &str,
         tick_data_fetcher: Option<Bound<'_, PyAny>>,
         tick_data_block: Option<u64>,
+        slot_layout: Option<&str>,
     ) -> PyResult<u64> {
         let addr = parse_address(address)?;
         let t0 = parse_address(token0)?;
@@ -1827,6 +1846,30 @@ impl PyBot {
             }
         };
 
+        // CL slot layout (VERIFY2 T4 / W32CAU): an explicit override wins
+        // (the Python driver knows the pool class for non-JSON deployments);
+        // else the deployment table; else the canonical Uniswap layout.
+        // Validated BEFORE the CREATE2 verify (cheap string check first — no
+        // RPC-adjacent work behind a malformed argument).
+        let slot_layout = match slot_layout {
+            Some("pancakeswap") => degenbot_pools::v3_state::ClSlotLayout::PancakeV3,
+            Some("uniswap") | None => {
+                if degenbot_uniswap::deployments::is_pancakeswap_v3_factory(
+                    self.bot.chain_id(),
+                    fac,
+                ) {
+                    degenbot_pools::v3_state::ClSlotLayout::PancakeV3
+                } else {
+                    degenbot_pools::v3_state::ClSlotLayout::UniswapV3
+                }
+            }
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "register_v3_pool: slot_layout must be 'uniswap' or 'pancakeswap', got {other:?}"
+                )));
+            }
+        };
+
         // Verify the pool address against the JSON-sourced CREATE2 deployer +
         // init hash (Fork A, JC6OFG). Skipped if (chain, factory) is not in the
         // shipped JSON — preserves the manual/ad-hoc registration path.
@@ -1859,6 +1902,7 @@ impl PyBot {
             fetcher: tick_data_fetcher
                 .filter(|f| !f.is_none())
                 .map(|f| crate::bot::pool::make_tick_fetcher(f.clone().unbind())),
+            slot_layout,
         };
         // YLYJM2: the write-lock acquisition + `register_v3_pool` run inside
         // the accessor's py.detach so the live pump + asyncio loop keep making GIL

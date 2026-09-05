@@ -147,6 +147,7 @@ fn main() -> ExitCode {
             fetcher: Some(fetcher.clone()),
             deployer: Address::ZERO,
             init_hash: B256::ZERO,
+            slot_layout: degenbot_pools::ClSlotLayout::UniswapV3,
         };
         let (_identity, mut state) = V3PoolState::from_params(params, 8);
         let mut fetches = 0usize;

@@ -48,7 +48,7 @@ use std::time::SystemTime;
 /// bindings intentionally omit experimental option constants, so the index
 /// is pinned here against the vendored `mimalloc.h` enum and the version
 /// guard in `supported_version`).
-#[cfg_attr(not(feature = "allocator-ctrl"), allow(dead_code))]
+#[cfg_attr(not(feature = "allocator-ctrl"), expect(dead_code))]
 const MI_OPTION_PURGE_DELAY: i32 = 15;
 /// `mi_option_purge_decommits` — same index (5) in both vendored v2 and v3
 /// headers. Set to 0: purges use `MADV_FREE` (lazy reclaim) instead of
@@ -56,7 +56,7 @@ const MI_OPTION_PURGE_DELAY: i32 = 15;
 /// is measurable until the kernel actually needs them under memory pressure.
 /// Matrix arm `madv-free` (epic AZZDBI T3): faults/block 5,598 vs 49,612 at
 /// default, best `on_drain` p95 of all arms, RSS delta fully reclaimable.
-#[cfg_attr(not(feature = "allocator-ctrl"), allow(dead_code))]
+#[cfg_attr(not(feature = "allocator-ctrl"), expect(dead_code))]
 const MI_OPTION_PURGE_DECOMMITS: i32 = 5;
 /// Also `mi_option_purge_decommits` (index 5) — same in v2/v3.
 /// The vendored C source ships BOTH mimalloc v2 (2.3.02,
@@ -64,9 +64,15 @@ const MI_OPTION_PURGE_DECOMMITS: i32 = 5;
 /// `mi_version() == 30302` (v3). Index `15` was verified byte-identical in both
 /// vendored headers (`mi_option_purge_delay`), so allow the 2.x and 3.x
 /// majors and refuse anything else (v1 or a future major reordering).
-#[cfg_attr(not(feature = "allocator-ctrl"), allow(dead_code))]
+// The supported-version constants + the guard fn are reachable in BOTH
+// feature configs (the feature build calls them from the apply paths; the
+// no-feature build's TESTS exercise them directly) — so the pair is
+// cfg-gated on `any(feature, test)` instead of a dead_code allow/expect
+// whose fulfillment would differ per build config (allow_attributes is
+// workspace-denied; an expect is unfulfilled under cfg(test)).
+#[cfg(any(feature = "allocator-ctrl", test))]
 const SUPPORTED_VERSION_MIN: i32 = 20_000;
-#[cfg_attr(not(feature = "allocator-ctrl"), allow(dead_code))]
+#[cfg(any(feature = "allocator-ctrl", test))]
 const SUPPORTED_VERSION_MAX: i32 = 40_000;
 
 pub const MIN_DELAY_MS: i64 = 2_000;
@@ -210,7 +216,7 @@ impl CadenceState {
     }
 }
 
-#[cfg_attr(not(feature = "allocator-ctrl"), allow(dead_code))]
+#[cfg(any(feature = "allocator-ctrl", test))]
 fn supported_version(version: i32) -> bool {
     (SUPPORTED_VERSION_MIN..SUPPORTED_VERSION_MAX).contains(&version)
 }

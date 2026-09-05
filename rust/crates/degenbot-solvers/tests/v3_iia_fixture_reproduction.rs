@@ -195,6 +195,7 @@ fn v3_iia_fixture_reproduces_plus_thirteen_divergence() {
         fetcher: Some(Arc::clone(&fetcher)),
         deployer: Address::ZERO,
         init_hash: alloy::primitives::B256::ZERO,
+        slot_layout: degenbot_pools::ClSlotLayout::UniswapV3,
     };
     let (_identity, mut state) = V3PoolState::from_params(params, 8);
 

@@ -5447,6 +5447,7 @@ mod tests {
             fetcher: None,
             deployer: Address::ZERO,
             init_hash: B256::ZERO,
+            slot_layout: degenbot_pools::v3_state::ClSlotLayout::UniswapV3,
         };
         let (_, state) = V3PoolState::from_params(params, 4);
 

@@ -29,7 +29,7 @@ use degenbot_pools::curve_state::RegisterCurvePoolParams;
 use degenbot_pools::curve_strategies::resolve_curve_strategy_discriminants;
 use degenbot_pools::spec_bounds;
 use degenbot_pools::v2_state::RegisterV2PoolParams;
-use degenbot_pools::v3_state::RegisterV3PoolParams;
+use degenbot_pools::v3_state::{ClSlotLayout, RegisterV3PoolParams};
 use degenbot_pools::v4_state::{RegisterV4PoolParams, V4PoolKey};
 use degenbot_rpc::abi;
 use degenbot_uniswap::deployments;
@@ -1106,6 +1106,14 @@ pub async fn build_v3(
 
     let deployer = deployments::resolve_deployer(chain_id, imm.factory);
     let init_hash: B256 = deployments::resolve_v3_init_hash(chain_id, imm.factory);
+    // Family-aware slot layout (VERIFY2 T4 / W32CAU): the Pancake V3 fork's
+    // divergent storage layout (liquidity@5, ticks@6) — resolved from the
+    // deployment table; the FFI layer can override for non-JSON pools.
+    let slot_layout = if deployments::is_pancakeswap_v3_factory(chain_id, imm.factory) {
+        ClSlotLayout::PancakeV3
+    } else {
+        ClSlotLayout::UniswapV3
+    };
 
     Ok(RegisterV3PoolParams {
         address,
@@ -1124,6 +1132,7 @@ pub async fn build_v3(
         fetcher: None,
         deployer,
         init_hash,
+        slot_layout,
     })
 }
 
