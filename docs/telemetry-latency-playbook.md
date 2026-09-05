@@ -82,6 +82,23 @@ its judged block's trace. Exporter caveat: a span only exports when ALL
 handles drop — a test holding a `tracing::Span` (or an `enter()` guard)
 across `force_flush` will not see it.
 
+### The simulate tail (pipeline, option A)
+
+Derived quantities - compute on every investigation:
+
+| Quantity | Formula | Healthy |
+|---|---|---|
+| per-block sim tail | last `degenbot.simulate.dispatch` end - first start, grouped by `current_block` | < 25% of the serial sum (K=8) |
+| serial sum | sum of per-fan-out `fanout_ms` within the block | trend only |
+| cold-fetch share | `[sim-lab]` slow_ms vs fanout_ms | storage RPCs dominate; see JSXP3I |
+
+The concurrent-sim pipeline is `DEGENBOT_SIM_PIPELINE_CONCURRENCY` (default
+8; 1 = serial A/B arm). Contract: sims overlap across batches; submissions
+stay FIFO in batch-arrival order with the nonce fetched at submit time.
+If the tail/sum ratio rises above ~0.5, the pipeline regressed. Lab + soak
+evidence: `logs/simpipe_lab.md`, `logs/simpipe_soak.md` (K=8 vs K=1: 4.2x
+tail compression, 0 leaf failures).
+
 Derived quantities (compute these on every investigation):
 
 | Quantity | Formula | Healthy |
