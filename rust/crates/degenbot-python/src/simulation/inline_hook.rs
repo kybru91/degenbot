@@ -39,12 +39,12 @@ use degenbot_bot::solvers::arb_engine::inline_sim::{
     AccessListRow, CapturedSwapRow, InlineSimFailure, InlineSimRequest, InlineSimulator,
     InlineSwapFamily, SimulatedPathResult,
 };
-use degenbot_bot::solvers::arb_engine::ArbitrageEngine;
 use degenbot_executor::composers::EncodeOptions;
 use degenbot_rpc::provider::AlloyProvider;
 use degenbot_simulation::sim::evm::inspectors::SwapFamily;
 use degenbot_simulation::WarmCodeCacheInner;
 use parking_lot::RwLock;
+use std::future::Future;
 
 /// The session-static sim config + the shared state arc-set the closure
 /// closes over. Built once (at `install_inline_simulator` time) and shared
@@ -63,9 +63,6 @@ pub(crate) struct InlineSimHook {
     runtime_bytecode: Bytes,
     warmup: degenbot_executor::WarmupSlots,
     erc6909_profit: bool,
-    /// The engine arc — `path_info_for` resolution at sim time (short lock;
-    /// the worker holds NO engine lock when the hook runs).
-    engine: Arc<parking_lot::Mutex<ArbitrageEngine>>,
     /// The shared core (the sim anchor's snapshot source) — the SAME short
     /// read discipline as the FFI path (ULUWNI: snapshot under a short read,
     /// drop the guard BEFORE any provider I/O).
@@ -99,7 +96,6 @@ impl InlineSimHook {
         runtime_bytecode: Bytes,
         warmup: degenbot_executor::WarmupSlots,
         erc6909_profit: bool,
-        engine: Arc<parking_lot::Mutex<ArbitrageEngine>>,
         bot_state: Arc<StateLock<BotState>>,
         warm_cache: Arc<RwLock<WarmCodeCacheInner>>,
     ) -> Self {
@@ -115,7 +111,6 @@ impl InlineSimHook {
             runtime_bytecode,
             warmup,
             erc6909_profit,
-            engine,
             bot_state,
             warm_cache,
             sim_runtime: Arc::new(
@@ -203,19 +198,45 @@ impl InlineSimHook {
     }
 }
 
+/// Join the spawned sim task from ANY thread context (the soak's runtime
+/// matrix): the solve arms' workers may be plain threads (rayon/`std`), OR
+/// tokio tasks on the solve-executor runtime (`DEGENBOT_SOLVE_EXECUTOR=tokio`
+/// spawns the per-bin jobs as tasks). `Runtime::block_on` from inside a
+/// runtime context panics ("Cannot start a runtime from within a runtime" —
+/// the 2026-09-05 soak freeze #2), so:
+/// - inside a multi-thread runtime: `block_in_place` + join on THAT runtime's
+///   handle (legal on a worker; the handle drive keeps the task-local context
+///   the DB wrap needs);
+/// - otherwise (plain threads): block on the dedicated sim runtime.
+fn join_sim_task<F>(sim_runtime: &tokio::runtime::Runtime, fut: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread => {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        _ => sim_runtime.block_on(fut),
+    }
+}
+
 impl InlineSimulator for InlineSimHook {
     #[expect(clippy::too_many_lines)]
     fn simulate_path(&self, req: InlineSimRequest) -> Option<SimulatedPathResult> {
-        // 1. PathInfo via the engine (short lock — the worker holds NO other
-        //    engine state at this point; engine-then-core order intact).
+        // 1. PathInfo STRAIGHT OFF THE CORE — engine-Lock-FREE. The calling
+        //    cycle holds the engine `Mutex` for its whole duration (the busy
+        //    loop that owns this worker), so re-entering the engine lock from
+        //    the worker would self-deadlock (cycle-waits-on-bin,
+        //    bin-waits-on-cycle — the 2026-09-05 soak freeze). The projection
+        //    (build_path_info) needs only a short core read, same class as
+        //    the T2 clamp's read. Unknown/unresolvable hops degrade to `None`
+        //    (the batch entry stays payload-less -> the legacy FFI path).
         let path_info = {
-            let engine = self.engine.lock();
-            // `Option<Result<PathInfo, _>>` — unknown path OR a projected-hop
-            // build error both degrade to `None` (the batch entry stays
-            // payload-less and takes the legacy FFI path).
-            match engine.path_info_for(req.path_id) {
-                Some(Ok(pi)) => pi,
-                _ => return None,
+            let core = self.bot_state.read();
+            match degenbot_bot::solvers::arb_engine::build_path_info(&core, &req.hops) {
+                Ok(pi) => pi,
+                Err(_) => return None,
             }
         };
 
@@ -277,7 +298,7 @@ impl InlineSimulator for InlineSimHook {
         //    into the task (the outer conversions read the original after).
         let (result, buckets): (Result<Option<SimResult>, String>, FailBuckets) = {
             let req_task = req.clone();
-            self.sim_runtime.block_on(async move {
+            let sim_future = async move {
                 tokio::spawn(async move {
                     let req = req_task;
                     let ctx = SimulateContext {
@@ -346,7 +367,8 @@ impl InlineSimulator for InlineSimHook {
                     );
                     (Err(format!("{e}")), buckets)
                 })
-            })
+            };
+            join_sim_task(&self.sim_runtime, sim_future)
         };
 
         // 5. Convert: Ok(Some) → success payload; Ok(None)/Err → failure

@@ -2204,6 +2204,9 @@ impl ArbitrageEngine {
             clamp.twins = clamp_twin_count,
             clamp.phase_us = u64::try_from(clamp_twins_start.elapsed().as_micros()).unwrap_or(u64::MAX),
             total_us = u64::try_from(cycle_start.elapsed().as_micros()).unwrap_or(u64::MAX),
+            inline.stance = INLINE_SIM_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
+            inline.hook = self.inline_sim.is_some(),
+            inline.payloads = self.inline_payloads.len(),
             "[solve-phase] cycle complete (clamp done)"
         );
 
@@ -3202,8 +3205,8 @@ mod executor_ab_probe {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use alloy::primitives::U256;
     use crate::solvers::arb_engine::BlockMetadata;
+    use alloy::primitives::U256;
     use degenbot_pools::int_v3_hop::{IntV3TickRangeHop, IntV3TickRangeSequence};
     use degenbot_solvers::mobius_v3_int::{build_cl_crossing_table, build_cl_word_profiles};
     use serde_json::Value;

@@ -419,10 +419,18 @@ fn simulated_path_result_to_py_dict<'py>(
             for row in rows {
                 let rd = PyDict::new(py);
                 rd.set_item("address", address_to_checksum(py, &row.address)?)?;
-                // EIP-2930 JSON shape — `parse_access_list` reads this key.
+                // EIP-2930 JSON shape — `parse_access_list` reads this key and
+                // decodes each entry as 0x-prefixed 32-byte HEX STRINGS (not
+                // ints — a decimal int re-parses as odd/invalid digits).
                 let keys = PyList::empty(py);
                 for k in &row.storage_keys {
-                    keys.append(PyU256(*k))?;
+                    keys.append(format!(
+                        "0x{}",
+                        k.to_be_bytes::<32>()
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>()
+                    ))?;
                 }
                 rd.set_item("storageKeys", keys)?;
                 list.append(rd)?;

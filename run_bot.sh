@@ -72,6 +72,9 @@ DEFAULT_RUST_LOG="info,degenbot_bot=debug,degenbot_arbitrage=debug,degenbot_simu
 export RUST_LOG="${RUST_LOG:-$DEFAULT_RUST_LOG}"
 export DEGENBOT_DEBUG="${DEGENBOT_DEBUG:-1}"
 export DEGENBOT_OTEL="${DEGENBOT_OTEL:-1}"
+# SIMPIPE2 T4 soak arm: the ENGINE-side inline sim (worker seam). Default 0
+# (legacy option-A FFI pipeline); the soak flips 0/1 across equal windows.
+export DEGENBOT_SOLVE_INLINE_SIM="${DEGENBOT_SOLVE_INLINE_SIM:-1}"
 export DEGENBOT_SIM_EXIT_ON_FAIL="${DEGENBOT_SIM_EXIT_ON_FAIL:-0}"
 export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-1}"
 # Publish-debounce window (ms), last dirty log -> settle decision. A/B'd on

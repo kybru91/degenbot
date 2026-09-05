@@ -51,6 +51,29 @@ pub enum PathInfoBuildError {
     UnsupportedHopType { hop_type: HopType, pool_id: u64 },
 }
 
+/// Build the `composers::PathInfo` for a hop list straight off the shared
+/// core — the ENGINE-LOCK-FREE form (SIMPIPE2 T4): the inline-sim hook runs
+/// in the SOLVE WORKER while the calling cycle holds the engine `Mutex`, so
+/// it must NEVER re-enter the engine lock. The projection (`build_hop_info`)
+/// resolves every hop's identity from the core (engine-then-core discipline:
+/// the caller takes the core read directly, holding no engine state).
+///
+/// # Errors
+/// A hop's pool identity is unregistered (or its family has no encoder arm)
+/// — the exact [`PathInfoBuildError`] the engine-side projection raises.
+///
+/// Re-exported via `crate::solvers::arb_engine` for the outer seam.
+pub fn build_path_info(
+    core: &BotState,
+    pools: &[MixedPoolRef],
+) -> Result<PathInfo, PathInfoBuildError> {
+    let mut hops = Vec::with_capacity(pools.len());
+    for pool_ref in pools {
+        hops.push(build_hop_info(core, pool_ref)?);
+    }
+    Ok(PathInfo::new(hops))
+}
+
 impl ArbitrageEngine {
     /// Build the engine-facing `composers::PathInfo` for `path_id` by
     /// resolving each registered hop's identity from the shared `BotState`.

@@ -185,7 +185,6 @@ impl crate::bot::engine::PyArbitrageEngine {
         context: &PySimulateContext,
         erc6909_profit: bool,
     ) {
-        let engine_arc = self.engine_arc();
         let bot_state = self.bot_state_arc();
         let warm_cache = self.warm_code_cache_arc();
         let hook = crate::simulation::inline_hook::InlineSimHook::new(
@@ -200,12 +199,18 @@ impl crate::bot::engine::PyArbitrageEngine {
             context.runtime_bytecode.clone(),
             context.warmup,
             erc6909_profit,
-            engine_arc,
             bot_state,
             warm_cache,
         );
         self.with_engine_mut(py, |e| {
             e.set_inline_simulator(std::sync::Arc::new(hook));
         });
+        // The soak's hook-wiring tell — one line at install, matching the
+        // `[solve-phase] cycle complete` inline.* fields it pairs with.
+        tracing::info!(
+            target: degenbot_bot::telemetry::DIAGNOSTIC_TARGET,
+            erc6909_profit,
+            "[inline-sim] hook installed"
+        );
     }
 }
