@@ -2756,7 +2756,7 @@ mod profit_clamp_recompute_tests {
 
     /// Narrow single-position V4 pool (±60 ticks, 1e6 liquidity) + a one-hop
     /// path: the over-fed committed input is the empty-march class. Returns
-    /// (engine, path_id, the to_solve-aligned pool-ref snapshot).
+    /// (engine, `path_id`, the to_solve-aligned pool-ref snapshot).
     fn overfed_v4_engine() -> (
         ArbitrageEngine,
         u64,
@@ -2764,9 +2764,6 @@ mod profit_clamp_recompute_tests {
     ) {
         use crate::bot_core::RegisterV4PoolParams;
         use crate::solvers::arb_engine::PoolTickCoverage;
-        let mut engine = ArbitrageEngine::new();
-        // V2 pool: large reserves so its output dwarfs the V4 hop's capacity —
-        // the V4 hop is the over-fed one (this isolates hop1's input clamp).
         fn usdc_local(amount: u64) -> alloy::primitives::Uint<112, 2> {
             (U256::from(amount) * U256::from(10u64).pow(U256::from(6)))
                 .to::<alloy::primitives::Uint<112, 2>>()
@@ -2777,6 +2774,9 @@ mod profit_clamp_recompute_tests {
         }
         const GAMMA_03: u64 = 997;
         const FEE_DENOM_03: u64 = 1000;
+        let mut engine = ArbitrageEngine::new();
+        // V2 pool: large reserves so its output dwarfs the V4 hop's capacity —
+        // the V4 hop is the over-fed one (this isolates hop1's input clamp).
         let v2 = engine.register_v2_pool(
             alloy::primitives::Address::from([0x11u8; 20]),
             usdc_local(1_500_000),
@@ -2912,14 +2912,14 @@ mod profit_clamp_recompute_tests {
         let _: Vec<Vec<MixedPoolRef>> = Vec::new();
     }
 
-    /// The merge honors the worker's twin report: twins > 0 = the result is
-    /// already clamp-committed (no second clip); twins = 0 = the merge clips
-    /// the over-fed input itself (the legacy path — bit-identical).
+    // The merge honors the worker's twin report: twins > 0 = the result is
+    // already clamp-committed (no second clip); twins = 0 = the merge clips
+    // the over-fed input itself (the legacy path — bit-identical).
 
     /// SIMPIPE2 T3: a payload riding `merge_one_result` is stored at the
     /// engine (`inline_payloads`) and a re-merge WITHOUT the payload drops the
     /// stale entry — per-entry presence decides Python-side. (The delivery
-    /// drain into `ResultBatch.payloads` is covered by the delivery_policy
+    /// drain into `ResultBatch.payloads` is covered by the `delivery_policy`
     /// tests + the FFI conversion; this pins the merge-site store/drop.)
     #[test]
     fn merge_stores_payload_and_drops_it_without_one() {

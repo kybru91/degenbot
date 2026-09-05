@@ -5633,7 +5633,7 @@ mod tests {
     /// Resolve->LPT staging trace (f701ccd36f4ecf80d671e798df218fa4, block
     /// 25906841): between the close of `arb.resolve` and the open of
     /// `arb.lpt` sat 647 ms of uninstrumented wall time — the results sweep
-    /// + resolved-snapshot staging (`to_solve`) that makes the engine
+    /// and resolved-snapshot staging (`to_solve`) that makes the engine
     /// borrow-free for the parallel dispatch. That phase must emit its own
     /// `degenbot.arb.stage` phase span carrying `paths.staged`, so the
     /// staging cost is attributable in Jaeger like its fanout/resolve/lpt/
@@ -5646,6 +5646,8 @@ mod tests {
         use hashbrown::HashSet;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
         use tracing_subscriber::layer::SubscriberExt;
+
+        const PATH_COUNT: u64 = 1;
 
         let exporter = InMemorySpanExporter::default();
         let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
@@ -5703,11 +5705,10 @@ mod tests {
         );
         // Dual-representation check (u64 fields map to String or I64 under
         // tracing-opentelemetry 0.33; mirrors the MQUKB6 pump test).
-        const PATH_COUNT: u64 = 1;
         assert!(
             stage_spans[0].attributes.iter().any(|kv| {
                 kv.key == opentelemetry::Key::from_static_str("paths.staged")
-                    && (matches!(kv.value, opentelemetry::Value::I64(v) if v as u64 == PATH_COUNT)
+                    && (matches!(kv.value, opentelemetry::Value::I64(v) if v.cast_unsigned() == PATH_COUNT)
                         || matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == PATH_COUNT.to_string().as_str()))
             }),
             "stage span must carry paths.staged={PATH_COUNT}; got {:?}",

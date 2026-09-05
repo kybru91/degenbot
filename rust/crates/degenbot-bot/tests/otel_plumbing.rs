@@ -90,7 +90,7 @@ fn layer_builds_on_bare_registry() {
     let _subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 }
 
-/// f701ccd3 session: the block→simulate handoff broke the OTel context at
+/// f701ccd3 session: the block→simulate handoff broke the `OTel` context at
 /// the Rust→Python bridge — `degenbot.simulate.dispatch` exported as a ROOT
 /// span, uncorrelated with `degenbot.pump.block` (two trace families joined
 /// only by the `current_block` tag). The block-context bridge
@@ -155,7 +155,7 @@ fn simulate_dispatch_span_carries_published_block_parent() {
 /// The attribute-key comparison used above relies on `Key` equality by static
 /// str — pin it so an `OTel` bump can't silently weaken the content assertion.
 /// The verifier task (ADR-021) creates its span on a DETACHED tokio task —
-/// the simulate_dispatch_span constructor form does not apply there. The
+/// the `simulate_dispatch_span` constructor form does not apply there. The
 /// attach helper must parent an EXISTING span to the published block's span,
 /// with the nearest-previous fallback (the judged block can trail the newest
 /// published one, and unrelated blocks may sit in between).

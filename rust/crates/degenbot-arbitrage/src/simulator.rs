@@ -1031,7 +1031,6 @@ impl Drop for SimSpanVerdict {
 ///
 /// Panics if a `TxEnv::builder().build()` fails (cannot happen with the
 /// well-formed balance/execute calldata + addresses this fn constructs).
-#[expect(clippy::too_many_lines)]
 pub fn simulate_path_on_evm<E>(
     evm: &mut E,
     ctx: &SimulateContext<'_>,
@@ -1055,6 +1054,7 @@ where
     result
 }
 
+#[expect(clippy::too_many_lines)] // moved off the timed wrapper — SIMPIPE T1 extraction left this as the 350-line body
 fn simulate_path_on_evm_inner<E>(
     evm: &mut E,
     ctx: &SimulateContext<'_>,

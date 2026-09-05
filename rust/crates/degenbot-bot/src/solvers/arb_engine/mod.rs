@@ -379,7 +379,7 @@ pub struct ArbitrageEngine {
     /// cleared by `finalize_block`. Owned by the engine since LEZJAS.
     has_logs_this_block: bool,
     /// REMED1 T2: which entry drove the CURRENT solve cycle - `drain`
-    /// (EngineHandle::solve_dirty, per-log streaming) vs `finalize` (the
+    /// (`EngineHandle::solve_dirty`, per-log streaming) vs `finalize` (the
     /// boundary catch in `finalize_block`). Emitted on the cycle-complete
     /// line so a block's two real cycles (65/1853 overnight) are attributable
     /// instead of looking like duplicate logging.

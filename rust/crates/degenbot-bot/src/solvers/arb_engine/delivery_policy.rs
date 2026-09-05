@@ -432,7 +432,7 @@ mod tests {
         // Pretend Python already saw path 3 at an older value.
         policy.delivered.insert(3, solve_result(700));
 
-        policy.diff_and_send(&results, 42, &BlockMetadata::default(), &Default::default());
+        policy.diff_and_send(&results, 42, &BlockMetadata::default(), &HashMap::default());
 
         let batch = rx.try_recv().expect("diff_and_send with a channel sends");
         assert_eq!(batch.solve_block, 42);
@@ -460,7 +460,7 @@ mod tests {
         let mut policy = DeliveryPolicy::default();
         let mut results: HashMap<u64, SolvePathResult> = HashMap::new();
         results.insert(1, solve_result(500));
-        policy.diff_and_send(&results, 7, &BlockMetadata::default(), &Default::default());
+        policy.diff_and_send(&results, 7, &BlockMetadata::default(), &HashMap::default());
         assert!(policy.delivered.contains_key(&1));
     }
 
@@ -482,7 +482,7 @@ mod tests {
         results.insert(1, solve_result(500)); // above threshold, would be fresh if anchored
 
         // results_block == 0 (cold start, no solve yet): batch is EMPTY.
-        policy.diff_and_send(&results, 0, &BlockMetadata::default(), &Default::default());
+        policy.diff_and_send(&results, 0, &BlockMetadata::default(), &HashMap::default());
         let batch = rx
             .try_recv()
             .expect("zero-anchor still sends metadata batch");
@@ -502,7 +502,7 @@ mod tests {
 
         // First real solve advances results_block to 42: the deferred candidate
         // is now delivered as fresh at a valid anchor.
-        policy.diff_and_send(&results, 42, &BlockMetadata::default(), &Default::default());
+        policy.diff_and_send(&results, 42, &BlockMetadata::default(), &HashMap::default());
         let batch = rx.try_recv().expect("anchored solve delivers");
         assert!(
             batch.fresh.iter().any(|(id, _)| *id == 1),

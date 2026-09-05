@@ -770,7 +770,8 @@ pub fn dispatch_profitable_results(
         tracing::info!(
             target: degenbot_bot::telemetry::DIAGNOSTIC_TARGET,
             current_block,
-            fanout_ms = lab_fanout_started.elapsed().as_millis() as u64,
+            fanout_ms = u64::try_from(lab_fanout_started.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
             "{}",
             degenbot_simulation::sim::evm::sim_metrics::format_delta(&lab, fanout_candidate_count)
         );

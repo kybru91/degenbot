@@ -71,6 +71,7 @@ impl DeliveryLifecycle {
 #[expect(clippy::expect_used)]
 mod tests {
     use super::*;
+    use hashbrown::HashMap;
 
     #[test]
     fn close_ends_the_result_stream_exactly_once() {
@@ -108,7 +109,7 @@ mod tests {
             updated: Vec::new(),
             expired: Vec::new(),
             removed: Vec::new(),
-            payloads: Default::default(),
+            payloads: HashMap::default(),
         };
         assert!(
             !lc.send_batch(batch),
@@ -132,7 +133,7 @@ mod tests {
             updated: Vec::new(),
             expired: Vec::new(),
             removed: Vec::new(),
-            payloads: Default::default(),
+            payloads: HashMap::default(),
         };
         assert!(lc.send_batch(batch));
         let got = rx.try_recv().expect("batch delivered");

@@ -4,7 +4,7 @@
 //! The engine's `degenbot_bot` seam stays strategy-agnostic (ADR-019 D7):
 //! this crate installs the concrete simulator. One per-path sim drives the
 //! SAME core the FFI fan-out drives — `BlockSimHandle` (the layered DB:
-//! AlloyDB → `WrapDatabaseAsync` → `BotStateDb` → `WarmCodeCache` →
+//! `AlloyDB` → `WrapDatabaseAsync` → `BotStateDb` → `WarmCodeCache` →
 //! `CacheDB`, the state overrides applied once) → `simulate_path_on_evm` —
 //! so the two arms' verdicts are comparable by construction (the T4
 //! soak's premise). The deliberate differences:
@@ -92,7 +92,7 @@ fn outputs_vec(req: &InlineSimRequest) -> Vec<u128> {
 }
 
 impl InlineSimHook {
-    /// Assemble the hook from the installed PyO3 context (see
+    /// Assemble the hook from the installed `PyO3` context (see
     /// `PyArbitrageEngine::install_inline_simulator`).
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -130,27 +130,31 @@ impl InlineSimHook {
             )),
             reverify_armed: std::sync::Mutex::new(std::collections::HashSet::new()),
             spotcheck_n: std::sync::atomic::AtomicU64::new(0),
-            sim_runtime: Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    // M2 soak sizing (2026-09-05): with the hard-coded 2
-                    // workers the per-cycle wall was 72ms + 4.74ms/path
-                    // (R^2 0.89, 228 steady cycles) - the payload sims queued
-                    // on the 2-thread runtime while ~50 bins/cycle arrived
-                    // concurrently (sims p50 12ms). Sizing to the core count
-                    // lets the bins' sims actually overlap. Env-tunable for
-                    // constrained hosts; the sim bodies still block on the
-                    // DB wrap's block_on, so workers also cover that wait.
-                    .worker_threads(inline_sim_worker_count())
-                    .enable_all()
-                    .build()
-                    .expect("inline-sim runtime build"),
-            ),
+            sim_runtime: {
+                #[expect(clippy::expect_used)]
+                // unreachable in production: multi-thread Builder only fails on allocator OOM or invalid config (worker count is clamped 1..=32)
+                Arc::new(
+                    tokio::runtime::Builder::new_multi_thread()
+                        // M2 soak sizing (2026-09-05): with the hard-coded 2
+                        // workers the per-cycle wall was 72ms + 4.74ms/path
+                        // (R^2 0.89, 228 steady cycles) - the payload sims queued
+                        // on the 2-thread runtime while ~50 bins/cycle arrived
+                        // concurrently (sims p50 12ms). Sizing to the core count
+                        // lets the bins' sims actually overlap. Env-tunable for
+                        // constrained hosts; the sim bodies still block on the
+                        // DB wrap's block_on, so workers also cover that wait.
+                        .worker_threads(inline_sim_worker_count())
+                        .enable_all()
+                        .build()
+                        .expect("inline-sim runtime build"),
+                )
+            },
         }
     }
 
     /// The EIP-1559 `next_base_fee` (the `calculations/evm_math.py` port —
     /// the worker-side twin of the driver's pre-sim computation).
-    fn next_base_fee(&self, req: &InlineSimRequest) -> u128 {
+    fn next_base_fee(req: &InlineSimRequest) -> u128 {
         if req.parent_base_fee == 0 {
             return 0; // pre-EIP-1559 / unknown parent
         }
@@ -249,15 +253,12 @@ where
 /// `DEGENBOT_INLINE_SIM_WORKERS`. Clamped to 1..=32; unparsable/garbage
 /// values fall back to the default rather than failing the engine build.
 fn inline_sim_worker_count() -> usize {
-    let default = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let default = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     match std::env::var("DEGENBOT_INLINE_SIM_WORKERS") {
         Ok(raw) => raw
             .trim()
             .parse::<usize>()
-            .map(|n| n.clamp(1, 32))
-            .unwrap_or(default),
+            .map_or(default, |n| n.clamp(1, 32)),
         Err(_) => default,
     }
 }
@@ -321,7 +322,7 @@ impl InlineSimulator for InlineSimHook {
 
         let path_id = req.path_id;
         let hop_count = req.hop_outputs.len();
-        let base_fee_next = self.next_base_fee(&req);
+        let base_fee_next = Self::next_base_fee(&req);
         let provider = Arc::clone(&self.provider);
         let warm_cache = Arc::clone(&self.warm_cache);
         // M2: the cycle-scoped storage memo - one per sim block; sims at a
@@ -335,7 +336,7 @@ impl InlineSimulator for InlineSimHook {
         let reverify = self
             .reverify_armed
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&req.path_id);
         let spotcheck = {
             static PERMYRIAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -349,8 +350,7 @@ impl InlineSimulator for InlineSimHook {
                 && self
                     .spotcheck_n
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    % (10_000 / permyriad.min(10_000))
-                    == 0
+                    .is_multiple_of(10_000 / permyriad.min(10_000))
         };
         let verify_divergence = reverify || spotcheck;
         if verify_divergence {
@@ -439,7 +439,7 @@ impl InlineSimulator for InlineSimHook {
                         block_timestamp: req.block_timestamp,
                         block_priority_fees: None,
                     };
-                    match degenbot_simulation::BlockSimHandle::build(
+                    if let Some(mut handle) = degenbot_simulation::BlockSimHandle::build(
                         &provider,
                         base_fee_next,
                         req.sim_block,
@@ -450,35 +450,28 @@ impl InlineSimulator for InlineSimHook {
                         Some(&storage_memo),
                         verify_divergence,
                     ) {
-                        Some(mut handle) => {
-                            let mut buckets = FailBuckets::new();
-                            let result = simulate_path_on_evm(
-                                handle.evm_mut(),
-                                &ctx,
-                                &sim_path,
-                                &mut buckets,
-                            )
-                            .map_err(|e| format!("{e}"));
-                            tracing::Span::current().record(
-                                "sim_ok",
-                                result.as_ref().ok().and_then(|o| o.as_ref()).is_some(),
-                            );
-                            (result, buckets)
-                        }
-                        None => {
-                            // No ambient runtime at build / an override error:
-                            // tally `rpc-failed` (mirrors the FFI build-failure arm).
-                            let mut buckets = FailBuckets::new();
-                            buckets.record(
-                                req.path_id,
-                                "rpc-failed",
-                                None,
-                                Bytes::new(),
-                                optimal_input,
-                                outputs_vec(&req),
-                            );
-                            (Ok(None), buckets)
-                        }
+                        let mut buckets = FailBuckets::new();
+                        let result =
+                            simulate_path_on_evm(handle.evm_mut(), &ctx, &sim_path, &mut buckets)
+                                .map_err(|e| format!("{e}"));
+                        tracing::Span::current().record(
+                            "sim_ok",
+                            result.as_ref().ok().and_then(|o| o.as_ref()).is_some(),
+                        );
+                        (result, buckets)
+                    } else {
+                        // No ambient runtime at build / an override error:
+                        // tally `rpc-failed` (mirrors the FFI build-failure arm).
+                        let mut buckets = FailBuckets::new();
+                        buckets.record(
+                            req.path_id,
+                            "rpc-failed",
+                            None,
+                            Bytes::new(),
+                            optimal_input,
+                            outputs_vec(&req),
+                        );
+                        (Ok(None), buckets)
                     }
                 })
                 .await
@@ -501,9 +494,10 @@ impl InlineSimulator for InlineSimHook {
 
         // 5. Convert: Ok(Some) → success payload; Ok(None)/Err → failure
         //    payload through the buckets (one record — single path).
-        match result {
-            Ok(Some(sim)) => Some(Self::payload_from_sim(path_id, &sim)),
-            Ok(None) | Err(_) => {
+        if let Ok(Some(sim)) = result {
+            Some(Self::payload_from_sim(path_id, &sim))
+        } else {
+            {
                 // VERIFY2 T2: this sim failed - arm the path so its NEXT sim
                 // re-verifies with the divergence probe (the failure itself
                 // already carries its failure data in the payload). The set
@@ -512,7 +506,7 @@ impl InlineSimulator for InlineSimHook {
                     let mut arm = self
                         .reverify_armed
                         .lock()
-                        .unwrap_or_else(|p| p.into_inner());
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if arm.len() >= 1024 {
                         arm.clear();
                     }
@@ -548,9 +542,7 @@ mod tests {
     // avoid the parallel-test env race (each case asserts a distinct tail).
     #[test]
     fn worker_count_env_matrix() {
-        let default = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        let default = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
 
         std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "not-a-number");
         assert_eq!(super::inline_sim_worker_count(), default);

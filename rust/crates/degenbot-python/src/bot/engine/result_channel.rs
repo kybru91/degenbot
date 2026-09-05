@@ -14,11 +14,11 @@ use crate::prelude::*;
 use degenbot_bot::solvers::arb_engine::inline_sim::{InlineSwapFamily, SimulatedPathResult};
 use pyo3::types::{PyBytes, PyString};
 
-fn address_to_checksum<'py>(py: Python<'py>, a: &Address) -> PyResult<Bound<'py, PyString>> {
-    Ok(PyString::new(
+fn address_to_checksum<'py>(py: Python<'py>, a: &Address) -> Bound<'py, PyString> {
+    PyString::new(
         py,
         &degenbot_core::address_utils::address_to_checksum_string(a),
-    ))
+    )
 }
 
 #[pymethods]
@@ -418,19 +418,13 @@ fn simulated_path_result_to_py_dict<'py>(
             let list = PyList::empty(py);
             for row in rows {
                 let rd = PyDict::new(py);
-                rd.set_item("address", address_to_checksum(py, &row.address)?)?;
+                rd.set_item("address", address_to_checksum(py, &row.address))?;
                 // EIP-2930 JSON shape — `parse_access_list` reads this key and
                 // decodes each entry as 0x-prefixed 32-byte HEX STRINGS (not
                 // ints — a decimal int re-parses as odd/invalid digits).
                 let keys = PyList::empty(py);
                 for k in &row.storage_keys {
-                    keys.append(format!(
-                        "0x{}",
-                        k.to_be_bytes::<32>()
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>()
-                    ))?;
+                    keys.append(format!("0x{k:064x}"))?;
                 }
                 rd.set_item("storageKeys", keys)?;
                 list.append(rd)?;
@@ -442,7 +436,7 @@ fn simulated_path_result_to_py_dict<'py>(
     let swaps = PyList::empty(py);
     for s in &payload.captured_swaps {
         let sd = PyDict::new(py);
-        sd.set_item("emitter", address_to_checksum(py, &s.emitter)?)?;
+        sd.set_item("emitter", address_to_checksum(py, &s.emitter))?;
         sd.set_item(
             "family",
             match s.family {

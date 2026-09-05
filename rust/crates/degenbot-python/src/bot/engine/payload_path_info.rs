@@ -28,7 +28,7 @@ impl PyArbitrageEngine {
     fn payload_path_info(&self, path_id: u64, py: Python<'_>) -> Option<Py<PyDict>> {
         let resolved = self
             .with_engine(py, |e| e.path_info_for(path_id))
-            .and_then(|res| res.ok())?;
+            .and_then(std::result::Result::ok)?;
         let dict = path_info_to_py_dict(py, &resolved).ok()?;
         Some(dict.unbind())
     }

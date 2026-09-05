@@ -238,6 +238,7 @@ mod inline_sim_tests {
         }
     }
 
+    #[expect(clippy::unwrap_used)]
     fn stub_payload() -> SimulatedPathResult {
         SimulatedPathResult {
             path_id: 0,
@@ -265,6 +266,7 @@ mod inline_sim_tests {
         }
     }
 
+    #[expect(clippy::expect_used)]
     fn two_hop_engine() -> (ArbitrageEngine, u64) {
         use crate::bot_core::TickInfo;
         use crate::solvers::arb_engine::PoolTickCoverage;
@@ -347,6 +349,7 @@ mod inline_sim_tests {
     }
 
     #[test]
+    #[expect(clippy::expect_used)]
     fn engine_calls_hook_with_aligned_primitive_request() {
         let (mut engine, path_id) = two_hop_engine();
         let sim = Arc::new(RecordingSim {

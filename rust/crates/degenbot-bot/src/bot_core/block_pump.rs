@@ -1463,14 +1463,14 @@ impl BlockPump {
                                 // REMED1 T3: throttled per-block phase
                                 // attribution on the console (every 20th block
                                 // - the Jaeger span carries all blocks).
+                                #[expect(clippy::items_after_statements)]
                                 static DIAG_ATTEMPT: std::sync::atomic::AtomicU32 =
                                     std::sync::atomic::AtomicU32::new(0);
                                 let nth =
                                     DIAG_ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if nth % 20 == 0 {
+                                if nth.is_multiple_of(20) {
                                     let apply_us = apply_started_at
-                                        .map(|t| t.elapsed().as_micros() as u64)
-                                        .unwrap_or(0);
+                                        .map_or(0, |t| t.elapsed().as_micros() as u64);
                                     let (hw, lw) = (pregap.header_at, pregap.first_log);
                                     tracing::info!(
                                         target: "degenbot::diag",

@@ -172,6 +172,7 @@ impl<'a> BlockSimHandle<'a> {
     /// `pyo3_async_runtimes` (`Builder::new_multi_thread()`), so the `None`
     /// path is unreachable in production — `None` means the dispatch host lost
     /// its runtime.
+    #[expect(clippy::too_many_arguments)] // VERIFY2 T2: 9 inputs hand-build a per-block sim handle
     #[must_use]
     pub fn build(
         provider: &degenbot_rpc::provider::AlloyProvider,
@@ -204,6 +205,7 @@ impl<'a> BlockSimHandle<'a> {
     }
 
     /// The verbatim pre-lab build body (extracted for the T1 build timer).
+    #[expect(clippy::too_many_arguments)] // mirrors `build` above
     fn build_inner(
         provider: &degenbot_rpc::provider::AlloyProvider,
         base_fee_next: u128,
