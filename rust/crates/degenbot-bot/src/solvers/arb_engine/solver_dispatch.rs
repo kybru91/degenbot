@@ -796,40 +796,46 @@ impl ArbitrageEngine {
         };
         // Telemetry: profitable solves are the signal in the noise -
         // emit the economics + the concrete hop list on the solve span.
-        tracing::info!(
-            target: "degenbot::solver",
-            block_number = solve_block,
-            path.id = pid,
-            input = %result.optimal_input,
-            profit = %result.profit,
-            path.hops = %self.describe_path_cached(pid),
-            "[path] profitable solve"
-        );
+        // M2 probe: per-result events cross the Python log bridge (GIL) -
+        // size that cost vs the map/delivery work (hotpath-attributed).
+        hotpath::measure_block!("merge.telemetry_event", {
+            tracing::info!(
+                target: "degenbot::solver",
+                block_number = solve_block,
+                path.id = pid,
+                input = %result.optimal_input,
+                profit = %result.profit,
+                path.hops = %self.describe_path_cached(pid),
+                "[path] profitable solve"
+            );
+        });
         // SIMPIPE2 T3: the inline-sim payload — store it so the delivery
         // diff ships it with the batch (`None` = the path re-solved without a
         // payload this cycle — stance off or hook failure — so any stale
         // entry MUST drop). G6HSIS parity: the engine emits the per-candidate
         // `degenbot.bundle.simulate` span here with the terminal verdict;
         // the FFI seam's span becomes render-only under the stance.
-        match payload {
-            Some(p) => {
-                let span = tracing::info_span!(
-                    "degenbot.bundle.simulate",
-                    path_id = pid,
-                    simulate.verdict = if p.failure.is_some() {
-                        "not_profitable"
-                    } else {
-                        "profitable"
-                    },
-                    simulate.expected_profit = %result.profit,
-                );
-                let _enter = span.enter();
-                self.inline_payloads.insert(pid, p);
+        hotpath::measure_block!("merge.payload_store", {
+            match payload {
+                Some(p) => {
+                    let span = tracing::info_span!(
+                        "degenbot.bundle.simulate",
+                        path_id = pid,
+                        simulate.verdict = if p.failure.is_some() {
+                            "not_profitable"
+                        } else {
+                            "profitable"
+                        },
+                        simulate.expected_profit = %result.profit,
+                    );
+                    let _enter = span.enter();
+                    self.inline_payloads.insert(pid, p);
+                }
+                None => {
+                    self.inline_payloads.remove(&pid);
+                }
             }
-            None => {
-                self.inline_payloads.remove(&pid);
-            }
-        }
+        });
         // T3 (epic BXUSGL): DEGENBOT_STREAMING_DELIVERY - each above-threshold
         // merged result is emitted IMMEDIATELY (before the slowest path can
         // possibly delay it). The per-entry emission composes with the
@@ -837,13 +843,15 @@ impl ArbitrageEngine {
         // metadata batch.
         let payload_now = self.inline_payloads.get(&pid).map(|e| e.value().clone());
         if self.streaming_delivery {
-            self.delivery.emit_single_result_batch(
-                solve_block,
-                metadata,
-                pid,
-                &result,
-                payload_now.as_ref(),
-            );
+            hotpath::measure_block!("merge.delivery_emit", {
+                self.delivery.emit_single_result_batch(
+                    solve_block,
+                    metadata,
+                    pid,
+                    &result,
+                    payload_now.as_ref(),
+                );
+            });
         }
         self.results.insert(pid, result);
         #[cfg(test)]
