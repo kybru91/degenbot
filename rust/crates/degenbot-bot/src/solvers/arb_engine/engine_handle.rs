@@ -206,6 +206,11 @@ impl Engine for EngineHandle {
         // REMED1 T2: the streaming (drain) entry tags its cycles.
         engine.set_solve_entry("drain");
         let span = tracing::info_span!("degenbot.arb.solve", block.number = block);
+        // ZZS6CG: exact-match reparent onto this block's published pump
+        // span. A no-op when the publish has not landed (ambient retention),
+        // and the fix for late finalize/drain work leaking into a LATER
+        // block's trace via the dispatch-time parent below.
+        crate::telemetry::attach_published_parent_exact(&span, block);
         let _guard = span.enter();
         // T3: solve duration + registered-path gauge (dirty solves only; the
         // no-op path above returns before this).
@@ -298,8 +303,13 @@ impl Engine for EngineHandle {
         if will_solve {
             engine.set_solve_entry("finalize");
         }
-        let span =
-            will_solve.then(|| tracing::info_span!("degenbot.arb.solve", block.number = block));
+        let span = will_solve.then(|| {
+            let span = tracing::info_span!("degenbot.arb.solve", block.number = block);
+            // ZZS6CG: exact-match reparent onto this block's published pump
+            // span (see the drain arm). No-op without a publish entry.
+            crate::telemetry::attach_published_parent_exact(&span, block);
+            span
+        });
         let _guard = span.as_ref().map(tracing::Span::enter);
         let solve_start = std::time::Instant::now();
         engine.finalize_block(block, metadata);

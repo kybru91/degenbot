@@ -396,6 +396,39 @@ pub fn simulate_dispatch_span(current_block: u64, candidate_count: usize) -> tra
     )
 }
 
+/// Exact-match-only re-attach for SOLVE spans (ZZS6CG): a solve span must
+/// parent to its OWN block's published span, or nowhere else. The nearest-
+/// previous fallback of [`attach_published_parent`] is correct when the
+/// consumer's notion of "current block" may run one AHEAD of the published
+/// contexts (the Python simulate seam, the verifier); it is WRONG for the
+/// solver arms — a fresh ad-hoc in-block solve (ambient = block N's loop
+/// context) must not be re-parented onto block N-1's closed span just
+/// because its publish has not landed yet. Exact hit = the late
+/// finalize/drain crossing a block boundary (19/20 of the recent Jaeger
+/// traces carried block N-1's arb.solve inside block N's trace); exact miss
+/// = keep the ambient parent, never orphan, never mis-date.
+#[cfg(feature = "otel")]
+pub fn attach_published_parent_exact(span: &tracing::Span, block: u64) {
+    if let Some(sc) = published_parent_exact(block) {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let cx = opentelemetry::Context::new().with_remote_span_context(sc);
+        let _ = span.set_parent(cx);
+    }
+}
+
+#[cfg(not(feature = "otel"))]
+pub fn attach_published_parent_exact(_span: &tracing::Span, _block: u64) {}
+
+/// Exporter-visible context for EXACTLY `block` — no fallback.
+#[cfg(feature = "otel")]
+fn published_parent_exact(block: u64) -> Option<opentelemetry::trace::SpanContext> {
+    let map = PUBLISHED_BLOCK_CONTEXTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.get(&block).cloned()
+}
+
 /// Best-effort flush of the `OTel` span exporter.
 ///
 /// `std::process::abort()` skips destructors, so the batched span processor

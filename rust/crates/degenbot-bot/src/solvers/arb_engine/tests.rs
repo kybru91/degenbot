@@ -5537,6 +5537,104 @@ mod tests {
         );
     }
 
+    /// ZZS6CG (trace hygiene): a solve span must parent to its OWN block's
+    /// published pump.block span - exact-match only. The stale
+    /// `DrainWork::Finalize` crossing a block boundary parked block N-1's
+    /// `arb.solve` inside block N's trace in 19/20 of the recent traces
+    /// analyzed (the drain/finalize arms inherited the dispatch-time loop
+    /// context unconditionally). RED before `attach_published_parent_exact`
+    /// existed. Two assertions:
+    /// 1. exact hit - solve(100) with a published context for 100 parents to
+    ///    the published pump.block(100) span, not the ambient newer block;
+    /// 2. exact miss - solve with NO published context keeps its ambient
+    ///    parent (no fallback onto an unrelated older block, no orphan).
+    #[cfg(feature = "otel")]
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn solve_spans_anchor_to_their_own_published_block() {
+        use crate::bot_core::engine::Engine;
+        use crate::otel;
+        use crate::solvers::arb_engine::engine_handle::EngineHandle;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
+                engine.lock().dirty_sets.insert(0x0BAD_F00D, HopType::V2);
+                Arc::new(EngineHandle::new(engine))
+            })
+            .collect();
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Published context for block 100 (a completed earlier settle).
+            {
+                let block100 = tracing::info_span!("degenbot.pump.block", block.number = 100u64);
+                let _guard = block100.enter();
+                crate::telemetry::publish_block_context(100);
+            }
+
+            // The newer block's loop context is ambient during both solves
+            // (the stale-crossing shape: block 101's context is current).
+            let ambient = tracing::info_span!("degenbot.pump.block", block.number = 101u64);
+            let _ambient_guard = ambient.enter();
+
+            // (1) Exact hit: solve of the PUBLISHED block 100 re-attaches to
+            // the published pump.block(100) span, not the ambient 101 span.
+            let h100 = Arc::clone(&handles[0]);
+            h100.solve_dirty(100, &BlockMetadata::default());
+
+            // (2) Exact miss: solve of block 101 (never published) keeps the
+            // ambient parent - no fallback re-parenting, no orphan.
+            let h101 = Arc::clone(&handles[1]);
+            h101.solve_dirty(101, &BlockMetadata::default());
+        });
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let span_for_block = |blk: u64, name: &str| {
+            spans
+                .iter()
+                .find(|sp| {
+                    sp.name.as_ref() == name
+                        && sp.attributes.iter().any(|kv| {
+                            kv.key == opentelemetry::Key::from_static_str("block.number")
+                                && (matches!(kv.value, opentelemetry::Value::I64(v) if v == blk as i64)
+                                    || matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == blk.to_string().as_str()))
+                        })
+                })
+                .map(|sp| sp.span_context.span_id())
+                .unwrap_or_else(|| panic!("{name} for block {blk} must be exported"))
+        };
+
+        let published_100 = span_for_block(100, "degenbot.pump.block");
+        let ambient_101 = span_for_block(101, "degenbot.pump.block");
+        let solve_100 = span_for_block(100, "degenbot.arb.solve");
+        let solve_101 = span_for_block(101, "degenbot.arb.solve");
+
+        // Look up both solve spans' parents via the exported spans.
+        let parent_of = |id| {
+            spans
+                .iter()
+                .find(|sp| sp.span_context.span_id() == id)
+                .map(|sp| sp.parent_span_id)
+                .expect("solve span exported")
+        };
+        assert_eq!(
+            parent_of(solve_100), published_100,
+            "solve(published block) must re-attach to its own block's published span"
+        );
+        assert_eq!(
+            parent_of(solve_101), ambient_101,
+            "solve(unpublished block) must keep the ambient parent - no fallback mis-dating"
+        );
+    }
+
     // P5FEOI (epic 2LXPPV): original span test, otel-gated like its harness.
     #[cfg(feature = "otel")]
     #[test]
