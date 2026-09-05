@@ -21,7 +21,6 @@ Prefer enum-based finite state machines to manage transitions within systems. Wh
 See the justfile.
 
 ## Rebuilding the Rust `.so` after edits
-
 `uv run maturin develop` and even `cargo clean -p <crate>` do **not** reliably force a from-source recompile of the PyO3 `.so` — maturin uses cached artifacts across different feature-flag hash variants and `uv sync` installs a pre-built wheel in milliseconds. An apparently successful rebuild (~0.3–6s compile, no errors) silently ships a **stale `.so`** that doesn't contain the changes. This has bitten multiple sessions.
 
 The only reliable way to force the `.so` to pick up Rust source changes:
@@ -32,37 +31,8 @@ uv sync --reinstall-package degenbot
 
 This takes ~15s (actual recompile). Verify before trusting any bot run after edits.
 
-The telltale sign of a stale `.so`: solve-phase telemetry repeating the **pre-fix** numbers and `slowest.paths` entries for the same path shape at the same multi-second latency, despite confirmed source edits + `cargo check` + `cargo test` passing locally.
-
 ## Python Environment
 Use `uv`.
-
-## Profiling
-Many performance critical Rust modules are instrumented with `#[hotpath::measure]` attributes and `hotpath::measure_block!` phase probes.
-
-`hotpath` is a non-optional dependency of certain crates with `default-features = false`. `hotpath` macros resolve to **no-op stubs unless the `hotpath` Cargo feature is enabled**.
-
-**Dev:** the `[tool.maturin] features` list in `pyproject.toml` compiles `degenbot-bot/hotpath` into every dev `uv sync` build, so the dev `.so` always has it. Profiling is toggled at runtime by the `DEGENBOT_HOTPATH_*` env vars — **no rebuild is required to profile**:
-```bash
-DEGENBOT_HOTPATH=1 \
-HOTPATH_SHUTDOWN_MS=300000 \
-HOTPATH_OUTPUT_PATH=hp.json \
-HOTPATH_OUTPUT_FORMAT=json \
-HOTPATH_REPORT=functions-timing,threads \
-uv run python examples/eth_settlement_arbitrage_v2_v3_v4_rust.py
-```
-
-`HOTPATH_SHUTDOWN_MS` forces a clean timed report from the long-running bot (the guard otherwise only drops at pump exit). For a live TUI view instead of a static report: `cargo install hotpath --features=tui` then `hotpath console` in another terminal while the bot runs.
-
-`DEGENBOT_HOTPATH=1` is an **opt-in runtime gate** (not a build gate): without it no guard is constructed, so the singleton-guard invariant can't be tripped by default runs, tests, or a Python process hosting multiple bots. Set it to construct the guard; leave it unset to run uninstrumented.
-
-## OTel Spans (Python-driven path)
-- The `degenbot-python` global tracing subscriber can export OTLP spans (epic `KDUED5`): Rust-core span sources (e.g. `degenbot.pump.block` around the pump drain loop) flow through the same subscriber that forwards records to Python `logging`, so one registry carries logs + trace context.
-- **Dev-only, like `hotpath`.** The `otel` entry in the `features` block of `[tool.maturin]` compiles the layer into every dev `uv sync` build. The PyPI `maturin-action` passes its own `--features pyo3/extension-module` list, which overrides it, so release wheels ship without the OTLP client footprint.
-- **Default-on in dev; opt out with `DEGENBOT_OTEL=0`.** Because the code only exists under the dev-only feature, the runtime gate defaults to enabled — no env var needed for local runs. `DEGENBOT_OTEL=0` disables it explicitly.
-- **Import-time gate.** Read in pymodule init (the one justified implicit call site). Endpoint precedence:
-  `OTEL_EXPORTER_OTLP_ENDPOINT` env var > `otel.endpoint` in `~/.config/degenbot/config.toml` > exporter default (`http://localhost:4318`). A Prometheus scrape endpoint also starts on `DEGENBOT_METRICS_ADDR` (default loopback 9464) whenever the layer is active.
-- **Fail-open.** If the OTLP exporter build fails, the layer logs a warning and the bot continues on the no-otel assembly (byte-equivalent to the historical subscriber).
 
 ### Schema ownership & Alembic retention (see [ADR-010](docs/adr/ADR-010-alembic-retention-and-rust-schema-cutover.md))
 The database schema is **Alembic-owned during the 0.6.x point releases** and becomes **Rust-owned** in a 0.7 release. The cutover mechanism (`degenbot database cutover` + the `ensure_schema` `RustOwned` branch) is built and opt-in during 0.6.x so `pip` users can upgrade a stale database through the final Alembic revision and then cutover at a time of their choosing. Dropping the Alembic dependency and deleting the migration scripts is gated to 0.7 (ergo task `JFFQV2`).

@@ -125,49 +125,6 @@ def find_paths_rust(
     pool_type_per_depth: list[set[int] | None] | None = ...,
 ) -> PathIterator: ...
 
-# ------------------------------------------------------------------
-# SQLite file operations (feature = "db").
-# ------------------------------------------------------------------
-# Thin PyO3 wrappers over `degenbot_db::ops`. The CLI (`degenbot.cli.database`)
-# delegates here; the GIL is released during file I/O. Raise `ValueError` on
-# any connection / DDL / backup / integrity-check failure.
-# `db_upgrade_database` returns a discriminant string.
-
-# The CancelHandle class lives on the degenbot._ffi.cancel submodule
-# (stub: cancel.pyi) — do not define it at this top level.
-# ------------------------------------------------------------------
-# V3/V4 DB-aware liquidity updater seam (feature = "db").
-# ------------------------------------------------------------------
-# Thin PyO3 wrappers over `degenbot-db`'s `apply_v3_liquidity_updates` /
-# `apply_v4_liquidity_updates` (the Rust apply-and-persist core). The Python
-# `cli/pool.py::apply_v3/v4_liquidity_updates` decode the raw `LogReceipt`s
-# (Burn/Mint negation) + delegate the reconstitute→apply-math→persist here.
-# Each call opens its own write handle on `database_path` (SQLite WAL allows
-# the concurrent connection); the driver's session stays open for its reads.
-# Events are pre-decoded ``(block_number, log_index, tick_lower, tick_upper,
-# liquidity_delta)`` tuples — the ABI decode stays in Python per the seam
-# boundary (`degenbot-db` is pure I/O+math, no ABI decode).
-
-# ------------------------------------------------------------------
-# Pool discovery writers (WR7EA6 — split out of QJSCA5).
-# Thin PyO3 wrappers over `degenbot-db`'s `discovery` substrate
-# (`upsert_v2/v3/v4_pools` + `set_exchange_last_update_block`). The Python
-# `cli/pool_updater_configs.py::update_v2/v3/v4_pools` shells decode the raw
-# `PoolCreated` `LogReceipt`s + do the RPC fee lookup, then build row-input
-# lists + delegate here — the Rust core owns the `erc20_tokens` get-or-create
-# escalate + the polymorphic pool-row insert + the exchange stamp. Raises
-# ``ValueError`` on a DB failure or an unknown `kind` discriminator.
-
-# ------------------------------------------------------------------
-# Thin PyO3 wrappers over `degenbot_executor` (the cmd-executor core).
-# The encode path lives in the Rust core: `dispatch_profitable_py` calls
-# `composers::encode_cmd_stream` (ADR-005), and the candidate resolves
-# `composers::PathInfo` from `path_id` via `path_info_for_core`. Rust-side
-# output is pinned by golden-file tests in `cargo test -p degenbot-executor`.
-# The GIL is released during the warmup-slot compute.
-
-type WarmupDict = dict[str, dict[str, Any]]
-
 class PathIterator:
     def __iter__(self) -> PathIterator: ...
     def __next__(self) -> list[tuple[int, int]]: ...
