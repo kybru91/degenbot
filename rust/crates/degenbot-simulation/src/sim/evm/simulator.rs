@@ -182,6 +182,7 @@ impl<'a> BlockSimHandle<'a> {
         anchor: &'a SimAnchorState,
         warm_cache: &Arc<RwLock<super::WarmCodeCacheInner>>,
         storage_memo: Option<&std::sync::Arc<super::StorageMemo>>,
+        verify_divergence: bool,
     ) -> Option<Self> {
         // SIMPIPE T1 lab: build cost (the M1 amortization target — today the
         // build re-arms per 1-candidate dispatch, M1 builds K per cycle).
@@ -195,6 +196,7 @@ impl<'a> BlockSimHandle<'a> {
                 anchor,
                 warm_cache,
                 storage_memo,
+                verify_divergence,
             )
         });
         super::sim_metrics::record_handle_build(build_dur);
@@ -211,6 +213,7 @@ impl<'a> BlockSimHandle<'a> {
         anchor: &'a SimAnchorState,
         warm_cache: &Arc<RwLock<super::WarmCodeCacheInner>>,
         storage_memo: Option<&std::sync::Arc<super::StorageMemo>>,
+        verify_divergence: bool,
     ) -> Option<Self> {
         // type-erased `Arc<dyn Provider>` from `provider_arc()` does NOT satisfy
         // it (Alloy's auto-impl covers `Arc<T: Provider + Sized>`, not
@@ -232,7 +235,8 @@ impl<'a> BlockSimHandle<'a> {
             provider.rpc_url(),
             current_block,
         )
-        .with_storage_memo_opt(storage_memo);
+        .with_storage_memo_opt(storage_memo)
+        .with_divergence_probe(verify_divergence);
         let warm_code_cache =
             super::WarmCodeCache::with_owner(Arc::clone(warm_cache), current_block, bot_state_db);
         let mut cache_db = CacheDB::new(warm_code_cache);

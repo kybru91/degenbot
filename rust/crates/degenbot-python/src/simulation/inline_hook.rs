@@ -75,6 +75,13 @@ pub(crate) struct InlineSimHook {
     /// the same sim height (recreated on block advance). Collapses the
     /// ~20-cold-storage-RPC-per-sim into ~per-pool-unique per cycle.
     storage_memo: std::sync::Mutex<(u64, Arc<degenbot_simulation::StorageMemo>)>,
+    /// VERIFY2 T2: paths whose LAST sim failed - their next sim re-verifies
+    /// with the divergence probe armed (engine-vs-RPC comparison on the same
+    /// storage reads). Cleared after one armed sim (verify once per failure).
+    reverify_armed: std::sync::Mutex<std::collections::HashSet<u64>>,
+    /// VERIFY2 T2: the random spot-check arm counter; 0 = the env spot-check
+    /// is off.
+    spotcheck_n: std::sync::atomic::AtomicU64,
 }
 
 fn outputs_vec(req: &InlineSimRequest) -> Vec<u128> {
@@ -121,6 +128,8 @@ impl InlineSimHook {
                 0,
                 Arc::new(degenbot_simulation::StorageMemo::new()),
             )),
+            reverify_armed: std::sync::Mutex::new(std::collections::HashSet::new()),
+            spotcheck_n: std::sync::atomic::AtomicU64::new(0),
             sim_runtime: Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
                     // M2 soak sizing (2026-09-05): with the hard-coded 2
@@ -317,6 +326,41 @@ impl InlineSimulator for InlineSimHook {
         let warm_cache = Arc::clone(&self.warm_cache);
         // M2: the cycle-scoped storage memo - one per sim block; sims at a
         // new block recreate it (pre-state differs across heights).
+        // VERIFY2 T2: on-demand verification arming. A path whose last sim
+        // failed re-simulates with the divergence probe armed; fresh paths
+        // may sample into a spot-check at DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD
+        // per-ten-thousand (default 0 = off). Armed probes cost no extra RPC
+        // - the engine-vs-RPC comparison rides the same storage reads - and
+        // only log on a real tracked-field mismatch.
+        let reverify = self
+            .reverify_armed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&req.path_id);
+        let spotcheck = {
+            static PERMYRIAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let permyriad = *PERMYRIAD.get_or_init(|| {
+                std::env::var("DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+            });
+            permyriad > 0
+                && self
+                    .spotcheck_n
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    % (10_000 / permyriad.min(10_000))
+                    == 0
+        };
+        let verify_divergence = reverify || spotcheck;
+        if verify_divergence {
+            tracing::info!(
+                target: "degenbot::diag",
+                path_id = req.path_id,
+                reason = if reverify { "fail-retry" } else { "spot-check" },
+                "[sim-verify] divergence probe armed (on-demand verification)"
+            );
+        }
         let storage_memo = {
             // A poisoned memo lock is recoverable: the memo is block-scoped
             // and purely advisory (the fallback path re-fetches on a miss).
@@ -404,6 +448,7 @@ impl InlineSimulator for InlineSimHook {
                         &anchor,
                         &warm_cache,
                         Some(&storage_memo),
+                        verify_divergence,
                     ) {
                         Some(mut handle) => {
                             let mut buckets = FailBuckets::new();
@@ -459,6 +504,20 @@ impl InlineSimulator for InlineSimHook {
         match result {
             Ok(Some(sim)) => Some(Self::payload_from_sim(path_id, &sim)),
             Ok(None) | Err(_) => {
+                // VERIFY2 T2: this sim failed - arm the path so its NEXT sim
+                // re-verifies with the divergence probe (the failure itself
+                // already carries its failure data in the payload). The set
+                // is flood-guarded (cleared beyond 1024 arms).
+                {
+                    let mut arm = self
+                        .reverify_armed
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if arm.len() >= 1024 {
+                        arm.clear();
+                    }
+                    arm.insert(path_id);
+                }
                 let mut failures = buckets.into_failures();
                 let f = failures.pop()?;
                 Some(SimulatedPathResult {

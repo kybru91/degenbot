@@ -92,6 +92,10 @@ where
     /// Values are the fallback's own answers at one block height - never the
     /// engine's slots - so the refuted partial-serve hazard does not apply.
     pub storage_memo: Option<std::sync::Arc<super::StorageMemo>>,
+    /// VERIFY2 T2: on-demand divergence-probe arm (one sim). When true, the
+    /// storage observer compares engine-vs-RPC even with the env gate off -
+    /// the same-storage-read observation costs no extra RPC.
+    pub divergence_probe: bool,
 }
 
 impl<'bot, ExtDb> BotStateDb<'bot, ExtDb>
@@ -108,6 +112,7 @@ where
             code_probe_rpc: None,
             code_probe_block: None,
             storage_memo: None,
+            divergence_probe: false,
         }
     }
 
@@ -127,6 +132,13 @@ where
         memo: Option<&std::sync::Arc<super::StorageMemo>>,
     ) -> Self {
         self.storage_memo = memo.cloned();
+        self
+    }
+    /// VERIFY2 T2: arm the divergence probe for THIS handle's sim (on-demand
+    /// verification - a sim-failure re-verify or a random spot-check).
+    #[must_use]
+    pub fn with_divergence_probe(mut self, on: bool) -> Self {
+        self.divergence_probe = on;
         self
     }
 
@@ -149,6 +161,7 @@ where
             code_probe_rpc: Some(rpc_url.to_string()),
             code_probe_block: Some(sim_block),
             storage_memo: None,
+            divergence_probe: false,
         }
     }
 
@@ -292,10 +305,20 @@ where
         if let Some(memo) = self.storage_memo.as_ref() {
             memo.put(address, index, rpc_value);
         }
-        // Observation first (env-gated, pure — compares engine vs RPC, logs
-        // divergence, never changes what the sim reads). Independent of the
-        // serving gate below.
-        super::divergence_probe::observe_storage_read(self.anchor, address, index, rpc_value);
+        // Observation first (compares engine vs RPC, logs divergence, never
+        // changes what the sim reads). Two gates: the env-default (off) or
+        // the per-sim on-demand arm (VERIFY2 T2 - sim-failure re-verify or a
+        // random spot-check). Independent of the serving gate below.
+        if self.divergence_probe {
+            super::divergence_probe::observe_storage_read_forced(
+                self.anchor,
+                address,
+                index,
+                rpc_value,
+            );
+        } else {
+            super::divergence_probe::observe_storage_read(self.anchor, address, index, rpc_value);
+        }
         // Serving seam (env-gated, DEFAULT OFF): if `(address, index)` maps
         // to a tracked pool slot the engine carries authoritatively, return
         // the engine's packed word instead of the RPC value (the sim's swap

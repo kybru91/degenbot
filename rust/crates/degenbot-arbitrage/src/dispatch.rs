@@ -700,6 +700,7 @@ pub fn dispatch_profitable_results(
                 &anchor,
                 &warm_cache,
                 Some(&storage_memo),
+                false,
             ) {
                 Some(mut handle) => candidates
                     .into_iter()

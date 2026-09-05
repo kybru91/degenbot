@@ -187,6 +187,20 @@ pub fn observe_storage_read(
     if !probe_enabled() {
         return;
     }
+    observe_storage_read_forced(anchor, address, index, rpc_value);
+}
+
+/// VERIFY2 T2: on-demand form - skips the env gate so a caller can arm the
+/// probe for ONE sim (sim-failure re-verify or a random spot-check) without
+/// rebuilding or touching process-global config. Same pure-observation
+/// contract as `observe_storage_read` (the RPC value is returned unchanged
+/// by the caller).
+pub fn observe_storage_read_forced(
+    anchor: &SimAnchorState,
+    address: Address,
+    index: U256,
+    rpc_value: U256,
+) {
     // ULUWNI: the anchor is the build-time SNAPSHOT — scalar slots compare
     // against the engine-at-build words; tick slots are not snapshotted and
     // fall through (see `SimAnchorState` module docs).
