@@ -594,7 +594,23 @@ fn inline_sim_payload(
         return None;
     }
     let sim = ctx.inline_sim.as_ref()?;
-    sim.simulate_path(crate::solvers::arb_engine::inline_sim::InlineSimRequest {
+    // RKXN5Z/IJUBV3 (G6HSIS parity): the REAL per-path EVM sim rides the
+    // `degenbot.bundle.simulate` span, parented under the entered cycle span
+    // (both executor arms re-enter solve_span around `solve_one_path`), with
+    // the terminal verdict recorded at close. This is the only remaining
+    // owner of the name - the merge-site marker that used to borrow it is a
+    // merge-span event now, so Jaeger's `bundle.simulate` spans are all
+    // genuine ms-class simulations again.
+    let span = tracing::info_span!(
+        "degenbot.bundle.simulate",
+        sim.path = "worker_inline",
+        path_id = pid,
+        sim_block = ctx.solve_block,
+        simulate.verdict = tracing::field::Empty,
+        simulate.expected_profit = tracing::field::Empty,
+    );
+    let _enter = span.enter();
+    let payload = sim.simulate_path(crate::solvers::arb_engine::inline_sim::InlineSimRequest {
         path_id: pid,
         hops: std::clone::Clone::clone(&ctx.pool_refs[idx]),
         optimal_input: result.optimal_input,
@@ -606,7 +622,17 @@ fn inline_sim_payload(
         parent_base_fee: ctx.metadata.base_fee_per_gas.unwrap_or(0),
         parent_gas_used: ctx.metadata.gas_used,
         parent_gas_limit: ctx.metadata.gas_limit,
-    })
+    })?;
+    span.record(
+        "simulate.verdict",
+        if payload.failure.is_some() {
+            "not_profitable"
+        } else {
+            "profitable"
+        },
+    );
+    span.record("simulate.expected_profit", tracing::field::display(result.profit));
+    Some(payload)
 }
 
 /// Per-cycle shared solve context (epic BXUSGL T1): everything the
@@ -812,23 +838,25 @@ impl ArbitrageEngine {
         // SIMPIPE2 T3: the inline-sim payload — store it so the delivery
         // diff ships it with the batch (`None` = the path re-solved without a
         // payload this cycle — stance off or hook failure — so any stale
-        // entry MUST drop). G6HSIS parity: the engine emits the per-candidate
-        // `degenbot.bundle.simulate` span here with the terminal verdict;
-        // the FFI seam's span becomes render-only under the stance.
+        // entry MUST drop). RKXN5Z/IJUBV3: the merge emits the terminal
+        // verdict as an EVENT on the enclosing merge span (both arms hold
+        // `degenbot.arb.merge` here; the detached sidecar re-enters the solve
+        // span). The former `degenbot.bundle.simulate` marker span collided
+        // with the real EVM-sim spans of the same name and flooded every
+        // block trace with 90-300 microsecond lookalikes. The span name now
+        // belongs to simulation work only (worker seam + the FFI seam in
+        // degenbot-arbitrage/simulator.rs).
+        if let Some(p) = &payload {
+            let verdict = if p.failure.is_some() { "not_profitable" } else { "profitable" };
+            tracing::info!(
+                target: "degenbot::solver",
+                { path.id = pid, verdict, expected_profit = %result.profit, sim.seam = "inline_payload_store" },
+                "[bundle] inline payload settle"
+            );
+        }
         hotpath::measure_block!("merge.payload_store", {
             match payload {
                 Some(p) => {
-                    let span = tracing::info_span!(
-                        "degenbot.bundle.simulate",
-                        path_id = pid,
-                        simulate.verdict = if p.failure.is_some() {
-                            "not_profitable"
-                        } else {
-                            "profitable"
-                        },
-                        simulate.expected_profit = %result.profit,
-                    );
-                    let _enter = span.enter();
                     self.inline_payloads.insert(pid, p);
                 }
                 None => {
@@ -3015,6 +3043,214 @@ mod profit_clamp_recompute_tests {
         assert_ne!(
             stored.consumed_inputs[1], pre,
             "twins=0 must run the merge-site clamp"
+        );
+    }
+
+    // ----------------- RKXN5Z / IJUBV3: bundle.simulate span hygiene -----------------
+
+    /// RED-gate (IJUBV3): the merge-site microsecond `degenbot.bundle.simulate`
+    /// "verdict bookmark" spans collided with the REAL per-path EVM sim spans
+    /// of the same name (traces 98f7cf52 / ab13f75fad50: 90-300 markers per
+    /// block drowned the ms-scale sims). The merge must create NO span with
+    /// that name - the verdict is an `info!` event on the enclosing merge
+    /// span, and the span name now belongs solely to simulation work.
+    ///
+    /// DEFAULT-GATE VISIBLE (no otel cfg), on the K4ETHF pattern: the marker
+    /// flood was what made Jaeger unreadable, so the regression gate must not
+    /// hide behind --features otel.
+    #[test]
+    fn merge_payload_store_emits_no_bundle_simulate_span() {
+        use std::sync::Mutex;
+
+        struct SpanNameCapture {
+            names: std::sync::Arc<Mutex<Vec<String>>>,
+        }
+        impl<S> tracing_subscriber::Layer<S> for SpanNameCapture
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.names
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(attrs.metadata().name().to_string());
+            }
+        }
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let names = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let capture = SpanNameCapture {
+            names: std::sync::Arc::clone(&names),
+        };
+        let subscriber = tracing_subscriber::registry().with(capture);
+
+        let (mut engine, path_id, _pool_refs) = overfed_v4_engine();
+        let metadata = BlockMetadata::default();
+        let mk = || SolvePathResult {
+            optimal_input: U256::from(1_000_000_000u64),
+            profit: U256::from(1_000u64),
+            hop_outputs: vec![U256::from(1u64)],
+            consumed_inputs: vec![U256::from(1u64)],
+            state_nonces: vec![0],
+            solver_pool_states: Vec::new(),
+        };
+        let payload = crate::solvers::arb_engine::inline_sim::SimulatedPathResult {
+            path_id,
+            gross_profit: U256::from(1_000u64),
+            net_profit: U256::from(900u64),
+            gas_used: 300_000,
+            priority_fee: 2,
+            base_fee_next: 30,
+            execute_calldata: vec![1, 2, 3],
+            access_list: None,
+            captured_swaps: Vec::new(),
+            hop_count: 1,
+            failure: None,
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Enclosing merge span, as in both production arms.
+            let merge = tracing::info_span!("degenbot.arb.merge", merge.paths = 1u64);
+            let _ctx = merge.enter();
+            engine.merge_one_result(42, &metadata, path_id, mk(), 0, Some(payload));
+        });
+
+        let created = names
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let offenders: Vec<_> = created
+            .iter()
+            .filter(|n| *n == "degenbot.bundle.simulate")
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "merge must not create bundle.simulate markers (the name belongs to real sims); \
+             spans created: {created:?}"
+        );
+    }
+
+    /// GREEN-gate (IJUBV3): the WORKER-side inline sim gets the honest
+    /// `degenbot.bundle.simulate` span - a real ms-class EVM sim on the solve
+    /// path, parented under the cycle span, with the terminal verdict.
+    #[cfg(feature = "otel")]
+    #[test]
+    fn inline_sim_payload_emits_worker_sim_span_with_verdict() {
+        use super::inline_sim_payload;
+        use crate::otel;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct StubSim {
+            fail: bool,
+            path_id: u64,
+        }
+        impl crate::solvers::arb_engine::inline_sim::InlineSimulator for StubSim {
+            fn simulate_path(
+                &self,
+                request: crate::solvers::arb_engine::inline_sim::InlineSimRequest,
+            ) -> Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult> {
+                assert_eq!(request.path_id, self.path_id, "stub receives the merged path id");
+                Some(crate::solvers::arb_engine::inline_sim::SimulatedPathResult {
+                    path_id: request.path_id,
+                    gross_profit: U256::from(1_000u64),
+                    net_profit: U256::from(900u64),
+                    gas_used: 300_000,
+                    priority_fee: 2,
+                    base_fee_next: 30,
+                    execute_calldata: vec![7, 8, 9],
+                    access_list: None,
+                    captured_swaps: Vec::new(),
+                    hop_count: 1,
+                    failure: self.fail.then(|| {
+                        crate::solvers::arb_engine::inline_sim::InlineSimFailure {
+                            fail_index: None,
+                            revert_data: Vec::new(),
+                            bucket: "test".to_string(),
+                        }
+                    }),
+                })
+            }
+        }
+
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+
+        let (engine, path_id, pool_refs) = overfed_v4_engine();
+        let mut ctx = worker_probe_ctx(Arc::clone(engine.core()), pool_refs);
+        // Fresh Arc (refcount 1): install the stub via get_mut.
+        Arc::get_mut(&mut ctx)
+            .expect("probe ctx exclusively owned")
+            .inline_sim = Some(Arc::new(StubSim { fail: false, path_id }));
+
+        let result = SolvePathResult {
+            optimal_input: U256::from(1_000_000_000u64),
+            profit: U256::from(1_000u64),
+            hop_outputs: vec![U256::from(1u64)],
+            consumed_inputs: vec![U256::from(1u64)],
+            state_nonces: vec![0],
+            solver_pool_states: Vec::new(),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let solve = tracing::info_span!("degenbot.arb.solve", block.number = 7u64);
+            let _guard = solve.enter();
+            let payload = inline_sim_payload(&ctx, 0, path_id, &result);
+            assert!(
+                payload.is_some(),
+                "stub hook returns a payload; None only when the seam is off"
+            );
+        });
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let solve_id = spans
+            .iter()
+            .find(|sp| sp.name.as_ref() == "degenbot.arb.solve")
+            .map(|sp| sp.span_context.span_id())
+            .expect("solve span must be exported");
+        let sims: Vec<_> = spans
+            .iter()
+            .filter(|sp| sp.name.as_ref() == "degenbot.bundle.simulate")
+            .collect();
+        assert_eq!(
+            sims.len(),
+            1,
+            "exactly one worker-side sim span; all: {:?}",
+            spans.iter().map(|sp| sp.name.as_ref()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            sims[0].parent_span_id, solve_id,
+            "the worker sim span must parent under the cycle span"
+        );
+        let attr = |k: &'static str| {
+            sims[0]
+                .attributes
+                .iter()
+                .find(|kv| kv.key == opentelemetry::Key::from_static_str(k))
+                .map(|kv| kv.value.to_string())
+        };
+        assert_eq!(
+            attr("path_id").as_deref(),
+            Some(path_id.to_string().as_str()),
+            "path_id attribute"
+        );
+        assert_eq!(
+            attr("simulate.verdict").as_deref(),
+            Some("profitable"),
+            "verdict recorded at span close; attrs: {:?}",
+            sims[0].attributes
+        );
+        assert_eq!(
+            attr("sim.path").as_deref(),
+            Some("worker_inline"),
+            "seam discriminator distinguishes worker sims from the FFI seam"
         );
     }
 }
