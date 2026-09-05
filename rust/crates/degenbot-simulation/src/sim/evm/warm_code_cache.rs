@@ -202,12 +202,17 @@ where
             let guard = self.cache.read();
             if let Some((loaded_block, info)) = guard.accounts.get(&address) {
                 if guard.is_fresh(*loaded_block, self.block) {
+                    // SIMPIPE T1 lab: warm-cache served (cross-block/candidate
+                    // reuse signal).
+                    super::sim_metrics::record_basic_warm_hit();
                     return Ok(info.clone());
                 }
             }
         }
         // Miss (or stale): forward + cache.
-        let info = self.db.basic_ref(address)?;
+        let (info, dur) = super::sim_metrics::timed(|| self.db.basic_ref(address));
+        super::sim_metrics::record_basic(dur);
+        let info = info?;
         let mut guard = self.cache.write();
         guard.accounts.insert(address, (self.block, info.clone()));
         Ok(info)
@@ -234,7 +239,9 @@ where
                 }
             }
         }
-        let code = self.db.code_by_hash_ref(code_hash)?;
+        let (code, dur) = super::sim_metrics::timed(|| self.db.code_by_hash_ref(code_hash));
+        super::sim_metrics::record_code(dur);
+        let code = code?;
         let mut guard = self.cache.write();
         guard.bytecode.insert(code_hash, (self.block, code.clone()));
         Ok(code)
@@ -253,7 +260,11 @@ where
         address: Address,
         index: StorageKey,
     ) -> Result<StorageValue, Self::Error> {
-        self.db.storage_ref(address, index)
+        // SIMPIPE T1 lab: storage ALWAYS forwards — the latency split sizes
+        // the anchor-served (fast) vs RPC-reached (slow) shares.
+        let (value, dur) = super::sim_metrics::timed(|| self.db.storage_ref(address, index));
+        super::sim_metrics::record_storage(dur);
+        value
     }
 
     /// Forward to the inner `Db` — block hashes are per-chain, not
@@ -263,6 +274,7 @@ where
     ///
     /// Returns the inner `Db`'s error if the RPC fetch fails.
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        super::sim_metrics::record_block_hash();
         self.db.block_hash_ref(number)
     }
 }

@@ -82,6 +82,9 @@ pub mod bot_state_db;
 pub mod divergence_probe;
 pub mod serving;
 
+/// LAB (SIMPIPE T1): cold-fetch + handle-build counters — see the module doc.
+pub mod sim_metrics;
+
 // (Deleted) V4 PoolManager transient-storage seeder — `v4_transient.rs` was
 // built on the false premise that V4 pool swap state (sqrtPriceX96 /
 // liquidity / tick) lives in transient storage (EIP-1153). Per the deployed

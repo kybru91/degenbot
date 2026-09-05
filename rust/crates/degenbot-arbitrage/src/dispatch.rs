@@ -625,6 +625,11 @@ pub fn dispatch_profitable_results(
     //    `ctx` for its lifetime, and we collect within this fn (no task
     //    outlives the call).
     let candidate_path_ids: Vec<u64> = candidates.iter().map(|c| c.path_id).collect();
+    // SIMPIPE T1 lab baseline: snapshot BEFORE the fan-out so the exit log
+    // carries this fan-out's cold-fetch/build/sim deltas.
+    let lab_before = degenbot_simulation::sim::evm::sim_metrics::snapshot();
+    let lab_fanout_started = std::time::Instant::now();
+    let fanout_candidate_count = candidates.len();
     let sim_results: Vec<(u64, FailBuckets, Result<Option<SimResult>, String>)> = match bot_state {
         // In-process revm path (Tier 1, `V5HCR5`): build ONE per-block EVM
         // (`BlockSimHandle`) and simulate each candidate SERIALLY on the
@@ -749,6 +754,21 @@ pub fn dispatch_profitable_results(
             )
         }
     };
+    // SIMPIPE T1 lab: this fan-out's delta — the per-dispatch cold-fetch and
+    // handle-build profile that decides the M1 handle-pool default.
+    {
+        let lab = degenbot_simulation::sim::evm::sim_metrics::delta(
+            degenbot_simulation::sim::evm::sim_metrics::snapshot(),
+            lab_before,
+        );
+        tracing::info!(
+            target: degenbot_bot::telemetry::DIAGNOSTIC_TARGET,
+            current_block,
+            fanout_ms = lab_fanout_started.elapsed().as_millis() as u64,
+            "{}",
+            degenbot_simulation::sim::evm::sim_metrics::format_delta(&lab, fanout_candidate_count)
+        );
+    }
 
     // 6. Categorize — gas-profitable / gas-unprofitable / exception (ports
     //    L2519–L2557). `simulate_path_on_evm` returns `Ok(Some(result))` for gross-

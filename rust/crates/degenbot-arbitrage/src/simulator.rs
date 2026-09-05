@@ -1046,6 +1046,29 @@ where
         > + InspectEvm<Inspector = SimInspector>,
     <E as ExecuteEvm>::Error: std::fmt::Display,
 {
+    // SIMPIPE T1 lab: per-candidate wall clock (the per-sim share of the
+    // serial tail that M1 parallelizes across solve workers).
+    let (result, sim_dur) = degenbot_simulation::sim::evm::sim_metrics::timed(|| {
+        simulate_path_on_evm_inner(evm, ctx, path, fail_buckets)
+    });
+    degenbot_simulation::sim::evm::sim_metrics::record_sim(sim_dur);
+    result
+}
+
+fn simulate_path_on_evm_inner<E>(
+    evm: &mut E,
+    ctx: &SimulateContext<'_>,
+    path: &SimulatePath,
+    fail_buckets: &mut FailBuckets,
+) -> ProviderResult<Option<SimResult>>
+where
+    E: ExecuteEvm<
+            Tx = TxEnv,
+            ExecutionResult = revm::context_interface::result::ExecutionResult,
+            State = revm::state::EvmState,
+        > + InspectEvm<Inspector = SimInspector>,
+    <E as ExecuteEvm>::Error: std::fmt::Display,
+{
     let span = tracing::info_span!(
         "degenbot.bundle.simulate",
         path_id = path.path_id,

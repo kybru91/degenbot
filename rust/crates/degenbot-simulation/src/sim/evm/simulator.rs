@@ -182,7 +182,33 @@ impl<'a> BlockSimHandle<'a> {
         anchor: &'a SimAnchorState,
         warm_cache: &Arc<RwLock<super::WarmCodeCacheInner>>,
     ) -> Option<Self> {
-        // `AlloyDB::new` requires `P: Provider<Ethereum>` by value; the
+        // SIMPIPE T1 lab: build cost (the M1 amortization target — today the
+        // build re-arms per 1-candidate dispatch, M1 builds K per cycle).
+        let (built, build_dur) = super::sim_metrics::timed(|| {
+            Self::build_inner(
+                provider,
+                base_fee_next,
+                current_block,
+                block_timestamp,
+                override_params,
+                anchor,
+                warm_cache,
+            )
+        });
+        super::sim_metrics::record_handle_build(build_dur);
+        built
+    }
+
+    /// The verbatim pre-lab build body (extracted for the T1 build timer).
+    fn build_inner(
+        provider: &degenbot_rpc::provider::AlloyProvider,
+        base_fee_next: u128,
+        current_block: u64,
+        block_timestamp: u64,
+        override_params: &SimulationOverrideParams,
+        anchor: &'a SimAnchorState,
+        warm_cache: &Arc<RwLock<super::WarmCodeCacheInner>>,
+    ) -> Option<Self> {
         // type-erased `Arc<dyn Provider>` from `provider_arc()` does NOT satisfy
         // it (Alloy's auto-impl covers `Arc<T: Provider + Sized>`, not
         // `?Sized` trait objects). [`ArcDynProviderEthereum`] bridges the gap.
