@@ -533,19 +533,25 @@ pub(crate) fn solve_one_path(
     outcome.result.map(|r| (pid, r))
 }
 
-/// `DEGENBOT_SOLVE_INLINE_SIM` (SIMPIPE2 T2, task PIRX3W): relocate the
-/// CL-hop clamp from the engine-Mutex merge site INTO the per-path solve
-/// worker, so the worker can simulate on the clamp-committed inputs without
-/// an engine-lock round-trip (the M1 seam T1/T3 build on). Parsed ONCE at
-/// engine construction; **default OFF** (bit-identical to the merge-site
-/// clamp) until the T4 soak flips. `1`/`true` opts in; unset/anything else
-/// keeps the legacy merge-site clamp — deliberately the same
-/// explicit-opt-in polarity as `DEGENBOT_DETACHED_SOLVES`.
+/// `DEGENBOT_SOLVE_INLINE_SIM` (SIMPIPE2 T2 → T4, task PIRX3W / AK7VJB):
+/// relocate the CL-hop clamp from the engine-Mutex merge site INTO the
+/// per-path solve worker, so the worker can simulate on the clamp-committed
+/// inputs without an engine-lock round-trip (the M1 seam T1/T3 build on).
+/// Parsed ONCE at engine construction.
+///
+/// **Default ON since the T4 mainnet soak** (2026-09-05): payload counts
+/// matched solved paths per cycle, ~99% of sim batches skipped the FFI
+/// dispatch, header→first-payload-render p50 1ms / p90 31ms (vs the option-A
+/// FFI pipeline's ~26ms solve wall + 49ms async sim tail), and the 46-minute
+/// soak ran with zero deadlocks/panics/storage-key incidents through a
+/// 200k-path registration flood. `DEGENBOT_SOLVE_INLINE_SIM=0`/`false`
+/// opts OUT (restores the legacy merge-site clamp for a run); unset keeps
+/// the inline stance. Later 0.7 hardening may remove the env entirely.
 pub(crate) static INLINE_SIM_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 fn solve_inline_stance_from_env(raw: Option<&str>) -> bool {
-    matches!(raw, Some("1" | "true"))
+    !matches!(raw, Some("0" | "false"))
 }
 
 /// SIMPIPE2 T2: the WORKER-side clamp — drive the merge-site-identical

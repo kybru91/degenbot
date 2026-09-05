@@ -96,8 +96,13 @@ def _render_sim_summary(outcome: DispatchOutcome) -> None:
             f"fot={outcome.fot_dropped}"
         )
 
+    # Sim-ready timestamp: the render fires the instant the merged outcome is
+    # consumed — pairing this with the block header time (pump.block INFO ts)
+    # gives the B-arm first-submit-proxy latency for the inline stance.
+    import time as _time
+
     bot_logger.info(
-        f"[sim] {outcome.candidate_count} candidates: "
+        f"[sim] ready_ms={_time.time():.3f} {outcome.candidate_count} candidates: "
         f"{sim_ok} ok ({len(profitable)} profitable, "
         f"{outcome.gas_unprofitable_count} below threshold), "
         f"{outcome.fail_count} failed, {outcome.exception_count} exceptions"
