@@ -325,7 +325,16 @@ impl BlockPump {
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
             tripwire_config: crate::bot_core::solver_state_tripwire::TripwireConfig {
-                enabled: crate::bot_core::bot_env_flag_default_on("DEGENBOT_ASSERT_SOLVER_STATE"),
+                // VERIFY2 T1 (2026-09-05): the strict per-hop verifier was
+                // reading every hop of every published path set per block
+                // (the tens-of-seconds degenbot.solver.verify spans) while
+                // finding no desyncs in 6.5h. It is now OPERATOR OPT-IN
+                // (DEGENBOT_ASSERT_SOLVER_STATE=1) - the standing promise is
+                // on-demand verification instead: sim failures arm a
+                // divergence probe on the failing path's next sim (VERIFY2
+                // T2), and the RPC pre-state the sim reads remains the
+                // authority between checks.
+                enabled: crate::bot_core::bot_env_flag_default_off("DEGENBOT_ASSERT_SOLVER_STATE"),
                 divergence_scan: crate::bot_core::bot_env_flag_default_off(
                     "DEGENBOT_SOLVER_DIVERGENCE_SCAN",
                 ),

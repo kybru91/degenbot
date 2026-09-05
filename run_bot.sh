@@ -85,10 +85,14 @@ export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-1}"
 export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
 # Solver-state verification policy: ON (loud fail-stop tripwire, ADR-021) —
 # every published block is judged against chain state on the detached verifier
-# task; a divergence quarantines the pool (or aborts, per failure_policy).
-# DEGENBOT_ASSERT_SOLVER_STATE=0 returns to the fast "solve against possibly-
-# stale state, invalidate later" path. Opt-out for benchmarking runs only.
-export DEGENBOT_ASSERT_SOLVER_STATE="${DEGENBOT_ASSERT_SOLVER_STATE:-1}"
+# VERIFY2 T1 (2026-09-05): the per-solve solver-state verifier is now OFF by
+# default - the overnight scan measured 29k tripwire WARNs and tens-of-
+# seconds verify spans (per-hop RPC scalar reads for every published path
+# set) with zero caught desyncs in 6.5h. Standing verification moved to
+# on-demand: sim failures arm a divergence probe on the failing path's next
+# sim (and DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD adds random spot-checks for
+# operators). DEGENBOT_ASSERT_SOLVER_STATE=1 re-enables the strict per-hop
+# gate per block for a run (operator opt-in).
 
 # SIMPIPE2 M2 soak-tuned solve/sim concurrency (measured 2026-09-05, see
 # logs/simpipe2_m2_close.md): the 8-core cgroup budget runs best with the
