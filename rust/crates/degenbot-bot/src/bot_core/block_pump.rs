@@ -93,6 +93,14 @@ const DEBOUNCE_MS: u64 = 50;
 /// deadline even under dense log pressure) and runs the same
 /// `handle_timeout_eager` catch-up the no-activity path uses.
 const HEADER_STALENESS_SECS: u64 = 30;
+/// SONJQA: the `pump.log_wait` waterfall child is force-closed (with an
+/// explicit stall warning) once it ages past this horizon - the observed
+/// failure shape (trace a1ad51bd, block 25913381) was a 12.7s all-quiet
+/// header gap leaving `log_wait` open until the NEXT header while its parent
+/// `pump.block` span exported at arm-exit (319us), corrupting the waterfall.
+/// Degenerate relative to the 30s staleness watchdog, a fresh 5s bound keeps
+/// children within a healthy block cadence.
+const LOG_WAIT_MAX_AGE_SECS: u64 = 5;
 
 /// Default window (seconds) for the logs-subscription liveness watchdog: if
 /// headers keep flowing (`newHeads` fresh) but the pump has received NO log
@@ -196,6 +204,11 @@ pub struct BlockPump {
     /// `HEADER_STALENESS_SECS`). Overridable in tests via
     /// `set_header_staleness_for_test`.
     header_staleness: Duration,
+    /// SONJQA: max age of the `pump.log_wait` waterfall child before the pump
+    /// force-closes it (with a stall warning). Default 5s; the tick
+    /// granularity is the 500ms timed-exit interval. Tests may set the field
+    /// directly (`pump_for_test` construction + assignment) - no env race.
+    log_wait_max_age: Duration,
     /// If no log arrives within this window WHILE headers stay fresh, the
     /// `eth_subscribe "logs"` subscription is presumed dead/stalled and the
     /// logs-silence watchdog emits a `[pump] logs subscription silent`
@@ -322,6 +335,7 @@ impl BlockPump {
             provider: Arc::new(provider),
             shutdown,
             header_staleness: Duration::from_secs(HEADER_STALENESS_SECS),
+            log_wait_max_age: Duration::from_secs(LOG_WAIT_MAX_AGE_SECS),
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
             tripwire_config: crate::bot_core::solver_state_tripwire::TripwireConfig {
@@ -1251,6 +1265,9 @@ impl BlockPump {
         // shows WHAT happens between `degenbot.pump.block` and
         // `degenbot.arb.solve` instead of an empty stretch.
         let mut log_wait_span: Option<tracing::Span> = None;
+        // SONJQA: creation instant of the stored log_wait child, so the 500ms
+        // timed-exit tick can force-close it past the max age.
+        let mut log_wait_created_at: Option<std::time::Instant> = None;
         let mut apply_span: Option<tracing::Span> = None;
         // REMED1 T3: per-block phase attribution - the apply-stream start
         // (first relevant log) vs the settle point, recorded on the block
@@ -1312,6 +1329,27 @@ impl BlockPump {
                     if self.shutdown.load(Ordering::Relaxed) {
                         tracing::info!("timed exit: shutdown signaled — unwinding pump loop");
                         break;
+                    }
+                    // SONJQA: force-close a stale log_wait child. Its parent
+                    // pump.block span exports when the header arm's ENTERED
+                    // scope exits (TQ7PD6 entry-refcount law) - microseconds
+                    // after header acceptance on an all-quiet block - so a
+                    // log_wait dangling until the next header extends a
+                    // waterfall child far past a closed parent (trace
+                    // a1ad51bd, block 25913381: 12.7s child on a 319us
+                    // parent). Bound the child with an explicit stall event.
+                    if let Some(created) = log_wait_created_at {
+                        let age = created.elapsed();
+                        if age > self.log_wait_max_age {
+                            if let Some(wait) = log_wait_span.take() {
+                                drop(wait);
+                            }
+                            tracing::warn!(
+                                stall_secs = age.as_secs(),
+                                "[pump] log_wait expired without logs; waterfall child force-closed"
+                            );
+                            log_wait_created_at = None;
+                        }
                     }
                     // Flag not yet raised: re-park. `continue` keeps both arm
                     // paths diverging so the arm types coerce to the event
@@ -1559,6 +1597,7 @@ impl BlockPump {
                         "degenbot.pump.log_wait",
                         block.number = number,
                     ));
+                    log_wait_created_at = Some(std::time::Instant::now());
                     // Sync-only header-processing scope (TQ7PD6): this enter
                     // guard dies before the first await below, so it can never
                     // leak across a task migration. The backfill future below
@@ -1697,6 +1736,7 @@ impl BlockPump {
                     // and carries the burst + applies + quiesce hold).
                     if let Some(wait) = log_wait_span.take() {
                         drop(wait);
+                        log_wait_created_at = None;
                     }
                     if apply_span.is_none() {
                         apply_started_at = Some(std::time::Instant::now());
@@ -2442,6 +2482,7 @@ impl BlockPump {
             provider,
             shutdown,
             header_staleness: Duration::from_secs(HEADER_STALENESS_SECS),
+            log_wait_max_age: Duration::from_secs(LOG_WAIT_MAX_AGE_SECS),
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
             // ADR-021 tripwire OFF in tests (deterministic per-pump opt-out; see
@@ -6297,6 +6338,95 @@ mod tests {
     /// structural fix (no `enter` guard may outlive a poll); this test locks
     /// the observable symptom — all N spans closed — and exercises cross-await
     /// parking so CI load that DOES migrate the task surfaces the old leak.
+    /// SONJQA (trace a1ad51bd, block 25913381): the waterfall child spans
+    /// (`pump.log_wait`) must never dangle for their WHOLE quiet gap. The
+    /// parent `pump.block` span exports when the header arm's ENTERED scope
+    /// exits (TQ7PD6 entry-refcount law - observed 58us on this fixture,
+    /// 319us in production), while an un-entered child lives by handle until
+    /// first-log or next-header. An all-quiet 12.7s gap left a 12.7s child
+    /// against a 319us parent. The fix: the 500ms timed-exit tick force-
+    /// closes a log_wait past `log_wait_max_age` with an explicit stall
+    /// warning. Deterministic contract under test:
+    /// 1. log_wait parents under its block span (linkage intact),
+    /// 2. a log_wait quiet longer than the max age closes AT the tick
+    ///    boundary (bounded duration), not at the next header.
+    #[cfg(feature = "otel")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn log_wait_never_outlives_its_block_span() {
+        use crate::otel;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const BASE: u64 = 0xCAFE_0000;
+        const GAP_MS: u64 = 700; // quiet window between headers
+
+        let (mut pump, _sink) = pump_for_test(None);
+        // Short max age: the tick (500ms) must close stale log_waits mid-gap.
+        pump.log_wait_max_age = std::time::Duration::from_millis(100);
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let events: Vec<WsEvent> = vec![
+            WsEvent::BlockHeader {
+                number: BASE,
+                timestamp: 1,
+                base_fee_per_gas: Some(1),
+                gas_used: 1,
+                gas_limit: 1,
+            },
+            WsEvent::BlockHeader {
+                number: BASE + 1,
+                timestamp: 1,
+                base_fee_per_gas: Some(1),
+                gas_used: 1,
+                gas_limit: 1,
+            },
+        ];
+        let combined = stream::iter(events)
+            .then(|e| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(GAP_MS)).await;
+                e
+            })
+            .boxed();
+        pump.run_test_loop(combined, BASE - 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+
+        let span_rec = |name: &'static str, blk: u64| {
+            spans
+                .iter()
+                .find(|sp| {
+                    sp.name.as_ref() == name
+                        && sp.attributes.iter().any(|kv| {
+                            kv.key == opentelemetry::Key::from_static_str("block.number")
+                                && matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == blk.to_string().as_str())
+                        })
+                })
+                .unwrap_or_else(|| panic!("{name}({blk}) must be exported; got {:?}", spans.iter().map(|sp| sp.name.as_ref()).collect::<Vec<_>>()))
+        };
+        let block = span_rec("degenbot.pump.block", BASE);
+        let wait = span_rec("degenbot.pump.log_wait", BASE);
+        let dur = |sp: &opentelemetry_sdk::trace::SpanData| {
+            sp.end_time.duration_since(sp.start_time).unwrap_or_default()
+        };
+        assert_eq!(
+            wait.parent_span_id,
+            block.span_context.span_id(),
+            "log_wait must parent under its block span"
+        );
+        // With max_age=100ms and a 700ms quiet gap, the log_wait must close
+        // at a tick boundary (~100-600ms), NOT at the next header (700ms).
+        assert!(
+            dur(wait) <= std::time::Duration::from_millis(GAP_MS),
+            "stale log_wait must be force-closed at the expiry tick, not dangle \
+             until the next header; dur={:?}",
+            dur(wait)
+        );
+    }
+
     #[cfg(feature = "otel")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn header_burst_closes_every_block_span() {
