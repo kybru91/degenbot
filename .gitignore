@@ -224,3 +224,4 @@ logs/
 
 # sphinx-autoapi generated source (recreated each build; autoapi_keep_files=False)
 docs/autoapi/
+hp.json
