@@ -26,7 +26,10 @@ use super::{ArbitrageEngine, BlockMetadata, HashMap, HashSet};
 // behavior (develop on loud failures).
 
 use crate::bot_core::resolve::resolve_hops;
-use ::degenbot_solvers::mixed::{HopType, ResolvedHop, ResolvedMixedPath, SolvePathResult};
+use crate::bot_core::BotState;
+use ::degenbot_solvers::mixed::{
+    HopType, MixedPoolRef, ResolvedHop, ResolvedMixedPath, SolvePathResult,
+};
 
 /// How many slowest-path entries the solve-cycle completion event names
 /// (D63GSE intra-solve visibility).
@@ -281,6 +284,10 @@ pub fn install_engine_env_stances() {
         std::env::var("DEGENBOT_DETACHED_SOLVES").as_deref() == Ok("1"),
         std::sync::atomic::Ordering::Relaxed,
     );
+    INLINE_SIM_ENABLED.store(
+        solve_inline_stance_from_env(std::env::var("DEGENBOT_SOLVE_INLINE_SIM").ok().as_deref()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let min_profit = std::env::var("DEGENBOT_MIN_PROFIT_WEI")
         .ok()
@@ -520,6 +527,45 @@ pub(crate) fn solve_one_path(
     outcome.result.map(|r| (pid, r))
 }
 
+/// `DEGENBOT_SOLVE_INLINE_SIM` (SIMPIPE2 T2, task PIRX3W): relocate the
+/// CL-hop clamp from the engine-Mutex merge site INTO the per-path solve
+/// worker, so the worker can simulate on the clamp-committed inputs without
+/// an engine-lock round-trip (the M1 seam T1/T3 build on). Parsed ONCE at
+/// engine construction; **default OFF** (bit-identical to the merge-site
+/// clamp) until the T4 soak flips. `1`/`true` opts in; unset/anything else
+/// keeps the legacy merge-site clamp — deliberately the same
+/// explicit-opt-in polarity as `DEGENBOT_DETACHED_SOLVES`.
+pub(crate) static INLINE_SIM_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn solve_inline_stance_from_env(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1") | Some("true"))
+}
+
+/// SIMPIPE2 T2: the WORKER-side clamp — drive the merge-site-identical
+/// clamp from the solve worker's `to_solve`-aligned pool-ref snapshot, so a
+/// result is clamp-committed BEFORE the streaming handoff (the T1/T3 seam
+/// simulates on a payload whose `consumed_inputs` are the merge-committed
+/// values with no engine-lock round-trip). Stance-gated: with
+/// `DEGENBOT_SOLVE_INLINE_SIM` unset the merge-site clamp runs exactly as
+/// before (this fn is a no-op returning 0).
+/// Invariant: twins > 0 ⟺ the clamp mutated the result (every clamp path
+/// runs its twin first) — the merge site treats twins > 0 as
+/// already-clamped and never re-clamps (a second pass would re-apply the
+/// margin and corrupt the committed inputs).
+fn clamp_result_in_worker(
+    ctx: &SolveCycleShared,
+    idx: usize,
+    pid: u64,
+    result: &mut SolvePathResult,
+) -> u64 {
+    if !ctx.worker_clamp || idx >= ctx.pool_refs.len() {
+        return 0;
+    }
+    let core = ctx.core.read();
+    ArbitrageEngine::clamp_result_with_state(&core, pid, &ctx.pool_refs[idx], result)
+}
+
 /// Per-cycle shared solve context (epic BXUSGL T1): everything the
 /// per-path dispatch touches besides the resolved snapshot. Bundled once
 /// per cycle so a worker handle is static for the dedicated-executor
@@ -548,6 +594,17 @@ pub(crate) struct SolveCycleShared {
     /// Test-only deterministic per-path delay hook (epic test knob).
     #[cfg(test)]
     test_solve_delay: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// SIMPIPE2 T2: the shared core (Arc-cloned from the engine at cycle
+    /// build) — the WORKER-side clamp takes the same short core read the
+    /// merge-site clamp took; no engine state is touched (MQUKB6-T3 intact:
+    /// engine-then-core ordering, short read, no guard across awaits).
+    core: std::sync::Arc<crate::bot_core::state_lock::StateLock<BotState>>,
+    /// Per-path pool-ref snapshot, ALIGNED TO `to_solve` ORDER (index i in
+    /// every bin mirrors `to_solve[i]`): the worker clamp's pool list, taken
+    /// under the cycle's engine Mutex (stable for the whole cycle).
+    pool_refs: Vec<Vec<MixedPoolRef>>,
+    /// The stance copy (construction-time static read at cycle build).
+    worker_clamp: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +649,9 @@ pub(crate) enum DetachedMergeItem {
         /// Per-hop `pool_update_block` snapshot at the enqueue resolve.
         update_stamp: Vec<u64>,
         result: SolvePathResult,
+        /// SIMPIPE2 T2: twins from the WORKER-side clamp (stance-gated);
+        /// > 0 tells the merge the result is already clamp-committed.
+        worker_clamp_twins: u64,
         /// The solve-cycle span at ENQUEUE time (MQUKB6-T2). The sidecar
         /// std-thread has NO ambient tracing context, so the item carries
         /// the issuing `degenbot.arb.solve` span and the merge enters it
@@ -661,15 +721,25 @@ impl ArbitrageEngine {
     /// calls it per streamed result (before the slowest path lands),
     /// the rayon path from the tail loop. Returns the twin-simulation
     /// count (clamp.twins).
+    ///
+    /// SIMPIPE2 T2: `worker_clamp_twins > 0` means the solving worker
+    /// ALREADY ran the clamp (clamp_result_in_worker) - the merge skips its
+    /// own pass (a second clip would re-apply the 1-wei margin and corrupt
+    /// the committed inputs) and just reports the twins for telemetry.
     fn merge_one_result(
         &mut self,
         solve_block: u64,
         metadata: &BlockMetadata,
         pid: u64,
         result: SolvePathResult,
+        worker_clamp_twins: u64,
     ) -> u64 {
         let mut result = result;
-        let twins = self.clamp_cl_hop_capacity(pid, &mut result);
+        let twins = if worker_clamp_twins > 0 {
+            worker_clamp_twins
+        } else {
+            self.clamp_cl_hop_capacity(pid, &mut result)
+        };
         // Telemetry: profitable solves are the signal in the noise -
         // emit the economics + the concrete hop list on the solve span.
         tracing::info!(
@@ -721,6 +791,7 @@ impl ArbitrageEngine {
             pid,
             update_stamp,
             result,
+            worker_clamp_twins,
             solve_span,
         } = item;
         // MQUKB6-T2: re-enter the enqueue-time cycle span for the whole
@@ -780,7 +851,7 @@ impl ArbitrageEngine {
             detached_age_cycles = age_cycles,
             "[detached] straggler merged (unchanged intake)"
         );
-        self.merge_one_result(solve_block, &metadata, pid, result);
+        self.merge_one_result(solve_block, &metadata, pid, result, worker_clamp_twins);
         // ADR-021 publish-verifier scoping (epic SRQEK5 T2): a straggler that
         // lands AFTER a publish consumed its cycle's change set must still be
         // covered by the NEXT publish's verifier diff — re-add it here, so a
@@ -831,12 +902,25 @@ impl ArbitrageEngine {
         let Some(path) = self.path_pools.get(&path_id) else {
             return 0; // Unknown path → nothing to clamp
         };
-        let pools = &path.pools;
+        let core = self.core.read();
+        Self::clamp_result_with_state(&core, path_id, &path.pools, result)
+    }
+
+    /// The clamp shared by the merge-site gate and the SIMPIPE2 T2 worker
+    /// relocation — the pool list is a parameter so the WORKER can drive the
+    /// identical logic from its `to_solve`-aligned snapshot. The worker takes
+    /// the SAME short core read the merge-site clamp took (MQUKB6-T3 intact:
+    /// engine-then-core, short read, no guard across awaits).
+    fn clamp_result_with_state(
+        core: &BotState,
+        path_id: u64,
+        pools: &[MixedPoolRef],
+        result: &mut SolvePathResult,
+    ) -> u64 {
         if pools.len() != result.consumed_inputs.len() {
             return 0; // Index misalignment — never clamp a wrong hop
         }
         let margin = Self::cl_hop_clamp_margin();
-        let core = self.core.read();
         // D63GSE: successful twin simulations executed this call (returned to
         // the caller for the solve-cycle completion event).
         let mut twins_executed: u64 = 0;
@@ -1486,6 +1570,18 @@ impl ArbitrageEngine {
         // Defaults OUT of the fixtures dir (loop-18: working rows never
         // accrete there; goldens are produced only by cl_capture_gen).
         let capture_mixed = HeavyMixedPathCapture::from_env();
+        // SIMPIPE2 T2: pool-ref snapshot aligned to `to_solve` order (the
+        // worker clamp's pool list) — captured under this cycle's engine
+        // Mutex so it cannot interleave with a re-registration.
+        let pool_refs: Vec<Vec<MixedPoolRef>> = to_solve
+            .iter()
+            .map(|(pid, _)| {
+                self.path_pools
+                    .get(pid)
+                    .map(|p| p.pools.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
         let shared = std::sync::Arc::new(SolveCycleShared {
             solve_block,
             epoch: solve_block,
@@ -1508,6 +1604,9 @@ impl ArbitrageEngine {
             gate_recorder: std::sync::Arc::clone(&self.last_gate_us),
             #[cfg(test)]
             test_solve_delay: self.test_solve_delay.clone(),
+            core: std::sync::Arc::clone(self.core()),
+            pool_refs,
+            worker_clamp: INLINE_SIM_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
         });
         // The LPT bins need Arc-shared access in the tokio arm; the rayon
         // arms index through the same deref (byte-identical semantics).
@@ -1632,11 +1731,23 @@ impl ArbitrageEngine {
                         .spawn(move || {
                             for &idx in &bin {
                                 let (pid, resolved) = &to_solve_bin[idx];
-                                // Same profitless filter the in-cycle arms
-                                // apply before merging.
-                                let Some((pid, result)) =
+                                // SIMPIPE2 T2: clamp in the bin thread
+                                // (stance-gated; BEFORE the profitless filter
+                                // — the profit-clamp recompute can zero a
+                                // candidate) so the committed inputs are
+                                // merge-ready with no sidecar round-trip.
+                                let Some((pid, result, worker_clamp_twins)) =
                                     solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved)
-                                        .filter(|(_, r)| {
+                                        .map(|(pid, mut r)| {
+                                            let twins = clamp_result_in_worker(
+                                                &shared_bin,
+                                                idx,
+                                                pid,
+                                                &mut r,
+                                            );
+                                            (pid, r, twins)
+                                        })
+                                        .filter(|(_, r, _)| {
                                             !r.optimal_input.is_zero() && !r.profit.is_zero()
                                         })
                                 else {
@@ -1658,6 +1769,7 @@ impl ArbitrageEngine {
                                         pid,
                                         update_stamp,
                                         result,
+                                        worker_clamp_twins,
                                         solve_span: solve_span_bin.clone(),
                                     })
                                     .is_ok()
@@ -1710,7 +1822,7 @@ impl ArbitrageEngine {
         let streaming_merge: bool;
         let mut clamp_twin_count: u64 = 0;
         let mut solved_count: usize = 0;
-        let mut solved: Vec<(u64, SolvePathResult)> = Vec::new();
+        let mut solved: Vec<(u64, SolvePathResult, u64)> = Vec::new();
         if tokio_solve_mode {
             streaming_merge = true;
             hotpath::measure_block!("arb_solve.tokio_solve", {
@@ -1725,7 +1837,8 @@ impl ArbitrageEngine {
                 // calling thread (T2 moves it to spawn_blocking for the
                 // async seam).
                 let executor = crate::solvers::arb_engine::solve_executor::global_solve_executor();
-                let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<(u64, SolvePathResult)>>();
+                let (res_tx, res_rx) =
+                    std::sync::mpsc::channel::<Option<(u64, SolvePathResult, u64)>>();
                 let bins = compute_bins();
                 for bin in &bins {
                     let bin = bin.clone();
@@ -1736,10 +1849,25 @@ impl ArbitrageEngine {
                     executor.spawn(move || {
                         for &i in &bin {
                             let (pid, resolved) = &to_solve_bin[i];
-                            let outcome =
-                                solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved);
+                            let outcome = solve_one_path(
+                                &shared_bin,
+                                &solve_span_bin,
+                                *pid,
+                                resolved,
+                            )
+                            .map(|(pid, mut result)| {
+                                // SIMPIPE2 T2: clamp in the worker
+                                // (stance-gated) BEFORE the
+                                // profitless filter — the
+                                // profit-clamp recompute can zero a
+                                // candidate, and the filter must see
+                                // the commit-ready values.
+                                let twins =
+                                    clamp_result_in_worker(&shared_bin, i, pid, &mut result);
+                                (pid, result, twins)
+                            });
                             // Same profitless filter the rayon arm applies.
-                            let _ = res_tx.send(outcome.filter(|(_, r)| {
+                            let _ = res_tx.send(outcome.filter(|(_, r, _)| {
                                 !r.optimal_input.is_zero() && !r.profit.is_zero()
                             }));
                         }
@@ -1758,7 +1886,7 @@ impl ArbitrageEngine {
                 );
                 let merge_ctx = merge_span.enter();
                 while let Ok(item) = res_rx.recv() {
-                    let Some((pid, solve_result)) = item else {
+                    let Some((pid, solve_result, worker_clamp_twins)) = item else {
                         continue;
                     };
                     if !solve_result.solver_pool_states.is_empty() {
@@ -1767,8 +1895,13 @@ impl ArbitrageEngine {
                             solve_result.solver_pool_states.join(";")
                         );
                     }
-                    clamp_twin_count +=
-                        self.merge_one_result(solve_block, metadata, pid, solve_result);
+                    clamp_twin_count += self.merge_one_result(
+                        solve_block,
+                        metadata,
+                        pid,
+                        solve_result,
+                        worker_clamp_twins,
+                    );
                     solved_count += 1;
                 }
                 drop(merge_ctx);
@@ -1782,10 +1915,15 @@ impl ArbitrageEngine {
                 // for the rayon arms (borrowed locals only). Behavior
                 // identical to the pre-change code: per-bin send, join on
                 // ALL bins, then the tail clamp merge.
-                let solve_fn =
-                    |pid: u64, resolved: &ResolvedMixedPath| -> Option<(u64, SolvePathResult)> {
-                        solve_one_path(&shared, &solve_span, pid, resolved)
-                    };
+                let solve_fn = |pid: u64,
+                                idx: usize,
+                                resolved: &ResolvedMixedPath|
+                 -> Option<(u64, SolvePathResult, u64)> {
+                    solve_one_path(&shared, &solve_span, pid, resolved).map(|(pid, mut r)| {
+                        let twins = clamp_result_in_worker(&shared, idx, pid, &mut r);
+                        (pid, r, twins)
+                    })
+                };
 
                 if lpt_partition_enabled() {
                     // RAYPAR T3: LPT-pre-balanced partition on rayon persistent global
@@ -1796,6 +1934,7 @@ impl ArbitrageEngine {
                     // at import by configure_rayon_solver_pool).
                     let bins = compute_bins();
                     let to_solve_ref = &to_solve;
+                    let pool_refs_ref = &shared.pool_refs;
                     let solve_ref = &solve_fn;
                     let (tx, rx) = std::sync::mpsc::channel();
                     rayon::scope(|s| {
@@ -1805,20 +1944,21 @@ impl ArbitrageEngine {
                                 let mut out = Vec::with_capacity(bin.len());
                                 for &i in bin {
                                     let (pid, resolved) = &to_solve_ref[i];
-                                    out.push(solve_ref(*pid, resolved));
+                                    out.push(solve_ref(*pid, i, resolved));
+                                    let _ = pool_refs_ref;
                                 }
                                 let _ = tx.send(out);
                             });
                         }
                     });
                     drop(tx);
-                    let per_bin: Vec<Vec<Option<(u64, SolvePathResult)>>> =
+                    let per_bin: Vec<Vec<Option<(u64, SolvePathResult, u64)>>> =
                         rx.into_iter().collect();
                     per_bin
                         .into_iter()
                         .flatten()
                         .flatten()
-                        .inspect(|(pid, r)| {
+                        .inspect(|(pid, r, _)| {
                             if !r.solver_pool_states.is_empty() {
                                 tracing::debug!(
                                     "[solver-st] path_id={pid} hops=[{}]",
@@ -1826,13 +1966,14 @@ impl ArbitrageEngine {
                                 );
                             }
                         })
-                        .filter(|(_, r)| !r.optimal_input.is_zero() && !r.profit.is_zero())
+                        .filter(|(_, r, _)| !r.optimal_input.is_zero() && !r.profit.is_zero())
                         .collect()
                 } else {
                     to_solve
                         .par_iter()
-                        .filter_map(|(pid, resolved)| solve_fn(*pid, resolved))
-                        .inspect(|(pid, r)| {
+                        .enumerate()
+                        .filter_map(|(i, (pid, resolved))| solve_fn(*pid, i, resolved))
+                        .inspect(|(pid, r, _)| {
                             if !r.solver_pool_states.is_empty() {
                                 tracing::debug!(
                                     "[solver-st] path_id={pid} hops=[{}]",
@@ -1840,7 +1981,7 @@ impl ArbitrageEngine {
                                 );
                             }
                         })
-                        .filter(|(_, r)| !r.optimal_input.is_zero() && !r.profit.is_zero())
+                        .filter(|(_, r, _)| !r.optimal_input.is_zero() && !r.profit.is_zero())
                         .collect()
                 }
             });
@@ -1944,9 +2085,14 @@ impl ArbitrageEngine {
             );
             let _merge_ctx = merge_span.enter();
             hotpath::measure_block!("arb_solve.clamp_merge", {
-                for (pid, solve_result) in solved {
-                    clamp_twin_count +=
-                        self.merge_one_result(solve_block, metadata, pid, solve_result);
+                for (pid, solve_result, worker_clamp_twins) in solved {
+                    clamp_twin_count += self.merge_one_result(
+                        solve_block,
+                        metadata,
+                        pid,
+                        solve_result,
+                        worker_clamp_twins,
+                    );
                 }
             });
         }
@@ -2398,7 +2544,13 @@ impl HeavyMixedPathCapture {
 #[cfg(test)]
 mod profit_clamp_recompute_tests {
     #![expect(clippy::expect_used)] // tests assert recompute invariants
-    use super::{ArbitrageEngine, SolvePathResult, U256};
+    use super::clamp_result_in_worker;
+    use super::{
+        ArbitrageEngine, BlockMetadata, HashMap, PathTimesHeap, SolveCycleShared, SolvePathResult,
+        U256,
+    };
+    use crate::bot_core::{TickInfo, V4PoolKey};
+    use std::sync::Arc;
 
     /// Path-142603 (V4-V4-V3 @25723658) regression: the solver reported a
     /// phantom +346,369,630 wei profit because its V3 hop2 output
@@ -2483,6 +2635,212 @@ mod profit_clamp_recompute_tests {
     fn degenerate_path_returns_none() {
         let r = SolvePathResult::default();
         assert!(ArbitrageEngine::recompute_clamped_profit(&r).is_none());
+    }
+
+    // ---------------- SIMPIPE2 T2 acceptance (task PIRX3W) ----------------
+
+    /// Narrow single-position V4 pool (±60 ticks, 1e6 liquidity) + a one-hop
+    /// path: the over-fed committed input is the empty-march class. Returns
+    /// (engine, path_id, the to_solve-aligned pool-ref snapshot).
+    fn overfed_v4_engine() -> (
+        ArbitrageEngine,
+        u64,
+        Vec<Vec<::degenbot_solvers::mixed::MixedPoolRef>>,
+    ) {
+        use crate::bot_core::RegisterV4PoolParams;
+        use crate::solvers::arb_engine::PoolTickCoverage;
+        let mut engine = ArbitrageEngine::new();
+        // V2 pool: large reserves so its output dwarfs the V4 hop's capacity —
+        // the V4 hop is the over-fed one (this isolates hop1's input clamp).
+        fn usdc_local(amount: u64) -> alloy::primitives::Uint<112, 2> {
+            (U256::from(amount) * U256::from(10u64).pow(U256::from(6)))
+                .to::<alloy::primitives::Uint<112, 2>>()
+        }
+        fn weth_local(amount: u64) -> alloy::primitives::Uint<112, 2> {
+            (U256::from(amount) * U256::from(10u64).pow(U256::from(18)))
+                .to::<alloy::primitives::Uint<112, 2>>()
+        }
+        const GAMMA_03: u64 = 997;
+        const FEE_DENOM_03: u64 = 1000;
+        let v2 = engine.register_v2_pool(
+            alloy::primitives::Address::from([0x11u8; 20]),
+            usdc_local(1_500_000),
+            weth_local(20_000_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let mut tick_data = HashMap::new();
+        tick_data.insert(
+            60,
+            TickInfo {
+                liquidity_gross: alloy::primitives::U128::from(300),
+                liquidity_net: 150i128,
+                block: 0,
+            },
+        );
+        tick_data.insert(
+            -60,
+            TickInfo {
+                liquidity_gross: alloy::primitives::U128::from(200),
+                liquidity_net: -100i128,
+                block: 0,
+            },
+        );
+        let v4_id = engine
+            .register_v4_pool(&RegisterV4PoolParams {
+                pool_manager: alloy::primitives::Address::from([0x44u8; 20]),
+                pool_id: [0xabu8; 32],
+                pool_key: V4PoolKey {
+                    currency0: alloy::primitives::Address::from([0x30u8; 20]),
+                    currency1: alloy::primitives::Address::from([0x31u8; 20]),
+                    fee: 500,
+                    tick_spacing: 10,
+                    hooks: alloy::primitives::Address::ZERO,
+                },
+                hook_flags: 0,
+                protocol_fee: 0,
+                sqrt_price_x96: U256::from(1u128) << 96,
+                liquidity: 1_000_000,
+                tick: 0,
+                tick_data,
+                update_block: 0,
+                tick_data_block: None,
+                coverage: PoolTickCoverage::Tracked,
+                fetcher: None,
+            })
+            .expect("V4 registration failed");
+        let path_id = engine
+            .register_path(vec![
+                ::degenbot_solvers::mixed::PoolHop {
+                    pool_id: v2,
+                    zero_for_one: true,
+                },
+                ::degenbot_solvers::mixed::PoolHop {
+                    pool_id: v4_id,
+                    zero_for_one: false,
+                },
+            ])
+            .expect("two-hop path registers");
+        let pool_refs = vec![engine
+            .path_pools
+            .get(&path_id)
+            .expect("registered")
+            .pools
+            .clone()];
+        (engine, path_id, pool_refs)
+    }
+
+    fn worker_probe_ctx(
+        core: Arc<crate::bot_core::state_lock::StateLock<crate::bot_core::BotState>>,
+        pool_refs: Vec<Vec<::degenbot_solvers::mixed::MixedPoolRef>>,
+    ) -> Arc<SolveCycleShared> {
+        Arc::new(SolveCycleShared {
+            core,
+            pool_refs,
+            worker_clamp: true,
+            solve_block: 0,
+            epoch: 0,
+            gate_capture: None,
+            walk_memo: Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
+                false, false,
+            )),
+            capture: None,
+            capture_mixed: None,
+            path_times: parking_lot::Mutex::new(PathTimesHeap::new()),
+            gate_total: parking_lot::Mutex::new(
+                ::degenbot_solvers::profit_envelope::GateStats::default(),
+            ),
+            solve_cpu_us: std::sync::atomic::AtomicU64::new(0),
+            walk_pieces_total: std::sync::atomic::AtomicU64::new(0),
+            walk_sims_total: std::sync::atomic::AtomicU64::new(0),
+            walk_word_steps_total: std::sync::atomic::AtomicU64::new(0),
+            walk_refine_sims_total: std::sync::atomic::AtomicU64::new(0),
+            walk_ternary_total: std::sync::atomic::AtomicU64::new(0),
+            walk_grid_total: std::sync::atomic::AtomicU64::new(0),
+            sims_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            gate_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            test_solve_delay: None,
+        })
+    }
+
+    /// The engine clamp and the WORKER clamp are the same computation from
+    /// two call sites: byte-identical result + twin count on identical input.
+    #[test]
+    fn worker_clamp_matches_engine_clamp_bit_for_bit() {
+        use ::degenbot_solvers::mixed::MixedPoolRef;
+        let (engine, path_id, pool_refs) = overfed_v4_engine();
+        let mk = || {
+            let committed = U256::from(1u128) << 120;
+            SolvePathResult {
+                optimal_input: U256::from(1_000_000_000u64),
+                profit: U256::from(1_000u64),
+                hop_outputs: vec![committed, committed],
+                consumed_inputs: vec![committed, committed],
+                state_nonces: vec![],
+                solver_pool_states: Vec::new(),
+            }
+        };
+        let (mut r_engine, mut r_worker) = (mk(), mk());
+        let twins_engine = engine.clamp_cl_hop_capacity(path_id, &mut r_engine);
+        assert!(twins_engine > 0, "premise: the over-fed input must clamp");
+        assert!(
+            r_engine.consumed_inputs[1] < U256::from(1u128) << 120,
+            "premise: the V4 hop input clamp fired"
+        );
+        let ctx = worker_probe_ctx(Arc::clone(engine.core()), pool_refs);
+        let twins_worker = clamp_result_in_worker(&ctx, 0, path_id, &mut r_worker);
+        assert_eq!(twins_worker, twins_engine, "twin count must match");
+        assert_eq!(r_engine, r_worker, "clamped result must be byte-identical");
+        // The pool-ref SNAPSHOT path (worker side) is exercised; the MixedPoolRef _ unused is intentional.
+        let _: Vec<Vec<MixedPoolRef>> = Vec::new();
+    }
+
+    /// The merge honors the worker's twin report: twins > 0 = the result is
+    /// already clamp-committed (no second clip); twins = 0 = the merge clips
+    /// the over-fed input itself (the legacy path — bit-identical).
+    #[test]
+    fn merge_reports_worker_twins_and_never_reclips() {
+        let (mut engine, path_id, pool_refs) = overfed_v4_engine();
+        let metadata = BlockMetadata::default();
+        let overfed = || {
+            let committed = U256::from(1u128) << 120;
+            SolvePathResult {
+                optimal_input: U256::from(1_000_000_000u64),
+                profit: U256::from(1_000u64),
+                hop_outputs: vec![committed, committed],
+                consumed_inputs: vec![committed, committed],
+                state_nonces: vec![],
+                solver_pool_states: Vec::new(),
+            }
+        };
+
+        // Worker arm: clamp once (the worker report = committed truth), then
+        // merge with twins > 0 — the stored result stays byte-identical.
+        let mut worker_result = overfed();
+        let ctx = worker_probe_ctx(Arc::clone(engine.core()), pool_refs);
+        let twins = clamp_result_in_worker(&ctx, 0, path_id, &mut worker_result);
+        assert!(twins > 0, "premise: worker clamp fired");
+        let committed = worker_result.clone();
+        engine.merge_one_result(42, &metadata, path_id, worker_result, twins);
+        {
+            let stored = engine.results.get(&path_id).expect("worker-merged");
+            assert_eq!(
+                stored.consumed_inputs, committed.consumed_inputs,
+                "twins>0 must not re-clip the committed inputs"
+            );
+            assert_eq!(stored.profit, committed.profit, "profit untouched on skip");
+        }
+
+        // Legacy arm (twins=0): the merge clips the over-fed V4 hop input
+        // itself (index 1 — the V2 hop has no input clamp by design).
+        let legacy = overfed();
+        let pre = legacy.consumed_inputs[1];
+        engine.merge_one_result(42, &metadata, path_id, legacy, 0);
+        let stored = engine.results.get(&path_id).expect("legacy-merged");
+        assert_ne!(
+            stored.consumed_inputs[1], pre,
+            "twins=0 must run the merge-site clamp"
+        );
     }
 }
 
@@ -2692,7 +3050,9 @@ mod executor_ab_probe {
     use degenbot_solvers::mobius_v3_int::{build_cl_crossing_table, build_cl_word_profiles};
     use serde_json::Value;
 
-    use super::{lpt_partition, path_cost_proxy, solve_one_path, PathTimesHeap, SolveCycleShared};
+    use super::{
+        lpt_partition, path_cost_proxy, solve_one_path, BotState, PathTimesHeap, SolveCycleShared,
+    };
     use crate::solvers::arb_engine::solve_executor::SolveExecutor;
     use hashbrown::HashMap;
 
@@ -2824,6 +3184,9 @@ mod executor_ab_probe {
             walk_grid_total: std::sync::atomic::AtomicU64::new(0),
             sims_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             gate_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            core: Arc::new(crate::bot_core::state_lock::StateLock::new(BotState::new())),
+            pool_refs: Vec::new(),
+            worker_clamp: false,
             #[cfg(test)]
             test_solve_delay: None,
         })

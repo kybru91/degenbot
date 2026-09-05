@@ -6359,6 +6359,7 @@ mod tests {
         let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
                 metadata: BlockMetadata::default(),
@@ -6385,6 +6386,7 @@ mod tests {
         // The unchanged-intake twin APPLIES (apply-if-unchanged).
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
                 metadata: BlockMetadata::default(),
@@ -6428,6 +6430,7 @@ mod tests {
 
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
                 metadata: BlockMetadata::default(),
@@ -6486,6 +6489,7 @@ mod tests {
             {
                 let _guard = solve_span.enter();
                 tx.send(DetachedMergeItem::Solved {
+                    worker_clamp_twins: 0,
                     cycle_seq: 1,
                     solve_block: 42,
                     metadata: BlockMetadata::default(),
@@ -6575,6 +6579,7 @@ mod tests {
         // the next publish's verifier diff covers it — no bypass.
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
                 metadata: BlockMetadata::default(),
@@ -6596,6 +6601,7 @@ mod tests {
         let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
         engine.merge_detached_item(
             crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                worker_clamp_twins: 0,
                 cycle_seq: 1,
                 solve_block: 100,
                 metadata: BlockMetadata::default(),
