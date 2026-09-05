@@ -48,6 +48,18 @@ impl ArbitrageEngine {
         self.solve_entry = entry;
     }
 
+    /// KNEUQX: the block the MOST RECENT solve cycle ran anchored on - the
+    /// solve-anchor resolution (request block floored by the pool-state head,
+    /// see `crate::bot_core::solve_anchor`), stamped into the cycle's
+    /// span as `cycle.solve_block`. The span's `block.number`
+    /// tag records the ENTRY (drain/finalize event) block per ZZS6CG lineage;
+    /// when a late finalize runs at a settle boundary these differ and the
+    /// phase children (fanout/resolve/stage) always carry the anchor.
+    #[must_use]
+    pub fn results_block(&self) -> u64 {
+        self.results_block
+    }
+
     pub fn solve_dirty(&mut self, block_number: u64, metadata: &BlockMetadata) {
         // Expire stale buffered events in the V3/V4 buffers (ADR-003: both
         // now live on BotState).

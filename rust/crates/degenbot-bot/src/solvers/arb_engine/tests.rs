@@ -5635,6 +5635,58 @@ mod tests {
         );
     }
 
+    /// KNEUQX: the arb.solve span records `cycle.solve_block` (the cycle's
+    /// anchored work block = engine.results_block()) alongside the entry
+    /// block.number tag. At a settle boundary the anchor is the pool-state
+    /// head and can run one (or more) ahead of the entry block - the field
+    /// makes that visible/self-documenting in Jaeger instead of showing a
+    /// parent span seemingly contradicting its phase children. Pin: the
+    /// exported attribute matches the engine's post-solve anchor.
+    #[cfg(feature = "otel")]
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn solve_span_records_cycle_solve_block() {
+        use crate::bot_core::engine::Engine;
+        use crate::otel;
+        use crate::solvers::arb_engine::engine_handle::EngineHandle;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use std::sync::Arc;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const MY_SOLVE_BLOCK: u64 = 0x5EED_B10C;
+
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+
+        let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
+        engine.lock().dirty_sets.insert(0x0BAD_F00D, HopType::V2);
+        let engine_arc = Arc::clone(&engine);
+        let handle = EngineHandle::new(engine);
+        tracing::subscriber::with_default(subscriber, || {
+            handle.solve_dirty(MY_SOLVE_BLOCK, &BlockMetadata::default());
+        });
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let solve = spans
+            .iter()
+            .find(|sp| sp.name.as_ref() == "degenbot.arb.solve")
+            .expect("solve span must be exported");
+        let expected = engine_arc.lock().results_block();
+        let recorded = solve
+            .attributes
+            .iter()
+            .find(|kv| kv.key == opentelemetry::Key::from_static_str("cycle.solve_block"))
+            .map(|kv| kv.value.to_string())
+            .unwrap_or_else(|| "ABSENT".to_string());
+        assert_eq!(
+            recorded,
+            expected.to_string(),
+            "arb.solve must record the cycle's anchored block"
+        );
+    }
+
     // P5FEOI (epic 2LXPPV): original span test, otel-gated like its harness.
     #[cfg(feature = "otel")]
     #[test]

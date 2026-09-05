@@ -205,7 +205,11 @@ impl Engine for EngineHandle {
         }
         // REMED1 T2: the streaming (drain) entry tags its cycles.
         engine.set_solve_entry("drain");
-        let span = tracing::info_span!("degenbot.arb.solve", block.number = block);
+        let span = tracing::info_span!(
+            "degenbot.arb.solve",
+            block.number = block,
+            cycle.solve_block = tracing::field::Empty,
+        );
         // ZZS6CG: exact-match reparent onto this block's published pump
         // span. A no-op when the publish has not landed (ambient retention),
         // and the fix for late finalize/drain work leaking into a LATER
@@ -238,6 +242,11 @@ impl Engine for EngineHandle {
             } else {
                 engine.solve_dirty(block, metadata);
             }
+            // KNEUQX: surface the cycle's anchored block on the span - the
+            // SolveAnchor resolution is max(request block, pool-state head),
+            // so a boundary-straddling solve (entry block behind the head)
+            // reports the block its work actually ran for.
+            span.record("cycle.solve_block", engine.results_block());
             if let Some(p) = crate::instruments::pipeline() {
                 p.observe_mutex_hold_duration(hold_start.elapsed().as_secs_f64());
             }
@@ -304,7 +313,11 @@ impl Engine for EngineHandle {
             engine.set_solve_entry("finalize");
         }
         let span = will_solve.then(|| {
-            let span = tracing::info_span!("degenbot.arb.solve", block.number = block);
+            let span = tracing::info_span!(
+                "degenbot.arb.solve",
+                block.number = block,
+                cycle.solve_block = tracing::field::Empty,
+            );
             // ZZS6CG: exact-match reparent onto this block's published pump
             // span (see the drain arm). No-op without a publish entry.
             crate::telemetry::attach_published_parent_exact(&span, block);
@@ -313,6 +326,12 @@ impl Engine for EngineHandle {
         let _guard = span.as_ref().map(tracing::Span::enter);
         let solve_start = std::time::Instant::now();
         engine.finalize_block(block, metadata);
+        // KNEUQX: surface the cycle's anchored block on the span - at a settle
+        // boundary the anchor is the pool-state HEAD (the block the work ran
+        // for), which can be one ahead of this finalize's entry block.
+        if let Some(span) = span.as_ref() {
+            span.record("cycle.solve_block", engine.results_block());
+        }
         drop(engine);
         if will_solve {
             if let Some(p) = crate::instruments::pipeline() {
