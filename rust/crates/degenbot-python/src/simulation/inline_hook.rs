@@ -300,7 +300,22 @@ impl InlineSimulator for InlineSimHook {
             let req_task = req.clone();
             let sim_future = async move {
                 tokio::spawn(async move {
+                    // SIMPIPE2 M1 span parity: the engine-side sim gets the
+                    // same Jaeger visibility the retired FFI fan-out had -
+                    // named `degenbot.simulate.inline`, nested under the
+                    // spawning solve worker's span context (tokio::spawn
+                    // clones the current task context). One span per sim:
+                    // closes the Jaeger-invisibility gap the T4 soak found.
                     let req = req_task;
+                    let _sim_span = tracing::info_span!(
+                        target: "degenbot::solver",
+                        "degenbot.simulate.inline",
+                        path_id = req.path_id,
+                        sim_block = req.sim_block,
+                        hops = req.hops.len(),
+                        sim_ok = false,
+                    )
+                    .entered();
                     let ctx = SimulateContext {
                         provider: &provider,
                         executor_owner,
@@ -335,6 +350,10 @@ impl InlineSimulator for InlineSimHook {
                                 &mut buckets,
                             )
                             .map_err(|e| format!("{e}"));
+                            tracing::Span::current().record(
+                                "sim_ok",
+                                result.as_ref().ok().and_then(|o| o.as_ref()).is_some(),
+                            );
                             (result, buckets)
                         }
                         None => {
