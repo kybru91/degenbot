@@ -378,6 +378,12 @@ pub struct ArbitrageEngine {
     /// `true` after `record_logs_this_block()` (the pump's forward-log path),
     /// cleared by `finalize_block`. Owned by the engine since LEZJAS.
     has_logs_this_block: bool,
+    /// REMED1 T2: which entry drove the CURRENT solve cycle - `drain`
+    /// (EngineHandle::solve_dirty, per-log streaming) vs `finalize` (the
+    /// boundary catch in `finalize_block`). Emitted on the cycle-complete
+    /// line so a block's two real cycles (65/1853 overnight) are attributable
+    /// instead of looking like duplicate logging.
+    solve_entry: &'static str,
     /// Paths registered via `register_and_solve_path` that have been eagerly
     /// solved and appended to `results`. Tracked so `rebuild_and_solve_affected`
     /// can merge them instead of discarding them when it replaces `self.results`.
@@ -560,6 +566,7 @@ impl ArbitrageEngine {
             last_processed_block: None,
             last_solved_block: 0,
             has_logs_this_block: false,
+            solve_entry: "drain",
             pending_new_paths: HashSet::new(),
             last_solved_path_ids: HashSet::new(),
             next_path_id: 1, // path IDs start at 1

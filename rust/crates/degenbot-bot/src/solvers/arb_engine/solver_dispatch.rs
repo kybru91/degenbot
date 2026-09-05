@@ -2221,6 +2221,7 @@ impl ArbitrageEngine {
             inline.stance = INLINE_SIM_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
             inline.hook = self.inline_sim.is_some(),
             inline.payloads = self.inline_payloads.len(),
+            solve.entry = self.solve_entry,
             "[solve-phase] cycle complete (clamp done)"
         );
 

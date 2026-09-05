@@ -203,6 +203,8 @@ impl Engine for EngineHandle {
             self.spawn_detached_sidecar_if_pending();
             return;
         }
+        // REMED1 T2: the streaming (drain) entry tags its cycles.
+        engine.set_solve_entry("drain");
         let span = tracing::info_span!("degenbot.arb.solve", block.number = block);
         let _guard = span.enter();
         // T3: solve duration + registered-path gauge (dirty solves only; the
@@ -292,6 +294,10 @@ impl Engine for EngineHandle {
         // span; no solve without its histogram sample + counter).
         let mut engine = self.engine.lock();
         let will_solve = engine.has_dirty_paths() || engine.has_logs_this_block();
+        // REMED1 T2: attribute this entry's cycle on the telemetry line.
+        if will_solve {
+            engine.set_solve_entry("finalize");
+        }
         let span =
             will_solve.then(|| tracing::info_span!("degenbot.arb.solve", block.number = block));
         let _guard = span.as_ref().map(tracing::Span::enter);

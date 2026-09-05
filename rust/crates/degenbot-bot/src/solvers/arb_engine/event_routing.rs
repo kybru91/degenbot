@@ -41,6 +41,13 @@ impl ArbitrageEngine {
     /// The pump calls this eagerly after each WS log to keep engine state
     /// current. The actual batch send is triggered by the pump's debounce
     /// timer or block boundary logic.
+    /// REMED1 T2: tag the entry that drives the CURRENT solve cycle
+    /// (`drain` streaming vs `finalize` boundary catch) for the
+    /// cycle-complete telemetry line.
+    pub fn set_solve_entry(&mut self, entry: &'static str) {
+        self.solve_entry = entry;
+    }
+
     pub fn solve_dirty(&mut self, block_number: u64, metadata: &BlockMetadata) {
         // Expire stale buffered events in the V3/V4 buffers (ADR-003: both
         // now live on BotState).
