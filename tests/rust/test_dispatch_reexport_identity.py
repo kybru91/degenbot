@@ -72,13 +72,19 @@ def test_fetch_fee_history_is_identity_alias() -> None:
     assert d.fetch_fee_history is fetch_fee_history_py
 
 
-def test_all_eight_symbols_reachable_from_package() -> None:
-    """All 8 stable names are exported from ``degenbot.dispatch``."""
+def test_all_nine_symbols_reachable_from_package() -> None:
+    """All 9 stable names are exported from ``degenbot.dispatch``.
+
+    ``SubmitCandidate`` joined the surface with the inline-sim seam
+    (SIMPIPE2 T3): the runner builds submit records from payload batches,
+    so it is a public name alongside the FFI leaf wrappers.
+    """
     expected = {
         "DispatchCandidate",
         "DispatchOutcome",
         "Dispatcher",
         "SimulateContext",
+        "SubmitCandidate",
         "TxSigner",
         "dispatch_and_submit",
         "dispatch_profitable",

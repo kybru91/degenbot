@@ -24,6 +24,11 @@ from degenbot.runner._driver_constants import _SIM_FAIL_RENDER_CAP
 
 if TYPE_CHECKING:
     from degenbot.dispatch import Dispatcher, DispatchOutcome
+    from degenbot.runner._dispatch import MergedOutcome
+
+# A sim-dispatch outcome handed to the renderers: the FFI batch outcome or
+# MergedOutcome (the payload-stitched adapter — structurally identical view).
+type _SimOutcome = DispatchOutcome | MergedOutcome
 
 
 def _hop_display_addr(hop: dict[str, Any]) -> str:
@@ -61,7 +66,7 @@ def _hop_token_summary(hops: list[dict[str, Any]] | tuple[dict[str, Any], ...]) 
     return " ".join(parts)
 
 
-def _render_sim_summary(outcome: DispatchOutcome) -> None:
+def _render_sim_summary(outcome: _SimOutcome) -> None:
     """Render the ``[sim]`` line from ``DispatchOutcome`` fields (D4 stay-Python).
 
 
@@ -112,7 +117,7 @@ def _render_sim_summary(outcome: DispatchOutcome) -> None:
     )
 
 
-def _render_profit_logs(outcome: DispatchOutcome) -> None:
+def _render_profit_logs(outcome: _SimOutcome) -> None:
     """Render the ``[profit]`` per-path hop-detail log (D4 stay-Python)."""
 
     for cand in outcome.gas_profitable:
@@ -226,7 +231,7 @@ def _dump_failure_fixture(
         )
 
 
-def _render_sim_failures(outcome: DispatchOutcome, *, current_block: int) -> None:
+def _render_sim_failures(outcome: _SimOutcome, *, current_block: int) -> None:
     """Render one ``[sim-fail]`` + one ``[sim-diag]`` line per reverted / failed
 
     candidate (D3 + AM5AJW). Capped at :data:`_SIM_FAIL_RENDER_CAP` records.

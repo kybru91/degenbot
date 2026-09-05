@@ -72,6 +72,7 @@ from .provider import (
 from .provider import (
     LogFilter as LogFilter,
 )
+from .simulation import SimulateContext
 from .submission import (
     TxParams as TxParams,
 )
@@ -1193,6 +1194,17 @@ class ArbitrageEngine:
     # ── Pool + path registration ──
     def register_path(self, pool_refs: list[tuple[int, bool]]) -> int: ...
     def register_and_solve_path(self, pool_refs: list[tuple[int, bool]]) -> int: ...
+
+    # ── Inline-sim hook (SIMPIPE2 T3/T4) ──
+    # Install this session's sim config as the engine's InlineSimulator
+    # hook (cheap Arc wiring; a no-op when the stance is off). Built once
+    # at install time — a later call replaces the hook.
+    def install_inline_simulator(self, context: SimulateContext, erc6909_profit: bool) -> None: ...
+
+    # INLINE_RE-2: the render accessor for one path's pool-ref snapshot
+    # (the "path_infos" entry shape: hops + pool identities). None =
+    # unknown path id.
+    def payload_path_info(self, path_id: int) -> dict[str, Any] | None: ...
 
 class BlockStream:
     """Async iterator over `newHeads` block notifications from the pump.

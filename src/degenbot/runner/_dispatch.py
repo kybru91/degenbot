@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import pathlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from degenbot.dispatch import (
     DispatchCandidate,
@@ -29,10 +29,12 @@ from degenbot.runner._render import (
     _render_profit_logs,
     _render_sim_failures,
     _render_sim_summary,
+    _SimOutcome,
 )
 from degenbot.runner.config import ArbitrageConfig
 
 if TYPE_CHECKING:
+    from degenbot.dispatch import DispatchOutcome
     from degenbot.runner.bot_runner import _SessionState
 
 #: One raw engine-result row (path_id, optimal_input, profit, hop_outputs,
@@ -122,7 +124,7 @@ async def _dispatch_profitable(
     into the outcome (per-entry presence decides).
     """
     candidates = _build_dispatch_candidates(session, results, payloads=payloads)
-    outcome: object | None = None
+    outcome: DispatchOutcome | None = None
     if candidates:
         current_block = session.dispatcher.current_block
         outcome = await _simulate_batch(
@@ -203,13 +205,13 @@ class MergedOutcome:
 
     def __init__(
         self,
-        base: object | None,
+        base: DispatchOutcome | None,
         candidates: list[SubmitCandidate],
-        failures: list[dict],
-        path_infos: dict[int, dict],
+        failures: list[dict[str, Any]],
+        path_infos: dict[int, dict[str, Any]],
         unprofitable_count: int,
     ) -> None:
-        self._base = base
+        self._base: DispatchOutcome | None = base
         self._candidates = candidates
         self._failures = failures
         self._path_infos = path_infos
@@ -224,62 +226,74 @@ class MergedOutcome:
 
     @property
     def gas_profitable(self) -> list[SubmitCandidate]:
-        base = list(self._base.gas_profitable) if self._base is not None else []
-        return base + self._candidates
+        base = self._base
+        base_candidates = [] if base is None else list(base.gas_profitable)
+        return base_candidates + self._candidates
 
     @property
     def gas_unprofitable_count(self) -> int:
-        base = self._base.gas_unprofitable_count if self._base is not None else 0
-        return base + self._unprofitable_count
+        base = self._base
+        base_count = 0 if base is None else base.gas_unprofitable_count
+        return base_count + self._unprofitable_count
 
     @property
     def exception_count(self) -> int:
-        return self._base.exception_count if self._base is not None else 0
+        base = self._base
+        return 0 if base is None else base.exception_count
 
     @property
     def fail_count(self) -> int:
-        base = self._base.fail_count if self._base is not None else 0
-        return base + len(self._failures)
+        base = self._base
+        base_count = 0 if base is None else base.fail_count
+        return base_count + len(self._failures)
 
     @property
     def candidate_count(self) -> int:
-        base = self._base.candidate_count if self._base is not None else 0
-        return base + len(self._candidates) + self._unprofitable_count + len(self._failures)
+        base = self._base
+        base_count = 0 if base is None else base.candidate_count
+        return base_count + len(self._candidates) + self._unprofitable_count + len(self._failures)
 
     @property
     def suppressed_count(self) -> int:
-        return self._base.suppressed_count if self._base is not None else 0
+        base = self._base
+        return 0 if base is None else base.suppressed_count
 
     @property
     def thin_dropped(self) -> int:
-        return self._base.thin_dropped if self._base is not None else 0
+        base = self._base
+        return 0 if base is None else base.thin_dropped
 
     @property
     def divergent_dropped(self) -> int:
-        return self._base.divergent_dropped if self._base is not None else 0
+        base = self._base
+        return 0 if base is None else base.divergent_dropped
 
     @property
     def fot_dropped(self) -> int:
-        return self._base.fot_dropped if self._base is not None else 0
+        base = self._base
+        return 0 if base is None else base.fot_dropped
 
     @property
     def fail_buckets(self) -> dict[str, int]:
-        base = dict(self._base.fail_buckets) if self._base is not None else {}
+        base = self._base
+        buckets = {} if base is None else dict(base.fail_buckets)
         for rec in self._failures:
             bucket = rec["bucket"]
-            base[bucket] = base.get(bucket, 0) + 1
-        return base
+            buckets[bucket] = buckets.get(bucket, 0) + 1
+        return buckets
 
     @property
-    def failures(self) -> list[dict]:
-        base = list(self._base.failures) if self._base is not None else []
-        return base + self._failures
+    def failures(self) -> list[dict[str, Any]]:
+        base = self._base
+        base_failures = [] if base is None else list(base.failures)
+        return base_failures + self._failures
 
     @property
-    def path_infos(self) -> dict[int, dict]:
-        base = dict(self._base.path_infos) if self._base is not None else {}
-        base.update(self._path_infos)
-        return base
+    def path_infos(self) -> dict[int, dict[str, Any]]:
+        base = self._base
+        merged = {} if base is None else dict(base.path_infos)
+        merged.update(self._path_infos)
+        return merged
 
 
 def _inline_failure_record(pid: int, payload: dict) -> dict:
@@ -308,9 +322,9 @@ def _inline_failure_record(pid: int, payload: dict) -> dict:
 
 def _merge_payload_outcome(
     session: _SessionState,
-    base_outcome: object | None,
+    base_outcome: DispatchOutcome | None,
     payloads: dict[int, dict] | None,
-) -> MergedOutcome | None:
+) -> _SimOutcome | None:
     """Stitch inline-sim payload records into (or over) the FFI batch outcome.
 
     Per-entry presence decides: each payload either yields a
@@ -380,7 +394,7 @@ async def _simulate_batch(
     block_timestamp: int,
     base_fee_next: int,
     current_block: int,
-) -> object:
+) -> DispatchOutcome:
     """Run the Rust simulate fan-out for a candidate batch (one DispatchOutcome)."""
     if session.sim_ctx is None:
         msg = "SimulateContext is required to dispatch (non-Alloy provider or sim context unbuilt)"
@@ -400,7 +414,7 @@ async def _simulate_batch(
 
 def _render_outcome(
     session: _SessionState,
-    outcome: object,
+    outcome: _SimOutcome,
     current_block: int,
 ) -> None:
     """The display-only renderers over a sim outcome (D4 stays-python)."""
@@ -412,7 +426,7 @@ def _render_outcome(
 
 async def _submit_batch_records(
     session: _SessionState,
-    outcome: object,
+    outcome: _SimOutcome,
     *,
     operator_nonce: int,
 ) -> None:

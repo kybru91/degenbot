@@ -46,7 +46,8 @@ from degenbot.runner._driver_constants import (
 )
 
 if TYPE_CHECKING:
-    from degenbot.runner._dispatch import _RawResult
+    from degenbot.dispatch import DispatchOutcome
+    from degenbot.runner._dispatch import _RawResult, _SimOutcome
     from degenbot.runner.bot_runner import _SessionState
 
 
@@ -77,10 +78,14 @@ class _BatchWork:
     # SIMPIPE2 T3: the engine's inline-sim payloads (empty = legacy FFI sim
     # for every entry — per-entry presence decides).
     payloads: dict[int, dict] | None = None
-    sim_task: asyncio.Task[object] | None = None
+    sim_task: asyncio.Task[_SimOutcome | None] | None = None
 
 
-async def _run_sim(session: _SessionState, work: _BatchWork, sem: asyncio.Semaphore) -> object:
+async def _run_sim(
+    session: _SessionState,
+    work: _BatchWork,
+    sem: asyncio.Semaphore,
+) -> _SimOutcome | None:
     """The simulate leaf for one batch (GIL-free across the RPC part)."""
     async with sem:
         # Candidate shaping runs under the GIL on this task (same engine lock
@@ -88,11 +93,18 @@ async def _run_sim(session: _SessionState, work: _BatchWork, sem: asyncio.Semaph
         # path_info_for_core). SIMPIPE2 T3: payload entries skip the FFI sim
         # (already simulated inline in the engine).
         candidates = _build_dispatch_candidates(session, work.results, payloads=work.payloads)
-        outcome: object | None = None
+        outcome: DispatchOutcome | None = None
         if candidates:
+            sim_ctx = session.sim_ctx
+            if sim_ctx is None:
+                msg = (
+                    "SimulateContext is required to dispatch"
+                    " (non-Alloy provider or sim context unbuilt)"
+                )
+                raise RuntimeError(msg)
             outcome = await dispatch_profitable(
                 candidates=candidates,
-                context=session.sim_ctx,
+                context=sim_ctx,
                 dispatcher=session.dispatcher,
                 base_fee_next=work.base_fee_next,
                 current_block=work.current_block,
@@ -110,7 +122,7 @@ async def _run_sim(session: _SessionState, work: _BatchWork, sem: asyncio.Semaph
 async def _submit_ordered(
     session: _SessionState,
     work: _BatchWork,
-    outcome: object,
+    outcome: _SimOutcome,
 ) -> None:
     """Render + submit one completed batch outcome (the fan-in step)."""
     _render_outcome(session, outcome, work.current_block)
