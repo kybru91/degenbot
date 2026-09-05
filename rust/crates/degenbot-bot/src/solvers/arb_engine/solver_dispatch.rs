@@ -590,9 +590,16 @@ fn inline_sim_payload(
     let sim = ctx.inline_sim.as_ref()?;
     sim.simulate_path(crate::solvers::arb_engine::inline_sim::InlineSimRequest {
         path_id: pid,
-        hops: ::std::clone::Clone::clone(&ctx.pool_refs[idx]),
+        hops: std::clone::Clone::clone(&ctx.pool_refs[idx]),
         optimal_input: result.optimal_input,
-        consumed_inputs: ::std::clone::Clone::clone(&result.consumed_inputs),
+        consumed_inputs: std::clone::Clone::clone(&result.consumed_inputs),
+        hop_outputs: std::clone::Clone::clone(&result.hop_outputs),
+        state_nonces: std::clone::Clone::clone(&result.state_nonces),
+        sim_block: ctx.solve_block,
+        block_timestamp: ctx.metadata.timestamp,
+        parent_base_fee: ctx.metadata.base_fee_per_gas.unwrap_or(0),
+        parent_gas_used: ctx.metadata.gas_used,
+        parent_gas_limit: ctx.metadata.gas_limit,
     })
 }
 
@@ -633,6 +640,9 @@ pub(crate) struct SolveCycleShared {
     /// every bin mirrors `to_solve[i]`): the worker clamp's pool list, taken
     /// under the cycle's engine Mutex (stable for the whole cycle).
     pool_refs: Vec<Vec<MixedPoolRef>>,
+    /// The cycle's block metadata (Copy) — the inline-sim request's block env
+    /// (solve block from `solve_block`; timestamp/base-fee from here).
+    metadata: BlockMetadata,
     /// The stance copy (construction-time static read at cycle build).
     worker_clamp: bool,
     /// SIMPIPE2 T3: the engine's inline-sim hook snapshot. `Some` + stance ON
@@ -1662,6 +1672,7 @@ impl ArbitrageEngine {
         let shared = std::sync::Arc::new(SolveCycleShared {
             solve_block,
             epoch: solve_block,
+            metadata: *metadata,
             gate_capture,
             walk_memo: std::sync::Arc::clone(&self.walk_memo),
             capture: capture.map(std::sync::Arc::new),
@@ -2827,6 +2838,7 @@ mod profit_clamp_recompute_tests {
             inline_sim: None,
             solve_block: 0,
             epoch: 0,
+            metadata: BlockMetadata::default(),
             gate_capture: None,
             walk_memo: Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
                 false, false,
@@ -3191,6 +3203,7 @@ mod executor_ab_probe {
     use std::time::Instant;
 
     use alloy::primitives::U256;
+    use crate::solvers::arb_engine::BlockMetadata;
     use degenbot_pools::int_v3_hop::{IntV3TickRangeHop, IntV3TickRangeSequence};
     use degenbot_solvers::mobius_v3_int::{build_cl_crossing_table, build_cl_word_profiles};
     use serde_json::Value;
@@ -3310,6 +3323,7 @@ mod executor_ab_probe {
         Arc::new(SolveCycleShared {
             solve_block: 0,
             epoch: 0,
+            metadata: BlockMetadata::default(),
             gate_capture: None,
             walk_memo: Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
                 false, false,

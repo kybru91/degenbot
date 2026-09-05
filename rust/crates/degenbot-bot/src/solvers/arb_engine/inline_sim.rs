@@ -38,6 +38,7 @@
 //! | — (dispatch failures only) | `failure: Option<InlineSimFailure>` |
 
 use crate::solvers::arb_engine::ArbitrageEngine;
+use crate::solvers::arb_engine::BlockMetadata;
 use alloy::primitives::{Address, I256, U256};
 use degenbot_solvers::mixed::{MixedPoolRef, SolvePathResult};
 
@@ -60,6 +61,24 @@ pub struct InlineSimRequest {
     pub optimal_input: U256,
     /// The clamp-committed per-hop consumed inputs (wei), path order.
     pub consumed_inputs: Vec<U256>,
+    /// The solver's per-hop outputs (wei), path order — the step outputs the
+    /// encoder must feed forward (T4: the sim's `SolveStep` rows).
+    pub hop_outputs: Vec<U256>,
+    /// The per-hop solve-time state nonces (AV42C7 staleness parity).
+    pub state_nonces: Vec<u64>,
+    // ---- The block env (the sim's `SimulateContext` primitives) ----
+    /// The block to simulate against (the cycle's solve block — the
+    /// head-anchored promoted block, MQIZ5M).
+    pub sim_block: u64,
+    /// The block timestamp (the pump's header; XPPMQG — the default `1`
+    /// timestamp forks Solidity-0.8 pair updates).
+    pub block_timestamp: u64,
+    /// The parent block's base fee + gas used/limit — the EIP-1559
+    /// `next_base_fee` inputs (the worker's `BlockMetadata`). `base_fee
+    /// None` (pre-EIP-1559) rides as `parent_base_fee = 0`.
+    pub parent_base_fee: u64,
+    pub parent_gas_used: u64,
+    pub parent_gas_limit: u64,
 }
 
 /// One EIP-2930 access-list row (primitive mirror of `AccessListItem`).
@@ -167,13 +186,14 @@ impl ArbitrageEngine {
 
     /// Simulate one clamp-admitted path through the installed hook. `None` =
     /// no hook installed, the path is unknown, or the hook reported failure-
-    /// without-payload. The stance-gated call sites batch this into the
-    /// result pipeline in T3; the seam itself is stance-free.
+    /// without-payload. `metadata` supplies the sim's block env (the same
+    /// fields the worker path fills from its cycle snapshot).
     #[must_use]
     pub fn inline_simulate(
         &self,
         path_id: u64,
         clamp_admitted: &SolvePathResult,
+        metadata: &BlockMetadata,
     ) -> Option<SimulatedPathResult> {
         let sim = self.inline_sim.as_ref()?;
         let hops = self.path_pools.get(&path_id)?.pools.clone();
@@ -182,6 +202,13 @@ impl ArbitrageEngine {
             hops,
             optimal_input: clamp_admitted.optimal_input,
             consumed_inputs: clamp_admitted.consumed_inputs.clone(),
+            hop_outputs: clamp_admitted.hop_outputs.clone(),
+            state_nonces: clamp_admitted.state_nonces.clone(),
+            sim_block: self.results_block,
+            block_timestamp: metadata.timestamp,
+            parent_base_fee: metadata.base_fee_per_gas.unwrap_or(0),
+            parent_gas_used: metadata.gas_used,
+            parent_gas_limit: metadata.gas_limit,
         };
         sim.simulate_path(request)
     }
@@ -328,7 +355,7 @@ mod inline_sim_tests {
         });
         engine.set_inline_simulator(sim.clone());
         let got = engine
-            .inline_simulate(path_id, &admitted())
+            .inline_simulate(path_id, &admitted(), &BlockMetadata::default())
             .expect("hook returns the payload");
 
         // The request the engine built: hops in path order, engine-native
@@ -364,7 +391,9 @@ mod inline_sim_tests {
     fn no_hook_or_unknown_path_is_none() {
         let (engine, path_id) = two_hop_engine();
         assert!(
-            engine.inline_simulate(path_id, &admitted()).is_none(),
+            engine
+                .inline_simulate(path_id, &admitted(), &BlockMetadata::default())
+                .is_none(),
             "no hook installed → None"
         );
         let mut engine2 = engine;
@@ -373,7 +402,9 @@ mod inline_sim_tests {
             payload: stub_payload(),
         }));
         assert!(
-            engine2.inline_simulate(99_999, &admitted()).is_none(),
+            engine2
+                .inline_simulate(99_999, &admitted(), &BlockMetadata::default())
+                .is_none(),
             "unknown path → None (no request built)"
         );
     }

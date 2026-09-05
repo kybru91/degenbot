@@ -193,6 +193,12 @@ impl PyArbitrageEngine {
     ) -> Arc<parking_lot::RwLock<degenbot_simulation::WarmCodeCacheInner>> {
         Arc::clone(&self.warm_code_cache)
     }
+
+    /// The engine state arc — SIMPIPE2 T4's inline-sim hook closes over it
+    /// (the worker-side `path_info_for` resolution). One Arc clone.
+    pub(crate) fn engine_arc(&self) -> Arc<parking_lot::Mutex<ArbitrageEngine>> {
+        Arc::clone(&self.engine)
+    }
 }
 
 pub(crate) fn make_tick_info(

@@ -45,6 +45,7 @@ pub mod candidate;
 pub mod context;
 pub mod dispatch;
 pub mod in_process_probe;
+mod inline_hook;
 pub mod outcome;
 
 pub use candidate::PyDispatchCandidate;

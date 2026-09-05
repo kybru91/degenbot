@@ -166,3 +166,46 @@ impl PySimulateContext {
         crate::address_utils::address_to_checksum_string(&self.executor_address)
     }
 }
+
+#[pymethods]
+impl crate::bot::engine::PyArbitrageEngine {
+    /// SIMPIPE2 T4: install the production inline-sim hook — the
+    /// `degenbot_bot`-defined `InlineSimulator` seam's concrete closure over
+    /// THIS session's sim config + the engine's shared state (theADR-019 D7
+    /// dependency inversion, plumbed exactly like `set_result_channel`).
+    /// Construction-time wiring: call once after the `SimulateContext` is
+    /// built (a later call simply replaces the hook).
+    ///
+    /// The sim itself runs per-path in the SOLVE WORKER (the T2 clamp seam)
+    /// through a dedicated multi-thread runtime — see
+    /// `simulation::inline_hook` for the thread/runtime matrix.
+    fn install_inline_simulator(
+        &self,
+        py: Python<'_>,
+        context: &PySimulateContext,
+        erc6909_profit: bool,
+    ) {
+        let engine_arc = self.engine_arc();
+        let bot_state = self.bot_state_arc();
+        let warm_cache = self.warm_code_cache_arc();
+        let hook = crate::simulation::inline_hook::InlineSimHook::new(
+            Arc::new(context.provider.sim_bounded()),
+            context.executor_owner,
+            context.executor_address,
+            context.weth_address,
+            context.pool_manager_address,
+            context.multicall3_address,
+            context.inject_code,
+            context.injected_address,
+            context.runtime_bytecode.clone(),
+            context.warmup,
+            erc6909_profit,
+            engine_arc,
+            bot_state,
+            warm_cache,
+        );
+        self.with_engine_mut(py, |e| {
+            e.set_inline_simulator(std::sync::Arc::new(hook));
+        });
+    }
+}

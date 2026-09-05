@@ -46,6 +46,7 @@ from degenbot.provider import AlloyProvider, AsyncAlloyProvider
 from degenbot.runner._consume import consume_result_batches
 from degenbot.runner._dispatch import _load_executor_runtime_bytecode
 from degenbot.runner._driver_constants import (
+    ERC6909_PROFIT,
     ETH_MAINNET_ALLOWED_TOKENS,
     INJECT_EXECUTOR_CODE,
     INJECTED_EXECUTOR_ADDRESS,
@@ -320,6 +321,15 @@ class BotRunner:
                 inject_code=INJECT_EXECUTOR_CODE,
                 executor_runtime_bytecode=bytes.fromhex(runtime_code[2:]),
                 injected_address=INJECTED_EXECUTOR_ADDRESS if INJECT_EXECUTOR_CODE else None,
+            )
+            # SIMPIPE2 T4: the inline-sim stance (`DEGENBOT_SOLVE_INLINE_SIM`)
+            # needs the ENGINE hook installed from this session's sim config —
+            # without it stance=1 carries no payloads (harmless but inert).
+            # Cheap Arc-clone wiring; the engine only calls the hook under the
+            # stance, so installing it unconditionally is a no-op when off.
+            self.engine_registry.engine.install_inline_simulator(
+                self._sim_ctx,
+                erc6909_profit=ERC6909_PROFIT,
             )
 
         # ── Snapshots (V3 pool tracker pre-population only; the engine's DB
