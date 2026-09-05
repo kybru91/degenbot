@@ -259,18 +259,32 @@ pub async fn dispatch_and_submit(
     dry_run: bool,
     inject_code: bool,
 ) -> Result<SubmitOutcome, crate::SubmissionError> {
-    // RMHQAR (epic 2LXPPV): OTel tier-1 - one Jaeger node per dispatch
-    // batch (degenbot.bundle.dispatch); parents under the block/solve
-    // spans when pump-driven. Inert without a subscriber.
-    let span = tracing::info_span!(
-        "degenbot.bundle.dispatch",
-        candidates = candidates.len(),
-        dry_run,
-        current_block,
-        dispatch.submitted = tracing::field::Empty,
-        dispatch.skipped = tracing::field::Empty,
-    );
-    let _guard = span.enter();
+    // RMHQAR (epic 2LXPPV) + ZHVXW2: one Jaeger node per dispatch batch
+    // (degenbot.bundle.dispatch).
+    // - NO span for an EMPTY batch: the observed failure shape was 20
+    //   consecutive single-span root traces, candidates=0, pure noise.
+    // - The span re-attaches the published block's span context as a REMOTE
+    //   parent (the f701ccd3 bridge family): the Python-driven submit task
+    //   has no ambient block span, so without this every batch exported as
+    //   its own disconnected trace family keyed only by the block tag.
+    //   The publisher is the Rust settle-side compute_diff_and_send
+    //   (telemetry::publish_block_context, keyed by results_block); the
+    //   nearest-previous fallback matches the one-ahead block semantics the
+    //   Python seam's simulate_dispatch_span already uses.
+    // - Field unified to block.number (the pump/solve span vocabulary).
+    let span = (!candidates.is_empty()).then(|| {
+        let span = tracing::info_span!(
+            "degenbot.bundle.dispatch",
+            candidates = candidates.len(),
+            dry_run,
+            block.number = current_block,
+            dispatch.submitted = tracing::field::Empty,
+            dispatch.skipped = tracing::field::Empty,
+        );
+        degenbot_bot::telemetry::attach_published_parent(&span, current_block);
+        span
+    });
+    let _guard = span.as_ref().map(tracing::Span::enter);
     // 1. Sort by net profit descending (the dispatch fan-out's output ordering
     //    — re-asserted so a caller handing un-sorted candidates submits
     //    best-first). Ports L2561's `gas_profitable.sort(key=net, reverse=...)`.
@@ -485,8 +499,12 @@ pub async fn dispatch_and_submit(
         }
     }
 
-    span.record("dispatch.submitted", outcome.submitted_count());
-    span.record("dispatch.skipped", outcome.skipped_count());
+    // ZHVXW2: with the empty-batch gate the span is optional - the outcome
+    // counts land only when a batch (span) actually exists.
+    if let Some(span) = span.as_ref() {
+        span.record("dispatch.submitted", outcome.submitted_count());
+        span.record("dispatch.skipped", outcome.skipped_count());
+    }
     Ok(outcome)
 }
 
@@ -1112,7 +1130,7 @@ mod tests {
     /// RMHQAR (epic 2LXPPV): the `dispatch_and_submit` span records the
     /// candidate count and outcome counts (`dry_run` marker path: 1 candidate
     /// -> 0 submitted, 1 skipped).
-    /// The unique `current_block` creation field filters this test's span from the
+    /// The unique `block.number` creation field filters this test's span from the
     /// shared global capture.
     #[tokio::test]
     async fn dispatch_span_records_candidate_and_outcome_counts() {
@@ -1145,7 +1163,7 @@ mod tests {
             if name != "degenbot.bundle.dispatch" {
                 continue;
             }
-            if fields.get("current_block").map(String::as_str)
+            if fields.get("block.number").map(String::as_str)
                 != Some(MY_BLOCK.to_string().as_str())
             {
                 continue;
@@ -1166,6 +1184,54 @@ mod tests {
         assert_eq!(
             mine, 1,
             "one dry-run dispatch span for block 999_999_999 captured"
+        );
+    }
+
+    /// ZHVXW2 (traces of block 25913390): the 20 most-recent Jaeger traces
+    /// were ALL single-span `degenbot.bundle.dispatch` roots with
+    /// candidates=0 and every counter 0 - empty batches export a span AND
+    /// the Python-driven task has no ambient block context, so it also
+    /// exported as its own disconnected trace family. Both fixed at the
+    /// span seam: an empty batch must export NO dispatch span (the call
+    /// itself is unchanged - outcome/loop bookkeeping is a no-op with zero
+    /// candidates, but the counters the loop tails write are unchanged).
+    #[tokio::test]
+    async fn empty_batch_exports_no_dispatch_span() {
+        const MY_BLOCK: u64 = 987_654_321;
+        let cap = crate::span_capture::global();
+        let asserter = Asserter::new();
+        let provider = mock_provider(&asserter);
+        let dispatcher = Arc::new(Mutex::new(Dispatcher::default()));
+        let s = signer();
+        let probe: Arc<dyn ReceiptProbe + Send + Sync> = Arc::new(NoopProbe);
+
+        let outcome = dispatch_and_submit(
+            Vec::new(),
+            &dispatcher,
+            &provider,
+            &s,
+            probe,
+            0,
+            MY_BLOCK,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.submitted_count(), 0, "empty batch submits nothing");
+
+        let spans_for_block = cap
+            .snapshot()
+            .into_iter()
+            .filter(|(name, fields)| {
+                name == "degenbot.bundle.dispatch"
+                    && fields.get("block.number").map(String::as_str)
+                        == Some(MY_BLOCK.to_string().as_str())
+            })
+            .count();
+        assert_eq!(
+            spans_for_block, 0,
+            "an empty-candidate batch must not export a dispatch span"
         );
     }
 }
