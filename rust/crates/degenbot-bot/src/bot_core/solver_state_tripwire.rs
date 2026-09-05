@@ -439,29 +439,73 @@ async fn divergence_scan_stage(
 /// per pool, keep max `stale_by`) and WARN individually only for genuine
 /// outliers (`stale_by >= SOLVER_STATE_ABNORMAL_STALE_BLOCKS`, well above
 /// the baseline); the quiet-but-benign bulk stays at `DEBUG`.
+/// REMED1 T1 (2026-09-05): the outlier REPORT memo. The overnight scan
+/// measured 29,032 solver-state WARNs in 6.5h (1.3/s, unbounded): the same
+/// Tracked/Live CL pools stale since the boot window are re-judged and
+/// re-WARNed EVERY cycle - `stale_by` grows every block but the pool set
+/// only ever grows, so the per-block individual WARNs repeat forever.
+///
+/// Policy (report-only memo - NO quarantine, see REMED1 T1 notes): WARN an
+/// individual outlier pool when first sighting since process start, OR when
+/// `stale_by` advanced by `OUTLIER_REWARN_STEP` since the last report (the
+/// pool got materially staler), OR when `OUTLIER_REWARN_MIN_BLOCKS` passed
+/// since the last report regardless. Otherwise the sighting folds into the
+/// (memo-hit) summary at DEBUG.
+static OUTLIER_REPORT_MEMO: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (u64, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Minimum `stale_by` growth before an already-reported pool re-WARNs.
+const OUTLIER_REWARN_STEP: u64 = 250;
+/// Minimum block gap between re-WARNs of one pool.
+const OUTLIER_REWARN_MIN_BLOCKS: u64 = 500;
+
+/// Pure decision for the outlier report memo (testable).
+fn should_report_outlier(last: Option<(u64, u64)>, block: u64, stale_by: u64) -> bool {
+    let Some((last_block, last_stale)) = last else {
+        return true; // first sighting
+    };
+    stale_by.saturating_sub(last_stale) >= OUTLIER_REWARN_STEP
+        || block.saturating_sub(last_block) >= OUTLIER_REWARN_MIN_BLOCKS
+}
+
 fn lagging_hop_report_stage(
     block: u64,
     path_hop_states: &[Vec<SolverHopScalarState>],
 ) -> Option<LaggingHop> {
     let lags_by_pool = aggregate_lagging_hops(block, path_hop_states);
     let worst = lags_by_pool.values().max_by_key(|l| l.stale_by).cloned();
-    if !lags_by_pool.is_empty() {
-        let n_pools = lags_by_pool.len();
-        let max_stale_by = lags_by_pool.values().map(|l| l.stale_by).max().unwrap_or(0);
-        tracing::warn!(
-            block,
-            n_pools,
-            max_stale_by,
-            "[solver-state] Tracked Live CL hop pools trail the solve anchor past the staleness \
-             threshold (summarized — genuine-outlier pools logged below, benign settle-lag \
-             baseline at debug)"
-        );
-        for lag in lags_by_pool.values() {
-            let update_block = lag.update_block;
-            let tick_data_block = lag.tick_data_block;
-            let stale_by = lag.stale_by;
-            let pool = &lag.pool;
-            if lag.stale_by >= SOLVER_STATE_ABNORMAL_STALE_BLOCKS {
+    if lags_by_pool.is_empty() {
+        return worst;
+    }
+    let n_pools = lags_by_pool.len();
+    let max_stale_by = lags_by_pool.values().map(|l| l.stale_by).max().unwrap_or(0);
+    let mut new_outliers = 0u32;
+    let mut memo_hits = 0u32;
+    for lag in lags_by_pool.values() {
+        let update_block = lag.update_block;
+        let tick_data_block = lag.tick_data_block;
+        let stale_by = lag.stale_by;
+        let pool = &lag.pool;
+        if lag.stale_by >= SOLVER_STATE_ABNORMAL_STALE_BLOCKS {
+            // REMED1 T1: per-pool horizon gates the individual WARN -
+            // already-reported outliers that merely aged with the anchor
+            // fold into the summary at DEBUG instead of re-spamming.
+            let should = {
+                // A poisoned memo is recoverable: the memo is advisory and
+                // worst case re-reports an outlier it already reported.
+                let mut memo = match OUTLIER_REPORT_MEMO.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let should = should_report_outlier(memo.get(pool).copied(), block, stale_by);
+                if should {
+                    memo.insert(pool.clone(), (block, stale_by));
+                }
+                should
+            };
+            if should {
+                new_outliers += 1;
                 tracing::warn!(
                     block,
                     hop_type = ?lag.hop_type,
@@ -475,21 +519,55 @@ fn lagging_hop_report_stage(
                      is a genuine staleness outlier (well past the natural settle lag) — the \
                      strict gate may escalate this to an abort"
                 );
-            } else {
-                tracing::debug!(
-                    block,
-                    hop_type = ?lag.hop_type,
-                    coverage = %lag.coverage,
-                    lifecycle = %lag.lifecycle,
-                    update_block,
-                    tick_data_block,
-                    stale_by,
-                    %pool,
-                    "[solver-state] Tracked Live CL hop pool trails the solve anchor \
-                     (benign settle-lag baseline, folded into the summary above)"
-                );
+                continue;
             }
+            memo_hits += 1;
+            tracing::debug!(
+                block,
+                hop_type = ?lag.hop_type,
+                stale_by,
+                %pool,
+                "[solver-state] DeliveryLag outlier suppressed (already reported; \
+                 horizon not reached - REMED1 memo)"
+            );
+        } else {
+            tracing::debug!(
+                block,
+                hop_type = ?lag.hop_type,
+                coverage = %lag.coverage,
+                lifecycle = %lag.lifecycle,
+                update_block,
+                tick_data_block,
+                stale_by,
+                %pool,
+                "[solver-state] Tracked Live CL hop pool trails the solve anchor \
+                 (benign settle-lag baseline, folded into the summary above)"
+            );
         }
+    }
+    // REMED1 T1: the summary escalates to WARN only when the block had a NEW
+    // (or stepped) outlier; a stable already-reported population is a DEBUG
+    // summary (the unconditional 1-per-block WARN was ~14.6k/night alone).
+    if new_outliers > 0 {
+        tracing::warn!(
+            block,
+            n_pools,
+            max_stale_by,
+            new_outliers,
+            memo_hits,
+            "[solver-state] Tracked Live CL hop pools trail the solve anchor past the staleness \
+             threshold (summarized - genuine-outlier pools logged below, benign settle-lag \
+             baseline at debug)"
+        );
+    } else {
+        tracing::debug!(
+            block,
+            n_pools,
+            max_stale_by,
+            memo_hits,
+            "[solver-state] Tracked Live CL hop pools trail the solve anchor \
+             (stable already-reported population - REMED1 memo, no new outliers)"
+        );
     }
     worst
 }
@@ -3021,6 +3099,18 @@ mod tests {
         assert_eq!(lag[0].hop_type, HopType::V4);
         assert!(lag[0].pool.starts_with("v4:"));
         assert!(lag[0].pool.contains("11")); // pool_id leading bytes surfaced
+    }
+
+    #[test]
+    fn outlier_report_memo_matrix() {
+        // First sighting always reports.
+        assert!(should_report_outlier(None, 100, 12));
+        // Aged past the min-block gap re-reports.
+        assert!(should_report_outlier(Some((100, 12)), 700, 13));
+        // Same-window aging below the step does NOT re-report.
+        assert!(!should_report_outlier(Some((100, 12)), 200, 20));
+        // Material stale growth re-reports.
+        assert!(should_report_outlier(Some((100, 12)), 120, 262));
     }
 
     #[test]
