@@ -61,6 +61,7 @@ pub(crate) mod dirty_sets;
 pub mod engine_handle;
 pub mod engine_subscriber;
 mod event_routing;
+pub mod inline_sim;
 mod lifecycle;
 pub mod path_info;
 mod path_lifecycle;
@@ -72,6 +73,10 @@ mod tests;
 
 pub use diagnostic::{
     compute_field_diffs, DiagnosticHop, DiagnosticPathState, DiagnosticPoolState, FieldDiff,
+};
+pub use inline_sim::{
+    AccessListRow, CapturedSwapRow, InlineSimFailure, InlineSimRequest, InlineSimulator,
+    InlineSwapFamily, SimulatedPathResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -492,6 +497,11 @@ pub struct ArbitrageEngine {
     detached_applied: std::sync::atomic::AtomicU64,
     detached_dropped_stale: std::sync::atomic::AtomicU64,
     detached_dropped_deregistered: std::sync::atomic::AtomicU64,
+    /// The inline-sim hook (SIMPIPE2 T1): `degenbot-python` installs the
+    /// implementation at engine construction via
+    /// [`ArbitrageEngine::set_inline_simulator`]; `None` = stance-relevant
+    /// callers fall back to the batch FFI sim (module `inline_sim` doc).
+    inline_sim: Option<std::sync::Arc<dyn inline_sim::InlineSimulator>>,
 }
 
 impl ArbitrageEngine {
@@ -580,6 +590,7 @@ impl ArbitrageEngine {
             detached_applied: std::sync::atomic::AtomicU64::new(0),
             detached_dropped_stale: std::sync::atomic::AtomicU64::new(0),
             detached_dropped_deregistered: std::sync::atomic::AtomicU64::new(0),
+            inline_sim: None,
         }
     }
 }

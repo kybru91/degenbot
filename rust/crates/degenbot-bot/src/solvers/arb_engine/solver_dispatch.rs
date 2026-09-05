@@ -539,7 +539,7 @@ pub(crate) static INLINE_SIM_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 fn solve_inline_stance_from_env(raw: Option<&str>) -> bool {
-    matches!(raw, Some("1") | Some("true"))
+    matches!(raw, Some("1" | "true"))
 }
 
 /// SIMPIPE2 T2: the WORKER-side clamp — drive the merge-site-identical
@@ -723,7 +723,7 @@ impl ArbitrageEngine {
     /// count (clamp.twins).
     ///
     /// SIMPIPE2 T2: `worker_clamp_twins > 0` means the solving worker
-    /// ALREADY ran the clamp (clamp_result_in_worker) - the merge skips its
+    /// ALREADY ran the clamp (`clamp_result_in_worker`) - the merge skips its
     /// own pass (a second clip would re-apply the 1-wei margin and corrupt
     /// the committed inputs) and just reports the twins for telemetry.
     fn merge_one_result(
@@ -895,7 +895,6 @@ impl ArbitrageEngine {
     /// CL hops (V3/V4) have the word-boundary empty-march class; V2 / Curve /
     /// Balancer / Solidly consume their full input at the boundary and need no
     /// clamp.
-    #[expect(clippy::too_many_lines)] // multi-hop CL twin loop + post-clamp profit recompute
     /// Returns the number of twin simulations executed (telemetry:
     /// `clamp.twins` on the solve-cycle completion event).
     pub(crate) fn clamp_cl_hop_capacity(&self, path_id: u64, result: &mut SolvePathResult) -> u64 {
@@ -911,6 +910,7 @@ impl ArbitrageEngine {
     /// identical logic from its `to_solve`-aligned snapshot. The worker takes
     /// the SAME short core read the merge-site clamp took (MQUKB6-T3 intact:
     /// engine-then-core, short read, no guard across awaits).
+    #[expect(clippy::too_many_lines)] // multi-hop CL twin loop + post-clamp profit recompute
     fn clamp_result_with_state(
         core: &BotState,
         path_id: u64,
