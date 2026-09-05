@@ -40,7 +40,6 @@ from degenbot.runner._dispatch import (
     dispatch_profitable,
 )
 from degenbot.runner._driver_constants import (
-    INJECT_EXECUTOR_CODE,
     MIN_PROFIT_MARGIN_BPS,
     MIN_PROFIT_NET,
 )
@@ -114,7 +113,6 @@ async def _submit_ordered(
         session,
         outcome,
         operator_nonce=operator_nonce,
-        inject_code=INJECT_EXECUTOR_CODE,
     )
     # Test seams (and any future sync fallback) may return a plain value
     # instead of a coroutine - tolerate BOTH, never treat None as awaitable.
