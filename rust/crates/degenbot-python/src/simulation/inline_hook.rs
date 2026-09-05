@@ -115,10 +115,15 @@ impl InlineSimHook {
             warm_cache,
             sim_runtime: Arc::new(
                 tokio::runtime::Builder::new_multi_thread()
-                    // The sim bodies block on the DB wrap's block_on from the
-                    // worker thread; 2 workers interleave that with the task
-                    // scheduling. The sims are serial per path anyway.
-                    .worker_threads(2)
+                    // M2 soak sizing (2026-09-05): with the hard-coded 2
+                    // workers the per-cycle wall was 72ms + 4.74ms/path
+                    // (R^2 0.89, 228 steady cycles) - the payload sims queued
+                    // on the 2-thread runtime while ~50 bins/cycle arrived
+                    // concurrently (sims p50 12ms). Sizing to the core count
+                    // lets the bins' sims actually overlap. Env-tunable for
+                    // constrained hosts; the sim bodies still block on the
+                    // DB wrap's block_on, so workers also cover that wait.
+                    .worker_threads(inline_sim_worker_count())
                     .enable_all()
                     .build()
                     .expect("inline-sim runtime build"),
@@ -218,6 +223,25 @@ where
             tokio::task::block_in_place(|| handle.block_on(fut))
         }
         _ => sim_runtime.block_on(fut),
+    }
+}
+
+/// The inline-sim runtime's worker count (M2 soak sizing): core-count by
+/// default (the payload sims are the per-path marginal cost of every solve
+/// cycle - see the M1/M2 soak records), overridable with
+/// `DEGENBOT_INLINE_SIM_WORKERS`. Clamped to 1..=32; unparsable/garbage
+/// values fall back to the default rather than failing the engine build.
+fn inline_sim_worker_count() -> usize {
+    let default = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    match std::env::var("DEGENBOT_INLINE_SIM_WORKERS") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<usize>()
+            .map(|n| n.clamp(1, 32))
+            .unwrap_or(default),
+        Err(_) => default,
     }
 }
 
@@ -416,5 +440,32 @@ impl InlineSimulator for InlineSimHook {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The env var is process-global, so the cases share ONE serial test to
+    // avoid the parallel-test env race (each case asserts a distinct tail).
+    #[test]
+    fn worker_count_env_matrix() {
+        let default = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "not-a-number");
+        assert_eq!(super::inline_sim_worker_count(), default);
+
+        std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "9999");
+        assert_eq!(super::inline_sim_worker_count(), 32);
+
+        std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "0");
+        assert_eq!(super::inline_sim_worker_count(), 1);
+
+        std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "6");
+        assert_eq!(super::inline_sim_worker_count(), 6);
+
+        std::env::remove_var("DEGENBOT_INLINE_SIM_WORKERS");
+        assert_eq!(super::inline_sim_worker_count(), default);
     }
 }
