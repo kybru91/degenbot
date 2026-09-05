@@ -90,6 +90,13 @@ export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
 # stale state, invalidate later" path. Opt-out for benchmarking runs only.
 export DEGENBOT_ASSERT_SOLVER_STATE="${DEGENBOT_ASSERT_SOLVER_STATE:-1}"
 
+# SIMPIPE2 M2 soak-tuned solve/sim concurrency (measured 2026-09-05, see
+# logs/simpipe2_m2_close.md): the 8-core cgroup budget runs best with the
+# full core count on solve bins and 16 inline-sim workers (slope 1.72ms/path
+# vs 2.34 at defaults). Env-respecting: an operator export still wins.
+export DEGENBOT_SOLVE_CPUS="${DEGENBOT_SOLVE_CPUS:-8}"
+export DEGENBOT_INLINE_SIM_WORKERS="${DEGENBOT_INLINE_SIM_WORKERS:-16}"
+
 # The actual bot invocation (uv rebuilds the Rust extension if any rust
 # source / Cargo.toml is newer than the installed build).
 BOT_CMD=(uv run python examples/eth_settlement_arbitrage_v2_v3_v4_rust.py)

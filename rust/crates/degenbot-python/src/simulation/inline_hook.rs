@@ -325,6 +325,20 @@ impl InlineSimulator for InlineSimHook {
                 Err(poisoned) => poisoned.into_inner(),
             };
             if guard.0 != req.sim_block {
+                // M2 visibility: the retiring block's memo tally - the hit
+                // share is the RPC-trip compression the memo buys. The
+                // degenbot::diag target stays off the Python log cap (console
+                // + OTel only).
+                let (hits, misses) = guard.1.stats();
+                if hits + misses > 0 {
+                    tracing::info!(
+                        target: "degenbot::diag",
+                        block_number = guard.0,
+                        memo.hits = hits,
+                        memo.misses = misses,
+                        "[inline-sim] storage memo stats (block retired)"
+                    );
+                }
                 *guard = (
                     req.sim_block,
                     Arc::new(degenbot_simulation::StorageMemo::new()),
