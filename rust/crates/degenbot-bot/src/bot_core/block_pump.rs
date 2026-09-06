@@ -6410,7 +6410,9 @@ mod tests {
         let block = span_rec("degenbot.pump.block", BASE);
         let wait = span_rec("degenbot.pump.log_wait", BASE);
         let dur = |sp: &opentelemetry_sdk::trace::SpanData| {
-            sp.end_time.duration_since(sp.start_time).unwrap_or_default()
+            sp.end_time
+                .duration_since(sp.start_time)
+                .unwrap_or_default()
         };
         assert_eq!(
             wait.parent_span_id,

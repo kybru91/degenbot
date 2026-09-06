@@ -296,49 +296,15 @@ impl Engine for EngineHandle {
 
     #[hotpath::measure(label = "EngineHandle::finalize_block")]
     fn finalize_block(&self, block: u64, metadata: &BlockMetadata) {
-        // Trace 91a4a776 (block 25907035, session f701ccd3): the tombstone-
-        // driven Finalize crossed a still-running burst and its inner
-        // `solve_dirty` ran a REAL solve cycle without the span gate (the
-        // gate lived only in this handle's Drain arm) — the phase spans
-        // orphaned under the captured block span and the cycle dropped its
-        // solve_duration sample. Mirror solve_dirty's gate here: probe the
-        // same conditions the inner finalize checks, and when the finalize
-        // will solve, run it under `degenbot.arb.solve` with full metric
-        // parity (K4ETHF invariant: every fanout's parent is an arb.solve
-        // span; no solve without its histogram sample + counter).
-        let mut engine = self.engine.lock();
-        let will_solve = engine.has_dirty_paths() || engine.has_logs_this_block();
-        // REMED1 T2: attribute this entry's cycle on the telemetry line.
-        if will_solve {
-            engine.set_solve_entry("finalize");
-        }
-        let span = will_solve.then(|| {
-            let span = tracing::info_span!(
-                "degenbot.arb.solve",
-                block.number = block,
-                cycle.solve_block = tracing::field::Empty,
-            );
-            // ZZS6CG: exact-match reparent onto this block's published pump
-            // span (see the drain arm). No-op without a publish entry.
-            crate::telemetry::attach_published_parent_exact(&span, block);
-            span
-        });
-        let _guard = span.as_ref().map(tracing::Span::enter);
-        let solve_start = std::time::Instant::now();
-        engine.finalize_block(block, metadata);
-        // KNEUQX: surface the cycle's anchored block on the span - at a settle
-        // boundary the anchor is the pool-state HEAD (the block the work ran
-        // for), which can be one ahead of this finalize's entry block.
-        if let Some(span) = span.as_ref() {
-            span.record("cycle.solve_block", engine.results_block());
-        }
-        drop(engine);
-        if will_solve {
-            if let Some(p) = crate::instruments::pipeline() {
-                p.observe_solve_duration(solve_start.elapsed().as_secs_f64());
-                p.count_solves_executed();
-            }
-        }
+        // PWPPAZ T1: the tombstone finalize is bookkeeping-only — boundary
+        // advance + terminal publish, no solve cycle, no span, no metric.
+        //
+        // (Supersedes the trace 91a4a776 span gate: that gate existed to give
+        // the finalize's inner `solve_dirty` a correct arb.solve parent +
+        // metric parity. With the solve retired, no span is possible and the
+        // K4ETHF invariant holds trivially — every remaining solve cycle is
+        // the drain arm's, which owns its span + histogram + counter.)
+        self.engine.lock().finalize_block(block, metadata);
     }
 
     fn set_last_solved_block(&self, block: u64) {

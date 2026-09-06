@@ -1163,8 +1163,7 @@ mod tests {
             if name != "degenbot.bundle.dispatch" {
                 continue;
             }
-            if fields.get("block.number").map(String::as_str)
-                != Some(MY_BLOCK.to_string().as_str())
+            if fields.get("block.number").map(String::as_str) != Some(MY_BLOCK.to_string().as_str())
             {
                 continue;
             }

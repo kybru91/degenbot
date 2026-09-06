@@ -5444,21 +5444,22 @@ mod tests {
         );
     }
 
-    /// Trace 91a4a776 (block 25907035, session f701ccd3): the tombstone-driven
-    /// `DrainWork::Finalize` raced a still-running burst; its inner
-    /// `solve_dirty` ran a REAL solve cycle (fanout 701 paths -> resolve ->
-    /// stage -> lpt -> merge) WITHOUT a `degenbot.arb.solve` span — the span
-    /// gate lives only in `EngineHandle::solve_dirty`'s Drain arm, and
-    /// `finalize_block` calls the inner method directly. The phase spans
-    /// orphaned under the captured block span (first set parented to
-    /// `pump.block`, second set under `arb.solve` in the same trace), and the
-    /// cycle dropped its `solve_duration` sample + `solves_executed` count.
-    /// K4ETHF-family invariant: every fanout span's parent is an `arb.solve`
-    /// span regardless of which entry drives the solve. RED before the
-    /// finalize-side gate existed.
+    /// PWPPAZ T1 (flips the trace-91a4a776 pin): the tombstone finalize must
+    /// NOT run a solve cycle. Trace 91a4a776's inner `solve_dirty` — and the
+    /// span gate later added around it — retired with this task: the finalize
+    /// is dispatched tombstone-driven and executed by the drainer while the
+    /// SUCCESSOR block's burst is still being applied, so its solve consumed
+    /// the successor's first-dirt under the dead block's identity (traces
+    /// ab13f75f: finalize(83) solved 1,755 paths of 84's dirt; 98f7cf52 and
+    /// the fresh census: 2/20 blocks with the degenerate pattern). The
+    /// boundary is now bookkeeping-only: the guard branch advances
+    /// `last_solved_block` / `has_logs_this_block` / `last_processed_block` /
+    /// `results_block` and emits the terminal publish; dirt stays unconsumed
+    /// for the pump's drained-settle gate. RED while `finalize_block` still
+    /// called `solve_dirty`.
     #[test]
     #[expect(clippy::expect_used)]
-    fn finalize_block_solve_runs_under_arb_solve_span() {
+    fn finalize_block_consumes_no_dirt_and_emits_no_solve() {
         use crate::bot_core::engine::Engine;
         use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use std::collections::HashSet;
@@ -5499,7 +5500,10 @@ mod tests {
             ])
             .expect("path registers");
         engine.dirty_sets.insert(a, HopType::V2);
-        let handle = EngineHandle::new(Arc::new(parking_lot::Mutex::new(engine)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_result_channel(tx);
+        let engine_state = Arc::new(parking_lot::Mutex::new(engine));
+        let handle = EngineHandle::new(Arc::clone(&engine_state));
 
         tracing::subscriber::with_default(subscriber, || {
             handle.finalize_block(5, &BlockMetadata::default());
@@ -5509,31 +5513,78 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // PWPPAZ T1: the finalize emits NO solve at all — no arb.solve span,
+        // no phase spans. Any solve here would race the successor block's
+        // burst (the steal observed in traces ab13f75f / 98f7cf52).
         let solve_ids: HashSet<u64> = spans
             .iter()
             .filter(|(name, _, _)| name == "degenbot.arb.solve")
             .map(|(_, id, _)| *id)
             .collect();
         assert!(
-            !solve_ids.is_empty(),
-            "finalize with dirt must emit exactly the arb.solve span; got {:?}",
-            spans.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+            solve_ids.is_empty(),
+            "finalize must not run a solve cycle; got arb.solve spans {solve_ids:?}"
         );
-        let fanouts: Vec<_> = spans
+        let phase_spans: Vec<&String> = spans
             .iter()
-            .filter(|(name, _, _)| name == "degenbot.arb.fanout")
+            .map(|(name, _, _)| name)
+            .filter(|name| name.contains("arb."))
             .collect();
         assert!(
-            !fanouts.is_empty(),
-            "fixture must produce a fanout span (dirty pool drives a real cycle)"
+            phase_spans.is_empty(),
+            "finalize must emit no solve-phase spans; got {phase_spans:?}"
         );
-        let orphaned = fanouts
-            .iter()
-            .filter(|(_, _, parent)| parent.is_none_or(|p| !solve_ids.contains(&p)))
-            .count();
+        // The dirt the finalize crossed stays unconsumed for the pump's
+        // drained-settle gate.
         assert!(
-            orphaned == 0,
-            "finalize-driven fanout spans orphaned outside an arb.solve parent: {orphaned}"
+            handle.has_dirty_paths(),
+            "finalize must leave the dirty sets intact"
+        );
+        // Boundary bookkeeping advanced under the same guard.
+        {
+            let engine = engine_state.lock();
+            assert_eq!(
+                engine.last_solved_block(),
+                5,
+                "finalize must advance the solved boundary"
+            );
+            assert!(!engine.has_logs_this_block());
+            // Results anchor advanced for the terminal batch.
+            assert_eq!(engine.results_block(), 5);
+        }
+        // Terminal publish: the boundary batch still flows to Python with the
+        // finalized block as its solve_block.
+        let batch = rx
+            .try_recv()
+            .expect("finalize must emit the terminal boundary batch");
+        assert_eq!(batch.solve_block, 5);
+    }
+
+    /// PWPPAZ T1: both guard branches — a block whose logs dirtied nothing
+    /// (or never arrived) still gets its one-shot boundary advance + terminal
+    /// publish (`solve_block` = the finalized block), and a re-fire of the
+    /// guard for the same boundary must not double-publish.
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn finalize_boundary_publishes_even_when_nothing_dirtied() {
+        let mut engine = ArbitrageEngine::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_result_channel(tx);
+        engine.set_last_solved_block(0);
+        // Empty-logs branch: no dirt, no recorded logs — the pure
+        // header-advance boundary.
+        engine.finalize_block(7, &BlockMetadata::default());
+        assert_eq!(engine.last_solved_block(), 7);
+        assert!(!engine.has_logs_this_block());
+        let batch = rx
+            .try_recv()
+            .expect("boundary batch must be emitted without dirt");
+        assert_eq!(batch.solve_block, 7);
+        // Guard no-ops the re-fired boundary.
+        engine.finalize_block(7, &BlockMetadata::default());
+        assert!(
+            rx.try_recv().is_err(),
+            "guard must not double-publish a settled boundary"
         );
     }
 
@@ -5626,11 +5677,13 @@ mod tests {
                 .expect("solve span exported")
         };
         assert_eq!(
-            parent_of(solve_100), published_100,
+            parent_of(solve_100),
+            published_100,
             "solve(published block) must re-attach to its own block's published span"
         );
         assert_eq!(
-            parent_of(solve_101), ambient_101,
+            parent_of(solve_101),
+            ambient_101,
             "solve(unpublished block) must keep the ambient parent - no fallback mis-dating"
         );
     }

@@ -631,7 +631,10 @@ fn inline_sim_payload(
             "profitable"
         },
     );
-    span.record("simulate.expected_profit", tracing::field::display(result.profit));
+    span.record(
+        "simulate.expected_profit",
+        tracing::field::display(result.profit),
+    );
     Some(payload)
 }
 
@@ -847,7 +850,11 @@ impl ArbitrageEngine {
         // belongs to simulation work only (worker seam + the FFI seam in
         // degenbot-arbitrage/simulator.rs).
         if let Some(p) = &payload {
-            let verdict = if p.failure.is_some() { "not_profitable" } else { "profitable" };
+            let verdict = if p.failure.is_some() {
+                "not_profitable"
+            } else {
+                "profitable"
+            };
             tracing::info!(
                 target: "degenbot::solver",
                 { path.id = pid, verdict, expected_profit = %result.profit, sim.seam = "inline_payload_store" },
@@ -3155,26 +3162,31 @@ mod profit_clamp_recompute_tests {
                 &self,
                 request: crate::solvers::arb_engine::inline_sim::InlineSimRequest,
             ) -> Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult> {
-                assert_eq!(request.path_id, self.path_id, "stub receives the merged path id");
-                Some(crate::solvers::arb_engine::inline_sim::SimulatedPathResult {
-                    path_id: request.path_id,
-                    gross_profit: U256::from(1_000u64),
-                    net_profit: U256::from(900u64),
-                    gas_used: 300_000,
-                    priority_fee: 2,
-                    base_fee_next: 30,
-                    execute_calldata: vec![7, 8, 9],
-                    access_list: None,
-                    captured_swaps: Vec::new(),
-                    hop_count: 1,
-                    failure: self.fail.then(|| {
-                        crate::solvers::arb_engine::inline_sim::InlineSimFailure {
-                            fail_index: None,
-                            revert_data: Vec::new(),
-                            bucket: "test".to_string(),
-                        }
-                    }),
-                })
+                assert_eq!(
+                    request.path_id, self.path_id,
+                    "stub receives the merged path id"
+                );
+                Some(
+                    crate::solvers::arb_engine::inline_sim::SimulatedPathResult {
+                        path_id: request.path_id,
+                        gross_profit: U256::from(1_000u64),
+                        net_profit: U256::from(900u64),
+                        gas_used: 300_000,
+                        priority_fee: 2,
+                        base_fee_next: 30,
+                        execute_calldata: vec![7, 8, 9],
+                        access_list: None,
+                        captured_swaps: Vec::new(),
+                        hop_count: 1,
+                        failure: self.fail.then(|| {
+                            crate::solvers::arb_engine::inline_sim::InlineSimFailure {
+                                fail_index: None,
+                                revert_data: Vec::new(),
+                                bucket: "test".to_string(),
+                            }
+                        }),
+                    },
+                )
             }
         }
 
@@ -3187,7 +3199,10 @@ mod profit_clamp_recompute_tests {
         // Fresh Arc (refcount 1): install the stub via get_mut.
         Arc::get_mut(&mut ctx)
             .expect("probe ctx exclusively owned")
-            .inline_sim = Some(Arc::new(StubSim { fail: false, path_id }));
+            .inline_sim = Some(Arc::new(StubSim {
+            fail: false,
+            path_id,
+        }));
 
         let result = SolvePathResult {
             optimal_input: U256::from(1_000_000_000u64),

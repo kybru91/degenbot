@@ -182,11 +182,10 @@ impl ArbitrageEngine {
             .collect()
     }
 
-    /// Finalize the current block: if dirty paths accumulated since the last
-    /// solve would be left behind by a block advance, solve them and send a
-    /// result batch carrying `metadata`. Otherwise, if logs were observed but
-    /// touched no registered pools, send an empty block-boundary batch so
-    /// Python sees the advance.
+    /// Finalize the current block: advance the solved boundary and emit the
+    /// terminal block-boundary batch carrying `metadata` so Python observes
+    /// the advance with genuine fees/gas/timestamp. Bookkeeping-only — this
+    /// method NEVER runs a solve cycle.
     ///
     /// This is the engine-side logic behind `ArbitrageEnginePump::finalize_if_dirty`.
     /// Holding it on the engine (rather than the pump) keeps it next to its
@@ -197,9 +196,9 @@ impl ArbitrageEngine {
     /// path sent `BlockMetadata::default()`, which would make the Python
     /// consumer compute `base_fee_next = 0` and broadcast underpriced txs.
     ///
-    /// The `block > last_solved_block` guard is load-bearing: the pump runs
-    /// `solve_dirty` at the top of every loop iteration before awaiting the
-    /// next event, so this normally only sends on a genuine block advance.
+    /// The `block > last_solved_block` guard is load-bearing: it makes the
+    /// boundary advance one-shot even when the tombstone re-fires for an
+    /// already-finalized block.
     ///
     /// `last_solved_block` + `has_logs_this_block` are owned by the engine
     /// since ergo task LEZJAS (the pump's `&mut` out-params retired); a
@@ -207,21 +206,24 @@ impl ArbitrageEngine {
     /// block via `set_last_solved_block` (ADR-006 D4).
     pub fn finalize_block(&mut self, block: u64, metadata: &BlockMetadata) {
         if block > self.last_solved_block {
-            if self.has_dirty_paths() {
-                self.solve_dirty(block, metadata);
-                self.send_result_batch(metadata);
-            } else if self.has_logs_this_block {
-                // X35QKN: previously this called `process_block_and_send(&[], ...)`
-                // — the parallel log-routing API. `process_block(&[])` over an
-                // empty slice is a no-op loop + `solve_dirty` (an empty-dirty-
-                // sets no-op apart from the `last_processed_block` stamp), so the
-                // empty-block boundary just sends an empty diff batch so Python
-                // sees the advance. Inlined here to retire the parallel path.
-                self.solve_dirty(block, metadata);
-                self.compute_diff_and_send(metadata);
-            }
+            // PWPPAZ T1 (supersedes the two former solve branches and the
+            // X35QKN empty-block inlining): the finalize is tombstone-
+            // dispatched and executed by the drainer while the SUCCESSOR
+            // block's log burst is still being applied, so the old inner
+            // `solve_dirty` consumed the successor's first-dirt under the
+            // dead block's identity (trace ab13f75f: finalize(83) solved
+            // 1,755 paths of block 84's dirt; 98f7cf52 repeats the pattern
+            // blocks apart). Unconsumed dirt now waits for the pump's
+            // drained-settle gate (plus its T2 early slice) — solve cycles
+            // are the settle gate's exclusive job. The boundary is:
+            //   last_solved_block / has_logs_this_block / last_processed_
+            //   block / results_block advance + the terminal publish.
             self.last_solved_block = block;
             self.has_logs_this_block = false;
+            self.last_processed_block = Some(block);
+            // Anchor is monotonic: never regress a real solve's anchor.
+            self.results_block = self.results_block.max(block);
+            self.compute_diff_and_send(metadata);
         }
         // Authoritative per-family apply split (2SDIQW): hotpath labels do
         // not aggregate reliably in impl_type mode, so the atomics summarize

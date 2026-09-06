@@ -338,7 +338,11 @@ impl DispatchOwner {
                 let _parent_guard = parent.enter();
                 // Solve-carrying items anchor the header→solved measurement;
                 // computed before the match (Publish partially moves `work`).
-                let carries_solve = !matches!(work, DrainWork::Publish { .. });
+                // PWPPAZ T1: Finalize no longer carries a solve cycle — it is
+                // boundary bookkeeping + a terminal publish, so it must not
+                // sample header_to_solved (previously it recorded boundary-
+                // only latencies whenever a block's settle gate skipped).
+                let carries_solve = matches!(work, DrainWork::Drain { .. });
                 match work {
                     DrainWork::Drain { block, metadata } => {
                         sink_clone.on_drain(block, &metadata);
