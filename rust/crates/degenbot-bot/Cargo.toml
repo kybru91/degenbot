@@ -110,6 +110,9 @@ libc = "^0.2"
 [dev-dependencies]
 
 
+# `start_paused` runtime for the PWPPAZ T2 early-slice gap-stream tests
+# (virtual-time determinism). Version pinned to the normal dep's spec above.
+tokio = { version = "^1.53", features = ["test-util"] }
 proptest = "^1.11"
 # Test-only constructors (e.g. AlloyProvider::from_provider) used by the
 # bot_core block-pump tests.

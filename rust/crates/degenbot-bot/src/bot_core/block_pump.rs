@@ -79,6 +79,13 @@ const BACKFILL_TIMEOUT_SECS: u64 = 60;
 /// extra same-block publishes; parse contract in `debounce_ms_cfg`).
 const DEBOUNCE_MS: u64 = 50;
 
+/// Default early-slice window for the drained-settle gate (PWPPAZ T2): when
+/// unsolved dirt has been sitting this long, ONE bounded early Drain fires
+/// mid-burst — the designed replacement for the retired finalize steal
+/// (J2X3LZ). `0` disables the slice (exact pre-T2 settle-only behavior).
+/// Operator-tunable via `DEGENBOT_EARLY_SLICE_MS`.
+const EARLY_SLICE_MS: u64 = 25;
+
 /// If no block header arrives within this window, poll `eth_blockNumber`
 /// and backfill the gap — independent of log activity.
 ///
@@ -243,6 +250,15 @@ pub struct BlockPump {
     /// (f701ccd3 lead-2: the window fired full-length on ~every block while
     /// log bursts spaned 1.3-27.5 ms, making it a fixed per-block settle-tax).
     debounce_ms: u64,
+    /// Early-slice window (ms) for the drained-settle gate (PWPPAZ T2): when
+    /// nonzero and unsolved dirt has been observed this long in the current
+    /// block window, the gate dispatches ONE bounded early Drain mid-burst
+    /// instead of waiting for burst quiesce — the designed replacement for
+    /// the retired finalize steal (J2X3LZ). `0` disables the slice (exact
+    /// pre-T2 gate behavior). One slice per block window (reset at each
+    /// accepted header and at each settle dispatch) keeps MBNASQ's unbounded
+    /// per-gap serial solves from returning.
+    early_slice_ms: u64,
 }
 
 /// State held between `subscribe()` and `resume()` calls.
@@ -292,6 +308,17 @@ impl BlockPump {
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEBOUNCE_MS)
+    }
+
+    /// Early-slice window parse (PWPPAZ T2, pure): unset/empty/unparseable/
+    /// negative/overflow fall back to [`EARLY_SLICE_MS`]; `0` is VALID —
+    /// it disables the slice (pre-T2 settle-only parity).
+    #[must_use]
+    fn early_slice_ms_cfg(raw: Option<&str>) -> u64 {
+        raw.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(EARLY_SLICE_MS)
     }
 
     #[expect(clippy::missing_errors_doc)]
@@ -369,6 +396,9 @@ impl BlockPump {
             ),
             debounce_ms: Self::debounce_ms_cfg(
                 std::env::var("DEGENBOT_PUMP_DEBOUNCE_MS").ok().as_deref(),
+            ),
+            early_slice_ms: Self::early_slice_ms_cfg(
+                std::env::var("DEGENBOT_EARLY_SLICE_MS").ok().as_deref(),
             ),
         };
 
@@ -1258,6 +1288,15 @@ impl BlockPump {
             last_log: None,
             logs: 0,
         };
+
+        // PWPPAZ T2 early-slice state: `Some` from the first gate iteration
+        // that observed unsolved dirt in the current block window; the slice
+        // fires once when the age crosses `early_slice_ms`. `slice_done`
+        // makes it one-per-window. Reset at each accepted header (new window)
+        // and at each settle dispatch. `tokio::time::Instant` (not std) so
+        // paused-runtime tests advance the age with virtual time.
+        let mut slice_first_dirty: Option<tokio::time::Instant> = None;
+        let mut slice_done = false;
         // Pre-solve gap waterfall spans (Jaeger): `log_wait` fills the
         // header→first-relevant-log stretch (WS delivery), `apply_stream`
         // fills first-log→settle (burst + applies + quiesce hold). Both are
@@ -1587,6 +1626,9 @@ impl BlockPump {
                         last_log: None,
                         logs: 0,
                     };
+                    // PWPPAZ T2: new block window — re-arm the early slice.
+                    slice_first_dirty = None;
+                    slice_done = false;
                     // Waterfall bookkeeping: close any leftover child spans
                     // (an all-quiet prior block never reached a settle) and
                     // open the delivery-wait child. its duration IS the
@@ -2051,7 +2093,45 @@ impl BlockPump {
             // the solve fires — coalescing all logs in the burst into one
             // solve. 50ms is well within the 12s block interval (same
             // `DEBOUNCE_MS` as the publish gate).
-            let has_buffered = if self.sink.has_dirty_paths() {
+            let dirty_now = self.sink.has_dirty_paths();
+            // PWPPAZ T2 — designed first-slice trigger: remember when the
+            // window's unsolved dirt was first observed. While the burst
+            // outlives `early_slice_ms`, ONE bounded early Drain fires
+            // mid-burst (the timed peek below is shortened to the slice
+            // deadline, so the dispatch happens at first-dirty + ~25ms
+            // without waiting for quiesce — the latency the retired finalize
+            // steal was accidentally providing). The slice consumes the dirty
+            // sets (`take_all` semantics) and re-derives its anchor per
+            // cycle, so a following tail solve only re-solves NEWLY dirtied
+            // pools; one slice per block window keeps MBNASQ's unbounded
+            // serial solves from returning. `0` = disabled → the wait below
+            // is always the bare debounce window (exact pre-T2 behavior).
+            if dirty_now && slice_first_dirty.is_none() && !slice_done {
+                slice_first_dirty = Some(tokio::time::Instant::now());
+            }
+            let slice_pending =
+                self.early_slice_ms > 0 && slice_first_dirty.is_some() && !slice_done;
+            // The timed peek waits only as long as the EARLIEST of the settle
+            // debounce and the slice deadline — the gate self-wakes at the
+            // deadline instead of waiting for the next event.
+            let peek_wait = match (slice_pending, slice_first_dirty) {
+                (true, Some(first)) => {
+                    let age = first.elapsed();
+                    let target = Duration::from_millis(self.early_slice_ms);
+                    if age >= target {
+                        // Deadline passed: the slice dispatch decision is
+                        // purely a function of the age below; the timed peek
+                        // resolves immediately (zero wait).
+                        Duration::ZERO.min(Duration::from_millis(self.debounce_ms))
+                    } else {
+                        target
+                            .saturating_sub(age)
+                            .min(Duration::from_millis(self.debounce_ms))
+                    }
+                }
+                _ => Duration::from_millis(self.debounce_ms),
+            };
+            let has_buffered = if dirty_now {
                 // Only await when there's work to solve — otherwise skip
                 // straight to the select (no dirty paths = nothing to do).
                 // `peek()` resolves immediately when an event is buffered or
@@ -2061,40 +2141,34 @@ impl BlockPump {
                 // fires only in that latter case — coalescing burst gaps without
                 // adding latency to streams with ready events.
                 use std::pin::Pin;
-                match tokio::time::timeout(
-                    Duration::from_millis(self.debounce_ms),
-                    Pin::new(&mut combined).peek(),
-                )
-                .await
-                {
+                match tokio::time::timeout(peek_wait, Pin::new(&mut combined).peek()).await {
                     // event buffered — skip solve
                     Ok(Some(_)) => true,
-                    // stream ended OR debounce timer elapsed — dispatch solve
+                    // stream ended OR the wait elapsed — dispatch solve
                     _ => false,
                 }
             } else {
                 false
             };
-            if !has_buffered && self.sink.has_dirty_paths() {
+            if !has_buffered && dirty_now {
                 // Strictly-synchronous solve dispatch: enter the cursor
                 // block span just long enough for dispatch() to capture it
                 // as the drainer parent (no await inside — TQ7PD6).
-                let _solve_ctx = block_span.as_ref().map(tracing::Span::enter);
-                // Pump-owned ACTIVE BLOCK promotion (QMSTSV/BO5FBS): the
-                // solve anchor is the LOG-DRIVEN settled block
-                // (`fsm.clock.latest_observed()`, never a racing header),
-                // floored by the pool-state head so it is never below the
-                // state it solves against (MQIZ5M +1-wei / IIA class; the
-                // backfill-ahead semantics). `drain_decision` owns the
-                // exact rule.
-                let state_head = self.bot.state_arc().read().pool_state_head();
-                let PumpDecision::Drain { block, metadata } = fsm.drain_decision(state_head) else {
-                    unreachable!("drain_decision always drains when called");
-                };
-                dispatch.dispatch(DrainWork::Drain { block, metadata });
-                // LEZJAS: engine owns `last_solved_block` now — mark this
-                // block solved so the next `finalize_block` guard no-ops.
-                self.sink.set_last_solved_block(block);
+                let slice_due = slice_pending
+                    && slice_first_dirty.is_some_and(|first| {
+                        first.elapsed() >= Duration::from_millis(self.early_slice_ms)
+                    });
+                self.boundary_drain_dispatch(&fsm, &dispatch, block_span.as_ref());
+                if slice_due {
+                    // The bounded slice took its one shot this window.
+                    slice_done = true;
+                    slice_first_dirty = None;
+                } else {
+                    // Settled-quiet solve: the window's tail is done, and the
+                    // slice budget resets with the next header.
+                    slice_done = false;
+                    slice_first_dirty = None;
+                }
             }
         }
         // S53STH: the loop has unwound — every span guard (pump iteration,
@@ -2111,6 +2185,33 @@ impl BlockPump {
             }
             crate::metrics::shutdown_global_metrics();
         }
+    }
+
+    /// Shared strictly-synchronous solve dispatch for the drained-settle
+    /// gate's quiesce solve and the PWPPAZ T2 early slice (TQ7PD6: no await
+    /// inside — the caller enters the cursor block span long enough for
+    /// `dispatch()` to capture it as the drainer parent).
+    ///
+    /// Pump-owned ACTIVE BLOCK promotion (QMSTSV/BO5FBS): the solve anchor is
+    /// the LOG-DRIVEN settled block (`fsm.clock.latest_observed()`, never a
+    /// racing header), floored by the pool-state head so it is never below
+    /// the state it solves against (MQIZ5M +1-wei / IIA class; the
+    /// backfill-ahead semantics). `drain_decision` owns the exact rule.
+    fn boundary_drain_dispatch(
+        &self,
+        fsm: &PumpFSM,
+        dispatch: &crate::bot_core::event_dispatch::DispatchOwner,
+        block_span: Option<&tracing::Span>,
+    ) {
+        let _solve_ctx = block_span.map(tracing::Span::enter);
+        let state_head = self.bot.state_arc().read().pool_state_head();
+        let PumpDecision::Drain { block, metadata } = fsm.drain_decision(state_head) else {
+            unreachable!("drain_decision always drains when called");
+        };
+        dispatch.dispatch(DrainWork::Drain { block, metadata });
+        // LEZJAS: engine owns `last_solved_block` now — mark this
+        // block solved so the next `finalize_block` guard no-ops.
+        self.sink.set_last_solved_block(block);
     }
 
     /// Handle a 60s timeout by backfilling any missed blocks (eager variant).
@@ -2498,6 +2599,10 @@ impl BlockPump {
             // pump override seam exists via the field, not env, so tests stay
             // immune to the global environment).
             debounce_ms: DEBOUNCE_MS,
+            // Production default (PWPPAZ T2) — finite test streams end before
+            // the slice deadline, so existing quiesce tests are unaffected;
+            // the gap-stream tests below set the field explicitly.
+            early_slice_ms: EARLY_SLICE_MS,
         }
     }
 
@@ -2525,6 +2630,12 @@ impl BlockPump {
     /// is observable without a 30s wait.
     pub fn set_header_staleness_for_test(&mut self, staleness: Duration) {
         self.header_staleness = staleness;
+    }
+
+    /// Test-only override of the early-slice window (PWPPAZ T2) — per-pump
+    /// field override (not env) so tests stay immune to the environment.
+    pub fn set_early_slice_ms_for_test(&mut self, ms: u64) {
+        self.early_slice_ms = ms;
     }
 
     /// Test-only override of the logs-subscription liveness window
@@ -2664,6 +2775,9 @@ mod tests {
         logs_recorded: std::sync::atomic::AtomicUsize,
         /// `pump_ended` recorded (incident 2026-08-20 stream-death test).
         pump_ended: std::sync::atomic::AtomicBool,
+        /// PWPPAZ T2: virtual-time stamps for each `on_drain` (paired with
+        /// `drained`), read via `drained_at`.
+        drained_at: Mutex<Vec<tokio::time::Instant>>,
     }
 
     impl FakeDrainSink {
@@ -2679,7 +2793,13 @@ mod tests {
                 dirty: AtomicBool::new(false),
                 logs_recorded: std::sync::atomic::AtomicUsize::new(0),
                 pump_ended: std::sync::atomic::AtomicBool::new(false),
+                drained_at: Mutex::new(Vec::new()),
             }
+        }
+
+        /// PWPPAZ T2: virtual-time stamps paired with `drained_blocks()`.
+        fn drained_at(&self) -> Vec<tokio::time::Instant> {
+            self.drained_at.lock().unwrap().clone()
         }
 
         /// Set the test dirty flag (see `dirty` field doc).
@@ -2732,6 +2852,12 @@ mod tests {
             // block (the anchoring `resume` relies on — see
             // `resume_anchors_to_subscribe_block`).
             self.drained.lock().unwrap().push((block, *metadata));
+            // PWPPAZ T2: virtual-time dispatch stamp (start_paused tests
+            // assert the slice fired at its deadline, not at burst end).
+            self.drained_at
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
             self.last_processed.store(block, Ordering::Relaxed);
         }
         fn on_send(&self, metadata: &BlockMetadata) {
@@ -3371,6 +3497,160 @@ mod tests {
             sink.drained_blocks(),
             vec![103],
             "solve must fire once, after the buffered header burst drains, at the newest block"
+        );
+    }
+
+    /// PWPPAZ T2 gap-stream builder: the block-101 header, then `logs` V2
+    /// Sync logs spaced `gap_ms` apart (a real burst shape: one header, a
+    /// multi-event log burst), then END. Under `start_paused` the sleeps
+    /// advance in virtual time, so the slice deadline (25ms < gap 40ms <
+    /// debounce 50ms) resolves deterministically mid-burst. Logs must NOT
+    /// reset the slice window — only headers do (one slice per BLOCK window).
+    fn gap_burst_stream(logs: u64, gap_ms: u64) -> stream::BoxStream<'static, WsEvent> {
+        use alloy::primitives::{Address as A, U256};
+        use stream::StreamExt;
+        let pool = A::from([0xccu8; 20]);
+        stream::unfold(0u64, move |i| {
+            let pool = pool;
+            async move {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(gap_ms)).await;
+                }
+                let ev = if i == 0 {
+                    WsEvent::BlockHeader {
+                        number: 101,
+                        timestamp: 101_000,
+                        base_fee_per_gas: Some(1_000_000_001),
+                        gas_used: 10_000_001,
+                        gas_limit: 30_000_001,
+                    }
+                } else {
+                    WsEvent::Log(make_v2_sync_log(
+                        pool,
+                        U256::from(1_000),
+                        U256::from(2_000),
+                        101,
+                        false,
+                    ))
+                };
+                (i <= logs).then_some((ev, i + 1))
+            }
+        })
+        .boxed()
+    }
+
+    /// PWPPAZ T2 — designed first-slice: with a gapped multi-event burst
+    /// (headers every 40ms; gap > slice deadline 25ms, gap < settle debounce
+    /// 50ms), the gate dispatches ONE early Drain at ~first-dirty + 25ms
+    /// (mid-burst, NOT at burst end), then the tail still gets its quiesce
+    /// settle at the newest block. RED before T2 (the gate only dispatched
+    /// at stream end).
+    /// Register the V2 pool `gap_burst_stream` logs target (mirrors
+    /// `solve_gate_waits_for_buffered_log_before_solving`'s fixture).
+    fn register_burst_pool(bot: &Arc<Bot>) {
+        use alloy::primitives::{aliases::U112, Address as A};
+        let arc = bot.state_arc();
+        let mut core = arc.write();
+        core.register_v2_pool(&RegisterV2PoolParams {
+            address: A::from([0xccu8; 20]),
+            token0: A::from([0xa0u8; 20]),
+            token1: A::from([0xa1u8; 20]),
+            reserve0: U112::from(1_000),
+            reserve1: U112::from(2_000),
+            fee_token0: (997, 1000),
+            fee_token1: (997, 1000),
+            factory: A::from([0xf0u8; 20]),
+            update_block: 100,
+            variant: degenbot_uniswap::dex_identity::DexVariant::UniswapV2,
+            stable_swap: false,
+            fee_denominator: None,
+            ..Default::default()
+        })
+        .expect("test setup: V2 registration");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_slice_fires_mid_burst_then_settles() {
+        let bot = Arc::new(Bot::new(1));
+        register_burst_pool(&bot);
+        let bot = Arc::new(Bot::new(1));
+        let (mut pump, sink, _shutdown) = pump_for_test_with_bot(bot, Some(100));
+        pump.set_early_slice_ms_for_test(25);
+        sink.set_dirty(true);
+
+        let combined = gap_burst_stream(3, 40);
+        let t0 = tokio::time::Instant::now();
+        pump.run_test_loop(combined, 100).await;
+        drainer_settle(|| sink.drained_blocks().len() >= 2).await;
+
+        assert_eq!(
+            sink.drained_blocks(),
+            vec![101, 101],
+            "slice fires at the deadline mid-burst, the tail settles at the newest block"
+        );
+        let stamps = sink.drained_at();
+        assert_eq!(stamps.len(), 2, "exactly slice + tail dispatches");
+        let first_rel = stamps[0] - t0;
+        assert!(
+            first_rel >= Duration::from_millis(20) && first_rel <= Duration::from_millis(45),
+            "slice must dispatch at ~first-dirty + 25ms, got {first_rel:?}"
+        );
+        let second_rel = stamps[1] - t0;
+        assert!(
+            second_rel >= Duration::from_millis(75),
+            "tail settle must fire at burst end, got {second_rel:?}"
+        );
+    }
+
+    /// PWPPAZ T2 — bounded: ONE early slice per block window, however long
+    /// the burst (MBNASQ's unbounded per-gap serial solves must not return).
+    /// Six gapped headers → exactly slice + tail, never a third dispatch.
+    #[tokio::test(start_paused = true)]
+    async fn early_slice_fires_at_most_once_per_window() {
+        let bot = Arc::new(Bot::new(1));
+        register_burst_pool(&bot);
+        let (mut pump, sink, _shutdown) = pump_for_test_with_bot(bot, Some(100));
+        pump.set_early_slice_ms_for_test(25);
+        sink.set_dirty(true);
+
+        let combined = gap_burst_stream(5, 40);
+        pump.run_test_loop(combined, 100).await;
+        drainer_settle(|| sink.drained_blocks().len() >= 2).await;
+
+        assert_eq!(
+            sink.drained_blocks(),
+            vec![101, 101],
+            "exactly one early slice + one quiesce tail solve for the window"
+        );
+    }
+
+    /// PWPPAZ T2 — parity: `DEGENBOT_EARLY_SLICE_MS=0` disables the slice
+    /// entirely — the same gapped burst produces exactly the pre-T2 gate
+    /// behavior (one quiesce solve at stream end, timed by the full debounce).
+    #[tokio::test(start_paused = true)]
+    async fn early_slice_disabled_restores_gate_parity() {
+        let bot = Arc::new(Bot::new(1));
+        register_burst_pool(&bot);
+        let (mut pump, sink, _shutdown) = pump_for_test_with_bot(bot, Some(100));
+        pump.set_early_slice_ms_for_test(0);
+        sink.set_dirty(true);
+
+        let combined = gap_burst_stream(3, 40);
+        let t0 = tokio::time::Instant::now();
+        pump.run_test_loop(combined, 100).await;
+        drainer_settle(|| !sink.drained_blocks().is_empty()).await;
+
+        assert_eq!(
+            sink.drained_blocks(),
+            vec![101],
+            "slice disabled: exactly the pre-T2 quiesce solve, at the newest block"
+        );
+        let stamps = sink.drained_at();
+        assert_eq!(stamps.len(), 1, "single late dispatch, no early slice");
+        let rel = stamps[0] - t0;
+        assert!(
+            rel >= Duration::from_millis(120),
+            "slice disabled: the solve must wait out the full debounce/quiesce, got {rel:?}"
         );
     }
 
