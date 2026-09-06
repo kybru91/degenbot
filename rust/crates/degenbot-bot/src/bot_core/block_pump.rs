@@ -1297,6 +1297,15 @@ impl BlockPump {
         // paused-runtime tests advance the age with virtual time.
         let mut slice_first_dirty: Option<tokio::time::Instant> = None;
         let mut slice_done = false;
+
+        // WAJEQP T-R1 reorg-window telemetry state: the episode span + its
+        // per-window counters live ACROSS loop iterations (EnterReorg →
+        // CloseReorg). The window span is its own trace root (episodes cross
+        // block windows); the `restore` children are emitted by the
+        // coordinator with this span as their explicit parent.
+        let mut reorg_span: Option<tracing::Span> = None;
+        let mut reorg_pools_restored: u64 = 0;
+        let mut reorg_idempotent_noops: u64 = 0;
         // Pre-solve gap waterfall spans (Jaeger): `log_wait` fills the
         // header→first-relevant-log stretch (WS delivery), `apply_stream`
         // fills first-log→settle (burst + applies + quiesce hold). Both are
@@ -1607,6 +1616,13 @@ impl BlockPump {
                         header_to_first_log_us = tracing::field::Empty,
                         log_burst_us = tracing::field::Empty,
                         settle_wait_us = tracing::field::Empty,
+                        // WAJEQP T-R1 reorg breadcrumbs: when a reorg episode
+                        // opens or closes while THIS block window is current,
+                        // the block trace is silently interrupted — surface it
+                        // here so an operator reading the block trace sees the
+                        // interruption without opening the window root trace.
+                        reorg.entry_block = tracing::field::Empty,
+                        reorg.closed = tracing::field::Empty,
                     );
                     // MQUKB6-T0 / JYCTXI: detached-at-creation so each header
                     // span is its own trace ROOT (the detach + its reasoning
@@ -1802,6 +1818,18 @@ impl BlockPump {
                     // remains a hard ADR-008 D3 fault (only the pump's own
                     // single-writer range is benign).
                     if fsm.should_drop_recovered_forward(log_block, log.removed) {
+                        // WAJEQP T-R1: a recovery-dropped log during an OPEN
+                        // reorg window is episode evidence — emit it as a
+                        // child span so the window trace shows which replay
+                        // events were discarded (outside a window it is
+                        // routine resume noise; only the log line remains).
+                        if let Some(window) = reorg_span.as_ref() {
+                            drop(tracing::info_span!(
+                                parent: window.clone(),
+                                "degenbot.reorg.dropped_recovery",
+                                reorg.block = log_block,
+                            ));
+                        }
                         crate::bot_core::trace_ws_log_dispatch(
                             log.address(),
                             log.topics(),
@@ -1868,10 +1896,56 @@ impl BlockPump {
                                 reorg_block,
                                 "BlockPump: chain reorg detected (removed log) — entering unwind path"
                             );
-                            if let Err(err) = self.reorg_coordinator.dispatch_reorg_log(&log) {
-                                tracing::error!(?err, "BlockPump: too-deep reorg — shutting down");
-                                self.shutdown.store(true, Ordering::Relaxed);
-                                return;
+                            // WAJEQP T-R1: open the episode span — its OWN
+                            // trace root (the episode crosses block windows;
+                            // parenting it under the current block span would
+                            // misattribute the unwind to the delivering block,
+                            // the same disease the solve-span reparenting
+                            // cured). Depth is the rollback distance at entry.
+                            let depth_blocks = fsm.current_block().saturating_sub(reorg_block);
+                            let window = tracing::info_span!(
+                                "degenbot.reorg.window",
+                                reorg.block = reorg_block,
+                                reorg.log_block = log_block,
+                                reorg.depth_blocks = depth_blocks,
+                                reorg.pools_restored = tracing::field::Empty,
+                                reorg.idempotent_noops = tracing::field::Empty,
+                                reorg.new_head = tracing::field::Empty,
+                                reorg.outcome = tracing::field::Empty,
+                            );
+                            crate::telemetry::make_trace_root(&window);
+                            if let Some(bs) = block_span.as_ref() {
+                                bs.record("reorg.entry_block", reorg_block);
+                            }
+                            reorg_span = Some(window);
+                            reorg_pools_restored = 0;
+                            reorg_idempotent_noops = 0;
+                            let outcome = {
+                                let _entered = reorg_span.as_ref().map(tracing::Span::enter);
+                                self.reorg_coordinator
+                                    .dispatch_reorg_log(&log, reorg_span.as_ref())
+                            };
+                            match outcome {
+                                Ok(crate::bot_core::reorg_coordinator::ReorgOutcome::Restored) => {
+                                    reorg_pools_restored += 1;
+                                }
+                                Ok(
+                                    crate::bot_core::reorg_coordinator::ReorgOutcome::IdempotentNoop,
+                                ) => {
+                                    reorg_idempotent_noops += 1;
+                                }
+                                Err(err) => {
+                                    // Too-deep: record the fault on the window
+                                    // span FIRST so the last trace before the
+                                    // graceful shutdown names the cause, then
+                                    // unwind (span guards drop on return).
+                                    if let Some(window) = reorg_span.as_ref() {
+                                        window.record("reorg.outcome", "too_deep_shutdown");
+                                    }
+                                    tracing::error!(?err, "BlockPump: too-deep reorg — shutting down");
+                                    self.shutdown.store(true, Ordering::Relaxed);
+                                    return;
+                                }
                             }
                             // ADR-021 D2 Part A — record the reorg window for the
                             // tripwire's UnhandledReorg evidence (cheap; the
@@ -1895,10 +1969,28 @@ impl BlockPump {
                                 log_block,
                                 "BlockPump: reorg continues — restoring pool for removed log"
                             );
-                            if let Err(err) = self.reorg_coordinator.dispatch_reorg_log(&log) {
-                                tracing::error!(?err, "BlockPump: too-deep reorg — shutting down");
-                                self.shutdown.store(true, Ordering::Relaxed);
-                                return;
+                            let outcome = {
+                                let _entered = reorg_span.as_ref().map(tracing::Span::enter);
+                                self.reorg_coordinator
+                                    .dispatch_reorg_log(&log, reorg_span.as_ref())
+                            };
+                            match outcome {
+                                Ok(crate::bot_core::reorg_coordinator::ReorgOutcome::Restored) => {
+                                    reorg_pools_restored += 1;
+                                }
+                                Ok(
+                                    crate::bot_core::reorg_coordinator::ReorgOutcome::IdempotentNoop,
+                                ) => {
+                                    reorg_idempotent_noops += 1;
+                                }
+                                Err(err) => {
+                                    if let Some(window) = reorg_span.as_ref() {
+                                        window.record("reorg.outcome", "too_deep_shutdown");
+                                    }
+                                    tracing::error!(?err, "BlockPump: too-deep reorg — shutting down");
+                                    self.shutdown.store(true, Ordering::Relaxed);
+                                    return;
+                                }
                             }
                             // ADR-021 D2 Part A — widen the open window's rollback.
                             crate::bot_core::solver_state_tripwire::reorg_window_continue(
@@ -1915,6 +2007,23 @@ impl BlockPump {
                                 new_head,
                                 "BlockPump: reorg window closed — resuming forward tracking"
                             );
+                            // WAJEQP T-R1: close the episode span with its
+                            // counters + outcome, and leave a breadcrumb field
+                            // on the current block window's span.
+                            if let Some(window) = reorg_span.take() {
+                                window.record("reorg.pools_restored", reorg_pools_restored);
+                                window.record("reorg.idempotent_noops", reorg_idempotent_noops);
+                                window.record("reorg.new_head", new_head);
+                                window.record("reorg.outcome", "closed");
+                                // Explicit drop: the window ends HERE, not at
+                                // the next reassignment of the local.
+                                drop(window);
+                            }
+                            if let Some(bs) = block_span.as_ref() {
+                                bs.record("reorg.closed", new_head);
+                            }
+                            reorg_pools_restored = 0;
+                            reorg_idempotent_noops = 0;
                             // ADR-021 D2 Part A — close the evidence window.
                             crate::bot_core::solver_state_tripwire::reorg_window_close(
                                 &mut self.trip_reorg_windows.lock(),
@@ -3569,6 +3678,98 @@ mod tests {
         .expect("test setup: V2 registration");
     }
 
+    /// WAJEQP T-R1 capture layer: one record per created span (name, id,
+    /// parent id) plus every `record`ed field, threaded through a
+    /// thread-local span stack so contextually-created children resolve the
+    /// way tracing's dispatcher does (same pattern as the `arb_span` tests'
+    /// `SpanParentCapture`; thread-local rather than global so it starves no
+    /// once-per-process `set_global_default` slot).
+    type SpanList = Vec<(String, u64, Option<u64>)>;
+    type FieldList = Vec<(u64, String, String)>;
+
+    #[derive(Clone)]
+    struct ReorgSpanCapture {
+        spans: std::sync::Arc<std::sync::Mutex<SpanList>>,
+        fields: std::sync::Arc<std::sync::Mutex<FieldList>>,
+    }
+
+    impl Default for ReorgSpanCapture {
+        fn default() -> Self {
+            Self {
+                spans: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fields: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    thread_local! {
+        static REORG_SPAN_STACK: std::cell::RefCell<Vec<u64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ReorgSpanCapture {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let parent = REORG_SPAN_STACK.with(|st| st.borrow().last().copied());
+            self.spans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((attrs.metadata().name().to_string(), id.into_u64(), parent));
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Saver(Vec<(String, String)>);
+            impl tracing::field::Visit for Saver {
+                fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                    self.0.push((f.name().to_string(), v.to_string()));
+                }
+                fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    self.0.push((f.name().to_string(), format!("{v:?}")));
+                }
+                fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                    self.0.push((f.name().to_string(), v.to_string()));
+                }
+                fn record_i64(&mut self, f: &tracing::field::Field, v: i64) {
+                    self.0.push((f.name().to_string(), v.to_string()));
+                }
+            }
+            let mut saver = Saver(Vec::new());
+            values.record(&mut saver);
+            let sid = id.into_u64();
+            self.fields
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(saver.0.into_iter().map(|(k, v)| (sid, k, v)));
+        }
+
+        fn on_enter(
+            &self,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            REORG_SPAN_STACK.with(|st| st.borrow_mut().push(id.into_u64()));
+        }
+
+        fn on_exit(
+            &self,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            REORG_SPAN_STACK.with(|st| {
+                st.borrow_mut().pop();
+            });
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn early_slice_fires_mid_burst_then_settles() {
         let bot = Arc::new(Bot::new(1));
@@ -3651,6 +3852,242 @@ mod tests {
         assert!(
             rel >= Duration::from_millis(120),
             "slice disabled: the solve must wait out the full debounce/quiesce, got {rel:?}"
+        );
+    }
+
+    /// Drive a reorg scenario under the [`ReorgSpanCapture`] layer on a local
+    /// current-thread runtime (spans are created on the pump task; the test
+    /// thread holds the subscriber for the whole `block_on`).
+    fn run_reorg_stream(capture: ReorgSpanCapture, pump: &mut BlockPump, events: Vec<WsEvent>) {
+        use stream::StreamExt;
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry().with(capture);
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            rt.block_on(async {
+                pump.run_test_loop(stream::iter(events).boxed(), 100).await;
+            });
+        });
+    }
+
+    /// WAJEQP T-R1: the reorg window span lifecycle. A `removed:true` log for
+    /// the current block opens exactly ONE `degenbot.reorg.window` span (own
+    /// root); each subsequent event adds a `degenbot.reorg.restore` child;
+    /// the closing forward log records `reorg.new_head` + counters +
+    /// `reorg.outcome=closed` and ends the span. The real restore is
+    /// `restored`; the replay duplicate is labeled `idempotent_noop`.
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn reorg_window_span_lifecycle_enter_restore_close() {
+        use alloy::primitives::{Address as A, U256};
+        let capture = ReorgSpanCapture::default();
+        let bot = Arc::new(Bot::new(1));
+        register_burst_pool(&bot);
+        let (mut pump, _sink, _shutdown) = pump_for_test_with_bot(bot, Some(100));
+        let pool = A::from([0xccu8; 20]);
+        let events = vec![
+            WsEvent::BlockHeader {
+                number: 101,
+                timestamp: 101_000,
+                base_fee_per_gas: Some(1_000_000_001),
+                gas_used: 10_000_001,
+                gas_limit: 30_000_001,
+            },
+            // Forward apply at 101: journal delta at 101.
+            WsEvent::Log(make_v2_sync_log(
+                pool,
+                U256::from(1_000),
+                U256::from(2_000),
+                101,
+                false,
+            )),
+            // Removed at 101 → EnterReorg, journal pops the 101 delta.
+            WsEvent::Log(make_v2_sync_log(
+                pool,
+                U256::from(1_000),
+                U256::from(2_000),
+                101,
+                true,
+            )),
+            // Duplicate removed replay → ContinueReorg, idempotent no-op.
+            WsEvent::Log(make_v2_sync_log(
+                pool,
+                U256::from(1_000),
+                U256::from(2_000),
+                101,
+                true,
+            )),
+            // First forward above the window → CloseReorg{102}.
+            WsEvent::Log(make_v2_sync_log(
+                pool,
+                U256::from(900),
+                U256::from(1_800),
+                102,
+                false,
+            )),
+        ];
+        run_reorg_stream(capture.clone(), &mut pump, events);
+
+        let spans = capture
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let fields = capture
+            .fields
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let windows: Vec<(u64, Option<u64>)> = spans
+            .iter()
+            .filter(|(n, _, _)| n == "degenbot.reorg.window")
+            .map(|(_, id, p)| (*id, *p))
+            .collect();
+        assert_eq!(
+            windows.len(),
+            1,
+            "exactly one window span per episode; got {:?}",
+            spans.iter().map(|(n, _, _)| n).collect::<Vec<_>>()
+        );
+        let (window_id, window_parent) = windows[0];
+        assert!(window_parent.is_none(), "window must be its own trace root");
+        let restores: Vec<(u64, Option<u64>)> = spans
+            .iter()
+            .filter(|(n, _, _)| n == "degenbot.reorg.restore")
+            .map(|(_, id, p)| (*id, *p))
+            .collect();
+        assert_eq!(restores.len(), 2, "one restore span per removed event");
+        for (_id, parent) in &restores {
+            assert_eq!(*parent, Some(window_id), "restore must parent the window");
+        }
+        // First restore: a real journal pop. Second: idempotent replay.
+        let actions = || -> Vec<(u64, String)> {
+            restores
+                .iter()
+                .filter_map(|(id, _)| {
+                    fields
+                        .iter()
+                        .find(|(sid, k, _)| sid == id && k == "reorg.action")
+                        .map(|(_, _, v)| (*id, v.clone()))
+                })
+                .collect()
+        };
+        let actions = actions();
+        assert!(
+            actions.iter().any(|(_, v)| v == "restored"),
+            "first removed event must restore: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|(_, v)| v == "idempotent_noop"),
+            "the replay duplicate must be idempotent: {actions:?}"
+        );
+        let window_fields = |want: &str| -> Option<String> {
+            fields
+                .iter()
+                .find(|(sid, k, _)| *sid == window_id && k == want)
+                .map(|(_, _, v)| v.clone())
+        };
+        assert_eq!(window_fields("reorg.outcome").as_deref(), Some("closed"));
+        assert_eq!(window_fields("reorg.new_head").as_deref(), Some("102"));
+        assert_eq!(window_fields("reorg.pools_restored").as_deref(), Some("1"));
+        assert_eq!(
+            window_fields("reorg.idempotent_noops").as_deref(),
+            Some("1")
+        );
+        // Breadcrumbs on the interrupted block's pump.block span.
+        let block_spans: Vec<u64> = spans
+            .iter()
+            .filter(|(n, _, _)| n == "degenbot.pump.block")
+            .map(|(_, id, _)| *id)
+            .collect();
+        assert!(!block_spans.is_empty());
+        let bs_id = block_spans[0];
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(sid, k, _)| *sid == bs_id && k == "reorg.entry_block")
+                .map(|(_, _, v)| v.as_str()),
+            Some("101")
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(sid, k, _)| *sid == bs_id && k == "reorg.closed")
+                .map(|(_, _, v)| v.as_str()),
+            Some("102")
+        );
+    }
+
+    /// WAJEQP T-R1: a removed log for a pool whose newest journal delta is
+    /// already below the target restores nothing — the restore span is still
+    /// emitted, labeled `idempotent_noop`, and the window still closes.
+    #[test]
+    fn reorg_restore_without_delta_is_idempotent_noop() {
+        use alloy::primitives::{Address as A, U256};
+        let capture = ReorgSpanCapture::default();
+        let bot = Arc::new(Bot::new(1));
+        register_burst_pool(&bot);
+        let (mut pump, _sink, _shutdown) = pump_for_test_with_bot(bot, Some(100));
+        let pool = A::from([0xccu8; 20]);
+        let events = vec![
+            WsEvent::BlockHeader {
+                number: 101,
+                timestamp: 101_000,
+                base_fee_per_gas: Some(1_000_000_001),
+                gas_used: 10_000_001,
+                gas_limit: 30_000_001,
+            },
+            // No forward apply at 101: the newest delta is the registration
+            // (block 100), so this removed event is a guaranteed no-op.
+            WsEvent::Log(make_v2_sync_log(
+                pool,
+                U256::from(1_000),
+                U256::from(2_000),
+                101,
+                true,
+            )),
+            WsEvent::Log(make_v2_sync_log(
+                pool,
+                U256::from(900),
+                U256::from(1_800),
+                102,
+                false,
+            )),
+        ];
+        run_reorg_stream(capture.clone(), &mut pump, events);
+
+        let spans = capture
+            .spans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let fields = capture
+            .fields
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let restores: Vec<u64> = spans
+            .iter()
+            .filter(|(n, _, _)| n == "degenbot.reorg.restore")
+            .map(|(_, id, _)| *id)
+            .collect();
+        assert_eq!(restores.len(), 1);
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(sid, k, _)| sid == &restores[0] && k == "reorg.action")
+                .map(|(_, _, v)| v.as_str()),
+            Some("idempotent_noop")
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(_, k, _)| k == "reorg.outcome")
+                .map(|(_, _, v)| v.as_str()),
+            Some("closed")
         );
     }
 

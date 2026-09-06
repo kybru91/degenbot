@@ -56,26 +56,46 @@ pub enum ReorgError {
     NoStatePriorToBlock { pool_id: u64, block: u64 },
 }
 
+/// The per-event state outcome of a reorg restore (modulo the too-deep error,
+/// which is always an `Err`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorgOutcome {
+    /// The journal popped at least one delta; the pool's live state changed.
+    Restored,
+    /// No state changed: idempotent replay (newest delta already before the
+    /// target) or the event resolved to an unregistered pool.
+    IdempotentNoop,
+}
+
 impl ReorgCoordinator {
     /// Decode `log` (reusing the dispatch decoders), resolve its `pool_id`
     /// WITHOUT applying it forward, restore that pool's state to just before
     /// `log`'s block, then notify subscribers.
     ///
-    /// Returns `Ok` on success (including the no-op case where the pool's
-    /// newest delta is already before the target — idempotent). Returns
-    /// `Err(NoStatePriorToBlock)` if the reorg target is at or below the
-    /// journal's earliest delta (the pump shuts down gracefully).
+    /// WAJEQP T-R1 telemetry: every resolved event emits a
+    /// `degenbot.reorg.restore` span parented under `parent` (the pump's open
+    /// `degenbot.reorg.window` episode span; `None` = detached — tests or
+    /// out-of-window callers). The outcome (`reorg.action`) distinguishes a
+    /// real journal rollback from an idempotent replay no-op and from an
+    /// untracked pool, and the too-deep fault records an exception on the
+    /// span before the caller shuts the pump down.
+    ///
+    /// Returns `Ok(ReorgOutcome)` on success (including the no-op cases).
+    /// Returns `Err(NoStatePriorToBlock)` if the reorg target is at or below
+    /// the journal's earliest delta (the pump shuts down gracefully).
     ///
     /// The removed event's CONTENT is unused — only its block number + pool
     /// identity (the journal's stored "before" values are the source of truth).
     ///
     /// # Errors
     ///
-    /// Returns `Ok` on success (including the idempotent no-op case where the
-    /// pool's newest delta is already before the target). Returns
-    /// `Err(NoStatePriorToBlock)` if the reorg target is at or below the
-    /// journal's earliest delta (the pump shuts down gracefully).
-    pub fn dispatch_reorg_log(&self, log: &Log) -> Result<(), ReorgError> {
+    /// Returns `Err(NoStatePriorToBlock)` if the target is at/below the
+    /// journal's earliest surviving delta (no known state before it).
+    pub fn dispatch_reorg_log(
+        &self,
+        log: &Log,
+        parent: Option<&tracing::Span>,
+    ) -> Result<ReorgOutcome, ReorgError> {
         let bot = &*self.bot;
         // Decode the log to identify the target pool. Reuses the same decoder
         // registry as forward `dispatch_log` — a removed log carries the same
@@ -83,25 +103,59 @@ impl ReorgCoordinator {
         let Some(decoded) = bot.try_decode_log(log) else {
             // Unrecognized / no decoder matches → no-op (same as forward
             // dispatch's unrecognized-path). A reorg for an unknown event
-            // family is harmless.
-            return Ok(());
+            // family is harmless. (No `restore` span: nothing decoded, so
+            // there is no pool or kind to attribute.)
+            return Ok(ReorgOutcome::IdempotentNoop);
         };
         let block = decoded.block_number();
+        // WAJEQP T-R1: one span per reorg event, named + attributed at the
+        // boundary where the journal decision is made. The pump parent enters
+        // the window span for the duration of this call, but the explicit
+        // `parent:` link keeps the child correct even if that changes.
+        let span = tracing::info_span!(
+            parent: parent.and_then(tracing::Span::id),
+            "degenbot.reorg.restore",
+            reorg.block = block,
+            reorg.action = tracing::field::Empty,
+        );
+        let _guard = span.enter();
         let Some(pool_id) = bot.resolve_pool_id(&decoded) else {
             // Pool not registered → no-op (parallel to forward dispatch's
             // `apply returns None` path). Subscribers can't be notified about
-            // a pool that isn't in the registry.
-            return Ok(());
+            // a pool that isn't in the registry. Visible on the event span —
+            // an untracked-pool replay is itself diagnostic.
+            span.record("reorg.action", "unregistered_noop");
+            return Ok(ReorgOutcome::IdempotentNoop);
         };
+        span.record("pool.id", pool_id);
 
         // Restore under the write guard. Pre-check `has_state_prior_to` for
         // V3/V4 (whose journal `restore_before_block` panics on empty); the
         // V2 path's `Result` would catch too-deep natively, but the pre-check
         // unifies V2/V3/V4 onto one `Err` path before any mutation.
         if !bot.has_state_prior_to(pool_id, block) {
+            span.record("reorg.action", "too_deep");
+            tracing::error!(
+                pool_id,
+                block,
+                "ReorgCoordinator: too-deep reorg — no journal state at or before the target"
+            );
             return Err(ReorgError::NoStatePriorToBlock { pool_id, block });
         }
+        // Idempotent-noop detection (WAJEQP T-R1): the newest journal delta for
+        // this pool is already strictly before the target, so the restore is a
+        // guaranteed no-op pop (state history is order-insensitive). Recorded
+        // as its own action — the share of redundant replay events is itself
+        // diagnostic of the node's replay behavior.
+        let newest_delta = bot.newest_journal_block(pool_id);
+        let idempotent = newest_delta.is_some_and(|b| b < block);
         bot.restore_pool_before_block(pool_id, block);
+        if idempotent {
+            span.record("reorg.action", "idempotent_noop");
+            bot.notify_pool_state_updated(pool_id);
+            return Ok(ReorgOutcome::IdempotentNoop);
+        }
+        span.record("reorg.action", "restored");
         // `restore_pool_before_block` released the write guard internally;
         // notify subscribers (engine dirties + re-solves at the next drain
         // tick; no separate reorg path in the engine).
@@ -117,7 +171,7 @@ impl ReorgCoordinator {
             "ReorgCoordinator: restored pool to its pre-block state + notified subscribers"
         );
         bot.notify_pool_state_updated(pool_id);
-        Ok(())
+        Ok(ReorgOutcome::Restored)
     }
 }
 
@@ -370,13 +424,16 @@ mod tests {
         // Reorg: a removed-flag Sync log at block 7 rolls it back to genesis.
         let coordinator = ReorgCoordinator::new(Arc::clone(&bot));
         coordinator
-            .dispatch_reorg_log(&make_sync_log(
-                pool_addr,
-                U256::from(1_500), // content unused — block + pool identity matter
-                U256::from(2_500),
-                7,
-                true,
-            ))
+            .dispatch_reorg_log(
+                &make_sync_log(
+                    pool_addr,
+                    U256::from(1_500), // content unused — block + pool identity matter
+                    U256::from(2_500),
+                    7,
+                    true,
+                ),
+                None,
+            )
             .expect("restore before 7 succeeds");
         assert_eq!(count(), 2, "reorg dispatched the SAME notify as forward");
         assert_eq!(
@@ -399,13 +456,10 @@ mod tests {
 
         // Removed log at block 5 (== genesis) → too-deep.
         let err = coordinator
-            .dispatch_reorg_log(&make_sync_log(
-                pool_addr,
-                U256::from(1_500),
-                U256::from(2_500),
-                5,
-                true,
-            ))
+            .dispatch_reorg_log(
+                &make_sync_log(pool_addr, U256::from(1_500), U256::from(2_500), 5, true),
+                None,
+            )
             .unwrap_err();
         match err {
             ReorgError::NoStatePriorToBlock { pool_id: p, block } => {
@@ -553,9 +607,10 @@ mod tests {
         // Reorg: removed-flag V3 Swap log at block 7 (the only journal delta).
         let coordinator = ReorgCoordinator::new(Arc::clone(&bot));
         coordinator
-            .dispatch_reorg_log(&make_v3_swap_log(
-                pool_addr, new_sqrt, 2_000_000, 50, 7, true,
-            ))
+            .dispatch_reorg_log(
+                &make_v3_swap_log(pool_addr, new_sqrt, 2_000_000, 50, 7, true),
+                None,
+            )
             .expect("single-delta-at-target restores, is NOT too-deep");
         assert_eq!(count(), 2, "reorg dispatched the SAME notify as forward");
         {
@@ -605,14 +660,10 @@ mod tests {
 
         let coordinator = ReorgCoordinator::new(Arc::clone(&bot));
         let err = coordinator
-            .dispatch_reorg_log(&make_v3_swap_log(
-                pool_addr,
-                U256::from(2u128) << 96,
-                2_000_000,
-                50,
-                5,
-                true,
-            ))
+            .dispatch_reorg_log(
+                &make_v3_swap_log(pool_addr, U256::from(2u128) << 96, 2_000_000, 50, 5, true),
+                None,
+            )
             .unwrap_err();
         match err {
             ReorgError::NoStatePriorToBlock { pool_id: p, block } => {
@@ -768,15 +819,18 @@ mod tests {
         // Reorg: removed-flag V4 Swap at block 7 (the only journal delta).
         let coordinator = ReorgCoordinator::new(Arc::clone(&bot));
         coordinator
-            .dispatch_reorg_log(&make_v4_swap_log(
-                pool_manager,
-                pool_id_bytes,
-                new_sqrt,
-                2_000_000,
-                50,
-                7,
-                true,
-            ))
+            .dispatch_reorg_log(
+                &make_v4_swap_log(
+                    pool_manager,
+                    pool_id_bytes,
+                    new_sqrt,
+                    2_000_000,
+                    50,
+                    7,
+                    true,
+                ),
+                None,
+            )
             .expect("V4 single-delta-at-target restores, is NOT too-deep");
         assert_eq!(count(), 2, "reorg dispatched the SAME notify as forward");
         {
@@ -810,15 +864,18 @@ mod tests {
 
         let coordinator = ReorgCoordinator::new(Arc::clone(&bot));
         let err = coordinator
-            .dispatch_reorg_log(&make_v4_swap_log(
-                pool_manager,
-                pool_id_bytes,
-                U256::from(2u128) << 96,
-                2_000_000,
-                50,
-                7,
-                true,
-            ))
+            .dispatch_reorg_log(
+                &make_v4_swap_log(
+                    pool_manager,
+                    pool_id_bytes,
+                    U256::from(2u128) << 96,
+                    2_000_000,
+                    50,
+                    7,
+                    true,
+                ),
+                None,
+            )
             .unwrap_err();
         match err {
             ReorgError::NoStatePriorToBlock { pool_id: p, block } => {

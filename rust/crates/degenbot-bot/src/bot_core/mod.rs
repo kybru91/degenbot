@@ -1058,6 +1058,19 @@ impl BotState {
     ///
     /// A pool whose newest delta is below `block` (idempotent no-op restore)
     /// returns `true` under both predicates.
+    /// Peek the newest reorg-journal delta block for `pool_id` without
+    /// mutating anything. `None` when unregistered or the journal is empty.
+    /// Used by `ReorgCoordinator` to label idempotent no-op restores
+    /// (newest delta strictly below the reorg target) in its
+    /// `degenbot.reorg.restore` spans (WAJEQP T-R1).
+    #[must_use]
+    pub fn newest_journal_block(&self, pool_id: u64) -> Option<u64> {
+        self.pools
+            .get(&pool_id)
+            .and_then(PoolEntry::as_reorg_state)
+            .and_then(ReorgPoolState::newest_block)
+    }
+
     #[must_use]
     pub fn has_state_prior_to(&self, pool_id: u64, block: u64) -> bool {
         let Some(entry) = self.pools.get(&pool_id) else {

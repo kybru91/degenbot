@@ -225,6 +225,14 @@ impl Bot {
         let _ = self.state.write().restore_pool_before_block(pool_id, block);
     }
 
+    /// Peek the newest reorg-journal delta block for `pool_id` (WAJEQP T-R1:
+    /// idempotent-noop detection for the `degenbot.reorg.restore` spans).
+    /// `None` when unregistered or the journal is empty.
+    #[must_use]
+    pub fn newest_journal_block(&self, pool_id: u64) -> Option<u64> {
+        self.state.read().newest_journal_block(pool_id)
+    }
+
     /// Does `pool_id`'s journal have state at or before `block`? (ADR-006
     /// slice 7.) `false` → a too-deep reorg; `ReorgCoordinator` returns
     /// `Err(NoStatePriorToBlock)` and the pump shuts down gracefully.
