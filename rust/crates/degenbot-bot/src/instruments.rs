@@ -68,6 +68,17 @@ pub struct PipelineInstruments {
     logs_undecoded: Counter<u64>,
     /// Relevant-topic logs that decoded but matched no registered pool (apply-miss).
     apply_missed: Counter<u64>,
+    /// WAJEQP T-R1: reorg episodes entered (one per `EnterReorg`).
+    reorg_windows: Counter<u64>,
+    /// WAJEQP T-R1: per-pool journal restores that CHANGED state (idempotent
+    /// no-ops excluded).
+    reorg_unwound_pools: Counter<u64>,
+    /// WAJEQP T-R1: rollback depth at episode entry (current head − reorg
+    /// target, in blocks).
+    reorg_depth_blocks: Histogram<f64>,
+    /// WAJEQP T-R1: log events discarded by the recovery-anchor rule
+    /// (`DroppedRecovery`); spikes during reorg episodes.
+    reorg_recovery_dropped: Counter<u64>,
     /// Published blocks judged by the solver-state verifier.
     solver_verify_blocks: Counter<u64>,
     /// Header-gap / settle backfills executed.
@@ -229,6 +240,28 @@ impl PipelineInstruments {
             blocks_observed: meter
                 .u64_counter("degenbot.blocks.observed")
                 .with_description("Accepted block headers")
+                .build(),
+            reorg_windows: meter
+                .u64_counter("degenbot.reorg.windows")
+                .with_description("Reorg episodes entered (EnterReorg)")
+                .build(),
+            reorg_unwound_pools: meter
+                .u64_counter("degenbot.reorg.unwound_pools")
+                .with_description("Per-pool journal restores that changed state")
+                .build(),
+            reorg_depth_blocks: meter
+                .f64_histogram("degenbot.reorg.depth_blocks")
+                .with_unit("1")
+                .with_boundaries(vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 20.0, 33.0, 50.0, 100.0])
+                .with_description(
+                    "Rollback depth at reorg-episode entry (current head minus reorg target)",
+                )
+                .build(),
+            reorg_recovery_dropped: meter
+                .u64_counter("degenbot.reorg.recovery_dropped")
+                .with_description(
+                    "Log events discarded by the recovery-anchor rule (DroppedRecovery)",
+                )
                 .build(),
             logs_received: meter
                 .u64_counter("degenbot.logs.received")
@@ -496,6 +529,27 @@ impl PipelineInstruments {
     /// One relevant-topic log that decoded but matched no registered pool.
     pub fn count_log_apply_missed(&self) {
         self.apply_missed.add(1, &[]);
+    }
+
+    /// One reorg episode entered (`EnterReorg`) — WAJEQP T-R1.
+    pub fn count_reorg_window(&self) {
+        self.reorg_windows.add(1, &[]);
+    }
+
+    /// One per-pool journal restore that CHANGED state — WAJEQP T-R1.
+    pub fn count_reorg_unwound_pool(&self) {
+        self.reorg_unwound_pools.add(1, &[]);
+    }
+
+    /// Rollback depth at reorg-episode entry, in blocks — WAJEQP T-R1.
+    pub fn observe_reorg_depth(&self, blocks: u64) {
+        self.reorg_depth_blocks
+            .record(f64::from(u32::try_from(blocks).unwrap_or(u32::MAX)), &[]);
+    }
+
+    /// One log event discarded by the recovery-anchor rule — WAJEQP T-R1.
+    pub fn count_reorg_recovery_dropped(&self) {
+        self.reorg_recovery_dropped.add(1, &[]);
     }
 
     /// One WS log event received by the pump (pre topic-filter).

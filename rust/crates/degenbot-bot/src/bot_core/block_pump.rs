@@ -1830,6 +1830,9 @@ impl BlockPump {
                                 reorg.block = log_block,
                             ));
                         }
+                        if let Some(p) = crate::instruments::pipeline() {
+                            p.count_reorg_recovery_dropped();
+                        }
                         crate::bot_core::trace_ws_log_dispatch(
                             log.address(),
                             log.topics(),
@@ -1914,6 +1917,11 @@ impl BlockPump {
                                 reorg.outcome = tracing::field::Empty,
                             );
                             crate::telemetry::make_trace_root(&window);
+                            // WAJEQP T-R1 metrics: episode count + entry depth.
+                            if let Some(p) = crate::instruments::pipeline() {
+                                p.count_reorg_window();
+                                p.observe_reorg_depth(depth_blocks);
+                            }
                             if let Some(bs) = block_span.as_ref() {
                                 bs.record("reorg.entry_block", reorg_block);
                             }
@@ -1928,6 +1936,9 @@ impl BlockPump {
                             match outcome {
                                 Ok(crate::bot_core::reorg_coordinator::ReorgOutcome::Restored) => {
                                     reorg_pools_restored += 1;
+                                    if let Some(p) = crate::instruments::pipeline() {
+                                        p.count_reorg_unwound_pool();
+                                    }
                                 }
                                 Ok(
                                     crate::bot_core::reorg_coordinator::ReorgOutcome::IdempotentNoop,
@@ -1977,6 +1988,9 @@ impl BlockPump {
                             match outcome {
                                 Ok(crate::bot_core::reorg_coordinator::ReorgOutcome::Restored) => {
                                     reorg_pools_restored += 1;
+                                    if let Some(p) = crate::instruments::pipeline() {
+                                        p.count_reorg_unwound_pool();
+                                    }
                                 }
                                 Ok(
                                     crate::bot_core::reorg_coordinator::ReorgOutcome::IdempotentNoop,
