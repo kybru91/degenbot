@@ -167,6 +167,45 @@ pub struct SimulatedPathResult {
     pub failure: Option<InlineSimFailure>,
 }
 
+/// A scheduled-but-maybe-unfinished inline sim (7LV6VN T5). The solve
+/// worker schedules the eager EVM simulation and keeps walking paths; the
+/// receipt is polled non-blockingly (delivery as soon as each sim lands)
+/// and joined at bin end.
+#[must_use]
+pub struct PendingSim {
+    rx: std::sync::mpsc::Receiver<Option<SimulatedPathResult>>,
+}
+
+/// Poll verdict for a scheduled sim (container-wrapped so no variant is
+/// meaningfully larger than another; the inner `Option` is the payload
+/// contract — `None` = sim-failed).
+#[derive(Debug)]
+pub(crate) enum SimPoll {
+    /// The sim finished.
+    Ready(Option<Box<SimulatedPathResult>>),
+    /// Still in flight.
+    InFlight,
+}
+
+impl PendingSim {
+    pub(crate) fn new(rx: std::sync::mpsc::Receiver<Option<SimulatedPathResult>>) -> Self {
+        Self { rx }
+    }
+
+    /// Non-blocking poll (the `Box` flattens back to the payload on join).
+    pub(crate) fn try_result(&self) -> SimPoll {
+        match self.rx.try_recv() {
+            Ok(payload) => SimPoll::Ready(payload.map(Box::new)),
+            Err(_) => SimPoll::InFlight,
+        }
+    }
+
+    /// Blocking join (bin-tail collection).
+    pub(crate) fn result(self) -> Option<SimulatedPathResult> {
+        self.rx.recv().ok().flatten()
+    }
+}
+
 /// The hook the outer driver installs (ADR-019 D7 dependency inversion).
 /// `Send + Sync + 'static` so the engine can hold it as
 /// `Arc<dyn InlineSimulator>` and call it from any solve/merge context.
@@ -175,6 +214,22 @@ pub trait InlineSimulator: Send + Sync + 'static {
     /// (the entry's batch payload slot stays empty — T3's map decides the
     /// legacy FFI sim path per entry).
     fn simulate_path(&self, request: InlineSimRequest) -> Option<SimulatedPathResult>;
+
+    /// Eagerly START the sim for ONE clamp-admitted path and return a
+    /// receipt the worker polls/joins later (7LV6VN T5 pipelining). The
+    /// default runs the synchronous [`InlineSimulator::simulate_path`]
+    /// immediately and hands the finished value back through the receipt
+    /// (stubs and sync-only hooks stay correct without threads); the
+    /// production hook starts the sim on the dedicated runtime and only
+    /// blocks when the receipt is collected.
+    fn simulate_path_pipelined(
+        &self,
+        request: InlineSimRequest,
+    ) -> std::sync::mpsc::Receiver<Option<SimulatedPathResult>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = tx.send(self.simulate_path(request));
+        rx
+    }
 }
 
 impl ArbitrageEngine {

@@ -27,7 +27,7 @@ use super::{ArbitrageEngine, BlockMetadata, HashMap, HashSet};
 
 use crate::bot_core::resolve::resolve_hops;
 use crate::bot_core::BotState;
-use crate::solvers::arb_engine::inline_sim::SimulatedPathResult;
+use crate::solvers::arb_engine::inline_sim::{PendingSim, SimPoll, SimulatedPathResult};
 use ::degenbot_solvers::mixed::{
     HopType, MixedPoolRef, ResolvedHop, ResolvedMixedPath, SolvePathResult,
 };
@@ -677,6 +677,191 @@ fn inline_sim_payload(
         tracing::field::display(result.profit),
     );
     Some(payload)
+}
+
+/// 7LV6VN T5: pipelined inline sims. Default ON; set
+/// `DEGENBOT_SOLVE_SIM_PIPE=0` to fall back to the synchronous
+/// `inline_sim_payload` per path (A/B switch, twin of the LPT knob).
+/// Measured basis: hotpath 10-min window / 48 cycles shows per-bin
+/// serialization of ~17 sims x 2.5ms avg on top of ~65ms of walk work per
+/// bin — the sim joins dominate the solve-cycle tail (`solve_dirty` p95
+/// 564ms). Pipelining schedules the sim eagerly (its own driver thread; the
+/// hook then drives the dedicated sim runtime exactly as the sync path) so
+/// the bin walks the remaining paths while sims run concurrently across
+/// the 16 runtime workers; receipts poll non-blockingly (delivery as soon
+/// as each sim lands) and join at bin end.
+fn solve_sim_pipe_enabled() -> bool {
+    static PIPE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PIPE.get_or_init(|| std::env::var("DEGENBOT_SOLVE_SIM_PIPE").as_deref() != Ok("0"))
+}
+
+/// One scheduled sim: pid + the receipt the worker polls/joins.
+#[derive(Default)]
+struct PipelinedSims {
+    pending: Vec<(u64, PendingSim)>,
+}
+
+impl PipelinedSims {
+    fn schedule_one(
+        &mut self,
+        ctx: &SolveCycleShared,
+        idx: usize,
+        pid: u64,
+        result: &SolvePathResult,
+        parent_span: &tracing::Span,
+    ) -> bool {
+        // No hook / clamp stance off: no sim can ever land, so the caller
+        // must flush the item immediately (payload None) — otherwise the
+        // held item would wait on a receipt that never exists.
+        if !ctx.worker_clamp || idx >= ctx.pool_refs.len() {
+            return false;
+        }
+        let Some(sim) = ctx.inline_sim.as_ref() else {
+            return false;
+        };
+        // 7LV6VN T1b: EXPLICIT parent at creation (TLS re-entry alone forked
+        // orphan roots on worker threads). The span is created and entered
+        // ON THE DRIVER THREAD (std thread context = no inherited span),
+        // mirroring the legacy `inline_sim_payload` worker span byte for
+        // byte so Jaeger nesting and the verdict records are unchanged:
+        // the span stays open until the sim completes instead of closing
+        // when the bin's synchronous call returns.
+        let request = crate::solvers::arb_engine::inline_sim::InlineSimRequest {
+            path_id: pid,
+            hops: std::clone::Clone::clone(&ctx.pool_refs[idx]),
+            optimal_input: result.optimal_input,
+            consumed_inputs: std::clone::Clone::clone(&result.consumed_inputs),
+            hop_outputs: std::clone::Clone::clone(&result.hop_outputs),
+            state_nonces: std::clone::Clone::clone(&result.state_nonces),
+            sim_block: ctx.solve_block,
+            block_timestamp: ctx.metadata.timestamp,
+            parent_base_fee: ctx.metadata.base_fee_per_gas.unwrap_or(0),
+            parent_gas_used: ctx.metadata.gas_used,
+            parent_gas_limit: ctx.metadata.gas_limit,
+        };
+        let sim = std::sync::Arc::clone(sim);
+        let parent = parent_span.clone();
+        let expected_profit = result.profit;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name(format!("arb-sim-{pid}"))
+            .spawn(move || {
+                let span = tracing::info_span!(
+                    target: "degenbot::solver",
+                    parent: parent,
+                    "degenbot.bundle.simulate",
+                    sim.path = "worker_inline",
+                    path_id = request.path_id,
+                    sim_block = request.sim_block,
+                    simulate.verdict = tracing::field::Empty,
+                    simulate.expected_profit = tracing::field::Empty,
+                );
+                let _enter = span.enter();
+                let payload = sim.simulate_path(request);
+                span.record(
+                    "simulate.verdict",
+                    if payload.as_ref().is_some_and(|p| p.failure.is_none()) {
+                        "profitable"
+                    } else {
+                        "not_profitable"
+                    },
+                );
+                span.record(
+                    "simulate.expected_profit",
+                    tracing::field::display(expected_profit),
+                );
+                let _ = tx.send(payload);
+            });
+        if spawned.is_err() {
+            // Liveness: a failed spawn must not strand the receipt (the
+            // poll/join would block forever on an empty channel). The
+            // payload slot empties — the merge treats it as sim-failed.
+            return false;
+        }
+        self.pending.push((pid, PendingSim::new(rx)));
+        true
+    }
+
+    /// Non-blocking sweep: hand back every sim that finished while the bin
+    /// kept walking. Each pid surfaces exactly once.
+    fn drain_ready(
+        &mut self,
+    ) -> Vec<(
+        u64,
+        Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult>,
+    )> {
+        let mut ready = Vec::new();
+        let mut still = Vec::with_capacity(self.pending.len());
+        for (pid, ps) in self.pending.drain(..) {
+            match ps.try_result() {
+                SimPoll::Ready(payload) => ready.push((pid, payload.map(|b| *b))),
+                SimPoll::InFlight => still.push((pid, ps)),
+            }
+        }
+        self.pending = still;
+        ready
+    }
+
+    /// Bin-tail join: block for every outstanding sim. Order preserved.
+    fn join_all(
+        self,
+    ) -> impl Iterator<
+        Item = (
+            u64,
+            Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult>,
+        ),
+    > {
+        self.pending.into_iter().map(|(pid, p)| (pid, p.result()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// Send ONE held detached item after stamping its sim payload (7LV6VN T5).
+/// The in-flight gauge bumps at SEND time exactly as the legacy inline
+/// send did (a bin that dies before sending never leaks a count).
+fn flush_detached_item(
+    held: &mut Vec<DetachedMergeItem>,
+    tx: &std::sync::mpsc::Sender<DetachedMergeItem>,
+    outstanding_bin: &std::sync::atomic::AtomicU64,
+    done_pid: u64,
+    payload: Option<SimulatedPathResult>,
+) {
+    let Some(ix) = held
+        .iter()
+        .position(|it| matches!(it, DetachedMergeItem::Solved { pid, .. } if *pid == done_pid))
+    else {
+        return;
+    };
+    let DetachedMergeItem::Solved { payload: slot, .. } = &mut held[ix];
+    *slot = payload;
+    let item = held.remove(ix);
+    if tx.send(item).is_ok() {
+        outstanding_bin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Tokio-arm twin of [`flush_detached_item`]: stamp the sim payload onto
+/// the held outcome and stream it to the drain (7LV6VN T5).
+fn flush_tokio_item(
+    held: &mut Vec<(u64, Option<SolveArmOutcome>)>,
+    res_tx: &std::sync::mpsc::Sender<Option<SolveArmOutcome>>,
+    done_pid: u64,
+    payload: Option<SimulatedPathResult>,
+) {
+    let Some(ix) = held.iter().position(|(pid, _)| *pid == done_pid) else {
+        return;
+    };
+    let Some(o) = held[ix].1.as_mut() else {
+        return; // already flushed
+    };
+    o.3 = payload;
+    let item = held.remove(ix);
+    if let Some(outcome) = item.1 {
+        let _ = res_tx.send(Some(outcome));
+    }
 }
 
 /// Per-cycle shared solve context (epic BXUSGL T1): everything the
@@ -1967,6 +2152,7 @@ impl ArbitrageEngine {
                 // the sidecar decrements after each terminal disposition.
                 let outstanding_in_bins = std::sync::Arc::clone(&self.detached_outstanding);
                 let n_bins = bins.len();
+                let sim_pipe = solve_sim_pipe_enabled();
                 for (bin_idx, bin) in bins.into_iter().enumerate() {
                     let shared_bin = std::sync::Arc::clone(&shared);
                     let to_solve_bin = std::sync::Arc::clone(&to_solve);
@@ -1977,6 +2163,11 @@ impl ArbitrageEngine {
                     if let Err(err) = std::thread::Builder::new()
                         .name(format!("arb-detach-bin-{bin_idx}"))
                         .spawn(move || {
+                            // 7LV6VN T5 (pipelined arm): results park until
+                            // their sim lands; the walk never waits on a
+                            // sim (legacy path below is the `!sim_pipe` twin).
+                            let mut held: Vec<DetachedMergeItem> = Vec::new();
+                            let mut pending = PipelinedSims::default();
                             for &idx in &bin {
                                 let (pid, resolved) = &to_solve_bin[idx];
                                 // SIMPIPE2 T2: clamp in the bin thread
@@ -1984,7 +2175,7 @@ impl ArbitrageEngine {
                                 // — the profit-clamp recompute can zero a
                                 // candidate) so the committed inputs are
                                 // merge-ready with no sidecar round-trip.
-                                let Some((pid, result, worker_clamp_twins, payload)) =
+                                let Some((pid, result, worker_clamp_twins)) =
                                     solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved)
                                         .map(|(pid, mut r)| {
                                             let twins = clamp_result_in_worker(
@@ -1993,6 +2184,85 @@ impl ArbitrageEngine {
                                                 pid,
                                                 &mut r,
                                             );
+                                            (pid, r, twins)
+                                        })
+                                else {
+                                    continue;
+                                };
+                                if sim_pipe {
+                                    // T5: the profitless filter runs BEFORE
+                                    // the sim is scheduled — a clamp-zeroed
+                                    // candidate never needs its payload (the
+                                    // legacy path simmed first, then filtered).
+                                    if result.optimal_input.is_zero() || result.profit.is_zero() {
+                                        continue;
+                                    }
+                                    if !pending.schedule_one(
+                                        &shared_bin,
+                                        idx,
+                                        pid,
+                                        &result,
+                                        &solve_span_bin,
+                                    ) {
+                                        // No sim rides this item (no hook /
+                                        // clamp off) — flush immediately.
+                                        let update_stamp =
+                                            stamps_bin.get(&pid).cloned().unwrap_or_default();
+                                        held.push(DetachedMergeItem::Solved {
+                                            cycle_seq,
+                                            solve_block,
+                                            metadata: cycle_metadata,
+                                            pid,
+                                            update_stamp,
+                                            result,
+                                            worker_clamp_twins,
+                                            payload: None,
+                                            solve_span: solve_span_bin.clone(),
+                                        });
+                                        flush_detached_item(
+                                            &mut held,
+                                            &tx,
+                                            &outstanding_bin,
+                                            pid,
+                                            None,
+                                        );
+                                        continue;
+                                    }
+                                    if !result.solver_pool_states.is_empty() {
+                                        tracing::debug!(
+                                            "[solver-st] path_id={pid} hops=[{}]",
+                                            result.solver_pool_states.join(";")
+                                        );
+                                    }
+                                    let update_stamp =
+                                        stamps_bin.get(&pid).cloned().unwrap_or_default();
+                                    held.push(DetachedMergeItem::Solved {
+                                        cycle_seq,
+                                        solve_block,
+                                        metadata: cycle_metadata,
+                                        pid,
+                                        update_stamp,
+                                        result,
+                                        worker_clamp_twins,
+                                        payload: None,
+                                        solve_span: solve_span_bin.clone(),
+                                    });
+                                    // Fan while walking: send every sim that
+                                    // landed during this iteration's solve.
+                                    for (done_pid, payload) in pending.drain_ready() {
+                                        flush_detached_item(
+                                            &mut held,
+                                            &tx,
+                                            &outstanding_bin,
+                                            done_pid,
+                                            payload,
+                                        );
+                                    }
+                                    continue;
+                                }
+                                let Some((pid, result, worker_clamp_twins, payload)) =
+                                    Some((pid, result, worker_clamp_twins))
+                                        .map(|(pid, r, twins)| {
                                             let payload = inline_sim_payload(
                                                 &shared_bin,
                                                 idx,
@@ -2032,6 +2302,18 @@ impl ArbitrageEngine {
                                 {
                                     outstanding_bin
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                            // Tail: join every outstanding sim and send.
+                            if sim_pipe && !pending.is_empty() {
+                                for (done_pid, payload) in pending.join_all() {
+                                    flush_detached_item(
+                                        &mut held,
+                                        &tx,
+                                        &outstanding_bin,
+                                        done_pid,
+                                        payload,
+                                    );
                                 }
                             }
                         })
@@ -2095,6 +2377,7 @@ impl ArbitrageEngine {
                 let executor = crate::solvers::arb_engine::solve_executor::global_solve_executor();
                 let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<SolveArmOutcome>>();
                 let bins = compute_bins();
+                let sim_pipe = solve_sim_pipe_enabled();
                 for bin in &bins {
                     let bin = bin.clone();
                     let res_tx = res_tx.clone();
@@ -2102,6 +2385,10 @@ impl ArbitrageEngine {
                     let to_solve_bin = std::sync::Arc::clone(&to_solve);
                     let solve_span_bin = solve_span.clone();
                     executor.spawn(move || {
+                        // 7LV6VN T5 (pipelined arm): outcomes park until
+                        // their sim lands; the walk never waits on a sim.
+                        let mut held: Vec<(u64, Option<SolveArmOutcome>)> = Vec::new();
+                        let mut pending = PipelinedSims::default();
                         for &i in &bin {
                             let (pid, resolved) = &to_solve_bin[i];
                             let outcome = solve_one_path(
@@ -2119,22 +2406,78 @@ impl ArbitrageEngine {
                                 // the commit-ready values.
                                 let twins =
                                     clamp_result_in_worker(&shared_bin, i, pid, &mut result);
-                                // SIMPIPE2 T3: the inline payload rides the
-                                // same handoff (resolved on the worker, off
-                                // the engine lock).
-                                let payload = inline_sim_payload(
-                                    &shared_bin,
-                                    i,
-                                    pid,
-                                    &result,
-                                    &solve_span_bin,
-                                );
-                                (pid, result, twins, payload)
+                                (pid, result, twins)
                             });
-                            // Same profitless filter the rayon arm applies.
-                            let _ = res_tx.send(outcome.filter(|(_, r, _, _)| {
-                                !r.optimal_input.is_zero() && !r.profit.is_zero()
-                            }));
+                            if sim_pipe {
+                                // T5: the profitless filter runs BEFORE the
+                                // sim is scheduled — a clamp-zeroed candidate
+                                // never needs its payload.
+                                match outcome {
+                                    Some((pid, result, twins)) => {
+                                        if result.optimal_input.is_zero() || result.profit.is_zero()
+                                        {
+                                            if !result.solver_pool_states.is_empty() {
+                                                tracing::debug!(
+                                                    "[solver-st] path_id={pid} hops=[{}]",
+                                                    result.solver_pool_states.join(";")
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        if !pending.schedule_one(
+                                            &shared_bin,
+                                            i,
+                                            pid,
+                                            &result,
+                                            &solve_span_bin,
+                                        ) {
+                                            // No sim rides this item — flush
+                                            // immediately.
+                                            held.push((pid, Some((pid, result, twins, None))));
+                                            flush_tokio_item(&mut held, &res_tx, pid, None);
+                                            continue;
+                                        }
+                                        if !result.solver_pool_states.is_empty() {
+                                            tracing::debug!(
+                                                "[solver-st] path_id={pid} hops=[{}]",
+                                                result.solver_pool_states.join(";")
+                                            );
+                                        }
+                                        held.push((pid, Some((pid, result, twins, None))));
+                                        // Fan: flush sims that landed mid-walk.
+                                        for (done_pid, payload) in pending.drain_ready() {
+                                            flush_tokio_item(&mut held, &res_tx, done_pid, payload);
+                                        }
+                                    }
+                                    // Same failed-solve stream the legacy arm
+                                    // sends (the drain skips None).
+                                    None => {
+                                        let _ = res_tx.send(None);
+                                    }
+                                }
+                                continue;
+                            }
+                            // Legacy: sim rides inline before the filter.
+                            let to_send = outcome
+                                .map(|(pid, r, twins)| {
+                                    let payload = inline_sim_payload(
+                                        &shared_bin,
+                                        i,
+                                        pid,
+                                        &r,
+                                        &solve_span_bin,
+                                    );
+                                    (pid, r, twins, payload)
+                                })
+                                .filter(|(_, r, _, _)| {
+                                    !r.optimal_input.is_zero() && !r.profit.is_zero()
+                                });
+                            let _ = res_tx.send(to_send);
+                        }
+                        if sim_pipe && !pending.is_empty() {
+                            for (done_pid, payload) in pending.join_all() {
+                                flush_tokio_item(&mut held, &res_tx, done_pid, payload);
+                            }
                         }
                     });
                 }
