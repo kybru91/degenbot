@@ -18,7 +18,7 @@ pub use degenbot_pools as pools;
 pub use degenbot_pathfinding as pathfinding;
 
 /// Stateless solver math (Möbius composition, V3/V4 tick solving, the
-/// QuantAMM Balancer basket solver) — relocated from `degenbot-bot` (ADR-015).
+/// `QuantAMM` Balancer basket solver) — relocated from `degenbot-bot` (ADR-015).
 pub use degenbot_solvers as solvers;
 
 /// The whole `degenbot-uniswap` crate (dex identity + V2 encoding + registry).

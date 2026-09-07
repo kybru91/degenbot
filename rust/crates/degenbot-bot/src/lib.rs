@@ -39,7 +39,7 @@
 //!   lifecycle, path registry, solve dispatch, inline simulation, delivery.
 //!
 //! The stateless solver math itself (Möbius composition, V3/V4 integer
-//! tick-range solving, the QuantAMM Balancer basket solver) lives in the
+//! tick-range solving, the `QuantAMM` Balancer basket solver) lives in the
 //! `degenbot-solvers` crate and is imported via `::degenbot_solvers` —
 //! never re-exported from here.
 
