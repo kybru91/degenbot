@@ -584,7 +584,12 @@ mod tests {
     // avoid the parallel-test env race (each case asserts a distinct tail).
     #[test]
     fn worker_count_env_matrix() {
-        let default = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        // The fallback default is the PRODUCTION default (7LV6VN T5): the
+        // leftover CPU budget after the solve bins, NOT raw
+        // available_parallelism. Asserting the prod source here keeps the
+        // env matrix honest — this test pins override parsing + clamping,
+        // and cpu_budget has its own detection unit tests.
+        let default = degenbot_bot::bot_core::cpu_budget::leftover_worker_budget();
 
         std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "not-a-number");
         assert_eq!(super::inline_sim_worker_count(), default);

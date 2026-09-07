@@ -618,7 +618,7 @@ fn clamp_result_in_worker(
 /// The payload rides the result handoff so the merge never calls out — the
 /// merge only stores/forwards. `None` = stance off, no hook, or the hook
 /// reported failure-without-payload.
-#[cfg(test)]
+#[cfg(all(test, feature = "otel"))]
 fn inline_sim_payload(
     ctx: &SolveCycleShared,
     idx: usize,
