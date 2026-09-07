@@ -94,13 +94,40 @@ impl CachedProjection {
 /// happens OUTSIDE the lock (misses are the CPU-heavy case), so cross-path
 /// hit reuse survives without serializing the loop.
 ///
+/// SINGLE-FLIGHT dedup: the walk runs outside the lock, so two rayon chunks
+/// missing the same (dirty) key concurrently would EACH walk it and EACH
+/// store, inflating the projection count above the serial arm's (the
+/// `resolve_chunk_parity` test's cache-reuse invariant). `in_flight` guards
+/// that: a thread finding another walker mid-flight for the SAME key blocks
+/// on the shard condvar and re-checks the map when the walker publishes,
+/// so exactly ONE walk per key serves every concurrent requester (the
+/// projection-count invariant the parity test pins). The walk itself is
+/// still outside the lock, so only same-key requesters serialize — never
+/// distinct pools sharing a shard.
+///
 /// Nonce validation is unchanged: entries carry the state nonce they were
 /// built against and a stale entry is detected at read time, so no wrong
-/// sharing is possible even with concurrent inserts racing.
+/// sharing is possible even with concurrent inserts racing. A waiter whose
+/// nonce advanced past the freshly published entry re-acquires the flight
+/// and re-projects (last-writer-wins), preserving the stale-detection
+/// semantics of the unsynchronized form.
 type HopCacheEntryMap = HashMap<(HopType, u64, bool), (CachedProjection, u64)>;
 
+/// Per-shard state: the entry map + the set of keys whose projection walk
+/// is currently in flight on another thread.
+#[derive(Default)]
+struct HopShardState {
+    map: HopCacheEntryMap,
+    in_flight: HashMap<(HopType, u64, bool), ()>,
+}
+
+struct HopShard {
+    state: parking_lot::Mutex<HopShardState>,
+    cv: parking_lot::Condvar,
+}
+
 pub(crate) struct HopProjectionCache {
-    shards: [parking_lot::Mutex<HopCacheEntryMap>; HOP_CACHE_SHARDS],
+    shards: [HopShard; HOP_CACHE_SHARDS],
 }
 
 const HOP_CACHE_SHARDS: usize = 64;
@@ -109,7 +136,10 @@ impl HopProjectionCache {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            shards: std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())),
+            shards: std::array::from_fn(|_| HopShard {
+                state: parking_lot::Mutex::new(HopShardState::default()),
+                cv: parking_lot::Condvar::new(),
+            }),
         }
     }
 
@@ -124,13 +154,89 @@ impl HopProjectionCache {
         ((h ^ (h >> 31)) % HOP_CACHE_SHARDS as u64) as usize
     }
 
-    /// Raw entry clone under the shard lock (cheap: `Arc` inside).
-    pub(crate) fn get_entry(&self, key: &(HopType, u64, bool)) -> Option<(CachedProjection, u64)> {
-        self.shards[Self::shard_of(*key)].lock().get(key).cloned()
+    /// Memo hit-or-single-flight-miss for one hop projection (the body of
+    /// `resolve_hops`' memo branch). Returns the projection (replayed from
+    /// the memo, or computed via `compute`) plus whether THIS call ran the
+    /// walk — only actual walkers count, so N concurrent misses of one key
+    /// increment the projection counter exactly once, matching the serial
+    /// arm byte-for-byte.
+    ///
+    /// DEADLOCK SAFETY: a flight owner never blocks (its `compute` is one
+    /// pure pool projection that never touches the cache), so every
+    /// condvar-waiter's release chain terminates. The `FlightGuard` clears
+    /// the in-flight mark and wakes waiters even if `compute` panics.
+    pub(crate) fn get_or_project(
+        &self,
+        key: (HopType, u64, bool),
+        current_nonce: u64,
+        compute: impl FnOnce() -> Result<(ResolvedHop, u64), MissingHopReason>,
+    ) -> (Result<(ResolvedHop, u64), MissingHopReason>, bool) {
+        struct FlightGuard<'a> {
+            cache: &'a HopProjectionCache,
+            key: (HopType, u64, bool),
+            shard: usize,
+        }
+        impl Drop for FlightGuard<'_> {
+            fn drop(&mut self) {
+                let shard = &self.cache.shards[self.shard];
+                let mut state = shard.state.lock();
+                state.in_flight.remove(&self.key);
+                shard.cv.notify_all();
+            }
+        }
+
+        let shard_idx = Self::shard_of(key);
+        loop {
+            let mut state = self.shards[shard_idx].state.lock();
+            // Double-checked hit: re-validate under the same lock acquisition
+            // that decides the flight, so a waiter waking after the walker's
+            // publish takes the hit path without a second lock round-trip.
+            if let Some((cached, built_nonce)) = state.map.get(&key) {
+                if *built_nonce == current_nonce {
+                    let replay = cached.materialize();
+                    return (replay.map(|hop| (hop, current_nonce)), false);
+                }
+            }
+            if state.in_flight.insert(key, ()).is_none() {
+                // We own the walk. Compute outside the lock; the guard
+                // guarantees in-flight teardown + waiter wakeup even on panic.
+                drop(state);
+                let guard = FlightGuard {
+                    cache: self,
+                    key,
+                    shard: shard_idx,
+                };
+                let projected = compute();
+                let entry = match &projected {
+                    Ok((hop, _)) => CachedProjection::Hop(Arc::new(hop.clone())),
+                    Err(reason) => CachedProjection::Invalid(*reason),
+                };
+                self.shards[shard_idx]
+                    .state
+                    .lock()
+                    .map
+                    .insert(key, (entry, current_nonce));
+                drop(guard);
+                return (projected, true);
+            }
+            // Another thread is walking this exact key: wait for its publish
+            // and re-check (the hit path above handles the walker's publish;
+            // a nonce mismatch loops back to acquire the flight).
+            self.shards[shard_idx].cv.wait(&mut state);
+        }
     }
 
-    pub(crate) fn set_entry(&self, key: (HopType, u64, bool), value: (CachedProjection, u64)) {
-        self.shards[Self::shard_of(key)].lock().insert(key, value);
+    /// Raw entry clone under the shard lock (cheap: `Arc` inside). Test-only:
+    /// production reads go through `get_or_project` (flight + nonce validation
+    /// in one critical section).
+    #[cfg(test)]
+    fn get_entry(&self, key: &(HopType, u64, bool)) -> Option<(CachedProjection, u64)> {
+        self.shards[Self::shard_of(*key)]
+            .state
+            .lock()
+            .map
+            .get(key)
+            .cloned()
     }
 }
 
@@ -321,45 +427,39 @@ pub(crate) fn resolve_hops(
         let cache_key = (pool_ref.hop_type, pool_ref.pool_key, pool_ref.zero_for_one);
         let current_nonce = core.pool_state_nonce(pool_ref.pool_key);
 
-        let cached_hit = if memo {
-            // Sharded map (T2): clone the entry under the shard lock, then
-            // validate the nonce exactly as the flat map did.
-            cache
-                .get_entry(&cache_key)
-                .and_then(|(cached, built_nonce)| {
-                    (built_nonce == current_nonce).then(|| cached.materialize())
-                })
-        } else {
-            // Gate OFF: skip the memo entirely (never read above, never
-            // written below) — every hop re-projects, byte-exact either way.
-            None
+        let project_family = || match pool_ref.hop_type {
+            HopType::V2 => v2::project_v2(core, pool_ref),
+            HopType::V3 => cl::project_v3(core, pool_ref),
+            HopType::V4 => cl::project_v4(core, pool_ref),
+            HopType::SolidlyStable => solidly::project_solidly(core, pool_ref),
+            HopType::BalancerWeighted => {
+                balancer_weighted::project_balancer_weighted(core, pool_ref)
+            }
+            HopType::BalancerStable => balancer_stable::project_balancer_stable(core, pool_ref),
+            HopType::CurveStableswap => curve::project_curve(core, pool_ref),
         };
 
-        let projection = if let Some(replay) = cached_hit {
-            replay.map(|hop| (hop, current_nonce))
+        let projection = if memo {
+            // Single-flight memo read/compute (T2 sharded map): a hit re-clones
+            // the shared snapshot (no tick walk); a miss projects fresh and
+            // stores exactly once, with concurrent same-key misses waiting on
+            // the flight instead of re-walking (parity with the serial arm's
+            // projection count).
+            let (projected, walked) =
+                cache.get_or_project(cache_key, current_nonce, project_family);
+            if walked {
+                if let Some(count) = projection_count.as_deref_mut() {
+                    *count += 1;
+                }
+            }
+            projected
         } else {
+            // Gate OFF: skip the memo entirely — every hop re-projects,
+            // byte-exact either way.
             if let Some(count) = projection_count.as_deref_mut() {
                 *count += 1;
             }
-            let projected = match pool_ref.hop_type {
-                HopType::V2 => v2::project_v2(core, pool_ref),
-                HopType::V3 => cl::project_v3(core, pool_ref),
-                HopType::V4 => cl::project_v4(core, pool_ref),
-                HopType::SolidlyStable => solidly::project_solidly(core, pool_ref),
-                HopType::BalancerWeighted => {
-                    balancer_weighted::project_balancer_weighted(core, pool_ref)
-                }
-                HopType::BalancerStable => balancer_stable::project_balancer_stable(core, pool_ref),
-                HopType::CurveStableswap => curve::project_curve(core, pool_ref),
-            };
-            let entry = match &projected {
-                Ok((hop, _nonce)) => CachedProjection::Hop(Arc::new(hop.clone())),
-                Err(reason) => CachedProjection::Invalid(*reason),
-            };
-            if memo {
-                cache.set_entry(cache_key, (entry, current_nonce));
-            }
-            projected
+            project_family()
         };
 
         match projection {
@@ -954,5 +1054,96 @@ mod tests {
             on, off,
             "memo ON/OFF solves are byte-equal on the mixed intake"
         );
+    }
+
+    /// Chunked-parallel regression (`resolve_chunk_parity` CI flake): N threads
+    /// concurrently missing the SAME key must single-flight — exactly one
+    /// projection walk, every requester receiving the identical published
+    /// entry. The engine-level A/B pins this via `hop_projection_count`; this
+    /// unit test pins the cache primitive directly, deterministically.
+    #[test]
+    fn concurrent_same_key_misses_single_flight() {
+        const THREADS: usize = 8;
+        let cache = HopProjectionCache::new();
+        let walks = std::sync::atomic::AtomicUsize::new(0);
+        let walked_flags = std::sync::atomic::AtomicUsize::new(0);
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+
+        std::thread::scope(|scope| {
+            let cache_ref = &cache;
+            let walks_ref = &walks;
+            let flags_ref = &walked_flags;
+            for _ in 0..THREADS {
+                let start = start.clone();
+                scope.spawn(move || {
+                    start.wait();
+                    let (_, walked) =
+                        cache_ref.get_or_project((HopType::V3, 0x0bad_c0de, true), 42, || {
+                            walks_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // Widen the miss window so slow/sparse schedulers
+                            // (CI) genuinely overlap the flight.
+                            std::thread::sleep(std::time::Duration::from_millis(25));
+                            Ok((
+                                ResolvedHop::V2 {
+                                    state: degenbot_math::v2::IntHopState::new(
+                                        U256::from(1_000u64),
+                                        U256::from(1_000u64),
+                                        997,
+                                        1_000,
+                                    ),
+                                },
+                                42u64,
+                            ))
+                        });
+                    if walked {
+                        flags_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            walks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one walk may run for concurrently-missed key"
+        );
+        assert_eq!(
+            walked_flags.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the flight owner reports walked=true; waiters replay"
+        );
+
+        // A post-publish call at the same nonce must be a pure cache hit —
+        // the compute closure is never invoked (unreachable panics if it is).
+        let (_, repeated) = cache.get_or_project((HopType::V3, 0x0bad_c0de, true), 42, || {
+            panic!("entry exists at nonce 42; must not re-project")
+        });
+        assert!(!repeated, "repeat resolve at same nonce is a memo hit");
+
+        // Stale-detection path (waiter re-projection): an advanced nonce
+        // invalidates the published entry and re-projects (last-writer-wins),
+        // then that nonce becomes a hit — the loop must terminate, not
+        // livelock between the two nonces.
+        walks.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (projection43, walked43) =
+            cache.get_or_project((HopType::V3, 0x0bad_c0de, true), 43, || {
+                Ok((
+                    ResolvedHop::V2 {
+                        state: degenbot_math::v2::IntHopState::new(
+                            U256::from(2_000u64),
+                            U256::from(2_000u64),
+                            997,
+                            1_000,
+                        ),
+                    },
+                    43u64,
+                ))
+            });
+        assert!(walked43, "advanced nonce must re-project");
+        assert_eq!(projection43.expect("nonce-43 projection").1, 43);
+        let (_, repeated43) = cache.get_or_project((HopType::V3, 0x0bad_c0de, true), 43, || {
+            panic!("nonce-43 entry now cached; must not re-project")
+        });
+        assert!(!repeated43, "nonce-43 entry serves subsequent resolves");
     }
 }
