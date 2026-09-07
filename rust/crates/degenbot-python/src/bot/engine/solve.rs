@@ -1,7 +1,7 @@
 //! `PyO3` wrapper for the `ArbitrageEngine` — solve `#[pymethods]` slice.
 //!
 //! Split out of the former monolithic `py_binding.rs` (ergo UG6FKN task 74W2Z6),
-//! mirroring `crates/degenbot-bot/src/solvers/arb_engine/`'s per-concern
+//! mirroring `crates/degenbot-bot/src/arb_engine/`'s per-concern
 //! layout. `PyO3` allows multiple `#[pymethods] impl PyArbitrageEngine { … }`
 //! blocks per type, so each concern file contributes one slice.
 
@@ -56,32 +56,23 @@ impl PyArbitrageEngine {
     fn flush_event_buffer(&self, py: Python<'_>) {
         self.with_engine_mut(
             py,
-            degenbot_bot::solvers::arb_engine::ArbitrageEngine::flush_event_buffer,
+            degenbot_bot::arb_engine::ArbitrageEngine::flush_event_buffer,
         );
     }
 
     /// Number of registered V2 pools.
     fn v2_pool_count(&self, py: Python<'_>) -> usize {
-        self.with_engine(
-            py,
-            degenbot_bot::solvers::arb_engine::ArbitrageEngine::v2_pool_count,
-        )
+        self.with_engine(py, degenbot_bot::arb_engine::ArbitrageEngine::v2_pool_count)
     }
 
     /// Number of registered V3 pools.
     fn v3_pool_count(&self, py: Python<'_>) -> usize {
-        self.with_engine(
-            py,
-            degenbot_bot::solvers::arb_engine::ArbitrageEngine::v3_pool_count,
-        )
+        self.with_engine(py, degenbot_bot::arb_engine::ArbitrageEngine::v3_pool_count)
     }
 
     /// Number of registered V4 pools.
     fn v4_pool_count(&self, py: Python<'_>) -> usize {
-        self.with_engine(
-            py,
-            degenbot_bot::solvers::arb_engine::ArbitrageEngine::v4_pool_count,
-        )
+        self.with_engine(py, degenbot_bot::arb_engine::ArbitrageEngine::v4_pool_count)
     }
 
     /// Apply all buffered **backfill** V3 Mint/Burn events for a pool address
@@ -311,10 +302,7 @@ impl PyArbitrageEngine {
     /// Number of registered paths.
     fn path_count(&self, py: Python<'_>) -> usize {
         // GIL hygiene: engine Mutex acquired inside the accessor's py.detach.
-        self.with_engine(
-            py,
-            degenbot_bot::solvers::arb_engine::ArbitrageEngine::path_count,
-        )
+        self.with_engine(py, degenbot_bot::arb_engine::ArbitrageEngine::path_count)
     }
 
     /// Snapshot the engine-owned state for every hop in a registered path.

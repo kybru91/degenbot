@@ -57,8 +57,8 @@ For function-level attribution below the span granularity, use hotpath profiling
 Read the span site behind the hot phase to see its fields and children:
 
 - `bot_core/block_pump.rs` (~line 1201) — pump block span
-- `solvers/arb_engine/engine_handle.rs` (~line 129) — solve span
-- `solvers/arb_engine/lifecycle.rs` (~line 97) — registration span
+- `arb_engine/engine_handle.rs` (~line 129) — solve span
+- `arb_engine/lifecycle.rs` (~line 97) — registration span
 
 If the span's fields answer the question, interpret and move on. If not, add instrumentation (Step 4) rather than inferring from indirect evidence.
 

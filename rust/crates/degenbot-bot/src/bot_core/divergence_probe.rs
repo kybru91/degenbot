@@ -560,10 +560,10 @@ fn pack_tick_info_word(info: &degenbot_pools::TickInfo) -> B256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arb_engine::PoolTickCoverage;
     use crate::bot_core::{
         BotState, RegisterV2PoolParams, RegisterV3PoolParams, RegisterV4PoolParams, V4PoolKey,
     };
-    use crate::solvers::arb_engine::PoolTickCoverage;
     use alloy::primitives::{address, aliases::U112, keccak256, Address, B256, U256};
     use degenbot_pools::TickInfo;
     use hashbrown::HashMap;

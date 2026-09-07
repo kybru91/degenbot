@@ -24,7 +24,7 @@ We've been working on the degenbot arbitrage bot in `/workspaces/degenbot` (Rust
 
 ## What to do this session — telemetry-driven performance investigation
 
-1. **Verify the live bot is healthy and tracing is capturing far more than the sparse baseline.** Check Jaeger for `degenbot-bot` spans across a lookback (confirm per-block pump spans, solve spans, registration spans are showing). If spans are still sparse, dig into `rust/crates/degenbot-bot/src/otel.rs`, `instruments.rs`, `metrics.rs`, and the span sites in `bot_core/block_pump.rs`, `solvers/arb_engine/engine_handle.rs`, `solver_dispatch.rs` — earlier work added OTel plumbing there.
+1. **Verify the live bot is healthy and tracing is capturing far more than the sparse baseline.** Check Jaeger for `degenbot-bot` spans across a lookback (confirm per-block pump spans, solve spans, registration spans are showing). If spans are still sparse, dig into `rust/crates/degenbot-bot/src/otel.rs`, `instruments.rs`, `metrics.rs`, and the span sites in `bot_core/block_pump.rs`, `arb_engine/engine_handle.rs`, `solver_dispatch.rs` — earlier work added OTel plumbing there.
 
 2. **Find slow traces.** Pull Jaeger traces and rank by `duration`. Drill into the slowest ones — is the time in pathfinding (DFS discover), pool building, solve (`degenbot_solvers` / `mobius_v3_int`), simulation (`degenbot-bot/src/solvers/arb_engine`), or submission (`degenbot-submission/src/submit.rs`)? Identify whether spans have the attribution you need, or whether you must add child spans / `#[instrument]` + key fields (pool count, depth, block number) to make root-causing possible.
 

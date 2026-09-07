@@ -22,7 +22,7 @@
 use crate::bot::engine::PyArbitrageEngine;
 use crate::prelude::*;
 use degenbot_arbitrage::DispatchCandidate;
-use degenbot_bot::solvers::arb_engine::path_info::PathInfoBuildError;
+use degenbot_bot::arb_engine::path_info::PathInfoBuildError;
 use degenbot_executor::composers::{EncodeOptions, PathInfo};
 use pyo3::exceptions::PyValueError;
 

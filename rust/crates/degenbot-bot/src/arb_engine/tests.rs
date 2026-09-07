@@ -11,9 +11,9 @@ mod tests {
 
     use alloy::primitives::{aliases::U112, Address, U256};
 
+    use crate::arb_engine::{ArbitrageEngine, BlockMetadata, EnginePhase};
     use crate::bot_core::RegisterV3PoolParams;
     use crate::bot_core::RegisterV4PoolParams;
-    use crate::solvers::arb_engine::{ArbitrageEngine, BlockMetadata, EnginePhase};
     use ::degenbot_solvers::mixed::{
         HopType, PoolHop, ResolvedHop, ResolvedMixedPath, SolidlyHopState, SolvePathResult,
         INT128_MAX,
@@ -76,7 +76,7 @@ mod tests {
             tick_data,
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -190,7 +190,7 @@ mod tests {
             tick_data,
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -232,7 +232,7 @@ mod tests {
             tick_data: HashMap::new(),
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -489,7 +489,7 @@ mod tests {
     /// production reverse-index fan-out.
     #[test]
     fn invalid_path_skips_unrelated_dirty_but_rechecks_own_pool() {
-        use crate::solvers::arb_engine::path_lifecycle::PathSolveStatus;
+        use crate::arb_engine::path_lifecycle::PathSolveStatus;
 
         let mut engine = ArbitrageEngine::new();
 
@@ -506,7 +506,7 @@ mod tests {
             tick_data: HashMap::new(),
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -1440,7 +1440,7 @@ mod tests {
             tick_data: tick_data_a,
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -1482,7 +1482,7 @@ mod tests {
             tick_data: tick_data_b,
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -1550,7 +1550,7 @@ mod tests {
             tick_data,
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -1648,7 +1648,7 @@ mod tests {
             tick_data,
             update_block: 100, // 50 blocks AHEAD of the solve block 50
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -1732,7 +1732,7 @@ mod tests {
             tick_data,
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -2022,7 +2022,7 @@ mod tests {
             tick_data: HashMap::new(),
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -2054,7 +2054,7 @@ mod tests {
                 tick_data: HashMap::new(),
                 update_block: 0,
                 tick_data_block: None,
-                coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+                coverage: crate::arb_engine::PoolTickCoverage::Tracked,
                 fetcher: None,
             })
             .expect("V4 registration failed");
@@ -2136,8 +2136,8 @@ mod tests {
     #[expect(clippy::too_many_lines)]
     #[test]
     fn clamp_cl_hop_capacity_realigns_terminal_v2_after_forward_clamp() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::TickInfo;
-        use crate::solvers::arb_engine::PoolTickCoverage;
 
         use degenbot_math::v2::IntHopState;
 
@@ -2270,8 +2270,8 @@ mod tests {
     #[expect(clippy::too_many_lines)]
     #[test]
     fn clamp_cl_hop_capacity_caps_overfed_v4_input() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::TickInfo;
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::I256;
         use degenbot_pools::v3_state::V3PoolState;
         use degenbot_pools::v4_state::v4_simulate_swap;
@@ -2430,8 +2430,8 @@ mod tests {
     /// change.
     #[test]
     fn clamp_cl_hop_capacity_aligns_v4_first_hop0_outputs() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::TickInfo;
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::I256;
         use degenbot_pools::v3_state::V3PoolState;
         use degenbot_pools::v4_state::v4_simulate_swap;
@@ -2545,8 +2545,8 @@ mod tests {
     /// `consumed_inputs` for the (common) fully-fed-hop case.
     #[test]
     fn clamp_cl_hop_capacity_noop_within_capacity() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::TickInfo;
-        use crate::solvers::arb_engine::PoolTickCoverage;
 
         let mut engine = ArbitrageEngine::new();
 
@@ -2681,7 +2681,7 @@ mod tests {
             tick_data,
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -2706,7 +2706,7 @@ mod tests {
                 tick_data: HashMap::new(),
                 update_block: 0,
                 tick_data_block: None,
-                coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+                coverage: crate::arb_engine::PoolTickCoverage::Tracked,
                 fetcher: None,
             })
             .expect("V4 registration should succeed");
@@ -2807,7 +2807,7 @@ mod tests {
             tick_data: make_tick_data(),
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -2826,7 +2826,7 @@ mod tests {
             tick_data: make_tick_data(),
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -2845,7 +2845,7 @@ mod tests {
             tick_data: make_tick_data(),
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -2942,7 +2942,7 @@ mod tests {
             tick_data,
             update_block: 0,
             tick_data_block: None,
-            coverage: crate::solvers::arb_engine::PoolTickCoverage::Tracked,
+            coverage: crate::arb_engine::PoolTickCoverage::Tracked,
             fetcher: None,
             ..Default::default()
         });
@@ -3197,8 +3197,8 @@ mod tests {
         // first time (S2b). apply_v3_swap journals scalars; the restore path
         // pops them + reverse-applies tick priors. An in-range Mint journals
         // scalar_priors: Some so the bump rolls back too.
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::TickInfo;
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::U128;
 
         let engine = ArbitrageEngine::new();
@@ -3418,7 +3418,7 @@ mod tests {
     #[test]
     #[expect(clippy::too_many_lines)]
     fn process_backfill_logs_stamps_per_log_block_number() {
-        use crate::solvers::arb_engine::PoolTickCoverage;
+        use crate::arb_engine::PoolTickCoverage;
         use alloy::primitives::{Bytes, B256};
         use alloy::rpc::types::Log;
         use degenbot_decoders::v3_swap_decoder::V3_SWAP_TOPIC;
@@ -3869,8 +3869,7 @@ mod tests {
             gas_used: 15_000_000,
             gas_limit: 30_000_000,
         };
-        let notif =
-            crate::solvers::arb_engine::BlockNotification::from_metadata(25_390_117, &metadata);
+        let notif = crate::arb_engine::BlockNotification::from_metadata(25_390_117, &metadata);
         assert_eq!(notif.number, 25_390_117);
         assert_eq!(notif.timestamp, metadata.timestamp);
         assert_eq!(notif.base_fee_per_gas, metadata.base_fee_per_gas);
@@ -5329,8 +5328,8 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used)]
     fn solve_dirty_race_marks_dirty_work_with_solve_span() {
+        use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
-        use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use std::collections::HashSet;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
@@ -5460,8 +5459,8 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used)]
     fn finalize_block_consumes_no_dirt_and_emits_no_solve() {
+        use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
-        use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use std::collections::HashSet;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
@@ -5603,9 +5602,9 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used)]
     fn solve_spans_anchor_to_their_own_published_block() {
+        use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
         use crate::otel;
-        use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
@@ -5697,9 +5696,9 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used)]
     fn solve_span_records_cycle_solve_block() {
+        use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
         use crate::otel;
-        use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
@@ -5742,9 +5741,9 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used)]
     fn solve_dirty_emits_arb_solve_span_with_block_number() {
+        use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
         use crate::otel;
-        use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
@@ -5800,9 +5799,9 @@ mod tests {
     #[cfg(feature = "otel")]
     #[test]
     fn solve_dirty_skips_expire_spans_when_max_age_unset() {
+        use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
         use crate::otel;
-        use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
@@ -5921,9 +5920,9 @@ mod tests {
     #[cfg(feature = "otel")]
     #[test]
     fn solve_dirty_emits_expire_spans_with_phase_split() {
+        use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
         use crate::otel;
-        use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
@@ -5991,9 +5990,9 @@ mod tests {
     #[cfg(feature = "otel")]
     #[test]
     fn solve_dirty_skips_span_when_nothing_dirty() {
+        use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
         use crate::otel;
-        use crate::solvers::arb_engine::engine_handle::EngineHandle;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
         use std::sync::Arc;
         use tracing_subscriber::layer::SubscriberExt;
@@ -6035,7 +6034,7 @@ mod tests {
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         let mut engine = ArbitrageEngine::new();
-        engine.set_solve_executor(crate::solvers::arb_engine::SolveExecutorKind::Tokio);
+        engine.set_solve_executor(crate::arb_engine::SolveExecutorKind::Tokio);
 
         // Seven independent mispriced V2->V2 pairs -> seven profitable paths
         // (>=2 cores: LPT puts the slow path FIRST in its bin, so at least
@@ -6204,9 +6203,8 @@ mod tests {
         engine.set_merge_probe(probe.clone());
 
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
-        let handle = crate::solvers::arb_engine::engine_handle::EngineHandle::new(
-            std::sync::Arc::clone(&engine),
-        );
+        let handle =
+            crate::arb_engine::engine_handle::EngineHandle::new(std::sync::Arc::clone(&engine));
 
         // Heartbeat task on the same runtime: with the seam, the scheduler
         // marks the solve-holding worker blocking and spawns a replacement,
@@ -6270,7 +6268,7 @@ mod tests {
         let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut engine = ArbitrageEngine::new();
-        engine.set_solve_executor(crate::solvers::arb_engine::SolveExecutorKind::Tokio);
+        engine.set_solve_executor(crate::arb_engine::SolveExecutorKind::Tokio);
         engine.set_streaming_delivery(true);
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
         engine.set_result_channel(result_tx);
@@ -6451,9 +6449,8 @@ mod tests {
         for &pool in &pool_ids {
             engine.lock().insert_dirty(pool);
         }
-        let handle = crate::solvers::arb_engine::engine_handle::EngineHandle::new(
-            std::sync::Arc::clone(&engine),
-        );
+        let handle =
+            crate::arb_engine::engine_handle::EngineHandle::new(std::sync::Arc::clone(&engine));
 
         let t0 = std::time::Instant::now();
         handle.solve_dirty(100, &BlockMetadata::default());
@@ -6559,7 +6556,7 @@ mod tests {
         // A straggler whose pools ALL ticked during the solve.
         let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
         engine.merge_detached_item(
-            crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
                 payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
@@ -6587,7 +6584,7 @@ mod tests {
 
         // The unchanged-intake twin APPLIES (apply-if-unchanged).
         engine.merge_detached_item(
-            crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
                 payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
@@ -6652,7 +6649,7 @@ mod tests {
         assert!(!engine.results.contains_key(&pid));
 
         engine.merge_detached_item(
-            crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
                 payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
@@ -6688,10 +6685,8 @@ mod tests {
     #[cfg(feature = "otel")]
     #[test]
     fn detached_merge_event_parents_under_the_carried_solve_span() {
-        use crate::solvers::arb_engine::solver_dispatch::{
-            detached_merge_sidecar, DetachedMergeItem,
-        };
-        use crate::{otel, solvers::arb_engine::ArbitrageEngine};
+        use crate::arb_engine::solver_dispatch::{detached_merge_sidecar, DetachedMergeItem};
+        use crate::{arb_engine::ArbitrageEngine, otel};
         use alloy::primitives::U256;
         use degenbot_solvers::mixed::SolvePathResult;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
@@ -6803,7 +6798,7 @@ mod tests {
         // (a) An APPLIED straggler that lands AFTER publish #1 is re-scoped:
         // the next publish's verifier diff covers it — no bypass.
         engine.merge_detached_item(
-            crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
                 payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
@@ -6826,7 +6821,7 @@ mod tests {
         // acquires no result entry and adds nothing to the change set.
         let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
         engine.merge_detached_item(
-            crate::solvers::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
                 payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
@@ -6870,9 +6865,8 @@ mod tests {
         for &pool in &pool_ids {
             engine.lock().insert_dirty(pool);
         }
-        let handle = crate::solvers::arb_engine::engine_handle::EngineHandle::new(
-            std::sync::Arc::clone(&engine),
-        );
+        let handle =
+            crate::arb_engine::engine_handle::EngineHandle::new(std::sync::Arc::clone(&engine));
         let coordinator = SolveCoordinator::new(vec![std::sync::Arc::new(handle)]);
         let (verify_tx, _verify_rx) = tokio::sync::watch::channel(None);
         let owner = DispatchOwner::new(std::sync::Arc::new(coordinator), &Some(verify_tx));
@@ -6994,7 +6988,7 @@ mod tests {
 
         let run = |parallel: bool| {
             let (mut engine, path_ids, hub_a, hub_b) = build();
-            crate::solvers::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE
+            crate::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE
                 .store(parallel, Ordering::Relaxed);
 
             // Cycle 1: dirty BOTH hubs -> all N paths re-resolve in one cycle.
@@ -7046,8 +7040,7 @@ mod tests {
         let (par_results, par_same_state, par_proj_delta, _path_ids) = run(true);
 
         // Restore the production stance after the A/B.
-        crate::solvers::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE
-            .store(true, Ordering::Relaxed);
+        crate::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE.store(true, Ordering::Relaxed);
 
         assert_eq!(path_ids.len(), N);
         for (path_id, _unique, _a, _b) in &path_ids {

@@ -62,7 +62,7 @@ pub enum PathInfoBuildError {
 /// A hop's pool identity is unregistered (or its family has no encoder arm)
 /// — the exact [`PathInfoBuildError`] the engine-side projection raises.
 ///
-/// Re-exported via `crate::solvers::arb_engine` for the outer seam.
+/// Re-exported via `crate::arb_engine` for the outer seam.
 pub fn build_path_info(
     core: &BotState,
     pools: &[MixedPoolRef],
@@ -286,8 +286,8 @@ mod tests {
     use alloy::primitives::{aliases::U112, Address, U256};
     use degenbot_executor::composers::HopInfo;
 
+    use crate::arb_engine::ArbitrageEngine;
     use crate::bot_core::{PoolTickCoverage, RegisterV3PoolParams, RegisterV4PoolParams};
-    use crate::solvers::arb_engine::ArbitrageEngine;
     use ::degenbot_decoders::v4_swap_decoder::V4PoolId;
     use ::degenbot_pools::v4_state::V4PoolKey;
     use ::degenbot_solvers::mixed::PoolHop;

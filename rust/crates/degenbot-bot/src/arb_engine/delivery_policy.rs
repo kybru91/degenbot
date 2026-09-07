@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 
 use super::delivery_lifecycle::DeliveryLifecycle;
 use super::{ArbitrageEngine, BlockMetadata, ResultBatch};
-use crate::solvers::arb_engine::inline_sim::SimulatedPathResult;
+use crate::arb_engine::inline_sim::SimulatedPathResult;
 use ::degenbot_solvers::mixed::SolvePathResult;
 
 /// The delivery policy: filters the engine's solve output by the profit
@@ -338,14 +338,11 @@ impl ArbitrageEngine {
         // SIMPIPE2 T3: drain the worker-resolved inline payloads for this
         // publish; the delivery ships the entries for the delivered paths and
         // drops the rest.
-        let inline_payloads: HashMap<
-            u64,
-            crate::solvers::arb_engine::inline_sim::SimulatedPathResult,
-        > = self
-            .inline_payloads
-            .iter()
-            .map(|e| (*e.key(), e.value().clone()))
-            .collect();
+        let inline_payloads: HashMap<u64, crate::arb_engine::inline_sim::SimulatedPathResult> =
+            self.inline_payloads
+                .iter()
+                .map(|e| (*e.key(), e.value().clone()))
+                .collect();
         self.inline_payloads.clear();
         self.delivery
             .diff_and_send(&results_snapshot, results_block, metadata, &inline_payloads);

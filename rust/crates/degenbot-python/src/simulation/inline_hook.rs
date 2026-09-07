@@ -33,12 +33,12 @@ use alloy::primitives::{Bytes, U256};
 use degenbot_arbitrage::{
     simulate_path_on_evm, FailBuckets, SimResult, SimulateContext, SimulatePath, SolveStep,
 };
-use degenbot_bot::bot_core::state_lock::StateLock;
-use degenbot_bot::bot_core::{BotState, SimAnchorState};
-use degenbot_bot::solvers::arb_engine::inline_sim::{
+use degenbot_bot::arb_engine::inline_sim::{
     AccessListRow, CapturedSwapRow, InlineSimFailure, InlineSimRequest, InlineSimulator,
     InlineSwapFamily, SimulatedPathResult,
 };
+use degenbot_bot::bot_core::state_lock::StateLock;
+use degenbot_bot::bot_core::{BotState, SimAnchorState};
 use degenbot_executor::composers::EncodeOptions;
 use degenbot_rpc::provider::AlloyProvider;
 use degenbot_simulation::sim::evm::inspectors::SwapFamily;
@@ -312,7 +312,7 @@ impl InlineSimulator for InlineSimHook {
         //    (the batch entry stays payload-less -> the legacy FFI path).
         let path_info = {
             let core = self.bot_state.read();
-            match degenbot_bot::solvers::arb_engine::build_path_info(&core, &req.hops) {
+            match degenbot_bot::arb_engine::build_path_info(&core, &req.hops) {
                 Ok(pi) => pi,
                 Err(_) => return None,
             }

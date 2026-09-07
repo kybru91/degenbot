@@ -25,9 +25,9 @@ use super::{ArbitrageEngine, BlockMetadata, HashMap, HashSet};
 // genuine stale/desync pool it fails HARD and LOUDLY, which is the preferred
 // behavior (develop on loud failures).
 
+use crate::arb_engine::inline_sim::{PendingSim, SimPoll, SimulatedPathResult};
 use crate::bot_core::resolve::resolve_hops;
 use crate::bot_core::BotState;
-use crate::solvers::arb_engine::inline_sim::{PendingSim, SimPoll, SimulatedPathResult};
 use ::degenbot_solvers::mixed::{
     HopType, MixedPath, MixedPoolRef, ResolvedHop, ResolvedMixedPath, SolvePathResult,
 };
@@ -625,7 +625,7 @@ fn inline_sim_payload(
     pid: u64,
     result: &SolvePathResult,
     parent_span: &tracing::Span,
-) -> Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult> {
+) -> Option<crate::arb_engine::inline_sim::SimulatedPathResult> {
     if !ctx.worker_clamp || idx >= ctx.pool_refs.len() {
         return None;
     }
@@ -652,7 +652,7 @@ fn inline_sim_payload(
         simulate.expected_profit = tracing::field::Empty,
     );
     let _enter = span.enter();
-    let payload = sim.simulate_path(crate::solvers::arb_engine::inline_sim::InlineSimRequest {
+    let payload = sim.simulate_path(crate::arb_engine::inline_sim::InlineSimRequest {
         path_id: pid,
         hops: std::clone::Clone::clone(&ctx.pool_refs[idx].pools),
         optimal_input: result.optimal_input,
@@ -711,7 +711,7 @@ impl PipelinedSims {
         // byte so Jaeger nesting and the verdict records are unchanged:
         // the span stays open until the sim completes instead of closing
         // when the bin's synchronous call returns.
-        let request = crate::solvers::arb_engine::inline_sim::InlineSimRequest {
+        let request = crate::arb_engine::inline_sim::InlineSimRequest {
             path_id: pid,
             hops: std::clone::Clone::clone(&ctx.pool_refs[idx].pools),
             optimal_input: result.optimal_input,
@@ -734,13 +734,13 @@ impl PipelinedSims {
         // sims stay bounded by the budget-derived cap - the explicit
         // replacement for the pacing the synchronous sim join used to
         // provide. The guard releases exactly when the sim finishes.
-        let slots = crate::solvers::arb_engine::sim_slots::sim_slots_global();
+        let slots = crate::arb_engine::sim_slots::sim_slots_global();
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(format!("arb-sim-{pid}"))
             .spawn(move || {
                 slots.acquire();
-                let _slot = crate::solvers::arb_engine::sim_slots::SlotGuard::acquired(slots);
+                let _slot = crate::arb_engine::sim_slots::SlotGuard::acquired(slots);
                 let span = tracing::info_span!(
                     target: "degenbot::solver",
                     parent: parent,
@@ -783,7 +783,7 @@ impl PipelinedSims {
         &mut self,
     ) -> Vec<(
         u64,
-        Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult>,
+        Option<crate::arb_engine::inline_sim::SimulatedPathResult>,
     )> {
         let mut ready = Vec::new();
         let mut still = Vec::with_capacity(self.pending.len());
@@ -803,7 +803,7 @@ impl PipelinedSims {
     ) -> impl Iterator<
         Item = (
             u64,
-            Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult>,
+            Option<crate::arb_engine::inline_sim::SimulatedPathResult>,
         ),
     > {
         self.pending.into_iter().map(|(pid, p)| (pid, p.result()))
@@ -948,7 +948,7 @@ pub(crate) struct SolveCycleShared {
     /// SIMPIPE2 T3: the engine's inline-sim hook snapshot. `Some` + stance ON
     /// → the worker resolves the per-path payload right after the clamp (no
     /// engine lock — the same off-lock seam the worker clamp opened).
-    inline_sim: Option<std::sync::Arc<dyn crate::solvers::arb_engine::inline_sim::InlineSimulator>>,
+    inline_sim: Option<std::sync::Arc<dyn crate::arb_engine::inline_sim::InlineSimulator>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -998,7 +998,7 @@ pub(crate) enum DetachedMergeItem {
         worker_clamp_twins: u64,
         /// SIMPIPE2 T3: the WORKER-side inline-sim payload (None = stance
         /// off / no hook / hook failure-without-payload).
-        payload: Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult>,
+        payload: Option<crate::arb_engine::inline_sim::SimulatedPathResult>,
         /// The solve-cycle span at ENQUEUE time (MQUKB6-T2). The sidecar
         /// std-thread has NO ambient tracing context, so the item carries
         /// the issuing `degenbot.arb.solve` span and the merge enters it
@@ -2359,7 +2359,7 @@ impl ArbitrageEngine {
 
         let tokio_solve_mode = matches!(
             self.solve_executor,
-            crate::solvers::arb_engine::SolveExecutorKind::Tokio
+            crate::arb_engine::SolveExecutorKind::Tokio
         );
         let streaming_merge: bool;
         let mut clamp_twin_count: u64 = 0;
@@ -2378,7 +2378,7 @@ impl ArbitrageEngine {
                 // overlap the next block cycle; the drain runs on the
                 // calling thread (T2 moves it to spawn_blocking for the
                 // async seam).
-                let executor = crate::solvers::arb_engine::solve_executor::global_solve_executor();
+                let executor = crate::arb_engine::solve_executor::global_solve_executor();
                 let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<SolveArmOutcome>>();
                 let bins = compute_bins();
                 for bin in &bins {
@@ -3253,8 +3253,8 @@ mod profit_clamp_recompute_tests {
     /// path: the over-fed committed input is the empty-march class. Returns
     /// (engine, `path_id`, the to_solve-aligned pool-ref snapshot).
     fn overfed_v4_engine() -> (ArbitrageEngine, u64, Vec<std::sync::Arc<MixedPath>>) {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::RegisterV4PoolParams;
-        use crate::solvers::arb_engine::PoolTickCoverage;
         fn usdc_local(amount: u64) -> alloy::primitives::Uint<112, 2> {
             (U256::from(amount) * U256::from(10u64).pow(U256::from(6)))
                 .to::<alloy::primitives::Uint<112, 2>>()
@@ -3411,7 +3411,7 @@ mod profit_clamp_recompute_tests {
     /// tests + the FFI conversion; this pins the merge-site store/drop.)
     #[test]
     fn merge_stores_payload_and_drops_it_without_one() {
-        use crate::solvers::arb_engine::inline_sim::{InlineSwapFamily, SimulatedPathResult};
+        use crate::arb_engine::inline_sim::{InlineSwapFamily, SimulatedPathResult};
         use alloy::primitives::{Address, I256, U256};
 
         let (mut engine, path_id, _pool_refs) = overfed_v4_engine();
@@ -3433,7 +3433,7 @@ mod profit_clamp_recompute_tests {
             base_fee_next: 30,
             execute_calldata: vec![1, 2, 3],
             access_list: None,
-            captured_swaps: vec![crate::solvers::arb_engine::inline_sim::CapturedSwapRow {
+            captured_swaps: vec![crate::arb_engine::inline_sim::CapturedSwapRow {
                 emitter: Address::from([0x11u8; 20]),
                 family: InlineSwapFamily::V4,
                 amount0: I256::MINUS_ONE,
@@ -3559,7 +3559,7 @@ mod profit_clamp_recompute_tests {
             state_nonces: vec![0],
             solver_pool_states: Vec::new(),
         };
-        let payload = crate::solvers::arb_engine::inline_sim::SimulatedPathResult {
+        let payload = crate::arb_engine::inline_sim::SimulatedPathResult {
             path_id,
             gross_profit: U256::from(1_000u64),
             net_profit: U256::from(900u64),
@@ -3614,36 +3614,34 @@ mod profit_clamp_recompute_tests {
             fail: bool,
             path_id: u64,
         }
-        impl crate::solvers::arb_engine::inline_sim::InlineSimulator for StubSim {
+        impl crate::arb_engine::inline_sim::InlineSimulator for StubSim {
             fn simulate_path(
                 &self,
-                request: crate::solvers::arb_engine::inline_sim::InlineSimRequest,
-            ) -> Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult> {
+                request: crate::arb_engine::inline_sim::InlineSimRequest,
+            ) -> Option<crate::arb_engine::inline_sim::SimulatedPathResult> {
                 assert_eq!(
                     request.path_id, self.path_id,
                     "stub receives the merged path id"
                 );
-                Some(
-                    crate::solvers::arb_engine::inline_sim::SimulatedPathResult {
-                        path_id: request.path_id,
-                        gross_profit: U256::from(1_000u64),
-                        net_profit: U256::from(900u64),
-                        gas_used: 300_000,
-                        priority_fee: 2,
-                        base_fee_next: 30,
-                        execute_calldata: vec![7, 8, 9],
-                        access_list: None,
-                        captured_swaps: Vec::new(),
-                        hop_count: 1,
-                        failure: self.fail.then(|| {
-                            crate::solvers::arb_engine::inline_sim::InlineSimFailure {
-                                fail_index: None,
-                                revert_data: Vec::new(),
-                                bucket: "test".to_string(),
-                            }
+                Some(crate::arb_engine::inline_sim::SimulatedPathResult {
+                    path_id: request.path_id,
+                    gross_profit: U256::from(1_000u64),
+                    net_profit: U256::from(900u64),
+                    gas_used: 300_000,
+                    priority_fee: 2,
+                    base_fee_next: 30,
+                    execute_calldata: vec![7, 8, 9],
+                    access_list: None,
+                    captured_swaps: Vec::new(),
+                    hop_count: 1,
+                    failure: self
+                        .fail
+                        .then(|| crate::arb_engine::inline_sim::InlineSimFailure {
+                            fail_index: None,
+                            revert_data: Vec::new(),
+                            bucket: "test".to_string(),
                         }),
-                    },
-                )
+                })
             }
         }
 
@@ -3928,7 +3926,7 @@ mod executor_ab_probe {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use crate::solvers::arb_engine::BlockMetadata;
+    use crate::arb_engine::BlockMetadata;
     use alloy::primitives::U256;
     use degenbot_pools::int_v3_hop::{IntV3TickRangeHop, IntV3TickRangeSequence};
     use degenbot_solvers::mobius_v3_int::{build_cl_crossing_table, build_cl_word_profiles};
@@ -3937,7 +3935,7 @@ mod executor_ab_probe {
     use super::{
         lpt_partition, path_cost_proxy, solve_one_path, BotState, PathTimesHeap, SolveCycleShared,
     };
-    use crate::solvers::arb_engine::solve_executor::SolveExecutor;
+    use crate::arb_engine::solve_executor::SolveExecutor;
     use hashbrown::HashMap;
 
     pub(super) fn pct(values: &[f64], q: f64) -> f64 {

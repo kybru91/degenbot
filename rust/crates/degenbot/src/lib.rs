@@ -6,9 +6,10 @@ pub use degenbot_core::{address_utils, errors, hex_utils, runtime};
 /// `examples/path*_solver_fixture.rs` investigate-runner dialect.
 pub mod investigation;
 
-/// state, plus the Möbius solvers + the unified `ArbitrageEngine`.
+/// The per-chain state owner + the unified multi-DEX arb engine (`bot_core`,
+/// `arb_engine`); the stateless solver math lives in [`crate::solvers`].
 pub use degenbot_bot as bot;
-/// `degenbot::solvers` — ADR-015 relocation).
+/// `BotState` state-owner surface, re-exported alongside [`crate::bot`].
 pub use degenbot_bot::bot_core;
 /// traits (ADR-005 standalone-by-design pool value/trait layer).
 pub use degenbot_pools as pools;
@@ -16,7 +17,8 @@ pub use degenbot_pools as pools;
 /// Pathfinding graph (`PathGraph`) + edge graph.
 pub use degenbot_pathfinding as pathfinding;
 
-/// re-exports only `arb_engine`; the relocated solver math lives here.
+/// Stateless solver math (Möbius composition, V3/V4 tick solving, the
+/// QuantAMM Balancer basket solver) — relocated from `degenbot-bot` (ADR-015).
 pub use degenbot_solvers as solvers;
 
 /// The whole `degenbot-uniswap` crate (dex identity + V2 encoding + registry).

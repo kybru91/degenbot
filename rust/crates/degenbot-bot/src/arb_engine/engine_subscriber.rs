@@ -16,11 +16,11 @@ use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
+use crate::arb_engine::dirty_sets::DirtySets;
+use crate::arb_engine::ArbitrageEngine;
 use crate::bot_core::log_dispatcher::PoolStateSubscriber;
 use crate::bot_core::state_lock::StateLock;
 use crate::bot_core::BotState;
-use crate::solvers::arb_engine::dirty_sets::DirtySets;
-use crate::solvers::arb_engine::ArbitrageEngine;
 
 /// A `PoolStateSubscriber` backed by a shared `ArbitrageEngine`.
 ///
@@ -83,7 +83,7 @@ impl PoolStateSubscriber for EngineSubscriber {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solvers::arb_engine::ArbitrageEngine;
+    use crate::arb_engine::ArbitrageEngine;
     use std::sync::Arc;
 
     #[test]

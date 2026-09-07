@@ -1,7 +1,7 @@
 //! `PyO3` wrapper for the `ArbitrageEngine` — `result_channel` `#[pymethods]` slice.
 //!
 //! Split out of the former monolithic `py_binding.rs` (ergo UG6FKN task 74W2Z6),
-//! mirroring `crates/degenbot-bot/src/solvers/arb_engine/`'s per-concern
+//! mirroring `crates/degenbot-bot/src/arb_engine/`'s per-concern
 //! layout. `PyO3` allows multiple `#[pymethods] impl PyArbitrageEngine { … }`
 //! blocks per type, so each concern file contributes one slice.
 
@@ -11,7 +11,7 @@ use super::{
 };
 use crate::conversion::alloy::{PyI256, PyU256};
 use crate::prelude::*;
-use degenbot_bot::solvers::arb_engine::inline_sim::{InlineSwapFamily, SimulatedPathResult};
+use degenbot_bot::arb_engine::inline_sim::{InlineSwapFamily, SimulatedPathResult};
 use pyo3::types::{PyBytes, PyString};
 
 fn address_to_checksum<'py>(py: Python<'py>, a: &Address) -> Bound<'py, PyString> {

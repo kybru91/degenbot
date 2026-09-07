@@ -16,7 +16,7 @@ use degenbot_solvers::mobius_v3_int::{
 
 use super::super::BotState;
 use super::MissingHopReason;
-use crate::solvers::arb_engine::PoolTickCoverage;
+use crate::arb_engine::PoolTickCoverage;
 
 /// The promoted fused-epoch table pair (cache-lab winner S1, KGXFT7): ONE
 /// crossing build derives BOTH artifacts as a unit — the crossing table
@@ -138,10 +138,10 @@ mod tests {
 
     use super::super::MissingHopReason;
     use super::{project_v3, project_v4};
+    use crate::arb_engine::PoolTickCoverage;
     use crate::bot_core::{
         BotState, RegisterV3PoolParams, RegisterV4PoolParams, TickInfo, V4PoolKey,
     };
-    use crate::solvers::arb_engine::PoolTickCoverage;
     use alloy::primitives::{Address, U128, U256};
     use degenbot_solvers::mixed::{HopType, MixedPoolRef, ResolvedHop};
 

@@ -37,8 +37,8 @@
 //! | `hop_count` | `hop_count` |
 //! | — (dispatch failures only) | `failure: Option<InlineSimFailure>` |
 
-use crate::solvers::arb_engine::ArbitrageEngine;
-use crate::solvers::arb_engine::BlockMetadata;
+use crate::arb_engine::ArbitrageEngine;
+use crate::arb_engine::BlockMetadata;
 use alloy::primitives::{Address, I256, U256};
 use degenbot_solvers::mixed::{MixedPoolRef, SolvePathResult};
 
@@ -323,8 +323,8 @@ mod inline_sim_tests {
 
     #[expect(clippy::expect_used)]
     fn two_hop_engine() -> (ArbitrageEngine, u64) {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::TickInfo;
-        use crate::solvers::arb_engine::PoolTickCoverage;
         let mut engine = ArbitrageEngine::new();
         let to_u112 = |v: u64| {
             (U256::from(v) * U256::from(10u64).pow(U256::from(18)))

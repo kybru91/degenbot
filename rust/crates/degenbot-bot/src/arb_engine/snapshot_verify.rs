@@ -1,7 +1,7 @@
 //! Re-export shim — the pure helpers now live in
 //! `crate::bot_core::snapshot_verify` (ADR-006 D4 relocation).
 //!
-//! This file is kept so existing `solvers::arb_engine::snapshot_verify::*`
+//! This file is kept so existing `arb_engine::snapshot_verify::*`
 //! imports continue to resolve. New code should import from
 //! `degenbot_bot::bot_core::snapshot_verify` directly.
 //!

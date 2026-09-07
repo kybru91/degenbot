@@ -134,7 +134,7 @@ walk (deepest `Revert` frame + `classify_revert`).
 
 ## 4. The `diagnostic.rs` retirement boundary
 
-`rust/crates/degenbot-bot/src/solvers/arb_engine/diagnostic.rs` (the
+`rust/crates/degenbot-bot/src/arb_engine/diagnostic.rs` (the
 "mixed Uniswap arbitrage engine" diagnostic path) splits cleanly:
 
 **DELETE (the onchain-recompute half — replaced by swap-event capture):**

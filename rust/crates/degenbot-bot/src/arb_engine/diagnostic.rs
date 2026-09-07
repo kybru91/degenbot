@@ -547,9 +547,9 @@ mod tests {
 
     use alloy::primitives::{aliases::U112, Address, U256};
 
+    use crate::arb_engine::{ArbitrageEngine, DiagnosticPathState, PoolTickCoverage};
     use crate::bot_core::RegisterV3PoolParams as V3Params;
     use crate::bot_core::{RegisterV4PoolParams as V4Params, V4PoolKey};
-    use crate::solvers::arb_engine::{ArbitrageEngine, DiagnosticPathState, PoolTickCoverage};
     use ::degenbot_solvers::mixed::PoolHop;
 
     fn usdc(amount: u64) -> U112 {

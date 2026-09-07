@@ -8,9 +8,9 @@ the Jaeger-side investigation guide.
 
 Sources of truth:
 
-- Spans/events: `rust/crates/degenbot-bot/src/solvers/arb_engine/solver_dispatch.rs`
+- Spans/events: `rust/crates/degenbot-bot/src/arb_engine/solver_dispatch.rs`
   (the `[solve-phase]` family), `bot_core/block_pump.rs` (`degenbot.pump.block`),
-  `solvers/arb_engine/engine_handle.rs` (`degenbot.arb.solve`).
+  `arb_engine/engine_handle.rs` (`degenbot.arb.solve`).
 - Metrics: `rust/crates/degenbot-bot/src/instruments.rs` (`degenbot_*` families).
 - OTel setup (event cap, exporter): `rust/crates/degenbot-bot/src/otel.rs`.
 

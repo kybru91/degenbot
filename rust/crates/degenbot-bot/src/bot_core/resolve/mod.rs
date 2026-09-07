@@ -1,5 +1,5 @@
 //! Per-family resolve projections — the deepened internals of
-//! [`ArbitrageEngine::resolve_path`](crate::solvers::arb_engine::ArbitrageEngine).
+//! [`ArbitrageEngine::resolve_path`](crate::arb_engine::ArbitrageEngine).
 //!
 //! One file per pool family exposing a free
 //! `project_<family>(&BotState, &MixedPoolRef) -> Result<(ResolvedHop, u64),

@@ -17,11 +17,11 @@
 
 use std::sync::Arc;
 
+use degenbot_bot::arb_engine::{ArbitrageEngine, EnginePhase};
 use degenbot_bot::bot_core::block_pump::{BlockPump, WsEvent};
 use degenbot_bot::bot_core::reorg_coordinator::ReorgCoordinator;
 use degenbot_bot::bot_core::solve_coordinator::SolveCoordinator;
 use degenbot_bot::bot_core::{drain_sink::DrainSink, Bot};
-use degenbot_bot::solvers::arb_engine::{ArbitrageEngine, EnginePhase};
 use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -650,12 +650,12 @@ mod tests {
     // `stop()`'s abort path is exercised without the real pump.
 
     use super::PumpState;
+    use degenbot_bot::arb_engine::engine_handle::EngineHandle;
+    use degenbot_bot::arb_engine::ArbitrageEngine;
     use degenbot_bot::bot_core::reorg_coordinator::ReorgCoordinator;
     use degenbot_bot::bot_core::solve_coordinator::SolveCoordinator;
     use degenbot_bot::bot_core::state_lock::StateLock;
     use degenbot_bot::bot_core::{Bot, BotState};
-    use degenbot_bot::solvers::arb_engine::engine_handle::EngineHandle;
-    use degenbot_bot::solvers::arb_engine::ArbitrageEngine;
     use tokio::sync::mpsc;
 
     fn pump_state_for_test() -> std::sync::Arc<PumpState> {

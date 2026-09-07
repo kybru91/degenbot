@@ -12,7 +12,7 @@
 //!   `#[pymethods] impl PyArbitrageEngine` blocks). [`errors`] holds the
 //!   `#[create_exception]` types.
 //! - Mirrors `polars-python/src/expr/`'s 17-file `PyExpr` split and the
-//!   existing `crates/degenbot-bot/src/solvers/arb_engine/` core split.
+//!   existing `crates/degenbot-bot/src/arb_engine/` core split.
 //!   (ergo UG6FKN task 74W2Z6.)
 
 mod errors;
@@ -47,11 +47,9 @@ pub(crate) use degenbot_bot::bot_core::reorg_coordinator::ReorgCoordinator;
 pub(crate) use degenbot_bot::bot_core::solve_coordinator::SolveCoordinator;
 pub(crate) use degenbot_bot::bot_core::{drain_sink::DrainSink, Bot, V4StateSync};
 
-pub(crate) use degenbot_bot::solvers::arb_engine::engine_handle::EngineHandle;
+pub(crate) use degenbot_bot::arb_engine::engine_handle::EngineHandle;
 
-pub(crate) use degenbot_bot::solvers::arb_engine::{
-    ArbitrageEngine, BlockNotification, ResultBatch,
-};
+pub(crate) use degenbot_bot::arb_engine::{ArbitrageEngine, BlockNotification, ResultBatch};
 pub(crate) use degenbot_solvers::mixed::{HopType, PoolHop, SolvePathResult};
 
 /// Python-facing mixed V2/V3 arbitrage engine.

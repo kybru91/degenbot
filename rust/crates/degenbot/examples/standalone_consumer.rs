@@ -191,7 +191,7 @@ fn fixture_snapshot_seed_block() -> Option<u64> {
 #[expect(clippy::too_many_lines)]
 fn main() {
     // 2b reaches ArbitrageEngine for the standalone lifecycle slice.
-    use degenbot::bot::solvers::arb_engine::{ArbitrageEngine, EnginePhase};
+    use degenbot::bot::arb_engine::{ArbitrageEngine, EnginePhase};
 
     // 1. Construct the Rust-owned per-chain bot state (no Python).
     let mut bot = BotState::new();

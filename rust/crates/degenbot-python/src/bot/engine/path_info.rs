@@ -16,7 +16,7 @@
 use degenbot_executor::composers::PathInfo;
 use pyo3::Python;
 
-use degenbot_bot::solvers::arb_engine::path_info::PathInfoBuildError;
+use degenbot_bot::arb_engine::path_info::PathInfoBuildError;
 
 use super::PyArbitrageEngine;
 

@@ -1256,7 +1256,7 @@ impl BotState {
     /// phase invariant is "state advanced, no batches emitted".
     ///
     /// This is the BotState-level relocation of what was
-    /// `ArbitrageEngine::process_backfill_logs` (`solvers/arb_engine/
+    /// `ArbitrageEngine::process_backfill_logs` (`arb_engine/
     /// event_routing.rs`); the engine method is now a thin delegator +
     /// `last_processed_block` stamp. `BotState` owns the state (ADR-003);
     /// `BlockPump::backfill_from_snapshot` (core) reaches it via `self.bot`.
@@ -1755,8 +1755,8 @@ mod tests {
         // (`initial_state_block == update_block`): the head-seeded slot0
         // `liquidity` scalar already reflects every in-range event up to head,
         // so a backfilled in-range replay below head must not adjust it.
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV3PoolParams, TickInfo};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         let mut core = BotState::new();
         let pool_addr = Address::from([0xccu8; 20]);
         let head = 1_000u64;
@@ -1814,8 +1814,8 @@ mod tests {
         // (so a mid-window reorg restores instead of a graceful
         // `NoStatePriorToBlock` shutdown) WITHOUT advancing either clock
         // (two-stamp OB7UNY).
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV3PoolParams, TickInfo};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         let mut core = BotState::new();
         let pool_addr = Address::from([0xe1u8; 20]);
         let head = 1_000u64;
@@ -2502,8 +2502,8 @@ mod tests {
     /// newly initializes 120. Helper does NOT create the `BotState` — the
     /// caller must buffer events on the SAME core before calling this.
     fn register_v3_on_core(core: &mut BotState, pool_addr: Address, update_block: u64) -> u64 {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV3PoolParams, TickInfo};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::U128;
         let mut tick_data = HashMap::new();
         tick_data.insert(
@@ -2672,8 +2672,8 @@ mod tests {
     /// via `v4_restore_before_block`.
     #[test]
     fn apply_backfill_buffer_v4_journals_and_advances_update_block() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolParams, TickInfo, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::{I256, U128};
 
         let pool_manager = Address::from([0x44u8; 20]);
@@ -2795,8 +2795,8 @@ mod tests {
         pool_id_bytes: [u8; 32],
         update_block: u64,
     ) -> u64 {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolParams, TickInfo, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::U128;
         let mut tick_data = HashMap::new();
         tick_data.insert(
@@ -2839,8 +2839,8 @@ mod tests {
     /// `Live`/direct-apply. True for both V3 and V4.
     #[test]
     fn fresh_pool_lifecycle_is_coverage_aware() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV3PoolParams, RegisterV4PoolParams, TickInfo, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::U128;
         let mut core = BotState::new();
 
@@ -3642,9 +3642,9 @@ mod tests {
         // ADR-037/X4EU3J: hooked pools are ADMITTED (the hard rejection is
         // gone) — their sims carry Caveats::HOOKED_POOL and paths through
         // them are excluded from solving at projection time.
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::swap_simulation::{Caveats, SwapOutcome, SwapRead, SwapRequest};
         use crate::bot_core::{RegisterV4PoolParams, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use hashbrown::HashMap;
 
         let mut core = BotState::new();
@@ -3709,8 +3709,8 @@ mod tests {
 
     #[test]
     fn register_v4_pool_rejects_dynamic_fee_with_typed_error() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolError, RegisterV4PoolParams, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use hashbrown::HashMap;
 
         let mut core = BotState::new();
@@ -3748,8 +3748,8 @@ mod tests {
 
     #[test]
     fn register_v4_pool_rejects_duplicate_with_already_registered_variant() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolError, RegisterV4PoolParams, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use hashbrown::HashMap;
 
         let pool_manager = Address::from([0x44u8; 20]);
@@ -3809,8 +3809,8 @@ mod tests {
     /// `tick_spacing=10`. Each spec-violation test below derives a
     /// broken-on-one-field copy.
     fn make_v4_params_in_spec() -> crate::bot_core::RegisterV4PoolParams {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolParams, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use hashbrown::HashMap;
         RegisterV4PoolParams {
             pool_manager: Address::from([0x44u8; 20]),
@@ -3996,8 +3996,8 @@ mod tests {
     /// and they match a direct `apply_v4_swap` on the same scalar inputs.
     #[test]
     fn apply_swap_by_pool_id_routes_to_v4_and_matches_apply_v4_swap() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolParams, V4PoolKey, V4SwapUpdate};
-        use crate::solvers::arb_engine::PoolTickCoverage;
 
         let pool_manager = Address::from([0x44u8; 20]);
         let pool_id_bytes: degenbot_decoders::v4_swap_decoder::V4PoolId = [0x66u8; 32];
@@ -4086,8 +4086,8 @@ mod tests {
     /// `apply_v4_liquidity_update` on the same inputs.
     #[test]
     fn apply_liquidity_update_by_pool_id_routes_to_v4_and_applies_ticks() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolParams, TickInfo, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::{I256, U128};
 
         let pool_manager = Address::from([0x55u8; 20]);
@@ -4184,8 +4184,8 @@ mod tests {
     /// `apply_v4_swap` on the same inputs.
     #[test]
     fn get_v3_or_v4_pool_reads_v4_scalars_matching_apply_v4_swap() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolParams, V4PoolKey, V4SwapUpdate};
-        use crate::solvers::arb_engine::PoolTickCoverage;
 
         let pool_manager = Address::from([0x88u8; 20]);
         let pool_id_bytes: degenbot_decoders::v4_swap_decoder::V4PoolId = [0x99u8; 32];
@@ -4282,8 +4282,8 @@ mod tests {
     /// it must match `apply_v4_liquidity_update` on the same inputs.
     #[test]
     fn get_v3_or_v4_pool_reads_v4_tick_data_matching_apply_v4_liquidity_update() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolParams, TickInfo, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
         use alloy::primitives::{I256, U128};
 
         let pool_manager = Address::from([0xaau8; 20]);
@@ -4382,8 +4382,8 @@ mod tests {
     /// which pops the block-B delta — the trigger exercised here.
     #[test]
     fn v3_restore_before_block_after_same_block_multi_swap_lands_on_pre_block() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::RegisterV3PoolParams;
-        use crate::solvers::arb_engine::PoolTickCoverage;
 
         let mut core = BotState::new();
         let pool_id = core
@@ -5274,8 +5274,8 @@ mod tests {
 
     #[test]
     fn unregister_v4_pool_by_tuple_key_discards_buffered_modify_liquidity() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::{RegisterV4PoolParams, V4PoolKey};
-        use crate::solvers::arb_engine::PoolTickCoverage;
 
         let pool_manager = Address::from([0x44u8; 20]);
         let pool_id_bytes: degenbot_decoders::v4_swap_decoder::V4PoolId = [0xeeu8; 32];
@@ -6016,8 +6016,8 @@ mod tests {
     // `verify_dbg_enabled()` branch is pure logging).
     #[test]
     fn verify_dbg_mark_complete_and_pin_are_behavior_preserving() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::RegisterV3PoolParams;
-        use crate::solvers::arb_engine::PoolTickCoverage;
         let mut core = BotState::new();
         let pool_addr = Address::from([0xf7u8; 20]);
         let _id = core
@@ -6084,8 +6084,8 @@ mod tests {
     // (undrained == 0, mod.rs:580 seed).
     #[test]
     fn pin_clamps_verify_block_to_complete_cutoff_when_pump_undrained() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::RegisterV3PoolParams;
-        use crate::solvers::arb_engine::PoolTickCoverage;
         let mut core = BotState::new();
         let pool_addr = Address::from([0xf8u8; 20]);
         core.register_v3_pool(&RegisterV3PoolParams {
@@ -6131,8 +6131,8 @@ mod tests {
 
     #[test]
     fn pin_preserves_clock_block_when_no_undrained_events() {
+        use crate::arb_engine::PoolTickCoverage;
         use crate::bot_core::RegisterV3PoolParams;
-        use crate::solvers::arb_engine::PoolTickCoverage;
         let mut core = BotState::new();
         let pool_addr = Address::from([0xf9u8; 20]);
         core.register_v3_pool(&RegisterV3PoolParams {

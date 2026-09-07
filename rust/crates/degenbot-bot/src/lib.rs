@@ -1,15 +1,16 @@
-//! The per-chain Rust-owned bot state + Möbius solvers + the unified
-//! Uniswap V2/V3/V4 engine, combined into one crate.
+//! The per-chain Rust-owned bot state + the unified Uniswap V2/V3/V4
+//! arbitrage engine, combined into one crate.
 //!
 //! Per ADR-003, `bot_core` (the `BotState` single-owner state, decoders,
-//! reorg journal, verifier, pump) and `solvers` (the Möbius solvers and
-//! the `ArbitrageEngine` path/solver/dispatch layer) are a **mutually coupled
-//! pair** — ~30 cross-references each way (`BotState` needs
-//! `IntHopState`/`IntV3TickRangeSequence`/decoders from `solvers`; the
-//! engine needs `BotState`/`V3PoolState`/`TickInfo`/`PoolStateSubscriber`
-//! from `bot_core`). ADR-003 explicitly refuses to extract a `LiquidityMap`
-//! generic against this sample-of-one, so the two live in one crate here
-//! rather than behind an artificial shared-trait seam.
+//! reorg journal, verifier, pump) and `arb_engine` (the `ArbitrageEngine`
+//! path/solve/dispatch + delivery layer) are a **mutually coupled pair** —
+//! ~30 cross-references each way (`BotState` needs the solver value types
+//! `IntHopState`/`IntV3TickRangeSequence` from `degenbot-solvers` and the
+//! decoders; the engine needs `BotState`/`V3PoolState`/`TickInfo`/
+//! `PoolStateSubscriber` from `bot_core`). ADR-003 explicitly refuses to
+//! extract a `LiquidityMap` generic against this sample-of-one, so the two
+//! live in one crate here rather than behind an artificial shared-trait
+//! seam.
 //!
 //! This fusion is **tracked debt** (ADR-018): the solve surface is not
 //! reachable standalone (a `cargo add degenbot` consumer wanting only the
@@ -28,13 +29,19 @@
 //! `degenbot_rs` cdylib's `py_bot` / `py_liquidity_pool` / `py_erc20_token` /
 //! `py_dex_identity` / `py_binding` modules — they need `conversion::alloy` /
 //! `conversion::cache` (binding-layer concerns). They reach the pure core through
-//! `degenbot_bot::{bot_core, solvers}`.
+//! `degenbot_bot::{arb_engine, bot_core}`.
 //!
 //! # Modules
 //!
 //! - [`bot_core`] — `BotState`, decoders, reorg journal, liquidity verifier,
 //!   block pump, log/solve/reorg coordinators, V2/V3/V4 state.
-//! - [`solvers`] — Möbius solvers + the unified `ArbitrageEngine`.
+//! - [`arb_engine`] — the unified multi-DEX `ArbitrageEngine`: per-block
+//!   lifecycle, path registry, solve dispatch, inline simulation, delivery.
+//!
+//! The stateless solver math itself (Möbius composition, V3/V4 integer
+//! tick-range solving, the QuantAMM Balancer basket solver) lives in the
+//! `degenbot-solvers` crate and is imported via `::degenbot_solvers` —
+//! never re-exported from here.
 
 pub mod bot_core;
 
@@ -171,6 +178,7 @@ pub mod instruments {
     }
 }
 pub mod allocator_ctrl;
+pub mod arb_engine;
 pub mod failure_policy;
 #[cfg(feature = "otel")]
 pub mod instruments;
@@ -179,11 +187,10 @@ pub mod metrics;
 #[cfg(feature = "otel")]
 pub mod otel;
 pub mod profiling;
-pub mod solvers;
 pub mod telemetry;
 
 /// Configure the process-global rayon pool used by the engine's
-/// `par_iter` solve fan-out ([`crate::solvers`]).
+/// `par_iter` solve fan-out ([`crate::arb_engine`]).
 ///
 /// GOQWCL (incident 2026-08-21): the pool was previously implicit — rayon
 /// spawns its global pool lazily on first `par_iter` with **unnamed**

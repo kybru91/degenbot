@@ -206,7 +206,7 @@ The seven `PoolEntry` variants fall into **three structural families**, grouped 
 
 ### Resolve→solve boundary (ADR-015)
 
-**Current shape — pure solve layer split across two crates by an accidental line.** `degenbot-solvers` holds the V2/CL Möbius solvers (`mobius_int`, `mobius_int_exact`, `mobius_v3_int`, `affected_keys`) — “value-only solver math … no chain/registry/async/tokio … consumable by both the standalone Rust path and the PyO3 driver shell.” But the rest of the pure solve family stayed behind in `degenbot-bot/src/solvers/arb_engine/` (the I/O orchestrator: tokio, `core: Arc<RwLock<BotState>>`, path registry, V3/V4 buffers): `solve_path` (the dispatcher) + `solve_*_path_int` (Balancer weighted/stable, Curve, Solidly), the `simulate_*_hop` swap leaves, `balancer_weighted_basket.rs` (QuantAMM), and the hop-state value types. A standalone `cargo add degenbot` consumer got V2/CL but not Balancer/Curve/Solidly/basket.
+**Current shape — pure solve layer split across two crates by an accidental line.** `degenbot-solvers` holds the V2/CL Möbius solvers (`mobius_int`, `mobius_int_exact`, `mobius_v3_int`, `affected_keys`) — “value-only solver math … no chain/registry/async/tokio … consumable by both the standalone Rust path and the PyO3 driver shell.” But the rest of the pure solve family stayed behind in `degenbot-bot/src/arb_engine/` (the I/O orchestrator: tokio, `core: Arc<RwLock<BotState>>`, path registry, V3/V4 buffers): `solve_path` (the dispatcher) + `solve_*_path_int` (Balancer weighted/stable, Curve, Solidly), the `simulate_*_hop` swap leaves, `balancer_weighted_basket.rs` (QuantAMM), and the hop-state value types. A standalone `cargo add degenbot` consumer got V2/CL but not Balancer/Curve/Solidly/basket.
 
 **Decision (ADR-015, 2026-07-19):** complete the seam. The pure solve layer — `solve_path` + all `solve_*_path_int` arms + `simulate_*_hop` leaves + the QuantAMM basket solver + the hop-state value types (`ResolvedHop`, `ResolvedMixedPath`, `SolvePathResult`, `*HopState`, `HopType`, `MixedPoolRef`, `PoolHop`) — moves to `degenbot-solvers`. `degenbot-bot` keeps `resolve_path` (the only core-bound step). The orchestrator’s solve-side import collapses to `degenbot_solvers::solve_path(&resolved)`. The dep graph stays a DAG (the new deps are leaf math crates `pools` already depends on); no-pyo3 invariant preserved.
 
@@ -546,7 +546,7 @@ fetch through the home.
 
 **The stragglers (the hygiene work — "slice A"):**
 
-- `solvers/arb_engine/diagnostic.rs` — `fn_selector`/`encode_call`/`build_v2/3/4_calls`/`decode_v2/3/4_results`/`uint_value`/`int_value_to_i32` (alloy `DynSolValue` directly, bypassing the sol! macro path the home uses).
+- `arb_engine/diagnostic.rs` — `fn_selector`/`encode_call`/`build_v2/3/4_calls`/`decode_v2/3/4_results`/`uint_value`/`int_value_to_i32` (alloy `DynSolValue` directly, bypassing the sol! macro path the home uses).
 - `bot_core/liquidity_verifier.rs` — `encode_calldata`/`decode_uint256/128`/`decode_int128`/`decode_v3/v4_*_result`.
 - `pool-updater/src/verify.rs` — `ticks_calldata`/`tick_bitmap_calldata`/`int_selector_calldata`/`decode_ticks_return`/`decode_tick_bitmap_return` (V3 half only).
 - `aave/src/updater/verify.rs` — `decode_uint256_return`.

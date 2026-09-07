@@ -1365,7 +1365,7 @@ def shutdown_subscriber_drainer() -> None:
 
 # ------------------------------------------------------------------
 # QuantAMM closed-form N-token Balancer weighted basket solver (feature = "bot").
-# Thin PyO3 wrapper over `degenbot_bot::solvers::balancer_weighted_basket`.
+# Thin PyO3 wrapper over `degenbot_solvers::basket::solve_balancer_weighted`.
 # ------------------------------------------------------------------
 def solve_balancer_weighted_basket(
     reserves: list[int],
@@ -1381,7 +1381,7 @@ def solve_balancer_weighted_basket(
     Returns ``(trades, profit, success, signature, iterations)``. ``trades``
     are integer native-token amounts (positive = deposit, negative =
     withdraw). FFI boundary over the Rust core
-    `degenbot-bot::solvers::balancer_weighted_basket::solve_balancer_weighted`;
+    `degenbot_solvers::basket::solve_balancer_weighted`;
     see `degenbot.arbitrage.solve_balancer_weighted_basket` for the stable
     re-export (ADR-013).
     """

@@ -336,7 +336,7 @@ mod tests {
             tick,
             tick_data: HashMap::new(),
             update_block,
-            coverage: degenbot_bot::solvers::arb_engine::PoolTickCoverage::Sparse,
+            coverage: degenbot_bot::arb_engine::PoolTickCoverage::Sparse,
             fetcher: None,
             ..Default::default()
         };

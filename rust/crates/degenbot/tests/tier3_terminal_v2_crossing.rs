@@ -26,7 +26,7 @@
 //! captures were restored from that commit's parent for this gate.
 
 use alloy::primitives::U256;
-use degenbot::bot::solvers::arb_engine::ArbitrageEngine;
+use degenbot::bot::arb_engine::ArbitrageEngine;
 use degenbot::investigation::reconstruct::{
     build_v3_state, build_v4_state, register_v2, register_v3, register_v4, V2_DEFAULT_FEE,
 };

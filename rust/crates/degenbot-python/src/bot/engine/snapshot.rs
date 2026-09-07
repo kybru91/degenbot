@@ -1,7 +1,7 @@
 //! `PyO3` wrapper for the `ArbitrageEngine` — snapshot `#[pymethods]` slice.
 //!
 //! Split out of the former monolithic `py_binding.rs` (ergo UG6FKN task 74W2Z6),
-//! mirroring `crates/degenbot-bot/src/solvers/arb_engine/`'s per-concern
+//! mirroring `crates/degenbot-bot/src/arb_engine/`'s per-concern
 //! layout. `PyO3` allows multiple `#[pymethods] impl PyArbitrageEngine { … }`
 //! blocks per type, so each concern file contributes one slice.
 //!

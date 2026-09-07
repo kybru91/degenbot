@@ -255,7 +255,7 @@ pub use crate::bot_core::PoolTickCoverage;
 // homes (`bot_core`, `degenbot_solvers::mixed`).
 
 // `BlockMetadata` lives in `bot_core` (general block data); re-exported here so
-// engine code + external references (`crate::solvers::arb_engine::BlockMetadata`)
+// engine code + external references (`crate::arb_engine::BlockMetadata`)
 // keep working (ADR-006 D4).
 pub use crate::bot_core::BlockMetadata;
 // ADR-027 completion (2026-08-20 review): the block-clock pipe is
