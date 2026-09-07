@@ -1798,11 +1798,18 @@ impl ArbitrageEngine {
                     // hop update-block snapshot against the previous cycle's
                     // recorded one. Byte-identical ⇒ the solve intake (every hop
                     // state) is unchanged since the stored result was produced.
-                    let update_snapshot: Vec<u64> = path
-                        .pools
-                        .iter()
-                        .map(|pool_ref| core.pool_update_block(pool_ref.pool_key))
-                        .collect();
+                    // RLVDUP T3: one pool walk builds the snapshot, the
+                    // same-state comparison AND the future-price check -
+                    // the per-path future probe re-walked all pools.
+                    let mut update_snapshot: Vec<u64> = Vec::with_capacity(path.pools.len());
+                    let mut future = false;
+                    for pool_ref in &path.pools {
+                        let ub = core.pool_update_block(pool_ref.pool_key);
+                        if anchor.is_future(ub) {
+                            future = true;
+                        }
+                        update_snapshot.push(ub);
+                    }
                     let same_state = self
                         .resolved_update_snapshot
                         .get(&path_id)
@@ -1811,9 +1818,6 @@ impl ArbitrageEngine {
                     if same_state {
                         out.same_state += 1;
                     }
-                    let future = path.pools.iter().any(|pool_ref| {
-                        anchor.is_future(core.pool_update_block(pool_ref.pool_key))
-                    });
                     if future {
                         out.deferred.push(path_id);
                         tracing::error!(

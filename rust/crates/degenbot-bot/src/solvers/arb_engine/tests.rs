@@ -6617,6 +6617,26 @@ mod tests {
         );
     }
 
+    /// RLVDUP T3 (red/green): de-registration removes the resolve
+    /// bookkeeping - `path_status` and `resolved_update_snapshot` entries
+    /// must follow the path out, or per-pool churn grows the maps
+    /// unbounded.
+    #[test]
+    fn deregister_removes_status_and_update_snapshot() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        for &pool in &pool_ids {
+            engine.insert_dirty(pool);
+        }
+        engine.solve_dirty(100, &BlockMetadata::default());
+        let pid = path_ids[0];
+        assert!(engine.resolved_update_snapshot.contains_key(&pid));
+        assert!(engine.path_status.contains_key(&pid));
+
+        assert!(engine.deregister_path(pid));
+        assert!(!engine.resolved_update_snapshot.contains_key(&pid));
+        assert!(!engine.path_status.contains_key(&pid));
+    }
+
     /// Q1a deregister (red/green): a straggler landing after its path was
     /// de-registered is DROPPED, never applied (and never re-creates a
     /// result entry).

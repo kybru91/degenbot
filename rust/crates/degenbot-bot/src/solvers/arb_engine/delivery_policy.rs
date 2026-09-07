@@ -382,6 +382,12 @@ impl ArbitrageEngine {
         // Remove from path_resolved
         self.path_resolved.remove(&path_id);
 
+        // RLVDUP T3: the resolve bookkeeping follows the path everywhere
+        // else - leaving `path_status` / `resolved_update_snapshot` entries
+        // behind grew the maps unbounded on path churn.
+        self.path_status.remove(&path_id);
+        self.resolved_update_snapshot.remove(&path_id);
+
         // Remove from results
         self.results.remove(&path_id);
 
