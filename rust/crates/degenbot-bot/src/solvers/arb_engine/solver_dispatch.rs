@@ -29,7 +29,7 @@ use crate::bot_core::resolve::resolve_hops;
 use crate::bot_core::BotState;
 use crate::solvers::arb_engine::inline_sim::{PendingSim, SimPoll, SimulatedPathResult};
 use ::degenbot_solvers::mixed::{
-    HopType, MixedPoolRef, ResolvedHop, ResolvedMixedPath, SolvePathResult,
+    HopType, MixedPath, MixedPoolRef, ResolvedHop, ResolvedMixedPath, SolvePathResult,
 };
 
 /// How many slowest-path entries the solve-cycle completion event names
@@ -609,7 +609,7 @@ fn clamp_result_in_worker(
         return 0;
     }
     let core = ctx.core.read();
-    ArbitrageEngine::clamp_result_with_state(&core, pid, &ctx.pool_refs[idx], result)
+    ArbitrageEngine::clamp_result_with_state(&core, pid, &ctx.pool_refs[idx].pools, result)
 }
 
 /// SIMPIPE2 T3: the WORKER-side inline sim — resolve the per-path payload
@@ -658,7 +658,7 @@ fn inline_sim_payload(
     let _enter = span.enter();
     let payload = sim.simulate_path(crate::solvers::arb_engine::inline_sim::InlineSimRequest {
         path_id: pid,
-        hops: std::clone::Clone::clone(&ctx.pool_refs[idx]),
+        hops: std::clone::Clone::clone(&ctx.pool_refs[idx].pools),
         optimal_input: result.optimal_input,
         consumed_inputs: std::clone::Clone::clone(&result.consumed_inputs),
         hop_outputs: std::clone::Clone::clone(&result.hop_outputs),
@@ -717,7 +717,7 @@ impl PipelinedSims {
         // when the bin's synchronous call returns.
         let request = crate::solvers::arb_engine::inline_sim::InlineSimRequest {
             path_id: pid,
-            hops: std::clone::Clone::clone(&ctx.pool_refs[idx]),
+            hops: std::clone::Clone::clone(&ctx.pool_refs[idx].pools),
             optimal_input: result.optimal_input,
             consumed_inputs: std::clone::Clone::clone(&result.consumed_inputs),
             hop_outputs: std::clone::Clone::clone(&result.hop_outputs),
@@ -943,7 +943,7 @@ pub(crate) struct SolveCycleShared {
     /// Per-path pool-ref snapshot, ALIGNED TO `to_solve` ORDER (index i in
     /// every bin mirrors `to_solve[i]`): the worker clamp's pool list, taken
     /// under the cycle's engine Mutex (stable for the whole cycle).
-    pool_refs: Vec<Vec<MixedPoolRef>>,
+    pool_refs: Vec<std::sync::Arc<MixedPath>>,
     /// The cycle's block metadata (Copy) — the inline-sim request's block env
     /// (solve block from `solve_block`; timestamp/base-fee from here).
     metadata: BlockMetadata,
@@ -2051,13 +2051,15 @@ impl ArbitrageEngine {
         // SIMPIPE2 T2: pool-ref snapshot aligned to `to_solve` order (the
         // worker clamp's pool list) — captured under this cycle's engine
         // Mutex so it cannot interleave with a re-registration.
-        let pool_refs: Vec<Vec<MixedPoolRef>> = to_solve
+        // RLVDUP2 T6: the snapshot is one Arc bump per path - path_pools
+        // values are Arc<MixedPath>, immutable between register/deregister.
+        let pool_refs: Vec<std::sync::Arc<MixedPath>> = to_solve
             .iter()
             .map(|(pid, _)| {
                 self.path_pools
                     .get(pid)
-                    .map(|p| p.pools.clone())
-                    .unwrap_or_default()
+                    .cloned()
+                    .unwrap_or_else(|| std::sync::Arc::new(MixedPath { pools: Vec::new() }))
             })
             .collect();
         let shared = std::sync::Arc::new(SolveCycleShared {
@@ -3161,6 +3163,7 @@ mod profit_clamp_recompute_tests {
         U256,
     };
     use crate::bot_core::{TickInfo, V4PoolKey};
+    use degenbot_solvers::mixed::MixedPath;
     use std::sync::Arc;
 
     /// Path-142603 (V4-V4-V3 @25723658) regression: the solver reported a
@@ -3253,11 +3256,7 @@ mod profit_clamp_recompute_tests {
     /// Narrow single-position V4 pool (±60 ticks, 1e6 liquidity) + a one-hop
     /// path: the over-fed committed input is the empty-march class. Returns
     /// (engine, `path_id`, the to_solve-aligned pool-ref snapshot).
-    fn overfed_v4_engine() -> (
-        ArbitrageEngine,
-        u64,
-        Vec<Vec<::degenbot_solvers::mixed::MixedPoolRef>>,
-    ) {
+    fn overfed_v4_engine() -> (ArbitrageEngine, u64, Vec<std::sync::Arc<MixedPath>>) {
         use crate::bot_core::RegisterV4PoolParams;
         use crate::solvers::arb_engine::PoolTickCoverage;
         fn usdc_local(amount: u64) -> alloy::primitives::Uint<112, 2> {
@@ -3332,18 +3331,15 @@ mod profit_clamp_recompute_tests {
                 },
             ])
             .expect("two-hop path registers");
-        let pool_refs = vec![engine
-            .path_pools
-            .get(&path_id)
-            .expect("registered")
-            .pools
-            .clone()];
+        let pool_refs =
+            std::iter::once(engine.path_pools.get(&path_id).expect("registered").clone())
+                .collect::<Vec<_>>();
         (engine, path_id, pool_refs)
     }
 
     fn worker_probe_ctx(
         core: Arc<crate::bot_core::state_lock::StateLock<crate::bot_core::BotState>>,
-        pool_refs: Vec<Vec<::degenbot_solvers::mixed::MixedPoolRef>>,
+        pool_refs: Vec<std::sync::Arc<MixedPath>>,
     ) -> Arc<SolveCycleShared> {
         Arc::new(SolveCycleShared {
             core,
@@ -3832,7 +3828,7 @@ mod lpt_partition_tests {
 mod solve_path_span_tests {
     use super::*;
     use crate::otel;
-    use degenbot_solvers::mixed::ResolvedMixedPath;
+    use degenbot_solvers::mixed::{MixedPath, ResolvedMixedPath};
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use tracing_subscriber::layer::SubscriberExt;
 

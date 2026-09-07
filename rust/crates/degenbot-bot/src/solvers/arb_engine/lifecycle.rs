@@ -161,7 +161,7 @@ impl ArbitrageEngine {
                 .push(path_id);
         }
         self.path_pools
-            .insert(path_id, MixedPath { pools: pool_refs });
+            .insert(path_id, std::sync::Arc::new(MixedPath { pools: pool_refs }));
 
         // Store the resolve snapshot + drive the state machine. Arc-shared:
         // the solve dispatch stages Arc clones (f701ccd3 staging fix).

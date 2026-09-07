@@ -328,7 +328,7 @@ pub struct ArbitrageEngine {
     /// register/deregister paths maintain). Downstream crates reach it only via
     /// the immutable [`ArbitrageEngine::path_pools`] accessor — no mutable
     /// access, so the reverse index can never be desynced externally.
-    pub(crate) path_pools: HashMap<u64, MixedPath>,
+    pub(crate) path_pools: HashMap<u64, std::sync::Arc<MixedPath>>,
     /// Resolved path states (mutated on each solve). Entries are Arc-shared
     /// into the parallel solve dispatch (f701ccd3 staging fix) — immutable
     /// between resolve passes, so staging is refcount bumps, not deep clones
@@ -634,7 +634,7 @@ impl ArbitrageEngine {
     /// reverse index, which only the engine's internal register/deregister
     /// paths maintain — so no mutable accessor is exposed.
     #[must_use]
-    pub fn path_pools(&self) -> &HashMap<u64, MixedPath> {
+    pub fn path_pools(&self) -> &HashMap<u64, std::sync::Arc<MixedPath>> {
         &self.path_pools
     }
 }
