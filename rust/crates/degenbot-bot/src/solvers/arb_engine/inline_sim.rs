@@ -170,15 +170,15 @@ pub struct SimulatedPathResult {
 /// A scheduled-but-maybe-unfinished inline sim (7LV6VN T5). The solve
 /// worker schedules the eager EVM simulation and keeps walking paths; the
 /// receipt is polled non-blockingly (delivery as soon as each sim lands)
-/// and joined at bin end.
+/// and joined at bin end. The in-flight slot (budget-derived pacing cap)
+/// moves into the driver thread and releases when the sim finishes.
 #[must_use]
 pub struct PendingSim {
     rx: std::sync::mpsc::Receiver<Option<SimulatedPathResult>>,
 }
 
-/// Poll verdict for a scheduled sim (container-wrapped so no variant is
-/// meaningfully larger than another; the inner `Option` is the payload
-/// contract — `None` = sim-failed).
+/// Poll verdict for a scheduled sim (the `Box` keeps variants balanced;
+/// the inner `Option` is the payload contract — `None` = sim-failed).
 #[derive(Debug)]
 pub(crate) enum SimPoll {
     /// The sim finished.

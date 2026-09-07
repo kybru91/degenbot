@@ -65,7 +65,8 @@ pub mod inline_sim;
 mod lifecycle;
 pub mod path_info;
 mod path_lifecycle;
-pub mod snapshot_verify;
+pub mod sim_slots;
+mod snapshot_verify;
 mod solve_executor;
 mod solver_dispatch;
 #[cfg(test)]

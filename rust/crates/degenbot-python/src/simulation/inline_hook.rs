@@ -285,7 +285,11 @@ where
 /// `DEGENBOT_INLINE_SIM_WORKERS`. Clamped to 1..=32; unparsable/garbage
 /// values fall back to the default rather than failing the engine build.
 fn inline_sim_worker_count() -> usize {
-    let default = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    // Two-runtime sizing (7LV6VN T5): the sim runtime follows the LEFTOVER
+    // of the CPU budget after the solve bins (not raw available
+    // parallelism), so sim runtime workers + solve bins never exceed
+    // the quota.
+    let default = degenbot_bot::bot_core::cpu_budget::leftover_worker_budget();
     match std::env::var("DEGENBOT_INLINE_SIM_WORKERS") {
         Ok(raw) => raw
             .trim()

@@ -203,6 +203,20 @@ pub(crate) fn effective_cpu_budget() -> usize {
 }
 
 /// Cached solve worker count; logs the detection verdict once via `tracing`.
+/// The leftover of the effective CPU budget after the solve bins take
+/// theirs - the solve worker count already embeds the I/O headroom. This
+/// is the two-runtime contract: the ambient I/O runtime keeps the
+/// headroom workers, and everything CPU-adjacent that is NOT a solve bin
+/// (inline-sim drivers behind the `sim_slots` cap, sim runtime sizing)
+/// derives from this value. Floor 1: one worker always remains for I/O
+/// latency even under a headroom-less operator override.
+#[must_use]
+pub fn leftover_worker_budget() -> usize {
+    effective_cpu_budget()
+        .saturating_sub(solve_worker_count())
+        .max(1)
+}
+
 pub(crate) fn solve_worker_count() -> usize {
     static SOLVE_WORKERS: OnceLock<usize> = OnceLock::new();
     *SOLVE_WORKERS.get_or_init(|| {

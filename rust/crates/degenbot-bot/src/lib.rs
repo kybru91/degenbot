@@ -195,8 +195,16 @@ pub mod telemetry;
 /// Idempotent-ish: if a global pool already exists (another component or
 /// test built it first), the request is ignored with a debug log — rayon's
 /// global pool can only be configured once per process.
+/// Two-runtime contract (ADR: the tokio CPU/I-O split): the ambient I/O
+/// runtime (pump, websocket, dispatch, delivery) keeps the headroom cores
+/// (`DEFAULT_SOLVE_HEADROOM`), so the CPU-side pools — this rayon global
+/// pool, the solve-executor bins, and the sim drivers behind the
+/// `sim_slots` cap — are all sized from `solve_worker_count()` and its
+/// leftover, never from raw `available_parallelism`.
 pub fn configure_rayon_solver_pool() {
+    let workers = crate::bot_core::cpu_budget::solve_worker_count();
     let result = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
         .thread_name(|i| format!("degenbot-solve-{i}"))
         .build_global();
     if let Err(err) = result {

@@ -94,12 +94,12 @@ export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
 # operators). DEGENBOT_ASSERT_SOLVER_STATE=1 re-enables the strict per-hop
 # gate per block for a run (operator opt-in).
 
-# SIMPIPE2 M2 soak-tuned solve/sim concurrency (measured 2026-09-05, see
-# logs/simpipe2_m2_close.md): the 8-core cgroup budget runs best with the
-# full core count on solve bins and 16 inline-sim workers (slope 1.72ms/path
-# vs 2.34 at defaults). Env-respecting: an operator export still wins.
-export DEGENBOT_SOLVE_CPUS="${DEGENBOT_SOLVE_CPUS:-8}"
-export DEGENBOT_INLINE_SIM_WORKERS="${DEGENBOT_INLINE_SIM_WORKERS:-16}"
+# Two-runtime contract (7LV6VN T5): solve bins, rayon resolve, sim runtime,
+# and the sim-driver cap all derive from the detected cgroup budget inside
+# the Rust core (cpu_budget::leftover_worker_budget), leaving the I/O
+# headroom to the ambient runtime by construction. An operator export of
+# DEGENBOT_SOLVE_CPUS / DEGENBOT_INLINE_SIM_WORKERS / DEGENBOT_SOLVE_SIM_INFLIGHT
+# still wins when set explicitly - none are pre-set here.
 
 # The actual bot invocation (uv rebuilds the Rust extension if any rust
 # source / Cargo.toml is newer than the installed build).

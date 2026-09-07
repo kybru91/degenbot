@@ -618,6 +618,11 @@ fn clamp_result_in_worker(
 /// The payload rides the result handoff so the merge never calls out — the
 /// merge only stores/forwards. `None` = stance off, no hook, or the hook
 /// reported failure-without-payload.
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "retained as the legacy sync path reference for the span test"
+)]
 fn inline_sim_payload(
     ctx: &SolveCycleShared,
     idx: usize,
@@ -679,20 +684,6 @@ fn inline_sim_payload(
     Some(payload)
 }
 
-/// 7LV6VN T5: pipelined inline sims. Default OFF; set
-/// `DEGENBOT_SOLVE_SIM_PIPE=1` to enable (A/B switch, twin of the LPT
-/// knob). Measured basis: hotpath 10-min windows before/after show the
-/// overlap raises per-cycle CPU demand 1021 -> 1508 ms (`solve.cpu_us`
-/// median) against the 8-core cgroup quota — throttling then starves the
-/// walks themselves (per-path 490 -> 935 µs wall; `solve_dirty` avg 277 ->
-/// 351 ms, p95 564 -> 838 ms). On a host without the CPU-quota ceiling the
-/// pipelined arm should win (the serial sim join it removes is real — ~2.5
-/// ms x ~17 sims per bin); re-enable there and re-measure.
-fn solve_sim_pipe_enabled() -> bool {
-    static PIPE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PIPE.get_or_init(|| std::env::var("DEGENBOT_SOLVE_SIM_PIPE").as_deref() == Ok("1"))
-}
-
 /// One scheduled sim: pid + the receipt the worker polls/joins.
 #[derive(Default)]
 struct PipelinedSims {
@@ -740,10 +731,22 @@ impl PipelinedSims {
         let sim = std::sync::Arc::clone(sim);
         let parent = parent_span.clone();
         let expected_profit = result.profit;
+        // Two-runtime pacing (7LV6VN T5): the slot comes from the
+        // budget-derived global pool (`budget - solve_workers` in-flight
+        // sims). Blocking the scheduling bin when the pool is dry is the
+        // explicit, environment-adaptive replacement for the pacing the
+        // synchronous sim join used to provide. The guard MOVES into the
+        // driver thread, so the slot returns exactly when the sim finishes.
+        let slots = crate::solvers::arb_engine::sim_slots::sim_slots_global();
+        slots.acquire();
+        let guard = crate::solvers::arb_engine::sim_slots::SlotGuard::acquired(
+            std::sync::Arc::clone(&slots),
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(format!("arb-sim-{pid}"))
             .spawn(move || {
+                let _slot = guard;
                 let span = tracing::info_span!(
                     target: "degenbot::solver",
                     parent: parent,
@@ -814,6 +817,50 @@ impl PipelinedSims {
 
     fn is_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+}
+
+/// Walk-batch sim attach for the rayon fallback arm (7LV6VN T5): park
+/// walk outcomes, schedule their pipelined sims on the budget-derived
+/// slot pool, drain non-blockingly, and block-join at the end -
+/// payload-complete outcomes reach the tail merge unchanged.
+struct RayonAttach<'a> {
+    pending: PipelinedSims,
+    held: Vec<Option<SolveArmOutcome>>,
+    span: &'a tracing::Span,
+    shared: &'a SolveCycleShared,
+}
+
+impl RayonAttach<'_> {
+    fn park(&mut self, idx: usize, pid: u64, r: SolvePathResult, twins: u64) {
+        let scheduled = self
+            .pending
+            .schedule_one(self.shared, idx, pid, &r, self.span);
+        self.held.push(Some((pid, r, twins, None)));
+        if !scheduled {
+            // No sim rides this item - deliver immediately.
+            self.flush_one(pid, None);
+        }
+    }
+
+    fn flush_one(&mut self, done_pid: u64, payload: Option<SimulatedPathResult>) {
+        if let Some(slot) = self
+            .held
+            .iter_mut()
+            .find(|it| matches!(it, Some((p, ..)) if *p == done_pid))
+        {
+            if let Some(outcome) = slot.as_mut() {
+                outcome.3 = payload;
+            }
+        }
+    }
+
+    fn finish(mut self) -> Vec<SolveArmOutcome> {
+        let pending = std::mem::take(&mut self.pending);
+        for (done_pid, payload) in pending.join_all() {
+            self.flush_one(done_pid, payload);
+        }
+        self.held.into_iter().flatten().collect()
     }
 }
 
@@ -2150,7 +2197,6 @@ impl ArbitrageEngine {
                 // the sidecar decrements after each terminal disposition.
                 let outstanding_in_bins = std::sync::Arc::clone(&self.detached_outstanding);
                 let n_bins = bins.len();
-                let sim_pipe = solve_sim_pipe_enabled();
                 for (bin_idx, bin) in bins.into_iter().enumerate() {
                     let shared_bin = std::sync::Arc::clone(&shared);
                     let to_solve_bin = std::sync::Arc::clone(&to_solve);
@@ -2163,7 +2209,9 @@ impl ArbitrageEngine {
                         .spawn(move || {
                             // 7LV6VN T5 (pipelined arm): results park until
                             // their sim lands; the walk never waits on a
-                            // sim (legacy path below is the `!sim_pipe` twin).
+                            // sim. Sims pace on the budget-derived global
+                            // slot pool (sim_slots), so walk + sim demand
+                            // never exceeds the CPU quota by construction.
                             let mut held: Vec<DetachedMergeItem> = Vec::new();
                             let mut pending = PipelinedSims::default();
                             for &idx in &bin {
@@ -2187,8 +2235,10 @@ impl ArbitrageEngine {
                                 else {
                                     continue;
                                 };
-                                if sim_pipe {
-                                    // T5: the profitless filter runs BEFORE
+                                {
+                                    // The profitless filter runs BEFORE the
+                                    // sim is scheduled - a clamp-zeroed
+                                    // candidate never needs its payload.
                                     // the sim is scheduled — a clamp-zeroed
                                     // candidate never needs its payload (the
                                     // legacy path simmed first, then filtered).
@@ -2256,54 +2306,10 @@ impl ArbitrageEngine {
                                             payload,
                                         );
                                     }
-                                    continue;
-                                }
-                                let Some((pid, result, worker_clamp_twins, payload)) =
-                                    Some((pid, result, worker_clamp_twins))
-                                        .map(|(pid, r, twins)| {
-                                            let payload = inline_sim_payload(
-                                                &shared_bin,
-                                                idx,
-                                                pid,
-                                                &r,
-                                                &solve_span_bin,
-                                            );
-                                            (pid, r, twins, payload)
-                                        })
-                                        .filter(|(_, r, _, _)| {
-                                            !r.optimal_input.is_zero() && !r.profit.is_zero()
-                                        })
-                                else {
-                                    continue;
-                                };
-                                if !result.solver_pool_states.is_empty() {
-                                    tracing::debug!(
-                                        "[solver-st] path_id={pid} hops=[{}]",
-                                        result.solver_pool_states.join(";")
-                                    );
-                                }
-                                let update_stamp =
-                                    stamps_bin.get(&pid).cloned().unwrap_or_default();
-                                if tx
-                                    .send(DetachedMergeItem::Solved {
-                                        cycle_seq,
-                                        solve_block,
-                                        metadata: cycle_metadata,
-                                        pid,
-                                        update_stamp,
-                                        result,
-                                        worker_clamp_twins,
-                                        payload,
-                                        solve_span: solve_span_bin.clone(),
-                                    })
-                                    .is_ok()
-                                {
-                                    outstanding_bin
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
                             // Tail: join every outstanding sim and send.
-                            if sim_pipe && !pending.is_empty() {
+                            if !pending.is_empty() {
                                 for (done_pid, payload) in pending.join_all() {
                                     flush_detached_item(
                                         &mut held,
@@ -2375,7 +2381,6 @@ impl ArbitrageEngine {
                 let executor = crate::solvers::arb_engine::solve_executor::global_solve_executor();
                 let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<SolveArmOutcome>>();
                 let bins = compute_bins();
-                let sim_pipe = solve_sim_pipe_enabled();
                 for bin in &bins {
                     let bin = bin.clone();
                     let res_tx = res_tx.clone();
@@ -2406,9 +2411,9 @@ impl ArbitrageEngine {
                                     clamp_result_in_worker(&shared_bin, i, pid, &mut result);
                                 (pid, result, twins)
                             });
-                            if sim_pipe {
-                                // T5: the profitless filter runs BEFORE the
-                                // sim is scheduled — a clamp-zeroed candidate
+                            {
+                                // The profitless filter runs BEFORE the sim
+                                // is scheduled - a clamp-zeroed candidate
                                 // never needs its payload.
                                 match outcome {
                                     Some((pid, result, twins)) => {
@@ -2453,26 +2458,9 @@ impl ArbitrageEngine {
                                         let _ = res_tx.send(None);
                                     }
                                 }
-                                continue;
                             }
-                            // Legacy: sim rides inline before the filter.
-                            let to_send = outcome
-                                .map(|(pid, r, twins)| {
-                                    let payload = inline_sim_payload(
-                                        &shared_bin,
-                                        i,
-                                        pid,
-                                        &r,
-                                        &solve_span_bin,
-                                    );
-                                    (pid, r, twins, payload)
-                                })
-                                .filter(|(_, r, _, _)| {
-                                    !r.optimal_input.is_zero() && !r.profit.is_zero()
-                                });
-                            let _ = res_tx.send(to_send);
                         }
-                        if sim_pipe && !pending.is_empty() {
+                        if !pending.is_empty() {
                             for (done_pid, payload) in pending.join_all() {
                                 flush_tokio_item(&mut held, &res_tx, done_pid, payload);
                             }
@@ -2522,28 +2510,37 @@ impl ArbitrageEngine {
                 // for the rayon arms (borrowed locals only). Behavior
                 // identical to the pre-change code: per-bin send, join on
                 // ALL bins, then the tail clamp merge.
-                let solve_fn = |pid: u64,
-                                idx: usize,
+                // 7LV6VN T5: the rayon fallback arm walks without sims; the
+                // sims schedule in one pipelined batch AFTER the walk joins
+                // (two-phase). The batch shape keeps the arm's semantics
+                // (results carry payloads before the tail merge) at the
+                // cost of one extra join - acceptable for a fallback arm.
+                // 7LV6VN T5: the rayon fallback arm walks WITHOUT sims (the
+                // per-item par_iter has no bin tail to join on). After the
+                // walk batch joins, sims schedule in one pipelined batch on
+                // the budget-derived slot pool, drain non-blockingly, and
+                // block-join at the end - payload-complete results reach the
+                // tail merge unchanged.
+                let solve_fn = |idx: usize,
+                                pid: u64,
                                 resolved: &ResolvedMixedPath|
-                 -> Option<SolveArmOutcome> {
+                 -> Option<(usize, u64, SolvePathResult, u64)> {
                     solve_one_path(&shared, &solve_span, pid, resolved).map(|(pid, mut r)| {
                         let twins = clamp_result_in_worker(&shared, idx, pid, &mut r);
-                        let payload = inline_sim_payload(&shared, idx, pid, &r, &solve_span);
-                        (pid, r, twins, payload)
+                        (idx, pid, r, twins)
                     })
                 };
 
-                if lpt_partition_enabled() {
-                    // RAYPAR T3: LPT-pre-balanced partition on rayon persistent global
-                    // pool. Each LPT bin is one s.spawn task - exactly n_threads
-                    // tasks on n_threads persistent workers means no splitting
-                    // and no stealing: pure static partition with warm L1/L2 +
-                    // allocator arenas across drains (the pool was built once
-                    // at import by configure_rayon_solver_pool).
+                let walk_batch: Vec<(usize, u64, SolvePathResult, u64)> = if lpt_partition_enabled()
+                {
+                    // RAYPAR T3: LPT-pre-balanced partition on rayon persistent
+                    // global pool. Each LPT bin is one s.spawn task - exactly
+                    // n_threads tasks on n_threads persistent workers means no
+                    // splitting and no stealing: pure static partition with warm
+                    // L1/L2 + allocator arenas across drains (the pool was built
+                    // once at import by configure_rayon_solver_pool).
                     let bins = compute_bins();
                     let to_solve_ref = &to_solve;
-                    let pool_refs_ref = &shared.pool_refs;
-                    let solve_ref = &solve_fn;
                     let (tx, rx) = std::sync::mpsc::channel();
                     rayon::scope(|s| {
                         for bin in &bins {
@@ -2552,45 +2549,45 @@ impl ArbitrageEngine {
                                 let mut out = Vec::with_capacity(bin.len());
                                 for &i in bin {
                                     let (pid, resolved) = &to_solve_ref[i];
-                                    out.push(solve_ref(*pid, i, resolved));
-                                    let _ = pool_refs_ref;
+                                    out.push(solve_fn(i, *pid, resolved));
                                 }
                                 let _ = tx.send(out);
                             });
                         }
                     });
                     drop(tx);
-                    let per_bin: Vec<Vec<Option<SolveArmOutcome>>> = rx.into_iter().collect();
-                    per_bin
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .inspect(|(pid, r, _, _)| {
-                            if !r.solver_pool_states.is_empty() {
-                                tracing::debug!(
-                                    "[solver-st] path_id={pid} hops=[{}]",
-                                    r.solver_pool_states.join(";")
-                                );
-                            }
-                        })
-                        .filter(|(_, r, _, _)| !r.optimal_input.is_zero() && !r.profit.is_zero())
-                        .collect()
+                    rx.into_iter().flatten().flatten().collect()
                 } else {
                     to_solve
                         .par_iter()
                         .enumerate()
-                        .filter_map(|(i, (pid, resolved))| solve_fn(*pid, i, resolved))
-                        .inspect(|(pid, r, _, _)| {
-                            if !r.solver_pool_states.is_empty() {
-                                tracing::debug!(
-                                    "[solver-st] path_id={pid} hops=[{}]",
-                                    r.solver_pool_states.join(";")
-                                );
-                            }
-                        })
-                        .filter(|(_, r, _, _)| !r.optimal_input.is_zero() && !r.profit.is_zero())
+                        .filter_map(|(i, (pid, resolved))| solve_fn(i, *pid, resolved))
                         .collect()
+                };
+
+                let mut attach = RayonAttach {
+                    pending: PipelinedSims::default(),
+                    held: Vec::with_capacity(walk_batch.len()),
+                    span: &solve_span,
+                    shared: shared.as_ref(),
+                };
+                for (idx, pid, r, twins) in walk_batch {
+                    if !r.solver_pool_states.is_empty() {
+                        tracing::debug!(
+                            "[solver-st] path_id={pid} hops=[{}]",
+                            r.solver_pool_states.join(";")
+                        );
+                    }
+                    if r.optimal_input.is_zero() || r.profit.is_zero() {
+                        continue; // profitless: no sim, dropped like the old filter did
+                    }
+                    attach.park(idx, pid, r, twins);
+                    // Fan: flush sims that finished during the walk batches.
+                    for (done_pid, payload) in attach.pending.drain_ready() {
+                        attach.flush_one(done_pid, payload);
+                    }
                 }
+                attach.finish()
             });
             solved_count = solved.len();
         }
