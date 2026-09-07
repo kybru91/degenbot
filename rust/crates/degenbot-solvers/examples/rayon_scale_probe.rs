@@ -162,7 +162,7 @@ fn reconstruct(doc: &Value) -> Result<(u64, Arc<ResolvedMixedPath>, Option<u128>
         hops.push(ResolvedHop::V3 {
             word_profiles: Arc::from(build_cl_word_profiles(&seq)),
             crossing_table: Arc::from(build_cl_crossing_table(&seq)),
-            int_seq: seq,
+            int_seq: Arc::new(seq),
         });
     }
     let golden = doc.get("golden").filter(|g| !g.is_null()).and_then(|g| {

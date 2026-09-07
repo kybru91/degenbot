@@ -55,6 +55,9 @@ impl CachedProjection {
     /// clone for `Ok`, the reason for an invalid entry. (Nonces are re-read
     /// from `core` by the caller — never trusted from a cached entry.)
     fn materialize(&self) -> Result<ResolvedHop, MissingHopReason> {
+        // RLVDUP T2: the clone is now cheap for CL hops - the tick-range
+        // sequence rides in an Arc built once per (pool, direction, nonce),
+        // so N paths sharing a memo hit clone an enum of Arc bumps.
         match self {
             Self::Hop(arc) => Ok((**arc).clone()),
             Self::Invalid(reason) => Err(*reason),

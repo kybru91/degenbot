@@ -288,14 +288,14 @@ pub enum ResolvedHop {
     /// `crossing_table` is the parallel precomputed per-ending-range crossing
     /// data (`build_cl_crossing_table`), also built once per projection.
     V3 {
-        int_seq: IntV3TickRangeSequence,
+        int_seq: std::sync::Arc<IntV3TickRangeSequence>,
         word_profiles: Arc<Vec<Option<Arc<V3WordProfile>>>>,
         crossing_table: Arc<Vec<IntTickRangeCrossing>>,
     },
     /// V4 concentrated-liquidity hop (same CL math as V3, different settlement).
     /// `word_profiles` + `crossing_table`: as `Self::V3`.
     V4 {
-        int_seq: IntV3TickRangeSequence,
+        int_seq: std::sync::Arc<IntV3TickRangeSequence>,
         word_profiles: Arc<Vec<Option<Arc<V3WordProfile>>>>,
         crossing_table: Arc<Vec<IntTickRangeCrossing>>,
     },
@@ -341,7 +341,9 @@ impl ResolvedHop {
 
     /// The integer tick-range sequence, if this is a CL hop (V3 or V4).
     #[must_use]
-    pub const fn as_int_sequence(&self) -> Option<&IntV3TickRangeSequence> {
+    pub fn as_int_sequence(&self) -> Option<&IntV3TickRangeSequence> {
+        // RLVDUP T2: the sequence is Arc-shared (built once per projection;
+        // the memo deep-cloning it per path was the point of this change).
         match self {
             Self::V3 { int_seq, .. } | Self::V4 { int_seq, .. } => Some(int_seq),
             Self::V2 { .. }

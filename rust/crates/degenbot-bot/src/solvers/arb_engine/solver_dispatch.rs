@@ -4031,7 +4031,7 @@ mod executor_ab_probe {
                 hops.push(::degenbot_solvers::mixed::ResolvedHop::V3 {
                     word_profiles: Arc::from(build_cl_word_profiles(&seq)),
                     crossing_table: Arc::from(build_cl_crossing_table(&seq)),
-                    int_seq: seq,
+                    int_seq: Arc::new(seq),
                 });
             }
             items.push(Arc::new(::degenbot_solvers::mixed::ResolvedMixedPath {

@@ -63,9 +63,12 @@ pub(crate) fn project_v3(
     let identity = core
         .get_v3_identity(pool_ref.pool_key)
         .ok_or(MissingHopReason::MissingIdentity)?;
+    // RLVDUP T2: build the sequence ONCE and Arc-share it - every path
+    // reusing this (pool, direction) clones an Arc, not the ranges Vec.
     let int_seq = pool_state
         .build_int_v3_sequence(identity.tick_spacing, identity.fee, pool_ref.zero_for_one)
         .ok_or(MissingHopReason::SequenceUnavailable)?;
+    let int_seq = std::sync::Arc::new(int_seq);
 
     let (crossing_table, word_profiles) = fused_cl_tables(&int_seq);
     Ok((
@@ -115,6 +118,7 @@ pub(crate) fn project_v4(
             pool_ref.zero_for_one,
         )
         .ok_or(MissingHopReason::SequenceUnavailable)?;
+    let int_seq = std::sync::Arc::new(int_seq);
 
     let (crossing_table, word_profiles) = fused_cl_tables(&int_seq);
     Ok((
