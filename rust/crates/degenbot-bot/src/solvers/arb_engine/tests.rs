@@ -5655,7 +5655,7 @@ mod tests {
                     sp.name.as_ref() == name
                         && sp.attributes.iter().any(|kv| {
                             kv.key == opentelemetry::Key::from_static_str("block.number")
-                                && (matches!(kv.value, opentelemetry::Value::I64(v) if v == blk as i64)
+                                && (matches!(kv.value, opentelemetry::Value::I64(v) if v == blk.cast_signed())
                                     || matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == blk.to_string().as_str()))
                         })
                 }).map_or_else(|| panic!("{name} for block {blk} must be exported"), |sp| sp.span_context.span_id())

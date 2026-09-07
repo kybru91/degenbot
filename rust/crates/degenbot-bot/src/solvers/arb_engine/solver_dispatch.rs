@@ -619,10 +619,6 @@ fn clamp_result_in_worker(
 /// merge only stores/forwards. `None` = stance off, no hook, or the hook
 /// reported failure-without-payload.
 #[cfg(test)]
-#[expect(
-    dead_code,
-    reason = "retained as the legacy sync path reference for the span test"
-)]
 fn inline_sim_payload(
     ctx: &SolveCycleShared,
     idx: usize,
@@ -3604,6 +3600,10 @@ mod profit_clamp_recompute_tests {
     /// path, parented under the cycle span, with the terminal verdict.
     #[cfg(feature = "otel")]
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "single end-to-end span-emission assertion: stub + emit + export + attribute checks read best as one sequence"
+    )]
     fn inline_sim_payload_emits_worker_sim_span_with_verdict() {
         use super::inline_sim_payload;
         use crate::otel;
