@@ -251,7 +251,6 @@ impl PipelineInstruments {
                 .build(),
             reorg_depth_blocks: meter
                 .f64_histogram("degenbot.reorg.depth_blocks")
-                .with_unit("1")
                 .with_boundaries(vec![1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 20.0, 33.0, 50.0, 100.0])
                 .with_description(
                     "Rollback depth at reorg-episode entry (current head minus reorg target)",

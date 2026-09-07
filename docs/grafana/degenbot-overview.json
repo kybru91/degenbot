@@ -2780,7 +2780,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "sum(increase(degenbot_reorg_depth_blocks_sum[1h])) / clamp_min(sum(increase(degenbot_reorg_depth_blocks_count[1h])), 1)",
+     "expr": "sum(increase(degenbot_reorg_depth_blocks_ratio_sum[1h])) / clamp_min(sum(increase(degenbot_reorg_depth_blocks_ratio_count[1h])), 1)",
      "legendFormat": "mean depth",
      "refId": "A"
     }
