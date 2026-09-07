@@ -82,7 +82,54 @@ impl CachedProjection {
 /// `state_nonce`. A tick-keyed expiry map is deliberately NOT used: it would
 /// need a nontrivial tick→affected-suffix index for a cache rebuilt in
 /// microseconds, adding risk without a measured win.
-pub(crate) type HopProjectionCache = HashMap<(HopType, u64, bool), (CachedProjection, u64)>;
+/// Sharded concurrency-ready form of the former flat
+/// `HashMap<(HopType, pool_key, zero_for_one), (CachedProjection, u64)>`
+/// (7LV6VN T2): the per-path resolve loop runs across rayon chunks, so the
+/// memo must be shared by reference - chunk-local caches would multiply the
+/// expensive CL tick-walk per shared pool (the cache exists so one walk
+/// serves N paths). Shard locks guard only map access; the projection walk
+/// happens OUTSIDE the lock (misses are the CPU-heavy case), so cross-path
+/// hit reuse survives without serializing the loop.
+///
+/// Nonce validation is unchanged: entries carry the state nonce they were
+/// built against and a stale entry is detected at read time, so no wrong
+/// sharing is possible even with concurrent inserts racing.
+type HopCacheEntryMap = HashMap<(HopType, u64, bool), (CachedProjection, u64)>;
+
+pub(crate) struct HopProjectionCache {
+    shards: [parking_lot::Mutex<HopCacheEntryMap>; HOP_CACHE_SHARDS],
+}
+
+const HOP_CACHE_SHARDS: usize = 64;
+
+impl HopProjectionCache {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Shard pick: splitmix64 over the pool key folded with the
+    /// type/direction bits, so hot pools do not all land on one shard. The
+    /// final `as usize` truncation is safe: the mod-64 fold bounds the value.
+    #[expect(clippy::cast_possible_truncation)]
+    fn shard_of(key: (HopType, u64, bool)) -> usize {
+        let mut h = key.1 ^ ((key.0 as u64) << 1) ^ u64::from(key.2);
+        h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((h ^ (h >> 31)) % HOP_CACHE_SHARDS as u64) as usize
+    }
+
+    /// Raw entry clone under the shard lock (cheap: `Arc` inside).
+    pub(crate) fn get_entry(&self, key: &(HopType, u64, bool)) -> Option<(CachedProjection, u64)> {
+        self.shards[Self::shard_of(*key)].lock().get(key).cloned()
+    }
+
+    pub(crate) fn set_entry(&self, key: (HopType, u64, bool), value: (CachedProjection, u64)) {
+        self.shards[Self::shard_of(key)].lock().insert(key, value);
+    }
+}
 
 /// Runtime gate for the fused hop-projection memo (KGXFT7 winner promotion:
 /// the lab's S1 fused-epoch strategy, production-framed as whole-pool nonce
@@ -224,7 +271,7 @@ pub(crate) fn resolve_hops(
     core: &BotState,
     pool_refs: &[MixedPoolRef],
     resolved: &mut ResolvedMixedPath,
-    cache: &mut HopProjectionCache,
+    cache: &HopProjectionCache,
     mut projection_count: Option<&mut u64>,
     // Fused memo switch (KGXFT7): 'false' makes this behave as if
     // 'cache' were empty — never read a hit, never store an entry —
@@ -272,14 +319,13 @@ pub(crate) fn resolve_hops(
         let current_nonce = core.pool_state_nonce(pool_ref.pool_key);
 
         let cached_hit = if memo {
-            match cache.get(&cache_key) {
-                // Nonce unchanged since the entry was built → reuse it.
-                Some((cached, built_nonce)) if *built_nonce == current_nonce => {
-                    Some(cached.materialize())
-                }
-                // Stale or absent — project fresh below.
-                _ => None,
-            }
+            // Sharded map (T2): clone the entry under the shard lock, then
+            // validate the nonce exactly as the flat map did.
+            cache
+                .get_entry(&cache_key)
+                .and_then(|(cached, built_nonce)| {
+                    (built_nonce == current_nonce).then(|| cached.materialize())
+                })
         } else {
             // Gate OFF: skip the memo entirely (never read above, never
             // written below) — every hop re-projects, byte-exact either way.
@@ -308,7 +354,7 @@ pub(crate) fn resolve_hops(
                 Err(reason) => CachedProjection::Invalid(*reason),
             };
             if memo {
-                cache.insert(cache_key, (entry, current_nonce));
+                cache.set_entry(cache_key, (entry, current_nonce));
             }
             projected
         };
@@ -406,7 +452,7 @@ mod tests {
         cache: &HopProjectionCache,
         key: &(HopType, u64, bool),
     ) -> *const Vec<Option<Arc<V3WordProfile>>> {
-        match &cache[key] {
+        match &cache.get_entry(key).expect("entry") {
             (CachedProjection::Hop(arc), _) => match arc.as_ref() {
                 ResolvedHop::V3 { word_profiles, .. } => Arc::as_ptr(word_profiles),
                 _ => panic!("expected a cached V3 hop"),
@@ -421,7 +467,7 @@ mod tests {
         cache: &HopProjectionCache,
         key: &(HopType, u64, bool),
     ) -> *const Vec<IntTickRangeCrossing> {
-        match &cache[key] {
+        match &cache.get_entry(key).expect("entry") {
             (CachedProjection::Hop(arc), _) => match arc.as_ref() {
                 ResolvedHop::V3 { crossing_table, .. } => Arc::as_ptr(crossing_table),
                 _ => panic!("expected a cached V3 hop"),
@@ -442,11 +488,11 @@ mod tests {
         let p = register_v3(&mut core, [0xc3u8; 20]);
         let q = register_v3(&mut core, [0xd4u8; 20]);
         let refs = [ref_v3(p), ref_v3(q)];
-        let mut cache = HopProjectionCache::new();
+        let cache = HopProjectionCache::new();
 
         let mut r = ResolvedMixedPath::default();
         assert!(
-            resolve_hops(&core, &refs, &mut r, &mut cache, None, true).is_empty(),
+            resolve_hops(&core, &refs, &mut r, &cache, None, true).is_empty(),
             "baseline: both pools project"
         );
         assert!(r.valid);
@@ -465,14 +511,7 @@ mod tests {
         );
 
         let mut r2 = ResolvedMixedPath::default();
-        let deficits = resolve_hops(
-            &core,
-            &[ref_v3(p), ref_v3(q)],
-            &mut r2,
-            &mut cache,
-            None,
-            true,
-        );
+        let deficits = resolve_hops(&core, &[ref_v3(p), ref_v3(q)], &mut r2, &cache, None, true);
         assert!(!r2.valid, "path with a quarantined hop is invalid");
         assert_eq!(
             deficits,
@@ -494,7 +533,7 @@ mod tests {
         assert!(!core.release_pool(p), "second release is a no-op");
         let mut r3 = ResolvedMixedPath::default();
         assert!(
-            resolve_hops(&core, &refs, &mut r3, &mut cache, None, true).is_empty(),
+            resolve_hops(&core, &refs, &mut r3, &cache, None, true).is_empty(),
             "released pool projects again"
         );
         assert!(r3.valid);
@@ -513,13 +552,13 @@ mod tests {
         let p = register_v3(&mut core, [0xa1u8; 20]);
         let q = register_v3(&mut core, [0xb2u8; 20]);
         let refs = [ref_v3(p), ref_v3(q)];
-        let mut cache = HopProjectionCache::new();
+        let cache = HopProjectionCache::new();
 
         // 1) First resolve: both pools project (their profile Arcs are built + cached).
         let mut r1 = ResolvedMixedPath::default();
         let mut pc = 0u64;
         assert!(
-            resolve_hops(&core, &refs, &mut r1, &mut cache, Some(&mut pc), true).is_empty(),
+            resolve_hops(&core, &refs, &mut r1, &cache, Some(&mut pc), true).is_empty(),
             "both pools project"
         );
         assert_eq!(pc, 2, "first resolve projects both pools");
@@ -532,7 +571,7 @@ mod tests {
         // both profile Arcs are the same allocations (reused, not rebuilt).
         let mut r2 = ResolvedMixedPath::default();
         let mut pc2 = 0u64;
-        assert!(resolve_hops(&core, &refs, &mut r2, &mut cache, Some(&mut pc2), true).is_empty());
+        assert!(resolve_hops(&core, &refs, &mut r2, &cache, Some(&mut pc2), true).is_empty());
         assert_eq!(pc2, 0, "unchanged pools are cache hits (no re-projection)");
         assert_eq!(
             profile_ptr(&cache, &(HopType::V3, p, true)),
@@ -576,7 +615,7 @@ mod tests {
         // P's profile Arc is a fresh allocation; Q's is the SAME allocation.
         let mut r3 = ResolvedMixedPath::default();
         let mut pc3 = 0u64;
-        assert!(resolve_hops(&core, &refs, &mut r3, &mut cache, Some(&mut pc3), true).is_empty());
+        assert!(resolve_hops(&core, &refs, &mut r3, &cache, Some(&mut pc3), true).is_empty());
         assert_eq!(pc3, 1, "only the minted pool re-projects; Q is a cache hit");
         assert_ne!(
             profile_ptr(&cache, &(HopType::V3, p, true)),
@@ -851,23 +890,21 @@ mod tests {
         let refs = [v3_ref(a, true), v4_ref(b, false)];
 
         // Memo ON: prime, then re-resolve from the memo.
-        let mut cache = HopProjectionCache::new();
+        let cache = HopProjectionCache::new();
         let mut r1 = ResolvedMixedPath::default();
         let mut pc = 0u64;
-        assert!(resolve_hops(&core, &refs, &mut r1, &mut cache, Some(&mut pc), true).is_empty());
+        assert!(resolve_hops(&core, &refs, &mut r1, &cache, Some(&mut pc), true).is_empty());
         assert_eq!(pc, 2, "first resolve projects both hops");
         let mut r2 = ResolvedMixedPath::default();
         let mut pc2 = 0u64;
-        assert!(resolve_hops(&core, &refs, &mut r2, &mut cache, Some(&mut pc2), true).is_empty());
+        assert!(resolve_hops(&core, &refs, &mut r2, &cache, Some(&mut pc2), true).is_empty());
         assert_eq!(pc2, 0, "second resolve is served from the memo");
 
         // Memo OFF: projections run again; entries must be byte-equal.
-        let mut cache_off = HopProjectionCache::new();
+        let cache_off = HopProjectionCache::new();
         let mut r3 = ResolvedMixedPath::default();
         let mut pc3 = 0u64;
-        assert!(
-            resolve_hops(&core, &refs, &mut r3, &mut cache_off, Some(&mut pc3), false).is_empty()
-        );
+        assert!(resolve_hops(&core, &refs, &mut r3, &cache_off, Some(&mut pc3), false).is_empty());
         assert_eq!(pc3, 2, "memo-off projects both hops");
         assert_eq!(
             crossing_pairs(&r2),
@@ -893,22 +930,20 @@ mod tests {
         let w = register_v2_skew(&mut core);
         let refs = [v4_ref(b, true), v2_ref(w)];
 
-        let mut cache = HopProjectionCache::new();
+        let cache = HopProjectionCache::new();
         let mut r1 = ResolvedMixedPath::default();
         let mut pc = 0u64;
-        assert!(resolve_hops(&core, &refs, &mut r1, &mut cache, Some(&mut pc), true).is_empty());
+        assert!(resolve_hops(&core, &refs, &mut r1, &cache, Some(&mut pc), true).is_empty());
         assert_eq!(pc, 2, "first resolve projects both hops");
         let mut r2 = ResolvedMixedPath::default();
         let mut pc2 = 0u64;
-        assert!(resolve_hops(&core, &refs, &mut r2, &mut cache, Some(&mut pc2), true).is_empty());
+        assert!(resolve_hops(&core, &refs, &mut r2, &cache, Some(&mut pc2), true).is_empty());
         assert_eq!(pc2, 0, "second resolve is served from the memo");
 
-        let mut cache_off = HopProjectionCache::new();
+        let cache_off = HopProjectionCache::new();
         let mut r3 = ResolvedMixedPath::default();
         let mut pc3 = 0u64;
-        assert!(
-            resolve_hops(&core, &refs, &mut r3, &mut cache_off, Some(&mut pc3), false).is_empty()
-        );
+        assert!(resolve_hops(&core, &refs, &mut r3, &cache_off, Some(&mut pc3), false).is_empty());
         assert_eq!(pc3, 2, "memo-off projects both hops");
         assert_eq!(crossing_pairs(&r2), crossing_pairs(&r3));
 

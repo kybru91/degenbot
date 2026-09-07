@@ -2081,7 +2081,7 @@ mod tests {
                     &core,
                     &path.pools,
                     &mut resolved,
-                    &mut engine.hop_projection_cache,
+                    &engine.hop_projection_cache,
                     None,
                     engine.cl_projection_memo,
                 );
@@ -6912,5 +6912,155 @@ mod tests {
         }
         let guard = engine.lock();
         assert!(path_ids.iter().all(|p| guard.results.contains_key(p)));
+    }
+
+    #[test]
+    #[expect(clippy::too_many_lines)] // A/B harness: two full engines, worth the length
+    fn resolve_chunk_parity_parallel_matches_serial_and_reuses_cache_walks() {
+        use std::sync::atomic::Ordering;
+
+        const N: usize = 600; // >= RESOLVE_PAR_MIN (512) so the parallel arm engages
+
+        let build = || {
+            let mut engine = ArbitrageEngine::new();
+            // Two HUB pools shared by every path; one unique pool per path.
+            let hub_a = engine.register_v2_pool(
+                Address::from([0xaa_u8; 20]),
+                usdc(1_000_000),
+                weth(700),
+                GAMMA_03,
+                FEE_DENOM_03,
+            );
+            let hub_b = engine.register_v2_pool(
+                Address::from([0xbb_u8; 20]),
+                weth(900),
+                usdc(1_200_000),
+                GAMMA_03,
+                FEE_DENOM_03,
+            );
+            let mut path_ids = Vec::with_capacity(N);
+            for i in 0..N {
+                let mut b = [0x33u8; 20];
+                // Distinct for the whole 0..600 range: high byte of the
+                // 16-bit index in b[15], low byte in b[16] (expect: a test
+                // address space, values provably < 256 per byte).
+                b[15] = u8::try_from(i / 256).expect("N < 65536");
+                b[16] = u8::try_from(i % 256).expect("index mod 256 fits u8");
+                b[17] = 0x5au8;
+                let unique = engine.register_v2_pool(
+                    Address::from(b),
+                    usdc(50_000),
+                    weth(30),
+                    GAMMA_03,
+                    FEE_DENOM_03,
+                );
+                let id = engine
+                    .register_and_solve_path(vec![
+                        PoolHop {
+                            pool_id: hub_a,
+                            zero_for_one: true,
+                        },
+                        PoolHop {
+                            pool_id: unique,
+                            zero_for_one: true,
+                        },
+                        PoolHop {
+                            pool_id: hub_b,
+                            zero_for_one: false,
+                        },
+                    ])
+                    .unwrap();
+                path_ids.push((id, unique, hub_a, hub_b));
+            }
+            (engine, path_ids, hub_a, hub_b)
+        };
+
+        let run = |parallel: bool| {
+            let (mut engine, path_ids, hub_a, hub_b) = build();
+            crate::solvers::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE
+                .store(parallel, Ordering::Relaxed);
+
+            // Cycle 1: dirty BOTH hubs -> all N paths re-resolve in one cycle.
+            engine.process_updates(
+                &[
+                    (Address::from([0xaa_u8; 20]), usdc(990_000), weth(705)),
+                    (Address::from([0xbb_u8; 20]), weth(895), usdc(1_210_000)),
+                ],
+                &[],
+                500,
+                &BlockMetadata::default(),
+            );
+            engine.rebuild_and_solve_affected(
+                &HashSet::from([hub_a, hub_b]),
+                &HashSet::new(),
+                &HashSet::new(),
+                500,
+                &BlockMetadata::default(),
+            );
+
+            // Cycle 2: dirty hub_b only -> 600 affected paths again; hub_a must
+            // be walked ONCE by the shared sharded cache (serial: also once).
+            let projections_before = engine.hop_projection_count;
+            engine.process_updates(
+                &[(Address::from([0xbb_u8; 20]), weth(880), usdc(1_230_000))],
+                &[],
+                501,
+                &BlockMetadata::default(),
+            );
+            engine.rebuild_and_solve_affected(
+                &HashSet::from([hub_b]),
+                &HashSet::new(),
+                &HashSet::new(),
+                501,
+                &BlockMetadata::default(),
+            );
+            let projections_delta = engine.hop_projection_count - projections_before;
+
+            let (results, _block) = engine.latest_results();
+            (
+                results,
+                engine.paths_same_state_this_cycle,
+                projections_delta,
+                path_ids,
+            )
+        };
+
+        let (serial_results, serial_same_state, serial_proj_delta, path_ids) = run(false);
+        let (par_results, par_same_state, par_proj_delta, _path_ids) = run(true);
+
+        // Restore the production stance after the A/B.
+        crate::solvers::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE
+            .store(true, Ordering::Relaxed);
+
+        assert_eq!(path_ids.len(), N);
+        for (path_id, _unique, _a, _b) in &path_ids {
+            let sres = serial_results.get(path_id).expect("serial result");
+            let pres = par_results.get(path_id).expect("parallel result");
+            assert_eq!(
+                sres.profit, pres.profit,
+                "profit diverged for path {path_id}"
+            );
+            assert_eq!(
+                sres.solver_pool_states.len(),
+                pres.solver_pool_states.len(),
+                "hop-state shape diverged for path {path_id}"
+            );
+        }
+        assert_eq!(
+            serial_same_state, par_same_state,
+            "same-state accounting diverged"
+        );
+        // THE cache-reuse invariant: both arms walk the same pool count on the
+        // second cycle, and exactly one walk per distinct pool (not per chunk).
+        assert_eq!(
+            serial_proj_delta, par_proj_delta,
+            "projection walks diverged"
+        );
+        // Cycle-2 re-resolve of 600 paths: only hub_b (dirty) misses the cache;
+        // hub_a hits in every path. 1 walk total in BOTH arms.
+        assert_eq!(
+            serial_proj_delta, 1,
+            "cycle-2 must walk only the dirty pool, got {serial_proj_delta}"
+        );
     }
 }

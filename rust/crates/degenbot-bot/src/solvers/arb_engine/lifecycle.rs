@@ -133,7 +133,7 @@ impl ArbitrageEngine {
                 &core,
                 &pool_refs,
                 &mut resolved,
-                &mut self.hop_projection_cache,
+                &self.hop_projection_cache,
                 Some(&mut self.hop_projection_count),
                 self.cl_projection_memo,
             )
@@ -355,7 +355,7 @@ impl ArbitrageEngine {
                     &core,
                     &path.pools,
                     &mut resolved,
-                    &mut self.hop_projection_cache,
+                    &self.hop_projection_cache,
                     Some(&mut self.hop_projection_count),
                     self.cl_projection_memo,
                 );

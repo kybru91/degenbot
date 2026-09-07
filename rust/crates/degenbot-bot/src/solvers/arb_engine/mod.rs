@@ -557,7 +557,7 @@ impl ArbitrageEngine {
             path_pools: HashMap::new(),
             path_resolved: HashMap::new(),
             path_status: HashMap::new(),
-            hop_projection_cache: HashMap::new(),
+            hop_projection_cache: HopProjectionCache::new(),
             hop_projection_count: 0,
             cl_projection_memo: crate::bot_core::resolve::projection_memo_enabled(),
             pool_to_paths: HashMap::new(),

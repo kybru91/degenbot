@@ -132,6 +132,29 @@ fn lpt_partition_enabled() -> bool {
     LPT_PARTITION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// 7LV6VN T2: chunked parallel resolve of the affected paths (sharded hop
+/// cache preserves cross-path hit reuse). Default ON; set
+/// `DEGENBOT_SOLVE_RESOLVE_PAR=0` for the serial A/B fallback.
+const RESOLVE_CHUNK: usize = 256;
+const RESOLVE_PAR_MIN: usize = 512;
+
+struct ResolveChunkOut {
+    resolved: Vec<(u64, std::sync::Arc<ResolvedMixedPath>)>,
+    status: Vec<(u64, Vec<crate::bot_core::resolve::HopDeficit>)>,
+    snapshots: Vec<(u64, Vec<u64>)>,
+    same_state: u64,
+    projections: u64,
+    invalid_reasons: HashMap<String, u64>,
+    deferred: Vec<u64>,
+}
+
+fn resolve_parallel_enabled() -> bool {
+    RESOLVE_PAR_STANCE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) static RESOLVE_PAR_STANCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 /// Pre-solve profitability floor for the profit-envelope gate (SU7MAE).
 /// Precedence: `DEGENBOT_MIN_PROFIT_WEI` (decimal wei) > default 0. Default 0
 /// skips only paths whose rigorous upper bound proves zero-or-negative profit.
@@ -310,6 +333,17 @@ pub fn install_engine_env_stances() {
         Err(_) => true,
     };
     crate::bot_core::resolve::install_projection_memo_stance(projection_memo);
+    // 7LV6VN T2: chunked parallel resolve stance, parsed once at construction.
+    RESOLVE_PAR_STANCE.store(
+        match std::env::var("DEGENBOT_SOLVE_RESOLVE_PAR") {
+            Ok(raw) => !matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "disabled"
+            ),
+            Err(_) => true,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
     ::degenbot_solvers::runtime::set_runtime(::degenbot_solvers::runtime::SolveRuntimeConfig {
         event_solver_legacy: std::env::var("DEGENBOT_WALK_EVENT_SOLVER").as_deref() == Ok("0"),
         walk_event_census: std::env::var("DEGENBOT_WALK_EVENT_CENSUS").as_deref() == Ok("1"),
@@ -1487,12 +1521,11 @@ impl ArbitrageEngine {
         // `deferred_paths` is now reserved for the genuinely illegitimate future-
         // price case below; genuine chain/solver divergence is left to the ADR-021
         // verifier, which fatal-aborts loudly (the preferred failure, esp. in dev).
-        let mut deferred_paths: HashSet<u64> = HashSet::new();
-        // Invalidation reason histogram — names WHY the invalid slice of the
-        // affected set dies before solving (SequenceUnavailable vs MissingState
-        // vs ...). Emitted on the resolve phase event.
-        let mut invalid_reasons: HashMap<String, u64> = HashMap::new();
         self.paths_same_state_this_cycle = 0;
+        // 7LV6VN T2: these accumulate from the chunk merges inside the resolve
+        // block below (same content the serial loop used to produce inline).
+        let mut deferred_paths: HashSet<u64> = HashSet::new();
+        let mut invalid_reasons: HashMap<String, u64> = HashMap::new();
         // MQUKB6-T2: phase span for the core-lock re-derive window (the
         // summary event after the block stays on the same node).
         let resolve_ctx = tracing::info_span!(
@@ -1502,80 +1535,150 @@ impl ArbitrageEngine {
             paths.affected = affected_path_ids.len(),
         )
         .entered();
+        // 7LV6VN T2: chunked rayon fan-out over the affected paths. The
+        // sharded hop cache keeps cross-path hit reuse intact (a chunk-local
+        // cache would multiply the expensive CL tick-walk per shared pool),
+        // so chunks contend only on shard locks, never on each other's work.
+        // Per-path chunk outputs merge serially below in deterministic order;
+        // `resolve_hops` semantics are byte-identical (same core-read window,
+        // same deficits, same memo validation).
+
         hotpath::measure_block!("arb_solve.resolve", {
             let core = self.core.read();
-            for &path_id in &affected_path_ids {
-                let Some(path) = self.path_pools.get(&path_id) else {
-                    continue;
+            let resolve_chunk = |path_ids: &[u64]| -> ResolveChunkOut {
+                let mut out = ResolveChunkOut {
+                    resolved: Vec::new(),
+                    status: Vec::new(),
+                    snapshots: Vec::new(),
+                    same_state: 0u64,
+                    projections: 0u64,
+                    invalid_reasons: HashMap::new(),
+                    deferred: Vec::new(),
                 };
-                // U6RNHH T1 solve-stage future-price tripwire: a hop whose PRICE
-                // clock runs ahead of the solve anchor is never legitimate and is
-                // rejected loudly (deferred + logged), not solved — a future-price
-                // solve reports a misleading downstream IIA. Rule owner:
-                // `crate::bot_core::solve_anchor`; after the head floor a hop can
-                // beat the anchor only on a mid-solve state advance (belt +
-                // suspenders, normally unreachable).
-                // Reuse ceiling probe (epic RZRORC last leaf): compare the
-                // hop update-block snapshot against the previous cycle's
-                // recorded one. Byte-identical ⇒ the solve intake (every hop
-                // state) is unchanged since the stored result was produced.
-                let update_snapshot: Vec<u64> = path
-                    .pools
-                    .iter()
-                    .map(|pool_ref| core.pool_update_block(pool_ref.pool_key))
-                    .collect();
-                let same_state = self
-                    .resolved_update_snapshot
-                    .get(&path_id)
-                    .is_some_and(|prev| *prev == update_snapshot);
-                self.resolved_update_snapshot
-                    .insert(path_id, update_snapshot);
-                if same_state {
-                    self.paths_same_state_this_cycle += 1;
-                }
-                let future = path
-                    .pools
-                    .iter()
-                    .any(|pool_ref| anchor.is_future(core.pool_update_block(pool_ref.pool_key)));
-                if future {
-                    deferred_paths.insert(path_id);
-                    tracing::error!(
-                        "[future-price] path_id={path_id} rejected at solve block {solve_block}: \
-                         a hop price clock runs AHEAD of the solve block (update_block > \
-                         solve_block) — never legitimate"
+                for (chunk_pos, &path_id) in path_ids.iter().enumerate() {
+                    let Some(path) = self.path_pools.get(&path_id) else {
+                        continue;
+                    };
+                    // U6RNHH T1 solve-stage future-price tripwire: a hop whose PRICE
+                    // clock runs ahead of the solve anchor is never legitimate and is
+                    // rejected loudly (deferred + logged), not solved — a future-price
+                    // solve reports a misleading downstream IIA. Rule owner:
+                    // `crate::bot_core::solve_anchor`; after the head floor a hop can
+                    // beat the anchor only on a mid-solve state advance (belt +
+                    // suspenders, normally unreachable).
+                    // Reuse ceiling probe (epic RZRORC last leaf): compare the
+                    // hop update-block snapshot against the previous cycle's
+                    // recorded one. Byte-identical ⇒ the solve intake (every hop
+                    // state) is unchanged since the stored result was produced.
+                    let update_snapshot: Vec<u64> = path
+                        .pools
+                        .iter()
+                        .map(|pool_ref| core.pool_update_block(pool_ref.pool_key))
+                        .collect();
+                    let same_state = self
+                        .resolved_update_snapshot
+                        .get(&path_id)
+                        .is_some_and(|prev| *prev == update_snapshot);
+                    out.snapshots.push((path_id, update_snapshot));
+                    if same_state {
+                        out.same_state += 1;
+                    }
+                    let future = path.pools.iter().any(|pool_ref| {
+                        anchor.is_future(core.pool_update_block(pool_ref.pool_key))
+                    });
+                    if future {
+                        out.deferred.push(path_id);
+                        tracing::error!(
+                            "[future-price] path_id={path_id} rejected at solve block {solve_block}: \
+                             a hop price clock runs AHEAD of the solve block (update_block > \
+                             solve_block) — never legitimate"
+                        );
+                        continue;
+                    }
+                    let mut resolved = ResolvedMixedPath::default();
+                    let mut chunk_projections = out.projections;
+                    let deficits = resolve_hops(
+                        &core,
+                        &path.pools,
+                        &mut resolved,
+                        &self.hop_projection_cache,
+                        Some(&mut chunk_projections),
+                        self.cl_projection_memo,
                     );
-                    continue;
+                    out.projections = chunk_projections;
+                    for d in &deficits {
+                        *out.invalid_reasons
+                            .entry(d.reason.to_string())
+                            .or_insert(0u64) += 1u64;
+                        tracing::debug!(
+                            %path_id,
+                            hop_type = ?d.hop_type,
+                            pool_key = d.pool_key,
+                            reason = %d.reason,
+                            "[resolve] path invalid at resolve"
+                        );
+                    }
+                    out.resolved.push((path_id, std::sync::Arc::new(resolved)));
+                    // R522XA: drive the path state machine from the full deficit set.
+                    out.status.push((path_id, deficits));
+                    let _ = chunk_pos;
                 }
-                let mut resolved = ResolvedMixedPath::default();
-                let deficits = resolve_hops(
-                    &core,
-                    &path.pools,
-                    &mut resolved,
-                    &mut self.hop_projection_cache,
-                    Some(&mut self.hop_projection_count),
-                    self.cl_projection_memo,
-                );
-                for d in &deficits {
-                    *invalid_reasons.entry(d.reason.to_string()).or_insert(0u64) += 1;
-                    tracing::debug!(
-                        %path_id,
-                        hop_type = ?d.hop_type,
-                        pool_key = d.pool_key,
-                        reason = %d.reason,
-                        "[resolve] path invalid at resolve"
-                    );
-                }
-                self.path_resolved
-                    .insert(path_id, std::sync::Arc::new(resolved));
-                // R522XA: drive the path state machine from the full deficit set.
-                self.path_status
-                    .entry(path_id)
-                    .or_default()
-                    .set_resolved(&deficits);
-            }
-        });
+                out
+            };
 
-        // Telemetry: resolve phase complete (core-lock window + hop re-derive).
+            let _ = RESOLVE_CHUNK;
+            // Deterministic chunking: hashbrown iteration order varies per
+            // process; a sorted snapshot keeps chunk boundaries (and thus
+            // debug-log ordering) identical across runs for ~microsecond cost.
+            let mut affected_vec: Vec<u64> = affected_path_ids.iter().copied().collect();
+            affected_vec.sort_unstable();
+            let chunk_outs: Vec<ResolveChunkOut> =
+                if resolve_parallel_enabled() && affected_vec.len() >= RESOLVE_PAR_MIN {
+                    affected_vec
+                        .par_chunks(RESOLVE_CHUNK)
+                        .map(resolve_chunk)
+                        .collect()
+                } else {
+                    vec![resolve_chunk(&affected_vec)]
+                };
+
+            // Serial, deterministic merge (the engine mutex is held by this
+            // cycle, so no other task can race these stores).
+            let mut same_state_total = 0u64;
+            let mut projections_total = 0u64;
+            for ResolveChunkOut {
+                resolved,
+                status,
+                snapshots,
+                same_state,
+                projections,
+                invalid_reasons: chunk_invalid,
+                deferred,
+            } in chunk_outs
+            {
+                same_state_total += same_state;
+                projections_total += projections;
+                deferred_paths.extend(deferred);
+                for (path_id, snapshot) in snapshots {
+                    self.resolved_update_snapshot.insert(path_id, snapshot);
+                }
+                for (path_id, arc) in resolved {
+                    self.path_resolved.insert(path_id, arc);
+                }
+                for (path_id, deficits) in status {
+                    self.path_status
+                        .entry(path_id)
+                        .or_default()
+                        .set_resolved(&deficits);
+                }
+                for (reason, count) in chunk_invalid {
+                    *invalid_reasons.entry(reason).or_insert(0u64) += count;
+                }
+            }
+            self.paths_same_state_this_cycle = same_state_total;
+            // Lifetime counter (the serial loop accumulated in place).
+            self.hop_projection_count += projections_total;
+        });
         tracing::info!(
             target: "degenbot::solver",
             block_number = solve_block,
