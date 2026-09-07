@@ -28,6 +28,7 @@ pub mod curve_state;
 pub mod divergence_probe;
 pub mod drain_sink;
 pub mod engine;
+pub mod epoch;
 pub mod event_dispatch;
 pub mod liquidity_verifier;
 pub mod log_dispatcher;
@@ -76,6 +77,7 @@ pub use cl_orchestration::{InstallWordOutcome, RegisteredV4, StagedWordFetch};
 pub use curve_state::{CurvePoolIdentity, CurvePoolState, RegisterCurvePoolParams};
 use degenbot_math::curve::{CurveBasePoolPort, CurveSwapError};
 pub use divergence_probe::{TrackedSlotKind, TrackedSlotProbe};
+pub use epoch::{BlockContext, Epoch, StaleEpoch};
 pub use registration_lifecycle::{
     run_cl_v3_lifecycle, run_cl_v4_lifecycle, run_v3_registration_lifecycle,
     run_v4_registration_lifecycle, RegistrationLifecycleError,

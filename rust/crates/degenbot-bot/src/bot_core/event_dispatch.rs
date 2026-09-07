@@ -37,32 +37,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::bot_core::drain_sink::DrainSink;
-use crate::bot_core::BlockMetadata;
+use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
 
 /// The payload handed from the pump to the solver-state verifier task at each
 /// publish point: the solve block and the pool refs for ONLY the paths re-solved
 /// that block (the ADR-021 change set). Captured atomically at the publish so
 /// the verifier diffs exactly what this block re-solved against the chain — never
 /// the whole registered set (the root of the confirmed pump freeze).
-pub type SolverVerifyRequest = (u64, Vec<Vec<degenbot_solvers::mixed::MixedPoolRef>>);
+pub type SolverVerifyRequest = (Epoch, Vec<Vec<degenbot_solvers::mixed::MixedPoolRef>>);
 
 /// A deferred drain-sink operation to the background drainer task: the sink's
 /// solve/dispatch/finalize run via these messages so the WS poller is never
 /// parked behind GIL-bound or heavy sink work (`Python::attach`, Möbius solve).
 /// FIFO ordering + the existing engine/sink locks give the deferred path the
-/// inline semantics it replaced (B4). The verifier anchor (`open`) and the
-/// change-set for `Publish` are consumed atomically in the pump (single-writer).
+/// inline semantics it replaced (B4). The change-set for `Publish` is consumed
+/// atomically in the pump (single-writer).
+///
+/// T6IYKY: every item carries its work block as a [`BlockContext`] — the ONE
+/// coordinate (block + rewind generation, minted by `PumpFSM::context_for`).
+/// The old loose `block`/`open` + `metadata` field pairs are gone; the
+/// verifier anchor IS `Publish`'s context epoch.
 pub enum DrainWork {
-    /// Eager solve of every dirty path at `block`.
-    Drain { block: u64, metadata: BlockMetadata },
+    /// Eager solve of every dirty path at the context's block.
+    Drain { context: BlockContext },
     /// Solve + emit the block-boundary batch (tombstone path).
-    Finalize { block: u64, metadata: BlockMetadata },
+    Finalize { context: BlockContext },
     /// The quiesce-gated publish: flush the sink's `on_send` to Python, then
-    /// hand the log-driven quiesced `block` + change-set to the latest-wins
-    /// verifier.
+    /// hand the log-driven quiesced context + change-set to the latest-wins
+    /// verifier (the context's epoch is the ADR-021 verifier anchor).
     Publish {
-        open: u64,
-        metadata: BlockMetadata,
+        context: BlockContext,
         change_set: Vec<Vec<degenbot_solvers::mixed::MixedPoolRef>>,
     },
 }
@@ -344,21 +348,21 @@ impl DispatchOwner {
                 // only latencies whenever a block's settle gate skipped).
                 let carries_solve = matches!(work, DrainWork::Drain { .. });
                 match work {
-                    DrainWork::Drain { block, metadata } => {
-                        sink_clone.on_drain(block, &metadata);
+                    DrainWork::Drain { context } => {
+                        sink_clone.on_drain(&context);
                     }
-                    DrainWork::Finalize { block, metadata } => {
-                        sink_clone.finalize_block(block, &metadata);
+                    DrainWork::Finalize { context } => {
+                        sink_clone.finalize_block(&context);
                     }
                     DrainWork::Publish {
-                        open,
-                        metadata,
+                        context,
                         change_set,
                     } => {
-                        // on_send first, then the latest-wins verifier.
-                        sink_clone.on_send(&metadata);
+                        // on_send first, then the latest-wins verifier — the
+                        // publish context's epoch is the verifier anchor.
+                        sink_clone.on_send(&context);
                         if let Some(ref tx) = vt {
-                            let _ = tx.send(Some((open, change_set)));
+                            let _ = tx.send(Some((context.epoch(), change_set)));
                         }
                     }
                 }
@@ -585,19 +589,19 @@ mod tests {
         fn has_dirty_paths(&self) -> bool {
             self.dirty.load(Ordering::Relaxed)
         }
-        fn on_drain(&self, block: u64, _metadata: &BlockMetadata) {
-            self.drained.lock().push(block);
+        fn on_drain(&self, ctx: &BlockContext) {
+            self.drained.lock().push(ctx.block());
         }
-        fn on_send(&self, _metadata: &BlockMetadata) {
+        fn on_send(&self, _ctx: &BlockContext) {
             self.send_count.fetch_add(1, Ordering::Relaxed);
         }
-        fn finalize_block(&self, block: u64, _metadata: &BlockMetadata) {
-            self.finalized.lock().push(block);
+        fn finalize_block(&self, ctx: &BlockContext) {
+            self.finalized.lock().push(ctx.block());
         }
-        fn set_last_solved_block(&self, block: u64) {
-            self.last_processed.store(block, Ordering::Relaxed);
+        fn set_last_solved_block(&self, solved: Epoch) {
+            self.last_processed.store(solved.block(), Ordering::Relaxed);
         }
-        fn set_solve_anchor(&self, _block: u64) {}
+        fn set_solve_anchor(&self, _anchor: Epoch) {}
         fn record_logs_this_block(&self) {}
         fn last_processed_block(&self) -> Option<u64> {
             Some(self.last_processed.load(Ordering::Relaxed))
@@ -633,8 +637,7 @@ mod tests {
         let owner = owner_for(&sink);
 
         owner.dispatch(DrainWork::Drain {
-            block: 42,
-            metadata: BlockMetadata::default(),
+            context: BlockContext::new(42, BlockMetadata::default()),
         });
         // The block-clock pipe is a direct dispatch, independent of the drainer.
         owner.notify_block(43, &BlockMetadata::default());
@@ -670,8 +673,7 @@ mod tests {
         let owner = DispatchOwner::new(Arc::clone(&sink) as Arc<dyn DrainSink>, &Some(verify_tx));
 
         owner.dispatch(DrainWork::Publish {
-            open: 7,
-            metadata: BlockMetadata::default(),
+            context: BlockContext::new(7, BlockMetadata::default()),
             change_set: Vec::new(),
         });
 
@@ -688,10 +690,10 @@ mod tests {
         // on_send ran, then the verifier got the most-recent request.
         assert_eq!(sink.send_count.load(Ordering::Relaxed), 1);
         let got = verify_rx.borrow().clone();
-        let Some((open, change_set)) = got else {
+        let Some((epoch, change_set)) = got else {
             panic!("verifier did not receive a publish");
         };
-        assert_eq!(open, 7);
+        assert_eq!(epoch.block(), 7);
         assert!(change_set.is_empty());
     }
 
@@ -738,17 +740,17 @@ mod tests {
             // `-> !` coerces to bool for the sink trait's signature.
             park_forever()
         }
-        fn on_drain(&self, _block: u64, _metadata: &BlockMetadata) {
+        fn on_drain(&self, _ctx: &BlockContext) {
             park_forever();
         }
-        fn on_send(&self, _metadata: &BlockMetadata) {
+        fn on_send(&self, _ctx: &BlockContext) {
             park_forever();
         }
-        fn finalize_block(&self, _block: u64, _metadata: &BlockMetadata) {
+        fn finalize_block(&self, _ctx: &BlockContext) {
             park_forever();
         }
-        fn set_last_solved_block(&self, _block: u64) {}
-        fn set_solve_anchor(&self, _block: u64) {}
+        fn set_last_solved_block(&self, _solved: Epoch) {}
+        fn set_solve_anchor(&self, _anchor: Epoch) {}
         fn record_logs_this_block(&self) {}
         fn last_processed_block(&self) -> Option<u64> {
             None
@@ -782,8 +784,7 @@ mod tests {
         let meta = BlockMetadata::default();
         for i in 0..8u64 {
             owner.dispatch(DrainWork::Drain {
-                block: i,
-                metadata: meta,
+                context: BlockContext::new(i, meta),
             });
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         }
@@ -812,16 +813,13 @@ mod tests {
         // the always-on watchdog tick can observe depth>=floor with a stale
         // healthy baseline and abort.
         owner.dispatch(DrainWork::Drain {
-            block: 0,
-            metadata: meta,
+            context: BlockContext::new(0, meta),
         });
         owner.dispatch(DrainWork::Drain {
-            block: 1,
-            metadata: meta,
+            context: BlockContext::new(1, meta),
         });
         owner.dispatch(DrainWork::Drain {
-            block: 2,
-            metadata: meta,
+            context: BlockContext::new(2, meta),
         });
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         unreachable!("watchdog abort should have killed this process before 30s");

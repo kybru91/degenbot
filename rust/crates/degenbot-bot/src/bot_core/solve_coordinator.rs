@@ -39,7 +39,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::bot_core::drain_sink::DrainSink;
-use crate::bot_core::BlockMetadata;
+use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
 use degenbot_solvers::mixed::MixedPoolRef;
 
 use super::block_clock_pipe::BlockClockPipe;
@@ -55,8 +55,11 @@ struct CoordinatorState {
     /// The last block every engine has *fully drained to* — the "good" block
     /// Python polls see. Updated at the end of a successful `on_drain` /
     /// `finalize_block` fan-out, under `drain_lock`, so `last_processed_block`
-    /// returns a consistent value (never a mid-drain read).
-    last_drained_block: Option<u64>,
+    /// returns a consistent value (never a mid-drain read). T6IYKY: the cursor
+    /// is the drain work's `Epoch` (block + rewind generation) — the same
+    /// coordinate every other anchor carries. Python-facing reads keep the
+    /// block coordinate (`last_processed_block`).
+    last_drained_block: Option<Epoch>,
 }
 
 /// The drain-point solve coordinator (ADR-006 D4 helper).
@@ -133,7 +136,7 @@ impl SolveCoordinator {
             "SolveCoordinator::start: engines have divergent cursors {cursors:?} \
              — all engines must backfill to the same block before start"
         );
-        state.last_drained_block = cursors[0];
+        state.last_drained_block = cursors[0].map(Epoch::at);
         state.started = true;
     }
 }
@@ -150,7 +153,7 @@ impl DrainSink for SolveCoordinator {
     }
 
     #[hotpath::measure(label = "SolveCoordinator::on_drain")]
-    fn on_drain(&self, block: u64, metadata: &BlockMetadata) {
+    fn on_drain(&self, ctx: &BlockContext) {
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let mut state = self.drain_lock.lock().expect("drain_lock poisoned");
         // DEFERRED (ADR-006): `SolvePolicy::Eager`/`Block`/`Manual` would
@@ -159,11 +162,11 @@ impl DrainSink for SolveCoordinator {
         // invariant). The policy needs a second consumer (the seam bar) and
         // is recorded as deferred in ADR-006.
         for engine in &self.engines {
-            engine.solve_dirty(block, metadata);
+            engine.solve_dirty(ctx.block(), ctx.metadata());
         }
-        // Record the drained block under the same lock — the "good" block
+        // Record the drained epoch under the same lock — the "good" block
         // Python polls will see once we release.
-        state.last_drained_block = Some(block);
+        state.last_drained_block = Some(ctx.epoch());
     }
 
     fn on_pump_ended(&self) {
@@ -181,32 +184,32 @@ impl DrainSink for SolveCoordinator {
     }
 
     #[hotpath::measure(label = "SolveCoordinator::on_send")]
-    fn on_send(&self, metadata: &BlockMetadata) {
+    fn on_send(&self, ctx: &BlockContext) {
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let _guard = self.drain_lock.lock().expect("drain_lock poisoned");
         for engine in &self.engines {
-            engine.send_result_batch(metadata);
+            engine.send_result_batch(ctx.metadata());
         }
     }
 
     #[hotpath::measure(label = "SolveCoordinator::finalize_block")]
-    fn finalize_block(&self, block: u64, metadata: &BlockMetadata) {
+    fn finalize_block(&self, ctx: &BlockContext) {
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let mut state = self.drain_lock.lock().expect("drain_lock poisoned");
         for engine in &self.engines {
-            engine.finalize_block(block, metadata);
+            engine.finalize_block(ctx.block(), ctx.metadata());
         }
-        state.last_drained_block = Some(block);
+        state.last_drained_block = Some(ctx.epoch());
     }
 
-    fn set_last_solved_block(&self, block: u64) {
+    fn set_last_solved_block(&self, solved: Epoch) {
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let _guard = self.drain_lock.lock().expect("drain_lock poisoned");
         // Fan-out mirrors `finalize_block`/`on_drain` — every engine seeds
         // its own `last_solved_block` (engine-owned since LEZJAS; the prior
         // shared `&mut` out-param was a latent overwrite bug across engines).
         for engine in &self.engines {
-            engine.set_last_solved_block(block);
+            engine.set_last_solved_block(solved.block());
         }
     }
 
@@ -215,11 +218,12 @@ impl DrainSink for SolveCoordinator {
     /// `set_last_solved_block`'s fan-out (ADR-006 D4); the pump calls it once
     /// at resume so registration eager-solve candidates deliver at a valid,
     /// verification-safe solve block instead of block 0 or a deferred deferral.
-    fn set_solve_anchor(&self, block: u64) {
+    /// T6IYKY: the seed anchor is an `Epoch`.
+    fn set_solve_anchor(&self, anchor: Epoch) {
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let _guard = self.drain_lock.lock().expect("drain_lock poisoned");
         for engine in &self.engines {
-            engine.set_solve_anchor(block);
+            engine.set_solve_anchor(anchor.block());
         }
     }
 
@@ -237,7 +241,7 @@ impl DrainSink for SolveCoordinator {
         // trade for never seeing a mid-drain cursor.
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let state = self.drain_lock.lock().expect("drain_lock poisoned");
-        state.last_drained_block
+        state.last_drained_block.map(Epoch::block)
     }
 
     #[hotpath::measure(label = "SolveCoordinator::notify_block")]
@@ -409,7 +413,7 @@ mod tests {
         assert!(engine.has_dirty_paths(), "red: dirty flag set");
 
         let metadata = BlockMetadata::default();
-        coordinator.on_drain(100, &metadata);
+        coordinator.on_drain(&BlockContext::new(100, metadata));
 
         assert_eq!(
             engine.solve_dirty_count(),
@@ -426,7 +430,7 @@ mod tests {
         let coordinator = SolveCoordinator::new(vec![a.clone(), b.clone()]);
 
         let metadata = BlockMetadata::default();
-        coordinator.on_drain(50, &metadata);
+        coordinator.on_drain(&BlockContext::new(50, metadata));
 
         assert_eq!(a.solve_dirty_count(), 1);
         assert_eq!(b.solve_dirty_count(), 1);
@@ -467,7 +471,7 @@ mod tests {
         // Before any drain → None.
         assert_eq!(coordinator.last_processed_block(), None);
 
-        coordinator.on_drain(42, &metadata);
+        coordinator.on_drain(&BlockContext::new(42, metadata));
         assert_eq!(
             coordinator.last_processed_block(),
             Some(42),

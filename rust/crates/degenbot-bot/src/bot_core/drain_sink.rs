@@ -22,7 +22,7 @@
 //! (the dispatch already released it). `on_drain`/`on_send`/`finalize_block`
 //! acquire core *write* guards internally — engine-then-core, never reversed.
 
-use crate::bot_core::BlockMetadata;
+use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
 use degenbot_solvers::mixed::MixedPoolRef;
 
 /// The per-block drain + reorg seam the `BlockPump` drives (ADR-006 D4).
@@ -38,8 +38,10 @@ pub trait DrainSink: Send + Sync {
     #[must_use]
     fn has_dirty_paths(&self) -> bool;
 
-    /// Solve every dirty path at `block` (the eager drain tick).
-    fn on_drain(&self, block: u64, metadata: &BlockMetadata);
+    /// Solve every dirty path at the context's block (the eager drain tick).
+    /// T6IYKY: the work block travels as ONE `BlockContext` — the drain seam
+    /// no longer threads a loose `(block, metadata)` pair.
+    fn on_drain(&self, ctx: &BlockContext);
 
     /// The pump's WS subscription stream ended (or the pump task exited):
     /// the bot will no longer process blocks. Implementors must make the
@@ -50,27 +52,33 @@ pub trait DrainSink: Send + Sync {
     fn on_pump_ended(&self) {}
 
     /// Flush a debounced result batch to Python (the `DEBOUNCE_MS` send-debounce).
-    fn on_send(&self, metadata: &BlockMetadata);
+    /// T6IYKY: the publishing block travels with the batch as a `BlockContext`
+    /// (the ADR-021 verifier anchor coordinate).
+    fn on_send(&self, ctx: &BlockContext);
 
     /// Solve + advance at a genuine block boundary: solve any dirty paths
     /// carried over from the previous block and emit a block-boundary batch.
     /// The `last_solved_block` / `has_logs_this_block` bookkeeping is owned
     /// by the engine since ergo task LEZJAS (the pump's `&mut` out-params
-    /// retired).
-    fn finalize_block(&self, block: u64, metadata: &BlockMetadata);
+    /// retired). T6IYKY: the boundary block travels as a `BlockContext`.
+    fn finalize_block(&self, ctx: &BlockContext);
 
-    /// Mark `block` as solved (the pump's `on_drain`-solved + backfill-solved
+    /// Mark a block as solved (the pump's `on_drain`-solved + backfill-solved
     /// paths). Owned by the engine since ergo task LEZJAS — the pump's
     /// `last_solved_block` local retired; the engine holds the field so a
-    /// mid-flight-joining engine can inherit it (ADR-006 D4).
-    fn set_last_solved_block(&self, block: u64);
+    /// mid-flight-joining engine can inherit it (ADR-006 D4). T6IYKY: the
+    /// solved cursor is an `Epoch` at the seam; the engine stamps its
+    /// generation-blind block guard from the epoch's block coordinate.
+    fn set_last_solved_block(&self, solved: Epoch);
 
-    /// Seed the cold-start solve-results anchor (`results_block`) to `block` —
-    /// the pump passes its settled resume/backfill boundary at resume. Lets
+    /// Seed the cold-start solve-results anchor (`results_block`) — the pump
+    /// passes its settled resume/backfill boundary epoch at resume. Lets
     /// registration eager-solve candidates deliver at a valid, verification-
     /// safe solve block without waiting for the first dirty event (and without
-    /// ever publishing at block 0). See `Engine::set_solve_anchor`.
-    fn set_solve_anchor(&self, block: u64);
+    /// ever publishing at block 0). See `Engine::set_solve_anchor`. T6IYKY:
+    /// the anchor travels as an `Epoch`; the engine seeds its `results_block`
+    /// from the epoch's block coordinate (generation-0 at resume).
+    fn set_solve_anchor(&self, anchor: Epoch);
 
     /// Record that at least one forward log applied this block (clears on the
     /// next `finalize_block`). Replaces the pump's `has_logs_this_block = true;`

@@ -33,14 +33,19 @@
 //!   (an early swap of the anchor block, e.g. 0xE0554a @ 25658682) and is
 //!   legitimate.
 
-use crate::bot_core::BotState;
+use crate::bot_core::{BotState, Epoch};
 
 /// The block solve / verify / sim run against: the request block floored by
 /// the pool-state head (see the module docs for the desync / IIA history),
 /// with the future-hop rule bound to the resolved anchor.
+///
+/// T6IYKY: the anchor IS an `Epoch` now — the same coordinate type every
+/// other block-carrying surface ([`DrainWork::Publish`] verifier anchor,
+/// [`BlockContext`]-carrying drain work, the FSM's recovery anchor) uses.
+/// Solve/verify/sim work names its block with exactly one answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolveAnchor {
-    block: u64,
+    epoch: Epoch,
 }
 
 impl SolveAnchor {
@@ -51,7 +56,7 @@ impl SolveAnchor {
     #[must_use]
     pub fn for_head(base: u64, state_head: u64) -> Self {
         Self {
-            block: base.max(state_head),
+            epoch: Epoch::at(base.max(state_head)),
         }
     }
 
@@ -64,7 +69,14 @@ impl SolveAnchor {
     /// The anchored block.
     #[must_use]
     pub fn block(self) -> u64 {
-        self.block
+        self.epoch.block()
+    }
+
+    /// The anchored epoch (block + rewind generation) — the coordinate
+    /// solve/verify/sim work stamped at this anchor carries downstream.
+    #[must_use]
+    pub const fn epoch(self) -> Epoch {
+        self.epoch
     }
 
     /// The future-hop rule (module docs): strictly ahead of the anchor is
@@ -72,7 +84,7 @@ impl SolveAnchor {
     /// capture and is NOT future.
     #[must_use]
     pub fn is_future(self, update_block: u64) -> bool {
-        update_block > self.block
+        update_block > self.epoch.block()
     }
 }
 

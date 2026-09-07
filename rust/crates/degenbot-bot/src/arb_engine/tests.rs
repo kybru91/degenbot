@@ -6873,6 +6873,7 @@ mod tests {
     async fn detached_stragglers_do_not_trip_the_frozen_drainer_backstop() {
         use crate::bot_core::event_dispatch::{DispatchOwner, DrainWork};
         use crate::bot_core::solve_coordinator::SolveCoordinator;
+        use crate::bot_core::BlockContext;
 
         let (mut engine, pool_ids, path_ids) = detached_fixture(400);
         engine.set_detached_solving(true);
@@ -6891,23 +6892,19 @@ mod tests {
         // The detached cycle: the drain item COMPLETES (enqueue-end) while the
         // 400ms slow solve still runs — no in-cycle multi-second hold.
         owner.dispatch(DrainWork::Drain {
-            block: 100,
-            metadata: meta,
+            context: BlockContext::new(100, meta),
         });
         // The shipped cadence continues UNCHANGED mid-merge: a debounce publish
         // + further block cycles interleave with the sidecar's merges.
         owner.dispatch(DrainWork::Publish {
-            open: 100,
-            metadata: meta,
+            context: BlockContext::new(100, meta),
             change_set: Vec::new(),
         });
         owner.dispatch(DrainWork::Drain {
-            block: 101,
-            metadata: meta,
+            context: BlockContext::new(101, meta),
         });
         owner.dispatch(DrainWork::Drain {
-            block: 102,
-            metadata: meta,
+            context: BlockContext::new(102, meta),
         });
 
         // The drainer completed ALL FOUR items long before the slow straggler
