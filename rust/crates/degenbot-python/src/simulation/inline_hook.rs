@@ -224,8 +224,40 @@ impl InlineSimHook {
     }
 }
 
-/// Join the spawned sim task from ANY thread context (the soak's runtime
-/// matrix): the solve arms' workers may be plain threads (rayon/`std`), OR
+// SIMPIPE2 T1 continuation: the spawned sim task must re-enter the calling
+// span context. tokio::spawn clones tokio task context but NOT the tracing
+// span context, so any span created inside the task without this re-entry
+// becomes an independent Jaeger trace ROOT (observed 635 orphan roots/60s -
+// epic 7LV6VN T1/SGDXWU: the in-memory Jaeger ring at ~100k traces shrank
+// to a 45-min window because ~30 pct of roots were these 2-span orphans).
+/// Spawn `fut` on a runtime, re-entering `parent` so traced work inside the
+/// task joins the caller's trace. Awaitable from any thread (plain thread or
+/// runtime worker); the caller's current span is captured by value.
+pub(crate) async fn spawn_sim_task<T, Fut>(
+    parent: tracing::Span,
+    fut: Fut,
+) -> Result<T, tokio::task::JoinError>
+where
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        // THE FIX: re-enter the caller's span. The tracing thread-local on a
+        // fresh runtime worker is empty, so without this the first span
+        // created inside the task becomes an independent trace root that
+        // never joins the block's solve trace. `parent.enter()` installs the
+        // caller's tracing+OTel context for the task body (guard held till
+        // the future completes; harmless if `parent` is a no-op root).
+        let _guard = parent.enter();
+        fut.await
+    })
+    .await
+}
+
+/// Join a sim-task future from ANY thread context (the soak's runtime
+/// caveat: `block_in_place` is only legal on runtime workers, so an ambient
+/// multi-thread runtime blocks in place; otherwise the dedicated sim runtime
+/// is driven directly): the solve arms' workers may be plain threads (rayon/`std`), OR
 /// tokio tasks on the solve-executor runtime (`DEGENBOT_SOLVE_EXECUTOR=tokio`
 /// spawns the per-bin jobs as tasks). `Runtime::block_on` from inside a
 /// runtime context panics ("Cannot start a runtime from within a runtime" —
@@ -405,14 +437,20 @@ impl InlineSimulator for InlineSimHook {
         //    into the task (the outer conversions read the original after).
         let (result, buckets): (Result<Option<SimResult>, String>, FailBuckets) = {
             let req_task = req.clone();
+            // 7LV6VN T1: capture the caller's span (the worker's entered
+            // `degenbot.bundle.simulate`) BEFORE the runtime hop; the helper
+            // re-enters it inside the spawned task so `degenbot.simulate.inline`
+            // joins the block trace instead of forking an orphan root.
+            let sim_task_parent = tracing::Span::current();
             let sim_future = async move {
-                tokio::spawn(async move {
+                spawn_sim_task(sim_task_parent, async move {
                     // SIMPIPE2 M1 span parity: the engine-side sim gets the
                     // same Jaeger visibility the retired FFI fan-out had -
                     // named `degenbot.simulate.inline`, nested under the
-                    // spawning solve worker's span context (tokio::spawn
-                    // clones the current task context). One span per sim:
-                    // closes the Jaeger-invisibility gap the T4 soak found.
+                    // spawning solve worker's span context (the T1 helper
+                    // forwards the caller's span across the tokio::spawn).
+                    // One span per sim: closes the Jaeger-invisibility gap
+                    // the T4 soak found.
                     let req = req_task;
                     let _sim_span = tracing::info_span!(
                         target: "degenbot::solver",
@@ -558,5 +596,75 @@ mod tests {
 
         std::env::remove_var("DEGENBOT_INLINE_SIM_WORKERS");
         assert_eq!(super::inline_sim_worker_count(), default);
+    }
+}
+
+// 7LV6VN T1: the spawned sim task must JOIN the caller's trace, not fork a
+// new root. Pinned against the in-memory exporter seam (K6PCKP pattern): the
+// `degenbot.simulate.inline` span created inside `spawn_sim_task` must carry
+// the calling span's trace/parent - the exact relationship Jaeger lost when
+// 635 orphan roots/60s fragmented the block traces.
+#[cfg(all(test, feature = "otel", not(target_arch = "wasm32")))]
+#[expect(clippy::expect_used)] // otel tests assert loudly per telemetry.rs otel_tests
+mod spawn_span_parent_tests {
+    use degenbot_bot::otel;
+    use opentelemetry_sdk::trace::InMemorySpanExporter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn sim_task_span_parents_under_the_caller_span() {
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test sim runtime");
+
+        // Cross-thread spans need the GLOBAL slot (repo convention, see the
+        // block_pump header-span test: with_default is thread-local and the
+        // spawned task runs on a runtime worker thread). This crate's test
+        // binary installs it at most once.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("global default already set by another test");
+
+        // Scope the solve span so it ENDS before the flush (an exporter only
+        // receives closed spans).
+        {
+            let solve = tracing::info_span!("degenbot.arb.solve", block.number = 9u64);
+            let _guard = solve.enter();
+            let parent = tracing::Span::current();
+
+            // The spawned task creates a span exactly like the inline-hook sim
+            // body does; with the fix it must JOIN the solve trace.
+            let verdict = rt.block_on(super::spawn_sim_task(parent, async {
+                let sim = tracing::info_span!("degenbot.simulate.inline", path_id = 5u64);
+                let _enter = sim.enter();
+                42u8
+            }));
+            assert_eq!(verdict.expect("join"), 42);
+        }; // solve span ends here (guard drop) - before the flush
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let solve = spans
+            .iter()
+            .find(|sp| sp.name.as_ref() == "degenbot.arb.solve")
+            .expect("caller span must be exported");
+        let inline = spans
+            .iter()
+            .find(|sp| sp.name.as_ref() == "degenbot.simulate.inline")
+            .expect("sim span must be exported");
+        assert_eq!(
+            inline.span_context.trace_id(),
+            solve.span_context.trace_id(),
+            "sim span must JOIN the caller's trace (no orphan root)"
+        );
+        assert_eq!(
+            inline.parent_span_id,
+            solve.span_context.span_id(),
+            "sim span must parent under the calling span"
+        );
     }
 }

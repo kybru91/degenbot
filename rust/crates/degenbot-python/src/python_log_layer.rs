@@ -944,13 +944,28 @@ mod tests {
             otel::layer(tracer),
             capture.clone(),
         );
-        tracing::subscriber::set_global_default(subscriber)
-            .expect("this test owns the lib-binary global slot");
+        // Scoped thread-local subscriber: every span this test observes is
+        // created on THIS thread (in_scope), so the once-per-process global
+        // slot stays free for the cross-thread sim-span test (7LV6VN T1).
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("seam.c.span").in_scope(|| {
+                tracing::info!(target: "degenbot_bot::bot_core::block_pump", "seam c event");
+            });
+            provider.force_flush().expect("flush");
 
-        tracing::info_span!("seam.c.span").in_scope(|| {
-            tracing::info!(target: "degenbot_bot::bot_core::block_pump", "seam c event");
+            // Console-vs-trace split invariant: a high-frequency diagnostic
+            // event (degenbot::diag INFO) must reach the OTel layer (uncapped
+            // record filter) while being capped OFF the console sinks. Kept
+            // inside the scoped subscriber - all emissions stay on THIS
+            // thread, so the thread-local layer sees them.
+            tracing::info_span!("seam.c.diag.span").in_scope(|| {
+                tracing::info!(
+                    target: degenbot_bot::telemetry::DIAGNOSTIC_TARGET,
+                    "seam c diag event"
+                );
+            });
+            provider.force_flush().expect("flush after diag event");
         });
-        provider.force_flush().expect("flush");
 
         let spans = exporter.get_finished_spans().expect("spans");
         assert!(
@@ -958,16 +973,6 @@ mod tests {
             "seam.c.span missing from the OTel exporter; got {:?}",
             spans.iter().map(|sp| sp.name.as_ref()).collect::<Vec<_>>()
         );
-        // Console-vs-trace split invariant: a high-frequency diagnostic event
-        // (degenbot::diag INFO) must reach the OTel layer (uncapped record
-        // filter) while being capped OFF the console sinks.
-        tracing::info_span!("seam.c.diag.span").in_scope(|| {
-            tracing::info!(
-                target: degenbot_bot::telemetry::DIAGNOSTIC_TARGET,
-                "seam c diag event"
-            );
-        });
-        provider.force_flush().expect("flush after diag event");
 
         let spans = exporter
             .get_finished_spans()
