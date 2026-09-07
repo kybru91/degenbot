@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::bot_core::block_clock::{BlockClock, HeaderDecision, LogDecision};
 use crate::bot_core::block_pump::RELEVANT_TOPICS;
-use crate::bot_core::BlockMetadata;
+use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
 use alloy::primitives::B256;
 
 /// One consequence the pump's decision machine can emit. The driver maps each
@@ -104,8 +104,14 @@ pub struct PumpFSM {
     first_header: bool,
     /// Whether a quiesce-gated publish is armed (a forward log applied).
     publish_pending: bool,
-    /// BQ7ZBC — the highest block an authoritative catch-up has owned.
-    recovery_anchor: u64,
+    /// BQ7ZBC — the highest block an authoritative catch-up has owned, with
+    /// the rewind generation the ownership was established in (T6IYKY: the
+    /// recovery anchor is an `Epoch`, not a bare block).
+    recovery_anchor: Epoch,
+    /// The rewind generation — bumped once per reorg episode (the stage
+    /// machine's future `Rewind` event, T6IYKY). Epochs minted before the
+    /// bump are stale and fail fast via `Epoch::ensure_current`.
+    rewind_seq: u64,
     /// Per-block metadata snapshots (deferred tombstone finalize, VTWCIG).
     block_metadata: HashMap<u64, BlockMetadata>,
     /// WS-delivery completeness tracker (relevant log indices per block).
@@ -127,7 +133,8 @@ impl PumpFSM {
             current_metadata: BlockMetadata::default(),
             first_header: true,
             publish_pending: false,
-            recovery_anchor: 0,
+            recovery_anchor: Epoch::at(0),
+            rewind_seq: 0,
             block_metadata: HashMap::new(),
             ws_delivered: HashMap::new(),
             last_header_at_ms: now_ms,
@@ -153,6 +160,34 @@ impl PumpFSM {
     #[must_use]
     pub fn publish_pending(&self) -> bool {
         self.publish_pending
+    }
+
+    /// The FSM's CURRENT epoch: the cursor block in the current rewind
+    /// generation (T6IYKY). Contexts minted earlier — before the last
+    /// reorg episode bumped the generation — fail `ensure_current`
+    /// against this epoch instead of silently applying.
+    #[must_use]
+    pub fn current_epoch(&self) -> Epoch {
+        Epoch::with_generation(self.current_block, self.rewind_seq)
+    }
+
+    /// Mint a `BlockContext` for work about `block` carrying `metadata`:
+    /// THE single-answer coordinate (the FSM's rewind generation stamped
+    /// onto the work's block). The driver calls this at every decision
+    /// point that hands work downstream, so every `DrainWork` item and
+    /// every verifier anchor carries the same epoch type.
+    #[must_use]
+    pub fn context_for(&self, block: u64, metadata: BlockMetadata) -> BlockContext {
+        BlockContext::new(Epoch::with_generation(block, self.rewind_seq), metadata)
+    }
+
+    /// A reorg episode opened (the FSM's `Rewind`): the rewind generation
+    /// bumps, so every context minted before this point is stale and must
+    /// fail `ensure_current` rather than silently applying to the rewound
+    /// chain view (T6IYKY). No separate driver call — the bump lives
+    /// inside `on_log`'s reorg classification.
+    fn rewind(&mut self) {
+        self.rewind_seq += 1;
     }
 
     /// The snapshotted metadata for `block` (deferred tombstone finalize, VTWCIG).
@@ -192,12 +227,25 @@ impl PumpFSM {
     }
 
     /// BQ7ZBC — record that an authoritative catch-up (a header-gap backfill
-    /// or a `handle_timeout_eager` recovery) has OWNED the range up to
-    /// `through`. Per the single-writer rule (DFQYM5), the live WS no longer
-    /// owns any block ≤ `recovery_anchor`, so later recovered forwards there
-    /// are benign duplicates (dropped) rather than re-asserted faults.
-    pub fn record_backfill(&mut self, through: u64) {
-        self.recovery_anchor = self.recovery_anchor.max(through);
+    /// or a `handle_timeout_eager` recovery) has OWNED the range up to the
+    /// epoch of that catch-up's work. Per the single-writer rule (DFQYM5),
+    /// the live WS no longer owns any block at/below the anchor's block, so
+    /// later recovered forwards there are benign duplicates (dropped) rather
+    /// than re-asserted faults. The anchor is stamped in the CURRENT rewind
+    /// generation and only ever extends (monotone in the block coordinate —
+    /// T6IYKY: the anchor is an `Epoch` now).
+    pub fn record_backfill(&mut self, through: impl Into<Epoch>) {
+        let through = through.into();
+        if through.block() > self.recovery_anchor.block() {
+            self.recovery_anchor = Epoch::with_generation(through.block(), self.rewind_seq);
+        }
+    }
+
+    /// The recovery anchor's block coordinate (the single-writer boundary
+    /// `should_drop_recovered_forward` / `completeness_decision` apply).
+    #[must_use]
+    pub fn recovery_anchor_block(&self) -> u64 {
+        self.recovery_anchor.block()
     }
 
     /// Record that a relevant live `WsEvent::Log` was delivered for `block`
@@ -220,7 +268,14 @@ impl PumpFSM {
     pub fn on_log(&mut self, block: u64, removed: bool) -> LogDecision {
         let decision = self.clock.observe_log(block, removed);
         match decision {
-            LogDecision::EnterReorg(_) | LogDecision::ContinueReorg => {
+            LogDecision::EnterReorg(_) => {
+                // A reorg invalidates any publish armed from pre-reorg state —
+                // AND rewinds the FSM: the rewind generation bumps so every
+                // context minted pre-reorg is stale (T6IYKY).
+                self.publish_pending = false;
+                self.rewind();
+            }
+            LogDecision::ContinueReorg => {
                 // A reorg invalidates any publish armed from pre-reorg state.
                 self.publish_pending = false;
             }
@@ -289,7 +344,7 @@ impl PumpFSM {
                         from: self.current_block + 1,
                         to: Some(number - 1),
                     });
-                    self.recovery_anchor = self.recovery_anchor.max(number - 1);
+                    self.record_backfill(number - 1);
                 }
                 self.current_block = number;
                 decisions.push(PumpDecision::SetLastSolved { block: number });
@@ -307,7 +362,7 @@ impl PumpFSM {
                 // BQ7ZBC — this authoritative header-gap catch-up OWNS
                 // `[old+1, number-1]`; a recovering WS flushing those blocks
                 // must be discarded (single-writer), not re-asserted.
-                self.recovery_anchor = self.recovery_anchor.max(number - 1);
+                self.record_backfill(number - 1);
             }
             self.current_block = number;
             decisions.push(PumpDecision::Notify {
@@ -328,7 +383,8 @@ impl PumpFSM {
     /// (only the pump's own single-writer range is benign).
     #[must_use]
     pub fn should_drop_recovered_forward(&self, log_block: u64, removed: bool) -> bool {
-        !removed && self.recovery_anchor > 0 && log_block <= self.recovery_anchor
+        let anchor_block = self.recovery_anchor.block();
+        !removed && anchor_block > 0 && log_block <= anchor_block
     }
 
     /// Feed a log-activity event (a `WsEvent::Log` that passed the topic
@@ -385,7 +441,8 @@ impl PumpFSM {
         // Consume any tracked set in both arms: the map must stay bounded
         // regardless of the verdict.
         let delivered = self.ws_delivered.remove(&prev).unwrap_or_default();
-        if self.recovery_anchor > 0 && prev <= self.recovery_anchor {
+        let anchor_block = self.recovery_anchor.block();
+        if anchor_block > 0 && prev <= anchor_block {
             CompletenessDecision::BackfillOwned
         } else {
             CompletenessDecision::Verify {

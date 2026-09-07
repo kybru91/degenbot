@@ -55,7 +55,7 @@ use crate::bot_core::solver_state_tripwire::{
     TripwireDivergence,
 };
 use crate::bot_core::LogDecision;
-use crate::bot_core::{drain_sink::DrainSink, BlockMetadata, Bot};
+use crate::bot_core::{drain_sink::DrainSink, BlockMetadata, Bot, Epoch};
 use degenbot_decoders::v2_sync_decoder::V2_SYNC_TOPIC;
 use degenbot_decoders::v3_mint_burn_decoder::{V3_BURN_TOPIC, V3_MINT_TOPIC};
 use degenbot_decoders::v3_pancakeswap_swap_decoder::V3_PANCAKESWAP_SWAP_TOPIC;
@@ -757,9 +757,12 @@ impl BlockPump {
         reorg_windows: Arc<parking_lot::Mutex<std::collections::VecDeque<TripReorgWindow>>>,
     ) {
         while rx.changed().await.is_ok() {
-            let Some((block, path_refs)) = (*rx.borrow_and_update()).clone() else {
+            let Some((epoch, path_refs)) = (*rx.borrow_and_update()).clone() else {
                 continue;
             };
+            // The verifier anchor is an Epoch (block + rewind generation);
+            // the on-chain reads below still need the block coordinate.
+            let block = epoch.block();
             if path_refs.is_empty() {
                 continue;
             }
@@ -1083,7 +1086,7 @@ impl BlockPump {
         // guard fires only on a genuine advance (matching the prior local
         // init). A mid-flight-joining engine inherits via `set_last_solved_block`
         // (ADR-006 D4).
-        self.sink.set_last_solved_block(current_block);
+        self.sink.set_last_solved_block(Epoch::at(current_block));
         // Seed the cold-start solve-results anchor to the settled resume
         // boundary (`current_block` = `first_observed_block` = backfill end):
         // `results_block` is 0 until the first real `on_drain` solve, but
@@ -1094,7 +1097,7 @@ impl BlockPump {
         // candidates deliver immediately at a valid, verification-safe solve
         // block — NOT the chain head, which a partially-applied live event could
         // race past the backfill window.
-        self.sink.set_solve_anchor(current_block);
+        self.sink.set_solve_anchor(Epoch::at(current_block));
         // Whether we're past the first header after resume. The first
         // Epic A1: the pump's decision state now lives in the PumpFSM; the
         // driver routes the decision arms through it. `current_block` seeds the FSM.
@@ -1573,8 +1576,7 @@ impl BlockPump {
                                 let change_set = self.sink.take_solver_path_pool_refs_change_set();
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
                                 dispatch.dispatch(DrainWork::Publish {
-                                    open,
-                                    metadata,
+                                    context: fsm.context_for(open, metadata),
                                     change_set,
                                 });
                             }
@@ -1726,7 +1728,7 @@ impl BlockPump {
                                 // to `block` already — mark it solved so the
                                 // first `finalize_block` guard no-ops.
                                 let _ctx = new_block_span.enter();
-                                self.sink.set_last_solved_block(block);
+                                self.sink.set_last_solved_block(block.into());
                             }
                             PumpDecision::Notify { block, metadata } => {
                                 // Python's block fsm.clock tracks `newHeads`.
@@ -2104,8 +2106,7 @@ impl BlockPump {
                                 .unwrap_or(fsm.current_metadata());
                             let _ctx = block_span.as_ref().map(tracing::Span::enter);
                             dispatch.dispatch(DrainWork::Finalize {
-                                block: prev,
-                                metadata: prev_meta,
+                                context: fsm.context_for(prev, prev_meta),
                             });
                         }
                         LogDecision::DispatchForward => {}
@@ -2176,8 +2177,7 @@ impl BlockPump {
                                 let change_set = self.sink.take_solver_path_pool_refs_change_set();
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
                                 dispatch.dispatch(DrainWork::Publish {
-                                    open,
-                                    metadata,
+                                    context: fsm.context_for(open, metadata),
                                     change_set,
                                 });
                             }
@@ -2339,10 +2339,12 @@ impl BlockPump {
         let PumpDecision::Drain { block, metadata } = fsm.drain_decision(state_head) else {
             unreachable!("drain_decision always drains when called");
         };
-        dispatch.dispatch(DrainWork::Drain { block, metadata });
+        dispatch.dispatch(DrainWork::Drain {
+            context: fsm.context_for(block, metadata),
+        });
         // LEZJAS: engine owns `last_solved_block` now — mark this
         // block solved so the next `finalize_block` guard no-ops.
-        self.sink.set_last_solved_block(block);
+        self.sink.set_last_solved_block(block.into());
     }
 
     /// Handle a 60s timeout by backfilling any missed blocks (eager variant).
@@ -2368,7 +2370,7 @@ impl BlockPump {
             fsm.on_backfill_range_done(latest_block);
             // LEZJAS: engine owns `last_solved_block` now — mark the backfilled
             // range solved through the sink.
-            self.sink.set_last_solved_block(latest_block);
+            self.sink.set_last_solved_block(Epoch::at(latest_block));
         }
     }
 
@@ -2421,7 +2423,7 @@ impl BlockPump {
                 match fsm.on_log(block, log.removed) {
                     LogDecision::TombstonePrevious(prev) => {
                         let prev_meta = fsm.block_metadata_for(prev).unwrap_or_default();
-                        self.sink.finalize_block(prev, &prev_meta);
+                        self.sink.finalize_block(&fsm.context_for(prev, prev_meta));
                         self.bot.dispatch_log(log);
                         fsm.on_log_applied(block);
                     }
@@ -2446,7 +2448,8 @@ impl BlockPump {
                 }
             }
             if !block_logs.is_empty() {
-                self.sink.on_drain(block, &BlockMetadata::default());
+                self.sink
+                    .on_drain(&fsm.context_for(block, BlockMetadata::default()));
                 any_processed = true;
             }
         }
@@ -2977,12 +2980,13 @@ mod tests {
         fn has_dirty_paths(&self) -> bool {
             self.dirty.load(Ordering::Relaxed)
         }
-        fn on_drain(&self, block: u64, metadata: &BlockMetadata) {
+        fn on_drain(&self, ctx: &BlockContext) {
             // Faithful to `SolveCoordinator::on_drain`: record + advance the
             // drain cursor so `last_processed_block()` reflects the drained
             // block (the anchoring `resume` relies on — see
             // `resume_anchors_to_subscribe_block`).
-            self.drained.lock().unwrap().push((block, *metadata));
+            let block = ctx.block();
+            self.drained.lock().unwrap().push((block, *ctx.metadata()));
             // PWPPAZ T2: virtual-time dispatch stamp (start_paused tests
             // assert the slice fired at its deadline, not at burst end).
             self.drained_at
@@ -2991,16 +2995,19 @@ mod tests {
                 .push(tokio::time::Instant::now());
             self.last_processed.store(block, Ordering::Relaxed);
         }
-        fn on_send(&self, metadata: &BlockMetadata) {
-            self.sent.lock().unwrap().push(*metadata);
+        fn on_send(&self, ctx: &BlockContext) {
+            self.sent.lock().unwrap().push(*ctx.metadata());
         }
-        fn finalize_block(&self, block: u64, metadata: &BlockMetadata) {
-            self.finalized.lock().unwrap().push((block, *metadata));
+        fn finalize_block(&self, ctx: &BlockContext) {
+            self.finalized
+                .lock()
+                .unwrap()
+                .push((ctx.block(), *ctx.metadata()));
         }
-        fn set_last_solved_block(&self, block: u64) {
-            self.solved.lock().unwrap().push(block);
+        fn set_last_solved_block(&self, solved: Epoch) {
+            self.solved.lock().unwrap().push(solved.block());
         }
-        fn set_solve_anchor(&self, _block: u64) {}
+        fn set_solve_anchor(&self, _anchor: Epoch) {}
         fn record_logs_this_block(&self) {
             self.logs_recorded
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4784,7 +4791,7 @@ mod tests {
             gas_limit: 15,
         };
         // The drain issued before resume anchors the cursor to W:
-        pump.sink.on_drain(w, &meta_w);
+        pump.sink.on_drain(&BlockContext::new(w, meta_w));
         assert_eq!(
             pump.sink.last_processed_block(),
             Some(w),
@@ -4852,7 +4859,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::bot_core::log_dispatcher::PoolStateSubscriber;
-    use crate::bot_core::RegisterV2PoolParams;
+    use crate::bot_core::{BlockContext, RegisterV2PoolParams};
     use alloy::primitives::{aliases::U112, Address, Bytes, U256};
 
     /// Build a V2 `Sync` log for `pool_address` carrying
