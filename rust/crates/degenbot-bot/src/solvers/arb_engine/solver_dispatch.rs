@@ -679,20 +679,18 @@ fn inline_sim_payload(
     Some(payload)
 }
 
-/// 7LV6VN T5: pipelined inline sims. Default ON; set
-/// `DEGENBOT_SOLVE_SIM_PIPE=0` to fall back to the synchronous
-/// `inline_sim_payload` per path (A/B switch, twin of the LPT knob).
-/// Measured basis: hotpath 10-min window / 48 cycles shows per-bin
-/// serialization of ~17 sims x 2.5ms avg on top of ~65ms of walk work per
-/// bin — the sim joins dominate the solve-cycle tail (`solve_dirty` p95
-/// 564ms). Pipelining schedules the sim eagerly (its own driver thread; the
-/// hook then drives the dedicated sim runtime exactly as the sync path) so
-/// the bin walks the remaining paths while sims run concurrently across
-/// the 16 runtime workers; receipts poll non-blockingly (delivery as soon
-/// as each sim lands) and join at bin end.
+/// 7LV6VN T5: pipelined inline sims. Default OFF; set
+/// `DEGENBOT_SOLVE_SIM_PIPE=1` to enable (A/B switch, twin of the LPT
+/// knob). Measured basis: hotpath 10-min windows before/after show the
+/// overlap raises per-cycle CPU demand 1021 -> 1508 ms (`solve.cpu_us`
+/// median) against the 8-core cgroup quota — throttling then starves the
+/// walks themselves (per-path 490 -> 935 µs wall; `solve_dirty` avg 277 ->
+/// 351 ms, p95 564 -> 838 ms). On a host without the CPU-quota ceiling the
+/// pipelined arm should win (the serial sim join it removes is real — ~2.5
+/// ms x ~17 sims per bin); re-enable there and re-measure.
 fn solve_sim_pipe_enabled() -> bool {
     static PIPE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PIPE.get_or_init(|| std::env::var("DEGENBOT_SOLVE_SIM_PIPE").as_deref() != Ok("0"))
+    *PIPE.get_or_init(|| std::env::var("DEGENBOT_SOLVE_SIM_PIPE").as_deref() == Ok("1"))
 }
 
 /// One scheduled sim: pid + the receipt the worker polls/joins.
