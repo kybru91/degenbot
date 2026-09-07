@@ -262,7 +262,9 @@ fn main() {
         for _ in 0..iters {
             let t0 = std::time::Instant::now();
             let no_tables = vec![None; hop_order.len()];
-            let out = exact_solve_mixed_path_n(&v2_hops, &cl_seqs, &no_tables, &hop_order);
+            let seq_refs: Vec<Option<&IntV3TickRangeSequence>> =
+                cl_seqs.iter().map(|o| o.as_ref()).collect();
+            let out = exact_solve_mixed_path_n(&v2_hops, &seq_refs, &no_tables, &hop_order);
             let us = t0.elapsed().as_micros() as u128;
             times_us.push(us);
             last_ws = out.stats;

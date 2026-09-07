@@ -456,11 +456,11 @@ fn solve_mixed_path_int(
         .iter()
         .map(|h| h.as_v2_state().cloned())
         .collect();
-    let int_v3_sequences: Vec<Option<crate::mobius_v3_int::IntV3TickRangeSequence>> = resolved
-        .hops
-        .iter()
-        .map(|h| h.as_int_sequence().cloned())
-        .collect();
+    // RLVDUP T1: borrow the CL sequences straight off the resolved hops -
+    // the walk reads them; the old deep clone copied every ranges Vec per
+    // solve.
+    let int_v3_sequences: Vec<Option<&crate::mobius_v3_int::IntV3TickRangeSequence>> =
+        resolved.hops.iter().map(|h| h.as_int_sequence()).collect();
     let cl_crossings: Vec<Option<Arc<crate::mobius_v3_int::ClCrossingTable>>> = resolved
         .hops
         .iter()

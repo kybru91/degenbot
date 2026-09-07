@@ -2753,7 +2753,10 @@ fn int_simulate_mixed_path_n(
 #[hotpath::measure(label = "cl_solve.exact_solve_mixed_path_n")]
 pub fn exact_solve_mixed_path_n(
     v2_hops: &[Option<IntHopState>],
-    cl_sequences: &[Option<IntV3TickRangeSequence>],
+    // RLVDUP T1: borrowed sequences - the walk only READS a sequence
+    // (fallback table build); the previous owned signature forced every
+    // caller to deep-copy the ranges Vec per solve.
+    cl_sequences: &[Option<&IntV3TickRangeSequence>],
     cl_prepared: &[Option<ClPrepared>],
     hop_order: &[bool], // true = V2, false = CL
 ) -> WalkOutcome {
@@ -2772,7 +2775,7 @@ pub fn exact_solve_mixed_path_n(
             };
             hops.push(WalkHop::ConstantProduct(v2));
         } else {
-            let Some(seq) = cl_sequences[i].as_ref() else {
+            let Some(seq) = cl_sequences[i] else {
                 return WalkOutcome::none();
             };
             let crossings;
@@ -3596,7 +3599,7 @@ mod tests {
         // V2 first, then CL
         let result = exact_solve_mixed_path_n(
             &[Some(v2_hop.clone()), None],
-            &[None, Some(v3_seq.clone())],
+            &[None, Some(&v3_seq)],
             &[None, None], // offline shape: tables derive here
             &[true, false],
         );
@@ -3647,7 +3650,7 @@ mod tests {
         let cl_seq = multi_range_sequence(0, 60, false, &liquidities);
 
         let v2_hops = [Some(v2_entry), None];
-        let cl_sequences = [None, Some(cl_seq)];
+        let cl_sequences = [None, Some(&cl_seq)];
         let crossing = Arc::new(build_cl_crossing_table(
             cl_sequences[1].as_ref().expect("CL hop present"),
         ));
@@ -3696,7 +3699,7 @@ mod tests {
 
         let result = exact_solve_mixed_path_n(
             &[Some(v2_hop1.clone()), None, Some(v2_hop2.clone())],
-            &[None, Some(v3_seq), None],
+            &[None, Some(&v3_seq), None],
             &[None, None, None],  // offline shape: tables derive here
             &[true, false, true], // V2 → CL → V2
         );
@@ -3737,7 +3740,7 @@ mod tests {
                 .unwrap();
 
         let v2_hops = [Some(v2_hop1), None, Some(v2_hop2)];
-        let cl_sequences = [None, Some(v3_seq), None];
+        let cl_sequences = [None, Some(&v3_seq), None];
         let crossing = Arc::new(build_cl_crossing_table(
             cl_sequences[1].as_ref().expect("CL hop present"),
         ));
@@ -4939,7 +4942,7 @@ mod tests {
         );
         let result = exact_solve_mixed_path_n(
             &[Some(v2_entry), None],
-            &[None, Some(cl_seq)],
+            &[None, Some(&cl_seq)],
             &[None, None],
             &[true, false],
         );

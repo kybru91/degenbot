@@ -831,12 +831,9 @@ mod tests {
             .map(ResolvedHop::as_v2_state)
             .map(|opt| opt.cloned())
             .collect();
-        let seqs: Vec<Option<degenbot_solvers::mobius_v3_int::IntV3TickRangeSequence>> = r
-            .hops
-            .iter()
-            .map(ResolvedHop::as_int_sequence)
-            .map(|opt| opt.cloned())
-            .collect();
+        // RLVDUP T1: borrow - the walk reads the sequences only.
+        let seqs: Vec<Option<&degenbot_solvers::mobius_v3_int::IntV3TickRangeSequence>> =
+            r.hops.iter().map(ResolvedHop::as_int_sequence).collect();
         let crossings: Vec<
             Option<std::sync::Arc<degenbot_solvers::mobius_v3_int::ClCrossingTable>>,
         > = r
