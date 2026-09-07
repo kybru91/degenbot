@@ -2140,6 +2140,14 @@ impl BlockPump {
                     // the engine's `has_logs_this_block` (finalize
                     // bookkeeping, LEZJAS). Coordinated here, once; do not
                     // split or drop either write.
+                    // 7LV6VN T1c: the DispatchForward arm never entered the
+                    // block span (unlike Finalize et al.), so the
+                    // `LogDispatcher::dispatch` instrument span ran with an
+                    // empty thread-local and forked a single-span Jaeger ROOT
+                    // per applied log (~25 roots/s — 1488 of 1500 newest
+                    // traces in the live probe). Enter the block span so the
+                    // apply chain nests under its block's trace.
+                    let _block_ctx = block_span.as_ref().map(tracing::Span::enter);
                     self.bot.dispatch_log(&log);
                     fsm.on_log_applied(log_block);
                     telemetry.note_apply();

@@ -589,6 +589,7 @@ fn inline_sim_payload(
     idx: usize,
     pid: u64,
     result: &SolvePathResult,
+    parent_span: &tracing::Span,
 ) -> Option<crate::solvers::arb_engine::inline_sim::SimulatedPathResult> {
     if !ctx.worker_clamp || idx >= ctx.pool_refs.len() {
         return None;
@@ -601,7 +602,13 @@ fn inline_sim_payload(
     // owner of the name - the merge-site marker that used to borrow it is a
     // merge-span event now, so Jaeger's `bundle.simulate` spans are all
     // genuine ms-class simulations again.
+    // 7LV6VN T1b: EXPLICIT parent at creation. TLS re-entry alone proved
+    // insufficient on the detached bin threads (worker-side spans still
+    // forked their own trace with a dangling parent id - 1041 roots/60s
+    // live-probed). The macro `parent:` form binds the identity directly,
+    // independent of the thread-local current span.
     let span = tracing::info_span!(
+        parent: parent_span.clone(),
         "degenbot.bundle.simulate",
         sim.path = "worker_inline",
         path_id = pid,
@@ -1883,8 +1890,13 @@ impl ArbitrageEngine {
                                                 pid,
                                                 &mut r,
                                             );
-                                            let payload =
-                                                inline_sim_payload(&shared_bin, idx, pid, &r);
+                                            let payload = inline_sim_payload(
+                                                &shared_bin,
+                                                idx,
+                                                pid,
+                                                &r,
+                                                &solve_span_bin,
+                                            );
                                             (pid, r, twins, payload)
                                         })
                                         .filter(|(_, r, _, _)| {
@@ -2007,7 +2019,13 @@ impl ArbitrageEngine {
                                 // SIMPIPE2 T3: the inline payload rides the
                                 // same handoff (resolved on the worker, off
                                 // the engine lock).
-                                let payload = inline_sim_payload(&shared_bin, i, pid, &result);
+                                let payload = inline_sim_payload(
+                                    &shared_bin,
+                                    i,
+                                    pid,
+                                    &result,
+                                    &solve_span_bin,
+                                );
                                 (pid, result, twins, payload)
                             });
                             // Same profitless filter the rayon arm applies.
@@ -2066,7 +2084,7 @@ impl ArbitrageEngine {
                  -> Option<SolveArmOutcome> {
                     solve_one_path(&shared, &solve_span, pid, resolved).map(|(pid, mut r)| {
                         let twins = clamp_result_in_worker(&shared, idx, pid, &mut r);
-                        let payload = inline_sim_payload(&shared, idx, pid, &r);
+                        let payload = inline_sim_payload(&shared, idx, pid, &r, &solve_span);
                         (pid, r, twins, payload)
                     })
                 };
@@ -3216,7 +3234,7 @@ mod profit_clamp_recompute_tests {
         tracing::subscriber::with_default(subscriber, || {
             let solve = tracing::info_span!("degenbot.arb.solve", block.number = 7u64);
             let _guard = solve.enter();
-            let payload = inline_sim_payload(&ctx, 0, path_id, &result);
+            let payload = inline_sim_payload(&ctx, 0, path_id, &result, &tracing::Span::current());
             assert!(
                 payload.is_some(),
                 "stub hook returns a payload; None only when the seam is off"
