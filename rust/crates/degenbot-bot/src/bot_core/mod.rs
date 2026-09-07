@@ -44,6 +44,7 @@ pub mod snapshot_verify;
 pub(crate) mod solve_anchor;
 pub mod solve_coordinator;
 pub mod solver_state_tripwire;
+pub mod stage_handlers;
 pub mod state_lock;
 pub mod swap_simulation;
 pub mod tick_assembly;
@@ -83,6 +84,7 @@ pub use registration_lifecycle::{
     run_v4_registration_lifecycle, RegistrationLifecycleError,
 };
 pub use sim_anchor::SimAnchorState;
+pub use stage_handlers::{Stage, StageError, StageHandlers};
 
 pub use ::degenbot_pools::v4_state::{
     v4_simulate_swap, BufferedV4LiquidityUpdate, BufferedV4PoolEvent, BufferedV4SwapEvent,
