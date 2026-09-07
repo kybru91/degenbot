@@ -3828,7 +3828,7 @@ mod lpt_partition_tests {
 mod solve_path_span_tests {
     use super::*;
     use crate::otel;
-    use degenbot_solvers::mixed::{MixedPath, ResolvedMixedPath};
+    use degenbot_solvers::mixed::ResolvedMixedPath;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use tracing_subscriber::layer::SubscriberExt;
 

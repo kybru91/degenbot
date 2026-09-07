@@ -5658,9 +5658,7 @@ mod tests {
                                 && (matches!(kv.value, opentelemetry::Value::I64(v) if v == blk as i64)
                                     || matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == blk.to_string().as_str()))
                         })
-                })
-                .map(|sp| sp.span_context.span_id())
-                .unwrap_or_else(|| panic!("{name} for block {blk} must be exported"))
+                }).map_or_else(|| panic!("{name} for block {blk} must be exported"), |sp| sp.span_context.span_id())
         };
 
         let published_100 = span_for_block(100, "degenbot.pump.block");
@@ -5689,7 +5687,7 @@ mod tests {
     }
 
     /// KNEUQX: the arb.solve span records `cycle.solve_block` (the cycle's
-    /// anchored work block = engine.results_block()) alongside the entry
+    /// anchored work block = `engine.results_block()`) alongside the entry
     /// block.number tag. At a settle boundary the anchor is the pool-state
     /// head and can run one (or more) ahead of the entry block - the field
     /// makes that visible/self-documenting in Jaeger instead of showing a
@@ -5731,8 +5729,7 @@ mod tests {
             .attributes
             .iter()
             .find(|kv| kv.key == opentelemetry::Key::from_static_str("cycle.solve_block"))
-            .map(|kv| kv.value.to_string())
-            .unwrap_or_else(|| "ABSENT".to_string());
+            .map_or_else(|| "ABSENT".to_string(), |kv| kv.value.to_string());
         assert_eq!(
             recorded,
             expected.to_string(),

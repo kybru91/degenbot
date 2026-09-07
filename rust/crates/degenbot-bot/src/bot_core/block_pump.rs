@@ -7084,10 +7084,10 @@ mod tests {
     /// 319us in production), while an un-entered child lives by handle until
     /// first-log or next-header. An all-quiet 12.7s gap left a 12.7s child
     /// against a 319us parent. The fix: the 500ms timed-exit tick force-
-    /// closes a log_wait past `log_wait_max_age` with an explicit stall
+    /// closes a `log_wait` past `log_wait_max_age` with an explicit stall
     /// warning. Deterministic contract under test:
-    /// 1. log_wait parents under its block span (linkage intact),
-    /// 2. a log_wait quiet longer than the max age closes AT the tick
+    /// 1. `log_wait` parents under its block span (linkage intact),
+    /// 2. a `log_wait` quiet longer than the max age closes AT the tick
     ///    boundary (bounded duration), not at the next header.
     #[cfg(feature = "otel")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
