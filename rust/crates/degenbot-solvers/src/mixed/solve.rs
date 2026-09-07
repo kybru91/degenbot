@@ -380,6 +380,16 @@ pub fn solve_path_inner(
 
     let result = result.map(|mut r| {
         r.state_nonces.clone_from(&resolved.state_nonces);
+        // RLVDUP2 T5: the pool-state descriptions are consumed ONLY by the
+        // [solver-st] debug sites in the bot - formatting U256s for every
+        // solved path every cycle is pure waste unless a debug subscriber
+        // is active (RUST_LOG=degenbot::solver=debug turns them back on).
+        if !tracing::enabled!(
+            target: "degenbot::solver",
+            tracing::Level::DEBUG
+        ) {
+            return r;
+        }
         // Capture solver pool state for diagnostic cross-referencing.
         let pool_states: Vec<String> = resolved
             .hops
