@@ -739,7 +739,7 @@ mod tests {
         assert_eq!(snap.engine_processed_block, None);
 
         // Drive solve_dirty(123) → last_processed_block = Some(123).
-        engine.solve_dirty(123, &BlockMetadata::default());
+        engine.solve_dirty(123, &BlockMetadata::default(), &[]);
         let snap = engine.diagnostic_path_state(path_id).expect("path exists");
         assert_eq!(
             snap.engine_processed_block,
@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(snap.engine_processed_block, Some(123));
 
         // Advance: solve_dirty(124) → last_processed_block = Some(124).
-        engine.solve_dirty(124, &BlockMetadata::default());
+        engine.solve_dirty(124, &BlockMetadata::default(), &[]);
         let snap = engine.diagnostic_path_state(path_id).expect("path exists");
         assert_eq!(snap.engine_processed_block, Some(124));
 

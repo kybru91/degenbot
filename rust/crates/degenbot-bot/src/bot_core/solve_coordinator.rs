@@ -39,6 +39,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::bot_core::drain_sink::DrainSink;
+use crate::bot_core::EpochDelta;
 use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
 use degenbot_solvers::mixed::MixedPoolRef;
 
@@ -69,6 +70,14 @@ struct CoordinatorState {
 /// per-engine backfill machinery.
 pub struct SolveCoordinator {
     engines: Vec<Arc<dyn Engine>>,
+    /// The active epoch's touched-pool ledger (epic MROOY7, task LXDY4C).
+    /// Log application records into it (via `Bot::active_delta`, wired by
+    /// the construction layer); `on_drain` consumes the taken keys and
+    /// drives every engine's solve with them — the affected-path derivation
+    /// reads the delta directly, and `has_dirty_paths` is ledger emptiness.
+    /// Replaced by [`set_delta`](Self::set_delta) at construction time
+    /// (before start) when the wiring has a shared `Bot`.
+    delta: parking_lot::RwLock<Arc<EpochDelta>>,
     drain_lock: Mutex<CoordinatorState>,
     /// The block-clock pipe (ADR-027 completion): the coordinator is the ONE
     /// dispatch owner, so the newHeads pipe lives here — not on the engines,
@@ -85,12 +94,28 @@ impl SolveCoordinator {
     pub fn new(engines: Vec<Arc<dyn Engine>>) -> Self {
         Self {
             engines,
+            delta: parking_lot::RwLock::new(Arc::new(EpochDelta::new(0u64))),
             drain_lock: Mutex::new(CoordinatorState {
                 started: false,
                 last_drained_block: None,
             }),
             block_clock: Mutex::new(BlockClockPipe::default()),
         }
+    }
+
+    /// Hand the coordinator the shared epoch ledger (the wiring layer passes
+    /// `Bot::active_delta` before pump start, so `Bot::dispatch_log`
+    /// records into the SAME ledger this drain seam consumes). Must be
+    /// called before `start`.
+    pub fn set_delta(&self, delta: Arc<EpochDelta>) {
+        *self.delta.write() = delta;
+    }
+
+    /// Test probe: clone of the actively-shared delta ledger.
+    #[cfg(test)]
+    #[must_use]
+    pub fn delta_for_test(&self) -> Arc<EpochDelta> {
+        Arc::clone(&self.delta.read())
     }
 
     /// Attach the block-clock channel sender (the wiring layer creates the
@@ -149,7 +174,9 @@ impl DrainSink for SolveCoordinator {
         // flags — `on_drain` holds the same lock through the fan-out).
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let _guard = self.drain_lock.lock().expect("drain_lock poisoned");
-        self.engines.iter().any(|e| e.has_dirty_paths())
+        // LXDY4C: dirtiness = pending keys in the epoch ledger (take-then-
+        // drain parity with the retired per-engine dirty sets).
+        !self.delta.read().is_empty()
     }
 
     #[hotpath::measure(label = "SolveCoordinator::on_drain")]
@@ -161,8 +188,13 @@ impl DrainSink for SolveCoordinator {
         // engine on every drain tick = the existing eager-coalescing
         // invariant). The policy needs a second consumer (the seam bar) and
         // is recorded as deferred in ADR-006.
+        // LXDY4C: consume the epoch delta's touched keys ONCE, under the
+        // same lock that serializes drains, and drive every engine with
+        // them (the delta take preserves DirtySets::take_all semantics;
+        // keys recorded while this drain runs land in the NEXT cycle).
+        let affected = self.delta.read().take_keys();
         for engine in &self.engines {
-            engine.solve_dirty(ctx.block(), ctx.metadata());
+            engine.solve_dirty(&affected, ctx.block(), ctx.metadata());
         }
         // Record the drained epoch under the same lock — the "good" block
         // Python polls will see once we release.
@@ -285,6 +317,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
+    use degenbot_solvers::mixed::HopType;
+
     /// A counting fake `Engine` for unit tests (AGENTS.md `Fake` prefix).
     /// Records every method invocation count; `last_processed_block` returns
     /// a settable cursor so the coordinator's divergence/start assertions
@@ -293,10 +327,9 @@ mod tests {
         solve_dirty_calls: StdMutex<u32>,
         send_result_batch_calls: StdMutex<u32>,
         finalize_block_calls: StdMutex<u32>,
-        has_dirty_paths_calls: StdMutex<u32>,
         on_pump_ended_calls: StdMutex<u32>,
-        dirty: StdMutex<bool>,
         cursor: StdMutex<Option<u64>>,
+        recorded_solves: StdMutex<Vec<Vec<degenbot_solvers::affected_keys::AffectedKey>>>,
     }
 
     impl FakeEngine {
@@ -305,14 +338,10 @@ mod tests {
                 solve_dirty_calls: StdMutex::new(0),
                 send_result_batch_calls: StdMutex::new(0),
                 finalize_block_calls: StdMutex::new(0),
-                has_dirty_paths_calls: StdMutex::new(0),
                 on_pump_ended_calls: StdMutex::new(0),
-                dirty: StdMutex::new(false),
                 cursor: StdMutex::new(None),
+                recorded_solves: StdMutex::new(Vec::new()),
             }
-        }
-        fn set_dirty(&self, dirty: bool) {
-            *self.dirty.lock().unwrap() = dirty;
         }
         fn set_cursor(&self, block: Option<u64>) {
             *self.cursor.lock().unwrap() = block;
@@ -326,15 +355,17 @@ mod tests {
     }
 
     impl Engine for FakeEngine {
-        fn solve_dirty(&self, _block: u64, _metadata: &BlockMetadata) {
+        fn solve_dirty(
+            &self,
+            affected: &[degenbot_solvers::affected_keys::AffectedKey],
+            _block: u64,
+            _metadata: &BlockMetadata,
+        ) {
             *self.solve_dirty_calls.lock().unwrap() += 1;
+            self.recorded_solves.lock().unwrap().push(affected.to_vec());
         }
         fn send_result_batch(&self, _metadata: &BlockMetadata) {
             *self.send_result_batch_calls.lock().unwrap() += 1;
-        }
-        fn has_dirty_paths(&self) -> bool {
-            *self.has_dirty_paths_calls.lock().unwrap() += 1;
-            *self.dirty.lock().unwrap()
         }
         fn finalize_block(&self, _block: u64, _metadata: &BlockMetadata) {
             *self.finalize_block_calls.lock().unwrap() += 1;
@@ -392,25 +423,24 @@ mod tests {
         assert_eq!(b.on_pump_ended_count(), 1, "engine B must be notified");
     }
 
-    /// RED→GREEN tracer (ADR-006 slice 6): the coordinator coalesces. Dirty
-    /// three `pool_ids` into a fake engine (simulating 3 subscriber notifications),
+    /// RED→GREEN tracer (ADR-006 slice 6): the coordinator coalesces. Seed
+    /// three keys into the shared epoch ledger (the LXDY4C byproduct of log
+    /// application; one `record` per subscriber notification in production),
     /// fire `on_drain` once → the engine's `solve_dirty` is called exactly
-    /// once (coalesced across the `3` dirties), not `3×`.
+    /// once with the taken keys (coalesced), not `3×`.
     #[test]
     fn on_drain_coalesces_multiple_dirties_into_one_solve() {
+        use degenbot_solvers::affected_keys::AffectedKey;
         let engine = Arc::new(FakeEngine::new());
         let coordinator = SolveCoordinator::new(vec![engine.clone()]);
-
-        // Three "dirty" notifications seed the engine's dirty set. In the
-        // real topology these arrive via `LogDispatcher` → `EngineSubscriber`
-        // → `engine.insert_dirty(pool_id)`. Here we just set the dirty flag
-        // three times — the coordinator's job is to translate "N dirties
-        // accumulated" into "1 solve" at the drain point, which holds
-        // regardless of how the dirties got there.
-        engine.set_dirty(true);
-        engine.set_dirty(true);
-        engine.set_dirty(true);
-        assert!(engine.has_dirty_paths(), "red: dirty flag set");
+        // The delta IS the shared byproduct ledger in production; the test
+        // records straight into it (set_delta with Bot::active_delta is the
+        // construction-time wiring).
+        let delta = coordinator.delta_for_test();
+        delta.record_affected(HopType::V2, 1);
+        delta.record_affected(HopType::V2, 1);
+        delta.record_affected(HopType::V3, 2);
+        assert!(coordinator.has_dirty_paths(), "red: ledger has keys");
 
         let metadata = BlockMetadata::default();
         coordinator.on_drain(&BlockContext::new(100, metadata));
@@ -419,6 +449,20 @@ mod tests {
             engine.solve_dirty_count(),
             1,
             "coalesced: one on_drain → one solve_dirty, not 3×"
+        );
+        assert_eq!(
+            engine
+                .recorded_solves
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+            vec![
+                AffectedKey::new(HopType::V2, 1),
+                AffectedKey::new(HopType::V3, 2),
+            ],
+            "the solve receives the delta's taken keys verbatim"
         );
     }
 
@@ -436,24 +480,21 @@ mod tests {
         assert_eq!(b.solve_dirty_count(), 1);
     }
 
-    /// `has_dirty_paths` ORs across engines: one dirty engine dirty → true.
+    /// `has_dirty_paths` tracks the shared ledger (LXDY4C): empty ledger →
+    /// false; a recorded key → true; a consumed ledger → false again.
     #[test]
-    fn has_dirty_paths_ors_across_engines() {
+    fn has_dirty_paths_follows_the_epoch_delta() {
         let a = Arc::new(FakeEngine::new());
         let b = Arc::new(FakeEngine::new());
         let coordinator = SolveCoordinator::new(vec![a.clone(), b.clone()]);
 
-        assert!(!coordinator.has_dirty_paths(), "both clean → false");
+        assert!(!coordinator.has_dirty_paths(), "empty ledger → false");
 
-        a.set_dirty(true);
-        assert!(coordinator.has_dirty_paths(), "one dirty → true");
+        coordinator.delta_for_test().record_affected(HopType::V2, 7);
+        assert!(coordinator.has_dirty_paths(), "pending keys → true");
 
-        a.set_dirty(false);
-        b.set_dirty(true);
-        assert!(coordinator.has_dirty_paths(), "other dirty → true");
-
-        b.set_dirty(false);
-        assert!(!coordinator.has_dirty_paths(), "both clean again → false");
+        coordinator.on_drain(&BlockContext::new(7u64, BlockMetadata::default()));
+        assert!(!coordinator.has_dirty_paths(), "consumed → false");
     }
 
     /// `last_processed_block` returns the coordinator's `last_drained_block`,

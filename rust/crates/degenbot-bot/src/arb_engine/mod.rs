@@ -57,9 +57,10 @@ use crate::bot_core::BotState;
 mod delivery_lifecycle;
 mod delivery_policy;
 mod diagnostic;
-pub(crate) mod dirty_sets;
 pub mod engine_handle;
 pub mod engine_subscriber;
+#[cfg(test)]
+mod epoch_delta_parity; // the LXDY4C capture-replay parity gate (primary validation gate)
 mod event_routing;
 pub mod inline_sim;
 mod lifecycle;
@@ -69,6 +70,8 @@ pub mod sim_slots;
 mod snapshot_verify;
 mod solve_executor;
 mod solver_dispatch;
+#[cfg(test)]
+mod test_oracle;
 #[cfg(test)]
 mod tests;
 
@@ -406,10 +409,6 @@ pub struct ArbitrageEngine {
     /// thresholds, and `result_tx`/`block_tx`; decoupled from solve state so a
     /// standalone consumer gets raw results without it.
     pub(crate) delivery: DeliveryPolicy,
-    /// Shared dirty-pool-key sets (RAYPAR engine-shard T3, C42WKO).
-    /// Co-owned with the `EngineSubscriber` so `on_pool_state_updated`
-    /// can mark pools dirty without taking the engine Mutex.
-    pub(crate) dirty_sets: Arc<dirty_sets::DirtySets>,
     /// Telemetry string cache: path id → formatted hop description, built
     /// once at first emission (paths are immutable after registration, so the
     /// cache never invalidates). Turns the per-block per-path hop formatting
@@ -595,7 +594,6 @@ impl ArbitrageEngine {
             )),
             paths_same_state_this_cycle: 0,
             delivery: DeliveryPolicy::default(),
-            dirty_sets: Arc::new(dirty_sets::DirtySets::new()),
             phase: std::sync::atomic::AtomicU8::new(EnginePhase::Created as u8),
             detached_solving: solver_dispatch::DETACHED_SOLVES_ENABLED
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -763,15 +761,6 @@ impl ArbitrageEngine {
         params: &crate::bot_core::RegisterV4PoolParams,
     ) -> Result<u64, crate::bot_core::RegisterV4PoolError> {
         self.core.write().register_v4_pool(params)
-    }
-}
-
-#[cfg(test)]
-impl ArbitrageEngine {
-    /// Are all dirty sets empty? (Used by `has_dirty_paths` + adapter tests.)
-    #[must_use]
-    pub fn dirty_sets_is_empty(&self) -> bool {
-        self.dirty_sets.is_empty()
     }
 }
 

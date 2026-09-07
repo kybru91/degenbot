@@ -8,33 +8,18 @@ use crate::bot_core::{V3SwapUpdate, V4SwapUpdate};
 use degenbot_solvers::mixed::MixedPoolRef;
 
 #[cfg(test)]
+use super::test_oracle::affected_keys;
+#[cfg(test)]
 use super::HashSet;
 
-use super::{ArbitrageEngine, BlockMetadata, HopType};
+use super::{ArbitrageEngine, BlockMetadata};
 
 impl ArbitrageEngine {
-    /// Mark `pool_id` dirty, classifying it into the V2/V3/V4 dirty set by
-    /// consulting the shared `BotState`'s `PoolEntry` variant (ADR-006 D4).
-    ///
-    /// This is the subscriber-facing entry point: the `EngineSubscriber`
-    /// adapter calls this from `on_pool_state_updated` (after the `BotState`
-    /// write guard is released), taking only the engine `Mutex`. If `pool_id`
-    /// isn't registered in `core`, the call is a no-op (the event was for a
-    /// pool no path references).
-    pub fn insert_dirty(&self, pool_id: u64) {
-        let core = self.core.read();
-        if core.get_v2_pool_state(pool_id).is_some() {
-            drop(core);
-            self.dirty_sets.insert(pool_id, HopType::V2);
-        } else if core.get_v3_pool(pool_id).is_some() {
-            drop(core);
-            self.dirty_sets.insert(pool_id, HopType::V3);
-        } else if core.get_v4_pool(pool_id).is_some() {
-            drop(core);
-            self.dirty_sets.insert(pool_id, HopType::V4);
-        }
-        // Unregistered pool_id → no-op (no path references it).
-    }
+    // (NOTE, LXDY4C): the former `insert_dirty` (BotState-bucket
+    // classification into the shared dirty sets) is retired — touched pools
+    // are recorded into the block's `EpochDelta` by log application
+    // (`LogDispatcher::dispatch` / `Bot::notify_pool_state_changed`), and
+    // the affected-path derivation consumes the delta's taken keys.
 
     /// call, but do NOT send a result batch to Python.
     ///
@@ -60,7 +45,12 @@ impl ArbitrageEngine {
         self.results_block
     }
 
-    pub fn solve_dirty(&mut self, block_number: u64, metadata: &BlockMetadata) {
+    pub fn solve_dirty(
+        &mut self,
+        block_number: u64,
+        metadata: &BlockMetadata,
+        affected: &[degenbot_solvers::affected_keys::AffectedKey],
+    ) {
         // Expire stale buffered events in the V3/V4 buffers (ADR-003: both
         // now live on BotState).
         //
@@ -98,13 +88,12 @@ impl ArbitrageEngine {
             );
         }
 
-        // Snapshot all dirty sets atomically (RAYPAR engine-shard T3).
-        let (dirty_v2, dirty_v3, dirty_v4) = self.dirty_sets.take_all();
-
+        // LXDY4C: the affected keys arrive from the block's EpochDelta
+        // (consumed by the SolveCoordinator fan-out); no engine-local
+        // dirty-set intake remains.
         // Re-solve only paths containing updated pools (no batch send)
-        self.rebuild_and_solve_affected(&dirty_v2, &dirty_v3, &dirty_v4, block_number, metadata);
+        self.rebuild_and_solve_affected(affected, block_number, metadata);
 
-        // dirty sets are already cleared by std::mem::take
         self.last_processed_block = Some(block_number);
     }
 
@@ -147,13 +136,6 @@ impl ArbitrageEngine {
     /// up-to-date (via `solve_dirty`) before calling this.
     pub fn send_result_batch(&mut self, metadata: &BlockMetadata) {
         self.compute_diff_and_send(metadata);
-    }
-
-    /// Returns `true` if there are unsolved dirty pool keys from `apply_log`
-    /// calls that haven't been followed by `solve_dirty` yet.
-    #[must_use]
-    pub fn has_dirty_paths(&self) -> bool {
-        !self.dirty_sets.is_empty()
     }
 
     /// Snapshot every registered path's per-hop pool refs for the Option-A
@@ -284,11 +266,9 @@ impl ArbitrageEngine {
             }
         }
 
-        // Re-solve only paths containing updated pools
+        // Re-solve only paths containing updated pools (test-only intake)
         self.rebuild_and_solve_affected(
-            &v2_affected,
-            &v3_affected,
-            &HashSet::new(),
+            &affected_keys(&v2_affected, &v3_affected, &HashSet::new()),
             block_number,
             metadata,
         );
@@ -313,9 +293,7 @@ impl ArbitrageEngine {
             }
         }
         self.rebuild_and_solve_affected(
-            &HashSet::new(),
-            &HashSet::new(),
-            &v4_affected,
+            &affected_keys(&HashSet::new(), &HashSet::new(), &v4_affected),
             block_number,
             metadata,
         );
