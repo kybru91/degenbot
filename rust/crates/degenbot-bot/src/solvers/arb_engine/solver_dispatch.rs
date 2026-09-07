@@ -731,22 +731,20 @@ impl PipelinedSims {
         let sim = std::sync::Arc::clone(sim);
         let parent = parent_span.clone();
         let expected_profit = result.profit;
-        // Two-runtime pacing (7LV6VN T5): the slot comes from the
-        // budget-derived global pool (`budget - solve_workers` in-flight
-        // sims). Blocking the scheduling bin when the pool is dry is the
-        // explicit, environment-adaptive replacement for the pacing the
-        // synchronous sim join used to provide. The guard MOVES into the
-        // driver thread, so the slot returns exactly when the sim finishes.
+        // Two-runtime pacing (7LV6VN T5): the slot is acquired INSIDE the
+        // driver thread, so a saturated sim pipeline parks queued sims at
+        // zero CPU cost instead of stalling the bins mid-walk (T5 window:
+        // schedule-time blocking starved the walks). Concurrent EXECUTING
+        // sims stay bounded by the budget-derived cap - the explicit
+        // replacement for the pacing the synchronous sim join used to
+        // provide. The guard releases exactly when the sim finishes.
         let slots = crate::solvers::arb_engine::sim_slots::sim_slots_global();
-        slots.acquire();
-        let guard = crate::solvers::arb_engine::sim_slots::SlotGuard::acquired(
-            std::sync::Arc::clone(&slots),
-        );
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(format!("arb-sim-{pid}"))
             .spawn(move || {
-                let _slot = guard;
+                slots.acquire();
+                let _slot = crate::solvers::arb_engine::sim_slots::SlotGuard::acquired(slots);
                 let span = tracing::info_span!(
                     target: "degenbot::solver",
                     parent: parent,

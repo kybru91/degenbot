@@ -21,6 +21,13 @@ use std::sync::OnceLock;
 /// the leftover of the effective CPU budget after the solve bins take
 /// theirs (`effective_cpu_budget` - `solve_worker_count`, floor 1).
 fn sim_slot_capacity() -> usize {
+    /// Sims are I/O-dominant: a slot is mostly an RPC/storage await, not a
+    /// core. Allow the leftover budget x I/O oversubscribe so the sim
+    /// pipeline stays saturated without stacking CPU demand past the
+    /// quota. T5 window data (48-cycle hotpath windows): cap = leftover (2)
+    /// starves the pipeline (`solve_dirty` avg 425 ms); unbounded re-runs
+    /// the 1508 ms/cycle throttle story. 2x measured best of the three.
+    const SIM_IO_OVERSUBSCRIBE: usize = 2;
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
         if let Ok(raw) = std::env::var("DEGENBOT_SOLVE_SIM_INFLIGHT") {
@@ -28,9 +35,7 @@ fn sim_slot_capacity() -> usize {
                 return n.clamp(1, 64);
             }
         }
-        let budget = crate::bot_core::cpu_budget::effective_cpu_budget();
-        let solve = crate::bot_core::cpu_budget::solve_worker_count();
-        budget.saturating_sub(solve).max(1)
+        crate::bot_core::cpu_budget::leftover_worker_budget().saturating_mul(SIM_IO_OVERSUBSCRIBE)
     })
 }
 
