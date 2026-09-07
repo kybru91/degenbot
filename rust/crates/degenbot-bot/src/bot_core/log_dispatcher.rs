@@ -107,6 +107,20 @@ pub enum DecodedPoolEvent {
 }
 
 impl DecodedPoolEvent {
+    /// The hop family this event belongs to — the `pool_to_paths` reverse
+    /// index's hop half. The decoder selects the family, so LOG APPLICATION
+    /// knows it directly: the retired `EngineSubscriber` classification
+    /// (BotState bucket lookups per notify) is subsumed by this method
+    /// (epic MROOY7, task LXDY4C).
+    #[must_use]
+    pub fn hop_type(&self) -> degenbot_solvers::mixed::HopType {
+        match self {
+            Self::V2Sync { .. } => degenbot_solvers::mixed::HopType::V2,
+            Self::V3Swap { .. } | Self::V3Liquidity { .. } => degenbot_solvers::mixed::HopType::V3,
+            Self::V4Swap { .. } | Self::V4Liquidity { .. } => degenbot_solvers::mixed::HopType::V4,
+        }
+    }
+
     /// The block number carried by this event's source log.
     #[must_use]
     pub fn block_number(&self) -> u64 {
@@ -470,9 +484,14 @@ impl LogDispatcher {
     /// **Lock order:** the `state` write guard is acquired and released BEFORE
     /// any subscriber notify — subscribers take only their own lock (D2's
     /// engine-then-core order preserved by not nesting).
-    #[tracing::instrument(name = "degenbot.log.dispatch", skip(self, log, state), fields(block = %log.block_number.unwrap_or_default()))]
+    #[tracing::instrument(name = "degenbot.log.dispatch", skip(self, log, state, delta), fields(block = %log.block_number.unwrap_or_default()))]
     #[expect(clippy::too_many_lines)]
-    pub fn dispatch(&self, log: &Log, state: &Arc<StateLock<BotState>>) {
+    pub fn dispatch(
+        &self,
+        log: &Log,
+        state: &Arc<StateLock<BotState>>,
+        delta: Option<&crate::bot_core::EpochDelta>,
+    ) {
         // Phase-labeled `measure_block!` for the rolling-start dirty-path
         // diagnostic: distinguishes "decode miss" (no decoder recognized the
         // log) from "apply miss" (pool not registered in BotState → no-op)
@@ -585,6 +604,9 @@ impl LogDispatcher {
         }
         // Route + execute under the write guard (cl_route table owns policy),
         // then RELEASE before notifying.
+        // LXDY4C: the event's hop family must be read BEFORE `apply`
+        // consumes the decoded event.
+        let event_hop = decoded.hop_type();
         let apply_start = std::time::Instant::now();
         let outcome = hotpath::measure_block!("dispatch.apply", decoded.apply(&mut state.write()));
         if let Some(p) = crate::instruments::pipeline() {
@@ -607,6 +629,14 @@ impl LogDispatcher {
                 // T2: successful apply to a registered pool.
                 if let Some(p) = crate::instruments::pipeline() {
                     p.count_log_applied();
+                }
+                // EpochDelta dirty tracking (epic MROOY7, task LXDY4C): log
+                // application records the touched pool into the block's
+                // ledger as a BYPRODUCT of the apply outcome — the
+                // subscriber-side dirty write is retired. Event family comes
+                // from the decode (no BotState classification).
+                if let Some(delta) = delta {
+                    delta.record_affected(event_hop, pool_id);
                 }
                 hotpath::measure_block!("dispatch.notify", {
                     self.notify(pool_id);
@@ -799,7 +829,7 @@ mod tests {
         let subscriber: Arc<dyn PoolStateSubscriber> = Arc::new(subscriber);
         dispatcher.subscribe(1, Arc::downgrade(&subscriber));
 
-        dispatcher.dispatch(&sentinel_log(), &state);
+        dispatcher.dispatch(&sentinel_log(), &state, None);
 
         let observed = calls.lock().unwrap().clone();
         assert_eq!(
@@ -899,7 +929,7 @@ mod tests {
         let subscriber: Arc<dyn PoolStateSubscriber> = Arc::new(subscriber);
         dispatcher.subscribe(1, Arc::downgrade(&subscriber));
 
-        dispatcher.dispatch(&sentinel_log(), &state);
+        dispatcher.dispatch(&sentinel_log(), &state, None);
 
         assert!(
             calls.lock().unwrap().is_empty(),
@@ -952,7 +982,7 @@ mod tests {
             // tmp_strong drops here → Weak goes dead.
         }
 
-        dispatcher.dispatch(&sentinel_log(), &state);
+        dispatcher.dispatch(&sentinel_log(), &state, None);
 
         // The live subscriber still fires exactly once; the dead one skipped.
         assert_eq!(live_calls.lock().unwrap().len(), 1);
@@ -1027,7 +1057,7 @@ mod tests {
             removed: false,
         };
 
-        dispatcher.dispatch(&log, &state);
+        dispatcher.dispatch(&log, &state, None);
 
         assert!(
             state.read().buffered_v3_event_count(&pool_addr) > 0,
@@ -1152,7 +1182,7 @@ mod tests {
         };
 
         let dispatcher = LogDispatcher::with_uniswap_decoders();
-        dispatcher.dispatch(&log, &state);
+        dispatcher.dispatch(&log, &state, None);
 
         let s = state.read();
         let pool = s.get_v3_pool(pool_id).expect("pool registered");

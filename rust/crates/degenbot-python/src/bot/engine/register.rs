@@ -64,6 +64,9 @@ impl PyArbitrageEngine {
         // business). The receiver lives on the shared `PumpState` beside the
         // pipe's owner; `PyBot::block_stream` hands it to Python once.
         coordinator.set_block_channel(block_tx);
+        // LXDY4C: the drain seam consumes the SAME epoch ledger
+        // `Bot::dispatch_log` records into — one dirty-tracking mechanism.
+        coordinator.set_delta(bot.active_delta());
         let reorg_coordinator = Arc::new(ReorgCoordinator::new(Arc::clone(&bot)));
         let pump = Arc::new(crate::bot::pump::PumpState::new(
             Arc::clone(&engine),

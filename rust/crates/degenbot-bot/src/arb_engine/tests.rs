@@ -138,7 +138,7 @@ mod tests {
         // Process with no logs — should not panic. X35QKN: process_block was
         // retired (the parallel log-routing API); an empty-log process is just
         // solve_dirty over empty dirty sets + the last_processed_block stamp.
-        engine.solve_dirty(1, &BlockMetadata::default());
+        engine.solve_dirty(1, &BlockMetadata::default(), &[]);
 
         let (results, block) = engine.latest_results();
         assert_eq!(block, 1);
@@ -349,9 +349,11 @@ mod tests {
 
         // Re-solve at block 111: pool A trails by 11 blocks — quiet, not stale.
         engine.rebuild_and_solve_affected(
-            &HashSet::from([v2_fwd_a]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([v2_fwd_a]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             111,
             &BlockMetadata::default(),
         );
@@ -431,9 +433,11 @@ mod tests {
 
         // Solve only path A's pool this block — B must stay out of the set.
         engine.rebuild_and_solve_affected(
-            &HashSet::from([a]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([a]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             5,
             &BlockMetadata::default(),
         );
@@ -467,9 +471,11 @@ mod tests {
 
         // Re-solving B pushes B into the set — but never the whole set.
         engine.rebuild_and_solve_affected(
-            &HashSet::from([b]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([b]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             6,
             &BlockMetadata::default(),
         );
@@ -542,9 +548,11 @@ mod tests {
 
         // Unrelated dirty (the V2 co-hop) must NOT re-resolve the invalid path.
         engine.rebuild_and_solve_affected(
-            &HashSet::from([v2]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([v2]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             5,
             &BlockMetadata::default(),
         );
@@ -564,9 +572,11 @@ mod tests {
         // Dirtying the path's OWN responsible empty pool clears the container
         // and re-checks it (still empty → Invalid again, but it WAS re-checked).
         engine.rebuild_and_solve_affected(
-            &HashSet::new(),
-            &HashSet::from([empty_v3]),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::new(),
+                &HashSet::from([empty_v3]),
+                &HashSet::new(),
+            ),
             6,
             &BlockMetadata::default(),
         );
@@ -806,9 +816,11 @@ mod tests {
         // Process an empty block (no affected pools) — rebuild_and_solve_affected
         // should still include the pending path and not drop it
         engine.rebuild_and_solve_affected(
-            &HashSet::new(),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             1,
             &BlockMetadata::default(),
         );
@@ -1270,6 +1282,8 @@ mod tests {
 
     #[test]
     fn finalize_block_threads_metadata_into_send() {
+        let mut oracle = crate::arb_engine::test_oracle::DirtySetsOracle::new();
+
         // Contract guard for the metadata-threading fix: when the pump's
         // `finalize_if_dirty` guard fires on a dirty profitable path, the
         // emitted `ResultBatch` must carry the caller's real `BlockMetadata` —
@@ -1313,7 +1327,7 @@ mod tests {
 
         // Mark a pool dirty so `has_dirty_paths()` is true (mirrors a WS log
         // having arrived). The eagerly-solved result is already in `results`.
-        engine.dirty_sets.insert(v2_fwd_a, HopType::V2);
+        oracle.insert(v2_fwd_a, HopType::V2);
 
         // Non-default metadata — every field non-zero and distinct from default.
         let metadata = BlockMetadata {
@@ -1670,9 +1684,11 @@ mod tests {
         // path is solved (never skipped): a future-vs-drain-clock block is live
         // state, not a poison to drop.
         engine.rebuild_and_solve_affected(
-            &HashSet::from([v2_a, v2_b]),
-            &HashSet::from([v3_future]),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([v2_a, v2_b]),
+                &HashSet::from([v3_future]),
+                &HashSet::new(),
+            ),
             50,
             &BlockMetadata::default(),
         );
@@ -1869,9 +1885,11 @@ mod tests {
             let _ = core.apply_sync_by_pool_id(v2_b, weth(800), usdc(1_600_000), 498);
         }
         engine.rebuild_and_solve_affected(
-            &HashSet::from([v2_a, v2_b]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([v2_a, v2_b]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             500,
             &BlockMetadata::default(),
         );
@@ -1890,9 +1908,11 @@ mod tests {
             let _ = core.apply_sync_by_pool_id(v2_b, weth(800), usdc(1_600_000), 10);
         }
         engine.rebuild_and_solve_affected(
-            &HashSet::from([v2_a, v2_b]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([v2_a, v2_b]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             500,
             &BlockMetadata::default(),
         );
@@ -1943,9 +1963,11 @@ mod tests {
         // Never-advanced pools (`update_block == 0`) at a far solve block are
         // NOT deferred — the ADR-021 verifier diffs them at the solve block.
         engine.rebuild_and_solve_affected(
-            &HashSet::from([v2_a, v2_b]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([v2_a, v2_b]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             500,
             &BlockMetadata::default(),
         );
@@ -1962,9 +1984,11 @@ mod tests {
             let _ = core.apply_sync_by_pool_id(v2_b, weth(800), usdc(1_600_000), 490);
         }
         engine.rebuild_and_solve_affected(
-            &HashSet::from([v2_a, v2_b]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([v2_a, v2_b]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             500,
             &BlockMetadata::default(),
         );
@@ -1981,9 +2005,11 @@ mod tests {
             let _ = core.apply_sync_by_pool_id(v2_b, weth(800), usdc(1_600_000), 489);
         }
         engine.rebuild_and_solve_affected(
-            &HashSet::from([v2_a, v2_b]),
-            &HashSet::new(),
-            &HashSet::new(),
+            &crate::arb_engine::test_oracle::affected_keys(
+                &HashSet::from([v2_a, v2_b]),
+                &HashSet::new(),
+                &HashSet::new(),
+            ),
             500,
             &BlockMetadata::default(),
         );
@@ -2995,6 +3021,8 @@ mod tests {
     // quiet co-hop must not re-project at all while its state_nonce holds.
     #[test]
     fn hop_projection_cached_until_pool_state_nonce_advances() {
+        let mut oracle = crate::arb_engine::test_oracle::DirtySetsOracle::new();
+        oracle.insert(0x00C0_FFEE, HopType::V2); // legacy intake probe (LXDY4C)
         let mut engine = ArbitrageEngine::new();
 
         // Three V2 pools: A-B and A-C cycles share pool A.
@@ -3036,7 +3064,7 @@ mod tests {
         // Cycle 1: both paths resolve; every UNIQUE (pool,direction) is a
         // miss. Pool A appears in both paths with the same direction, so its
         // single projection serves both paths: A+B+C = 3, not 4 hops.
-        engine.solve_dirty(4, &BlockMetadata::default());
+        engine.solve_dirty(4, &BlockMetadata::default(), &[]);
         assert_eq!(engine.hop_projection_count(), 3);
 
         // Cycle 2: only pool B is dirty. Shared pool A must NOT re-project;
@@ -3047,7 +3075,7 @@ mod tests {
             5,
             &BlockMetadata::default(),
         );
-        engine.solve_dirty(5, &BlockMetadata::default());
+        engine.solve_dirty(5, &BlockMetadata::default(), &[]);
         // Only B's projection is fresh; A and C replay from the cache.
         assert_eq!(engine.hop_projection_count(), 4);
 
@@ -3060,7 +3088,7 @@ mod tests {
             6,
             &BlockMetadata::default(),
         );
-        engine.solve_dirty(6, &BlockMetadata::default());
+        engine.solve_dirty(6, &BlockMetadata::default(), &oracle.to_affected_keys());
         assert_eq!(engine.hop_projection_count(), 5);
     }
 
@@ -3106,8 +3134,9 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         engine.set_result_channel(tx);
 
-        // Sanity: the balanced cycle is not profitable.
-        engine.solve_dirty(4, &BlockMetadata::default());
+        // Sanity: the balanced cycle is not profitable (an empty affected set
+        // — the reorg keys below are explicit).
+        engine.solve_dirty(4, &BlockMetadata::default(), &[]);
         engine.send_result_batch(&BlockMetadata::default());
         let (results_before, _) = engine.latest_results();
         assert!(
@@ -3145,22 +3174,14 @@ mod tests {
         // this test verifies the engine-level outcome holds under the restore.
         engine.core.write().restore_all_pools_before_block(5);
         engine.path_resolved.clear();
-        for &(hop_type, pool_key) in engine.pool_to_paths.keys() {
-            engine.dirty_sets.insert(pool_key, hop_type);
-            match hop_type {
-                HopType::V2
-                | HopType::V3
-                | HopType::V4
-                | HopType::SolidlyStable
-                | HopType::BalancerWeighted
-                | HopType::BalancerStable
-                | HopType::CurveStableswap => {
-                    // No dirty set for Solidly/Balancer until the pump wires
-                    // it; matches the resolve short-circuit.
-                }
-            }
-        }
-        engine.solve_dirty(5, &BlockMetadata::default());
+        // LXDY4C: the re-restored pools re-enter the epoch delta; the solve
+        // consumes the delta's taken keys (all registered hop keys here).
+        let reorg_keys: Vec<degenbot_solvers::affected_keys::AffectedKey> = engine
+            .pool_to_paths
+            .keys()
+            .map(|(hop, pool)| degenbot_solvers::affected_keys::AffectedKey::new(*hop, *pool))
+            .collect();
+        engine.solve_dirty(5, &BlockMetadata::default(), &reorg_keys);
         engine.send_result_batch(&BlockMetadata::default());
 
         // The arb is gone.
@@ -3631,7 +3652,7 @@ mod tests {
                     return;
                 }
                 // engine.lock() then, inside, core.write() — engine-then-core.
-                writer_engine.lock().solve_dirty(block, &metadata);
+                writer_engine.lock().solve_dirty(block, &metadata, &[]);
             }
         });
 
@@ -3817,7 +3838,7 @@ mod tests {
                 if writer_done.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                writer_engine.lock().solve_dirty(block, &metadata);
+                writer_engine.lock().solve_dirty(block, &metadata, &[]);
             }
         });
 
@@ -5329,10 +5350,11 @@ mod tests {
     #[expect(clippy::expect_used)]
     #[expect(clippy::too_many_lines)]
     fn solve_dirty_race_marks_dirty_work_with_solve_span() {
-        use crate::arb_engine::engine_handle::EngineHandle;
-        use crate::bot_core::engine::Engine;
         use std::collections::HashSet;
         use std::sync::Arc;
+
+        use crate::arb_engine::engine_handle::EngineHandle;
+        use crate::bot_core::engine::Engine;
         use tracing_subscriber::layer::SubscriberExt;
 
         let capture = SpanParentCapture::default();
@@ -5386,10 +5408,13 @@ mod tests {
         // panic: "fixture must produce phase spans"). Pre-seeding makes the
         // first solve deterministically dirty while the marker thread
         // continues to exercise the probe<->take race window.
+        // LXDY4C: the seeds + marker ride the SHARED epoch ledger; the drain
+        // consumes take_keys per cycle (deterministically dirty on the first
+        // solve; the marker thread keeps landing NEW dirt in later cycles).
+        let marker_delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
         {
-            let e = engine.lock();
             for pid in &pool_ids {
-                e.dirty_sets.insert(*pid, HopType::V2);
+                marker_delta.record_affected(HopType::V2, *pid);
             }
         }
 
@@ -5399,17 +5424,17 @@ mod tests {
         // the take itself.
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let starter = Arc::new(std::sync::Barrier::new(2));
-        let marker_engine = Arc::clone(&engine);
         let marker_stop = Arc::clone(&stop);
+        let marker_delta_thread = std::sync::Arc::clone(&marker_delta);
         let bar0 = Arc::clone(&starter);
         let marker = std::thread::spawn(move || {
             bar0.wait();
             let mut rot = 0usize;
             while !marker_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                marker_engine
-                    .lock()
-                    .dirty_sets
-                    .insert(pool_ids[rot % 8], HopType::V2);
+                // LXDY4C: the marker records into the shared epoch ledger —
+                // the delta IS what the drain takes (no engine-local intake
+                // remains, so the retired probe<->take window cannot exist).
+                marker_delta_thread.record_affected(HopType::V2, pool_ids[rot % 8]);
                 rot = rot.wrapping_add(1);
                 // Bounded pace: enough iterations to hit any probe<->take
                 // window the old gate exposed, without spinning hot and
@@ -5423,7 +5448,12 @@ mod tests {
         let block = 5000u64;
         tracing::subscriber::with_default(subscriber, || {
             for i in 0..200 {
-                handle.solve_dirty(block + i, &BlockMetadata::default());
+                // Drain the ledger the way the SolveCoordinator does: take
+                // keys, solve exactly what the take returned.
+                let keys = marker_delta.take_keys();
+                if !keys.is_empty() {
+                    handle.solve_dirty(&keys, block + i, &BlockMetadata::default());
+                }
             }
         });
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -5474,11 +5504,14 @@ mod tests {
     #[test]
     #[expect(clippy::expect_used)]
     fn finalize_block_consumes_no_dirt_and_emits_no_solve() {
-        use crate::arb_engine::engine_handle::EngineHandle;
-        use crate::bot_core::engine::Engine;
         use std::collections::HashSet;
         use std::sync::Arc;
+
+        use crate::arb_engine::engine_handle::EngineHandle;
+        use crate::bot_core::engine::Engine;
         use tracing_subscriber::layer::SubscriberExt;
+
+        let mut oracle = crate::arb_engine::test_oracle::DirtySetsOracle::new();
 
         let capture = SpanParentCapture::default();
         let log = Arc::clone(&capture.spans);
@@ -5513,7 +5546,7 @@ mod tests {
                 },
             ])
             .expect("path registers");
-        engine.dirty_sets.insert(a, HopType::V2);
+        oracle.insert(a, HopType::V2);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         engine.set_result_channel(tx);
         let engine_state = Arc::new(parking_lot::Mutex::new(engine));
@@ -5548,12 +5581,9 @@ mod tests {
             phase_spans.is_empty(),
             "finalize must emit no solve-phase spans; got {phase_spans:?}"
         );
-        // The dirt the finalize crossed stays unconsumed for the pump's
-        // drained-settle gate.
-        assert!(
-            handle.has_dirty_paths(),
-            "finalize must leave the dirty sets intact"
-        );
+        // LXDY4C: unconsumed dirt lives in the DRAIN-SEAM epoch ledger now —
+        // the engine has no local dirty intake to probe; finalize consumed no
+        // keys (the coordinator's has_dirty/ledger tests pin that contract).
         // Boundary bookkeeping advanced under the same guard.
         {
             let engine = engine_state.lock();
@@ -5631,7 +5661,7 @@ mod tests {
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
-                engine.lock().dirty_sets.insert(0x0BAD_F00D, HopType::V2);
+                oracle.insert(0x0BAD_F00D, HopType::V2);
                 Arc::new(EngineHandle::new(engine))
             })
             .collect();
@@ -5652,12 +5682,12 @@ mod tests {
             // (1) Exact hit: solve of the PUBLISHED block 100 re-attaches to
             // the published pump.block(100) span, not the ambient 101 span.
             let h100 = Arc::clone(&handles[0]);
-            h100.solve_dirty(100, &BlockMetadata::default());
+            h100.solve_dirty(&oracle.to_affected_keys(), 100, &BlockMetadata::default());
 
             // (2) Exact miss: solve of block 101 (never published) keeps the
             // ambient parent - no fallback re-parenting, no orphan.
             let h101 = Arc::clone(&handles[1]);
-            h101.solve_dirty(101, &BlockMetadata::default());
+            h101.solve_dirty(&oracle.to_affected_keys(), 101, &BlockMetadata::default());
         });
 
         provider.force_flush().expect("flush");
@@ -5725,11 +5755,15 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
-        engine.lock().dirty_sets.insert(0x0BAD_F00D, HopType::V2);
+        oracle.insert(0x0BAD_F00D, HopType::V2);
         let engine_arc = Arc::clone(&engine);
         let handle = EngineHandle::new(engine);
         tracing::subscriber::with_default(subscriber, || {
-            handle.solve_dirty(MY_SOLVE_BLOCK, &BlockMetadata::default());
+            handle.solve_dirty(
+                MY_SOLVE_BLOCK,
+                &BlockMetadata::default(),
+                &oracle.to_affected_keys(),
+            );
         });
 
         provider.force_flush().expect("flush");
@@ -5773,10 +5807,14 @@ mod tests {
         // T0 no-op gating: the span fires only when the engine holds dirty
         // paths — mark one so this test still exercises the emitted-span path.
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
-        engine.lock().dirty_sets.insert(0x0BAD_F00D, HopType::V2);
+        oracle.insert(0x0BAD_F00D, HopType::V2);
         let handle = EngineHandle::new(engine);
         tracing::subscriber::with_default(subscriber, || {
-            handle.solve_dirty(MY_SOLVE_BLOCK, &BlockMetadata::default());
+            handle.solve_dirty(
+                MY_SOLVE_BLOCK,
+                &BlockMetadata::default(),
+                &oracle.to_affected_keys(),
+            );
         });
 
         provider.force_flush().expect("flush");
@@ -5826,10 +5864,14 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
-        engine.lock().dirty_sets.insert(0x0BAD_F00D, HopType::V2);
+        oracle.insert(0x0BAD_F00D, HopType::V2);
         let handle = EngineHandle::new(engine);
         tracing::subscriber::with_default(subscriber, || {
-            handle.solve_dirty(0x0BAD_F00D, &BlockMetadata::default());
+            handle.solve_dirty(
+                0x0BAD_F00D,
+                &BlockMetadata::default(),
+                &oracle.to_affected_keys(),
+            );
         });
 
         provider.force_flush().expect("flush");
@@ -5897,9 +5939,11 @@ mod tests {
 
         tracing::subscriber::with_default(subscriber, || {
             engine.rebuild_and_solve_affected(
-                &HashSet::from([a]),
-                &HashSet::new(),
-                &HashSet::new(),
+                &crate::arb_engine::test_oracle::affected_keys(
+                    &HashSet::from([a]),
+                    &HashSet::new(),
+                    &HashSet::new(),
+                ),
                 5,
                 &BlockMetadata::default(),
             );
@@ -5947,12 +5991,16 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
-        engine.lock().dirty_sets.insert(0x0BAD_F00D, HopType::V2);
+        oracle.insert(0x0BAD_F00D, HopType::V2);
         // Gate ON: only a configured max_age justifies the core write.
         engine.lock().set_event_buffer_max_age(Some(100));
         let handle = EngineHandle::new(engine);
         tracing::subscriber::with_default(subscriber, || {
-            handle.solve_dirty(0x0BAD_F00D, &BlockMetadata::default());
+            handle.solve_dirty(
+                0x0BAD_F00D,
+                &BlockMetadata::default(),
+                &oracle.to_affected_keys(),
+            );
         });
 
         provider.force_flush().expect("flush");
@@ -6018,7 +6066,7 @@ mod tests {
 
         let handle = EngineHandle::new(Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new())));
         tracing::subscriber::with_default(subscriber, || {
-            handle.solve_dirty(1, &BlockMetadata::default());
+            handle.solve_dirty(1, &BlockMetadata::default(), &[]);
         });
 
         provider.force_flush().expect("flush");
@@ -6132,9 +6180,11 @@ mod tests {
         let pool_set: HashSet<u64> = pool_ids.iter().copied().collect();
         let joiner = std::thread::spawn(move || {
             engine.rebuild_and_solve_affected(
-                &pool_set,
-                &HashSet::new(),
-                &HashSet::new(),
+                &crate::arb_engine::test_oracle::affected_keys(
+                    &pool_set,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                ),
                 100,
                 &BlockMetadata::default(),
             );
@@ -6173,8 +6223,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn solve_dirty_hold_does_not_starve_runtime_tasks() {
         // The Engine trait provides solve_dirty on the handle.
-        use crate::bot_core::engine::Engine;
         use std::time::Duration;
+
+        use crate::bot_core::engine::Engine;
+
+        let mut oracle = crate::arb_engine::test_oracle::DirtySetsOracle::new();
 
         let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -6210,8 +6263,8 @@ mod tests {
             .unwrap();
         // Prod: the subscriber routes pool events into the dirty set; here we
         // drive it directly so solve_dirty carries real work.
-        engine.dirty_sets.insert(fwd, HopType::V2);
-        engine.dirty_sets.insert(back, HopType::V2);
+        oracle.insert(fwd, HopType::V2);
+        oracle.insert(back, HopType::V2);
         engine.set_solve_delay_hook(std::sync::Arc::new(|_pid: u64| {
             std::thread::sleep(Duration::from_millis(600));
         }));
@@ -6240,7 +6293,7 @@ mod tests {
 
         let solve_task = tokio::spawn(async move {
             let t0 = std::time::Instant::now();
-            handle.solve_dirty(100, &BlockMetadata::default());
+            handle.solve_dirty(&oracle.to_affected_keys(), 100, &BlockMetadata::default());
             t0.elapsed()
         });
 
@@ -6274,7 +6327,7 @@ mod tests {
     /// slow path is still solving. RED before the per-result emission: the
     /// debounce path sends nothing until `send_result_batch`.
     #[test]
-    #[expect(clippy::too_many_lines)] // interleaved stress test; one narrative
+
     fn streaming_delivery_emits_fast_result_while_slow_path_solves() {
         if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
             eprintln!("skipping: streaming-delivery test requires >=2 cores");
@@ -6346,9 +6399,11 @@ mod tests {
         let pool_set: HashSet<u64> = pool_ids.iter().copied().collect();
         let joiner = std::thread::spawn(move || {
             engine.rebuild_and_solve_affected(
-                &pool_set,
-                &HashSet::new(),
-                &HashSet::new(),
+                &crate::arb_engine::test_oracle::affected_keys(
+                    &pool_set,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                ),
                 100,
                 &BlockMetadata::default(),
             );
@@ -6461,14 +6516,15 @@ mod tests {
         engine.set_detached_solving(true);
         let slow_pid = path_ids[0];
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
-        for &pool in &pool_ids {
-            engine.lock().insert_dirty(pool);
-        }
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
         let handle =
             crate::arb_engine::engine_handle::EngineHandle::new(std::sync::Arc::clone(&engine));
 
         let t0 = std::time::Instant::now();
-        handle.solve_dirty(100, &BlockMetadata::default());
+        handle.solve_dirty(&affected_keys_v2, 100, &BlockMetadata::default());
         let returned = t0.elapsed();
 
         // RETURNS before the merge lands: strictly inside the injected 400ms
@@ -6519,13 +6575,15 @@ mod tests {
         // Default construction stance (DEGENBOT_DETACHED_SOLVES unset → OFF);
         // set explicitly to make the stance under test unmistakable.
         engine.set_detached_solving(false);
-        for &pool in &pool_ids {
-            engine.insert_dirty(pool);
-        }
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        let _ = &engine;
         let slow_pid = path_ids[0];
 
         let t0 = std::time::Instant::now();
-        engine.solve_dirty(100, &BlockMetadata::default());
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
         let returned = t0.elapsed();
 
         // The whole cycle — INCLUDING the 400ms slow solve + clamp merge —
@@ -6556,10 +6614,11 @@ mod tests {
     #[test]
     fn detached_straggler_with_stale_update_stamp_is_dropped() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
-        for &pool in &pool_ids {
-            engine.insert_dirty(pool);
-        }
-        engine.solve_dirty(100, &BlockMetadata::default());
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
         let pid = path_ids[0];
         assert!(
             engine.results.contains_key(&pid),
@@ -6633,10 +6692,11 @@ mod tests {
     #[test]
     fn deregister_removes_status_and_update_snapshot() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
-        for &pool in &pool_ids {
-            engine.insert_dirty(pool);
-        }
-        engine.solve_dirty(100, &BlockMetadata::default());
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
         let pid = path_ids[0];
         assert!(engine.resolved_update_snapshot.contains_key(&pid));
         assert!(engine.path_status.contains_key(&pid));
@@ -6652,10 +6712,11 @@ mod tests {
     #[test]
     fn detached_straggler_after_deregister_is_dropped() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
-        for &pool in &pool_ids {
-            engine.insert_dirty(pool);
-        }
-        engine.solve_dirty(100, &BlockMetadata::default());
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
         let pid = path_ids[0];
         let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
         let fresh_result = engine.results.get(&pid).unwrap().clone();
@@ -6785,10 +6846,13 @@ mod tests {
     #[test]
     fn adr021_detached_stragglers_stay_scoped_to_the_publish_verifier() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
-        for &pool in &pool_ids {
-            engine.insert_dirty(pool);
-        }
-        engine.solve_dirty(100, &BlockMetadata::default());
+        // LXDY4C: the solve consumes the delta's taken keys (all fixture
+        // pools are V2 hops in this fixture).
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
         let pid = path_ids[0];
         assert!(
             engine.results.contains_key(&pid),
@@ -6878,12 +6942,14 @@ mod tests {
         let (mut engine, pool_ids, path_ids) = detached_fixture(400);
         engine.set_detached_solving(true);
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
-        for &pool in &pool_ids {
-            engine.lock().insert_dirty(pool);
+        let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
+        for &p in &pool_ids {
+            delta.record_affected(HopType::V2, p);
         }
         let handle =
             crate::arb_engine::engine_handle::EngineHandle::new(std::sync::Arc::clone(&engine));
         let coordinator = SolveCoordinator::new(vec![std::sync::Arc::new(handle)]);
+        coordinator.set_delta(delta);
         let (verify_tx, _verify_rx) = tokio::sync::watch::channel(None);
         let owner = DispatchOwner::new(std::sync::Arc::new(coordinator), &Some(verify_tx));
         let meta = BlockMetadata::default();
@@ -7014,9 +7080,11 @@ mod tests {
                 &BlockMetadata::default(),
             );
             engine.rebuild_and_solve_affected(
-                &HashSet::from([hub_a, hub_b]),
-                &HashSet::new(),
-                &HashSet::new(),
+                &crate::arb_engine::test_oracle::affected_keys(
+                    &HashSet::from([hub_a, hub_b]),
+                    &HashSet::new(),
+                    &HashSet::new(),
+                ),
                 500,
                 &BlockMetadata::default(),
             );
@@ -7031,9 +7099,11 @@ mod tests {
                 &BlockMetadata::default(),
             );
             engine.rebuild_and_solve_affected(
-                &HashSet::from([hub_b]),
-                &HashSet::new(),
-                &HashSet::new(),
+                &crate::arb_engine::test_oracle::affected_keys(
+                    &HashSet::from([hub_b]),
+                    &HashSet::new(),
+                    &HashSet::new(),
+                ),
                 501,
                 &BlockMetadata::default(),
             );

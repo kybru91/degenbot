@@ -52,8 +52,9 @@ pub const INT128_MAX: U256 = match U256::from_str_radix("fffffffffffffffffffffff
 // Path types
 // ---------------------------------------------------------------------------
 
-/// Which engine owns a given hop.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Which engine owns a given hop. `Ord` is the discriminant order — used
+/// only for deterministic key sorting (`AffectedKey`, LXDY4C).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HopType {
     /// V2 constant-product hop
     V2,

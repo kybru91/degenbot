@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use crate::bot_core::snapshot_verify::SnapshotLoadError;
 use crate::bot_core::state_lock::StateLock;
+use crate::bot_core::EpochDelta;
 use crate::bot_core::{log_dispatcher, BotState};
 
 /// The per-chain orchestrator: a thin facade over a shared
@@ -45,6 +46,12 @@ pub struct Bot {
     /// [`dispatch_log`](Self::dispatch_log) per WS log; engine subscriber
     /// adapters attach via [`attach_engine`](Self::attach_engine).
     dispatcher: log_dispatcher::LogDispatcher,
+    /// The epoch's touched-pool ledger (epic MROOY7, task LXDY4C): every
+    /// successful log application records its touched `(HopType, pool_id)`
+    /// key here as a BYPRODUCT of [`dispatch_log`](Self::dispatch_log).
+    /// Shared with the drain seam (the coordinator consumes it at solve
+    /// time) so exactly ONE dirty-tracking mechanism exists.
+    delta: Arc<EpochDelta>,
     /// The construction-I/O handle (architecture review 2025-07-18 / candidate 1).
     /// `None` for a bare `Bot::new(chain_id)` (the test-fixture + standalone-
     /// Rust-no-I/O path). The Python `Bot.__init__` path attaches one via
@@ -74,6 +81,7 @@ impl Bot {
             chain_id,
             state: Arc::new(StateLock::new(BotState::new())),
             dispatcher: log_dispatcher::LogDispatcher::with_uniswap_decoders(),
+            delta: Arc::new(EpochDelta::new(0u64)),
             construction_io: parking_lot::RwLock::new(None),
         }
     }
@@ -95,6 +103,7 @@ impl Bot {
             chain_id: 0,
             state: core,
             dispatcher: log_dispatcher::LogDispatcher::with_uniswap_decoders(),
+            delta: Arc::new(EpochDelta::new(0u64)),
             construction_io: parking_lot::RwLock::new(None),
         }
     }
@@ -196,7 +205,8 @@ impl Bot {
     /// then notify subscribers. The pump (slice 5) calls this per log.
     #[hotpath::measure(impl_type = "Bot")]
     pub fn dispatch_log(&self, log: &alloy::rpc::types::Log) {
-        self.dispatcher.dispatch(log, &self.state);
+        self.dispatcher
+            .dispatch(log, &self.state, Some(&self.delta));
     }
 
     /// Decode `log` into a [`DecodedPoolEvent`] without applying (ADR-006 slice 7).
@@ -241,11 +251,23 @@ impl Bot {
         self.state.read().has_state_prior_to(pool_id, block)
     }
 
-    /// Notify every live subscriber of `pool_id` (ADR-006 slice 7).
+    /// The shared epoch-delta ledger: log application records touched
+    /// pools here (epic MROOY7, task LXDY4C); the wiring hands clones to
+    /// the drain seam so affected-path derivation reads this ledger.
+    #[must_use]
+    pub fn active_delta(&self) -> Arc<EpochDelta> {
+        Arc::clone(&self.delta)
+    }
+
+    /// Notify every live subscriber of `pool_id` (ADR-006 slice 7) and
+    /// record the touched pool into the epoch ledger (LXDY4C).
     /// `ReorgCoordinator` calls this after a per-pool restore — the same
-    /// notify path `dispatch_log` uses, so the engine dirties + re-solves at
-    /// the next drain tick with no distinct reorg path.
-    pub fn notify_pool_state_updated(&self, pool_id: u64) {
+    /// notify path `dispatch_log` uses, so the re-restored pool re-enters
+    /// the delta + re-solves at the next drain tick with no distinct reorg
+    /// path. `hop` is the restored event's family (the coordinator reads it
+    /// off the decoded log — no classification lookup).
+    pub fn notify_pool_state_changed(&self, pool_id: u64, hop: degenbot_solvers::mixed::HopType) {
+        self.delta.record_affected(hop, pool_id);
         self.dispatcher.notify(pool_id);
     }
 

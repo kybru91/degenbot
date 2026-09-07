@@ -59,14 +59,10 @@ impl EngineHandle {
     /// for the dispatcher's `Weak`) — see [`subscriber_weak`](Self::subscriber_weak).
     #[must_use]
     pub fn new(engine: Arc<parking_lot::Mutex<ArbitrageEngine>>) -> Self {
-        // RAYPAR engine-shard T3: pass the shared dirty sets + core to the
-        // subscriber so on_pool_state_updated never takes the engine lock.
-        let (dirty, core) = {
-            let guard = engine.lock();
-            (Arc::clone(&guard.dirty_sets), Arc::clone(guard.core()))
-        };
+        // LXDY4C: the subscriber is a liveness probe only — the epoch delta
+        // (Bot-owned, shared with the drain seam) carries the touched pools.
         let subscriber: Arc<dyn PoolStateSubscriber> =
-            Arc::new(EngineSubscriber::new(Arc::downgrade(&engine), dirty, core));
+            Arc::new(EngineSubscriber::new(Arc::downgrade(&engine)));
         Self { engine, subscriber }
     }
 
@@ -169,7 +165,12 @@ impl Engine for EngineHandle {
     /// OFF until epic SRQEK5 T3's soak flip); the historical in-cycle hold
     /// text above stays true for the default engine.
     #[hotpath::measure(label = "EngineHandle::solve_dirty")]
-    fn solve_dirty(&self, block: u64, metadata: &BlockMetadata) {
+    fn solve_dirty(
+        &self,
+        affected: &[degenbot_solvers::affected_keys::AffectedKey],
+        block: u64,
+        metadata: &BlockMetadata,
+    ) {
         // P5FEOI (epic 2LXPPV): the drain-path solve is one Jaeger node
         // (OTel tier-1). Entered for the whole lock-hold so sim/dispatch/
         // monitor spans fired inside inherit it, and it parents under
@@ -195,10 +196,10 @@ impl Engine for EngineHandle {
         let mut engine = hotpath::measure_block!("EngineHandle::solve_dirty.probe_lock", {
             self.engine.lock()
         });
-        if !engine.has_dirty_paths() {
+        if affected.is_empty() {
             // Kept for inner bookkeeping parity (last_processed_block et al);
             // provably cannot consume dirt under this continuous hold.
-            engine.solve_dirty(block, metadata);
+            engine.solve_dirty(block, metadata, affected);
             drop(engine);
             self.spawn_detached_sidecar_if_pending();
             return;
@@ -238,9 +239,9 @@ impl Engine for EngineHandle {
             // prior behavior (tests without a runtime).
             let hold_start = std::time::Instant::now();
             if is_multi_thread_runtime() {
-                tokio::task::block_in_place(|| engine.solve_dirty(block, metadata));
+                tokio::task::block_in_place(|| engine.solve_dirty(block, metadata, affected));
             } else {
-                engine.solve_dirty(block, metadata);
+                engine.solve_dirty(block, metadata, affected);
             }
             // KNEUQX: surface the cycle's anchored block on the span - the
             // SolveAnchor resolution is max(request block, pool-state head),
@@ -287,11 +288,6 @@ impl Engine for EngineHandle {
     #[hotpath::measure(label = "EngineHandle::send_result_batch")]
     fn send_result_batch(&self, metadata: &BlockMetadata) {
         self.engine.lock().send_result_batch(metadata);
-    }
-
-    #[hotpath::measure(label = "EngineHandle::has_dirty_paths")]
-    fn has_dirty_paths(&self) -> bool {
-        self.engine.lock().has_dirty_paths()
     }
 
     #[hotpath::measure(label = "EngineHandle::finalize_block")]
@@ -342,23 +338,27 @@ mod tests {
     /// must not panic.
     #[test]
     fn engine_handle_forwards_calls_without_panic() {
+        use degenbot_solvers::affected_keys::AffectedKey;
+        use degenbot_solvers::mixed::HopType;
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
         let handle = EngineHandle::new(engine);
         let metadata = BlockMetadata::default();
 
-        assert!(!handle.has_dirty_paths(), "fresh engine has no dirty paths");
         assert_eq!(
             handle.last_processed_block(),
             None,
             "fresh engine processed no block"
         );
 
-        handle.solve_dirty(1, &metadata);
+        // Empty affected set → the no-span bookkeeping path; a key set → the
+        // full cycle. Both must not panic (LXDY4C: keys are caller-supplied —
+        // the engine has no local dirty intake to probe).
+        handle.solve_dirty(&[], 1, &metadata);
         handle.send_result_batch(&metadata);
         handle.set_last_solved_block(0);
         handle.finalize_block(1, &metadata);
 
-        assert!(!handle.has_dirty_paths());
+        handle.solve_dirty(&[AffectedKey::new(HopType::V2, 0x0BAD_F00D)], 2, &metadata);
     }
 
     /// GREEN (fix for the hotpath-captured bug 2026-07-14): `subscriber_weak`

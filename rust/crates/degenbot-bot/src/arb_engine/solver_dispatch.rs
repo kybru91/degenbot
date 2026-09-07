@@ -1559,9 +1559,7 @@ impl ArbitrageEngine {
     #[expect(clippy::too_many_lines)] // telemetry events + solve pipeline are one narrative
     pub fn rebuild_and_solve_affected(
         &mut self,
-        v2_affected: &HashSet<u64>,
-        v3_affected: &HashSet<u64>,
-        v4_affected: &HashSet<u64>,
+        affected: &[degenbot_solvers::affected_keys::AffectedKey],
         block_number: u64,
         metadata: &BlockMetadata,
     ) {
@@ -1587,42 +1585,16 @@ impl ArbitrageEngine {
         // container empties (last faulty pool cleared). Unrelated co-hop dirt
         // leaves an Invalid path untouched — no 100k-path re-resolve churn.
         hotpath::measure_block!("arb_solve.dirty_status_scan", {
-            for pool_key in v2_affected {
-                if let Some(path_ids) = self.pool_to_paths.get(&(HopType::V2, *pool_key)) {
+            // LXDY4C: the affected keys ARE the delta's taken (HopType,
+            // pool_id) reverse-index keys — one loop, no per-family intake.
+            for key in affected {
+                if let Some(path_ids) = self.pool_to_paths.get(&key.path_index_key()) {
                     for &path_id in path_ids {
                         if self
                             .path_status
                             .entry(path_id)
                             .or_default()
-                            .on_pool_dirty((HopType::V2, *pool_key))
-                        {
-                            affected_path_ids.insert(path_id);
-                        }
-                    }
-                }
-            }
-            for pool_key in v3_affected {
-                if let Some(path_ids) = self.pool_to_paths.get(&(HopType::V3, *pool_key)) {
-                    for &path_id in path_ids {
-                        if self
-                            .path_status
-                            .entry(path_id)
-                            .or_default()
-                            .on_pool_dirty((HopType::V3, *pool_key))
-                        {
-                            affected_path_ids.insert(path_id);
-                        }
-                    }
-                }
-            }
-            for pool_key in v4_affected {
-                if let Some(path_ids) = self.pool_to_paths.get(&(HopType::V4, *pool_key)) {
-                    for &path_id in path_ids {
-                        if self
-                            .path_status
-                            .entry(path_id)
-                            .or_default()
-                            .on_pool_dirty((HopType::V4, *pool_key))
+                            .on_pool_dirty(key.path_index_key())
                         {
                             affected_path_ids.insert(path_id);
                         }
@@ -1696,9 +1668,7 @@ impl ArbitrageEngine {
                         block_number = solve_block,
                         path.id = path_id,
                         path.hops = %self.describe_path_cached(path_id),
-                        dirty.v2 = v2_affected.len(),
-                        dirty.v3 = v3_affected.len(),
-                        dirty.v4 = v4_affected.len(),
+                        dirty.keys = affected.len(),
                         "[path] activated by dirty pool"
                     );
                 }
@@ -1712,9 +1682,7 @@ impl ArbitrageEngine {
             target: "degenbot::solver",
             block_number = solve_block,
             paths.affected = affected_path_ids.len(),
-            dirty.v2 = v2_affected.len(),
-            dirty.v3 = v3_affected.len(),
-            dirty.v4 = v4_affected.len(),
+            dirty.keys = affected.len(),
             phase_us = fanout_us,
             "[solve-phase] fanned out to affected paths"
         );

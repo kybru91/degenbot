@@ -30,17 +30,20 @@ use degenbot_solvers::mixed::MixedPoolRef;
 /// plus `PoolStateSubscriber`) plus this drain-point fan-out. The trait is
 /// `Send + Sync` so `Arc<dyn Engine>` can cross the pump's tokio task.
 pub trait Engine: Send + Sync {
-    /// Solve every dirty path at `block` (the eager drain tick). Each engine
-    /// owns its own dirty-set (seeded by `PoolStateSubscriber` notifications
-    /// from `LogDispatcher`), so the coordinator does no dirty collection.
-    fn solve_dirty(&self, block: u64, metadata: &BlockMetadata);
+    /// Solve the affected paths at `block`. The affected keys come from the
+    /// block's `EpochDelta` (log-application byproduct, consumed by the
+    /// `SolveCoordinator` fan-out) — no engine-local dirty intake exists
+    /// since the LXDY4C cutover.
+    fn solve_dirty(
+        &self,
+        affected: &[degenbot_solvers::affected_keys::AffectedKey],
+        block: u64,
+        metadata: &BlockMetadata,
+    );
 
     /// Flush a debounced result batch to Python (the `DEBOUNCE_MS`
     /// send-debounce, owned by the pump — unchanged).
     fn send_result_batch(&self, metadata: &BlockMetadata);
-
-    /// Are there unsolved dirty pool keys accumulated since the last drain?
-    fn has_dirty_paths(&self) -> bool;
 
     /// Solve + advance at a genuine block boundary: solve any dirty paths
     /// carried over from the previous block, emit a block-boundary batch.
