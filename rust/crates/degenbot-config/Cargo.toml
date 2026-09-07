@@ -1,0 +1,21 @@
+[package]
+name = "degenbot-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Typed BotConfig schema + 12-factor loader (file + env parity) for degenbot"
+
+[dependencies]
+# TOML parsing for the --config file surface. `toml` v1 is already in the
+# workspace lock (degenbot-python uses the same release line).
+toml = "1.1.5"
+
+[dev-dependencies]
+# None: tests are std-only (the inventory sweep shells out to `rg` when
+# present and falls back to a committed snapshot otherwise).
+
+[lints]
+workspace = true

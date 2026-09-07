@@ -1,0 +1,117 @@
+//! Acceptance criterion: the loader's schema covers the FULL `DEGENBOT_*`
+//! key inventory. This test diffs the raw inventory sweep (`rg -o
+//! "DEGENBOT_[A-Z_]+" rust/crates --no-filename | sort -u`) against the
+//! schema's env names, with the documented artifact/expansion set below.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
+
+use degenbot_config::SCHEMA;
+
+/// Raw regex matches that are NOT real static keys:
+/// - `DEGENBOT_JAEGER_E` — the sweep regex stops at the digit of `DEGENBOT_JAEGER_E2E`.
+/// - `DEGENBOT_V` — the regex stops at the `3` of `DEGENBOT_V3_FIXTURE_*`.
+/// - `DEGENBOT_RPC_WS_CHAINID_` — trailing `_` of the DYNAMIC per-chain var
+///   `DEGENBOT_RPC_WS_CHAINID_<chain_id>` (documented next to `SCHEMA`).
+const SWEEP_ARTIFACTS: &[&str] = &[
+    "DEGENBOT_JAEGER_E",
+    "DEGENBOT_RPC_WS_CHAINID_",
+    "DEGENBOT_V",
+];
+
+/// Real static keys the artifact regex cannot capture (digit-terminated
+/// matches expand to these full names).
+const SWEEP_EXPANSIONS: &[&str] = &[
+    "DEGENBOT_JAEGER_E2E",
+    "DEGENBOT_V3_FIXTURE_RPC",
+    "DEGENBOT_V3_FIXTURE_BLOCK",
+];
+
+/// Committed snapshot of the sweep, used verbatim when `rg` is not installed
+/// (standalone-consumer checkouts). Refresh in-repo with:
+/// `rg -o 'DEGENBOT_[A-Z_]+' rust/crates --no-filename −g '!**/degenbot_env_inventory.txt' | sort -u > <snapshot>`
+const SNAPSHOT: &str = include_str!("degenbot_env_inventory.txt");
+
+fn repo_root() -> &'static Path {
+    let Some(root) = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3) else {
+        unreachable!("repo root is three levels above the crate manifest dir");
+    };
+    root
+}
+
+/// Prefer the live sweep; fall back to the committed snapshot.
+fn inventory() -> Vec<String> {
+    let live = Command::new("rg")
+        .args([
+            "-o",
+            "DEGENBOT_[A-Z_]+",
+            "rust/crates",
+            "--no-filename",
+            "-g",
+            "!**/degenbot_env_inventory.txt",
+            "-g",
+            "!**/degenbot-config/tests/**",
+        ])
+        .current_dir(repo_root())
+        .output();
+    match live {
+        Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+        // `rg` unavailable or produced nothing: use the committed snapshot.
+        _ => SNAPSHOT.lines().map(str::to_string).collect(),
+    }
+}
+
+#[test]
+fn schema_covers_the_full_key_inventory() {
+    let sweep: BTreeSet<String> = inventory().into_iter().collect();
+    assert!(!sweep.is_empty(), "inventory sweep produced no keys");
+
+    let mut expected: BTreeSet<String> = sweep
+        .iter()
+        .filter(|k| !SWEEP_ARTIFACTS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for expansion in SWEEP_EXPANSIONS {
+        // Only expand when the artifact that produced it was actually
+        // observed (keeps the snapshot fallback consistent).
+        if SWEEP_ARTIFACTS.iter().any(|a| sweep.contains(*a)) || sweep.contains(*expansion) {
+            let _ = expected.insert((*expansion).to_string());
+        }
+    }
+
+    let actual: BTreeSet<String> = SCHEMA.iter().map(|k| k.env.to_string()).collect();
+
+    let unknown: Vec<_> = actual.difference(&expected).collect();
+    let uncovered: Vec<_> = expected.difference(&actual).collect();
+    assert!(
+        unknown.is_empty() && uncovered.is_empty(),
+        "schema/inventory mismatch\n  schema keys not in inventory: {unknown:?}\n  inventory keys not in schema: {uncovered:?}"
+    );
+}
+
+#[test]
+fn snapshot_fallback_agrees_with_schema() {
+    // The committed snapshot must itself satisfy the parity contract — this
+    // is the standalone-consumer path (no `rg` in the build environment).
+    let sweep: BTreeSet<String> = SNAPSHOT.lines().map(str::to_string).collect();
+    assert!(
+        !sweep.iter().any(|k| k.contains("REGEN_DOCS")),
+        "snapshot is self-contaminated; regenerate it with the exclusion glob"
+    );
+    let mut expected: BTreeSet<String> = sweep
+        .iter()
+        .filter(|k| !SWEEP_ARTIFACTS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for expansion in SWEEP_EXPANSIONS {
+        let _ = expected.insert((*expansion).to_string());
+    }
+    let actual: BTreeSet<String> = SCHEMA.iter().map(|k| k.env.to_string()).collect();
+    assert_eq!(actual, expected);
+}

@@ -2196,6 +2196,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "degenbot-config"
+version = "0.6.0-alpha.8"
+dependencies = [
+ "toml",
+]
+
+[[package]]
 name = "degenbot-core"
 version = "0.6.0-alpha.8"
 dependencies = [
