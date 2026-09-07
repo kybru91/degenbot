@@ -5327,6 +5327,7 @@ mod tests {
     /// parenting, so there is no code path that does work without either.
     #[test]
     #[expect(clippy::expect_used)]
+    #[expect(clippy::too_many_lines)]
     fn solve_dirty_race_marks_dirty_work_with_solve_span() {
         use crate::arb_engine::engine_handle::EngineHandle;
         use crate::bot_core::engine::Engine;
@@ -5377,6 +5378,20 @@ mod tests {
             pool_ids.push(a);
         }
         let engine = Arc::new(parking_lot::Mutex::new(engine));
+
+        // Seed every path dirty up front: the fanout assertions below need
+        // at least one solve cycle, and the marker thread's 50us cadence is
+        // best-effort — a slow CI runner can starve it for the whole 200
+        // solve loop, leaving the engine clean and the fixture vacuous (CI
+        // panic: "fixture must produce phase spans"). Pre-seeding makes the
+        // first solve deterministically dirty while the marker thread
+        // continues to exercise the probe<->take race window.
+        {
+            let e = engine.lock();
+            for pid in &pool_ids {
+                e.dirty_sets.insert(*pid, HopType::V2);
+            }
+        }
 
         // Marker thread: continuously re-marks a tracked V2 pool dirty -
         // under the old gate these landings are exactly the probe<->take
