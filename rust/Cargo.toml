@@ -74,6 +74,7 @@ degenbot-abi = { version = "0.6.0-alpha.8", path = "crates/degenbot-abi" }
 degenbot-arbitrage = { version = "0.6.0-alpha.8", path = "crates/degenbot-arbitrage" }
 degenbot-bot = { version = "0.6.0-alpha.8", path = "crates/degenbot-bot" }
 degenbot-core = { version = "0.6.0-alpha.8", path = "crates/degenbot-core" }
+degenbot-config = { version = "0.6.0-alpha.8", path = "crates/degenbot-config" }
 degenbot-db = { version = "0.6.0-alpha.8", path = "crates/degenbot-db" }
 degenbot-decoders = { version = "0.6.0-alpha.8", path = "crates/degenbot-decoders" }
 degenbot-execution = { version = "0.6.0-alpha.8", path = "crates/degenbot-execution" }
@@ -107,6 +108,7 @@ members = [
     "crates/degenbot-aave",
     "crates/degenbot-abi",
     "crates/degenbot-bot",
+    "crates/degenbot-config",
     "crates/degenbot-core",
     "crates/degenbot-db",
     "crates/degenbot-decoders",

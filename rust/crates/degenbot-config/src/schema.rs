@@ -1,0 +1,368 @@
+//! The typed `BotConfig` schema — THE declaration site.
+//!
+//! [`SCHEMA`]'s `config_schema!` invocation declares every configuration key
+//! exactly once. Each line yields: the typed field on the generated section
+//! struct, the `DEGENBOT_*` env name, the dotted TOML path, the typed
+//! default, and the generated key-reference doc entry (see `doc`).
+//!
+//! # TOML / env raw-value conventions
+//!
+//! - `bool`: a flag word (`1`/`true`/`yes`/`on`/`y` vs empty/`0`/`false`/
+//!   `off`/`no`/`n`); `bool_not` inverts the parse (for vars whose `0`
+//!   historically ENABLED a legacy behavior).
+//! - `ms`: a decimal count of milliseconds (validated `> 0` at the call
+//!   sites historically; the schema states the default).
+//! - `u128` (wei) is a decimal integer in env; in TOML quote it as a string
+//!   (TOML integers are i64, wei values exceed that).
+//! - `path`: literal path text; defaults containing `{pid}` are expanded by
+//!   the reader at use time.
+//! - `string`: raw text.
+
+use std::fmt;
+
+/// The scalar base kind of a declared key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseKind {
+    /// Boolean flag (truthy/falsey word lists; see `parse_bool_flag`).
+    Bool,
+    /// Inverted boolean (legacy `=0`-enables keys).
+    BoolInverted,
+    /// Milliseconds duration (decimal `u64`).
+    Ms,
+    /// Free-form text.
+    Str,
+    /// Filesystem path.
+    Path,
+    /// Unsigned machine-word size (counts, caps, worker numbers).
+    Usize,
+    /// Unsigned 64-bit integer.
+    U64,
+    /// Signed 64-bit integer.
+    I64,
+    /// Signed 32-bit integer.
+    I32,
+    /// Decimal integer rendered as text (TOML: quoted) — wei amounts.
+    U128,
+    /// Floating point.
+    F64,
+    /// Small closed variant set (generated enum type).
+    Enum(&'static str, &'static [&'static str]),
+}
+
+impl fmt::Display for BaseKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bool => f.write_str("bool"),
+            Self::BoolInverted => f.write_str("bool (inverted: `0` enables)"),
+            Self::Ms => f.write_str("duration-ms (u64)"),
+            Self::Str => f.write_str("string"),
+            Self::Path => f.write_str("path"),
+            Self::Usize => f.write_str("usize"),
+            Self::U64 => f.write_str("u64"),
+            Self::I64 => f.write_str("i64"),
+            Self::I32 => f.write_str("i32"),
+            Self::U128 => f.write_str("u128 (decimal text)"),
+            Self::F64 => f.write_str("f64"),
+            Self::Enum(name, variants) => write!(f, "{name}({})", variants.join("|")),
+        }
+    }
+}
+
+/// Kind of a declared key: base scalar kind + whether the typed field is
+/// `Option<_>` (unset-able).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueKind {
+    /// Scalar base kind.
+    pub base: BaseKind,
+    /// `true` when the typed field is `Option<_>` and unset by default.
+    pub optional: bool,
+}
+
+impl fmt::Display for ValueKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.optional {
+            write!(f, "Option<{}>", self.base)
+        } else {
+            write!(f, "{}", self.base)
+        }
+    }
+}
+
+/// One declared configuration key: the machine-checkable registry entry
+/// produced by the single declaration in [`SCHEMA`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct KeyDecl {
+    /// Section path segment (TOML table name).
+    pub section: &'static str,
+    /// Field name within the section (TOML leaf key, `snake_case`).
+    pub field: &'static str,
+    /// `DEGENBOT_*` environment variable name (operator continuity).
+    pub env: &'static str,
+    /// Dotted TOML path (`section.field`).
+    pub toml_path: &'static str,
+    /// Declared kind (drives typed parsing).
+    pub kind: ValueKind,
+    /// Default rendered for docs (matches `Default` impl).
+    pub default_repr: &'static str,
+    /// Operator-facing description.
+    pub description: &'static str,
+}
+
+impl KeyDecl {
+    /// Fully qualified key label used in error messages.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("{} ({} / {})", self.toml_path, self.env, self.kind)
+    }
+}
+
+// ⚠ ONE DECLARATION SITE PER KEY BELOW. Do NOT add parallel env/TOML const
+// lists anywhere in the workspace; extend this list and regenerate the doc
+// (`REGEN_CONFIG_DOCS=1 cargo test -p degenbot-config`).
+//
+// Ordering is stable (defines doc + SCHEMA iteration order).
+
+crate::config_schema! {
+
+    telemetry TelemetryConfig {
+        otel [bool] = true, env = "DEGENBOT_OTEL", def = "true",
+            doc = "Enable the OTel OTLP span layer and the Prometheus metrics endpoint; `0`/empty opts out.";
+        metrics_addr [string] = String::from("127.0.0.1:9464"), env = "DEGENBOT_METRICS_ADDR", def = "127.0.0.1:9464",
+            doc = "Prometheus scrape endpoint bind address (only active when otel is on).";
+        jaeger_endpoint [string] = String::from("http://127.0.0.1:4318"), env = "DEGENBOT_JAEGER_ENDPOINT", def = "http://127.0.0.1:4318",
+            doc = "OTLP endpoint used by the opt-in Jaeger E2E test.";
+        jaeger_e2e [bool] = false, env = "DEGENBOT_JAEGER_E2E", def = "false",
+            doc = "Gate for the network-accessible Jaeger E2E test (Jaeger must be reachable at jaeger_endpoint).";
+    }
+
+    allocator AllocatorConfig {
+        mimalloc_purge_delay_ms [opt i64] = None, env = "DEGENBOT_MIMALLOC_PURGE_DELAY_MS", def = "(unset)",
+            doc = "Fixed mimalloc purge delay in ms overriding cadence discovery entirely (clamped 1_000..=600_000).";
+        mimalloc_auto_purge [bool] = true, env = "DEGENBOT_MIMALLOC_AUTO_PURGE", def = "true",
+            doc = "Whether mimalloc cadence discovery may re-apply the purge option; `0` disables.";
+        mimalloc_purge_delay_mult [f64] = 2.0, env = "DEGENBOT_MIMALLOC_PURGE_DELAY_MULT", def = "2.0",
+            doc = "Purge-delay multiplier over the mean block interval (clamped 1.0..=20.0).";
+        mimalloc_purge_decommits [bool] = false, env = "DEGENBOT_MIMALLOC_PURGE_DECOMMITS", def = "false",
+            doc = "Purge with MADV_DONTNEED instead of MADV_FREE (`1`/`true` enables aggressive decommit).";
+    }
+
+    state_lock StateLockConfig {
+        trace [bool] = false, env = "DEGENBOT_LOCK_TRACE", def = "false",
+            doc = "Capture full backtraces at lock acquire (diagnostics).";
+        warn_ms [ms] = 500, env = "DEGENBOT_LOCK_WARN_MS", def = "500",
+            doc = "Warn threshold (ms) for read-hold age and write-acquire block (clamped >= 1).";
+        diag [bool] = false, env = "DEGENBOT_STATE_LOCK_DIAG", def = "false",
+            doc = "Enable hold-tracking diagnostics for soak/incident forensics.";
+        thread_registry_path [path] = std::path::PathBuf::from("/tmp/degenbot-thread-registry-{pid}.json"), env = "DEGENBOT_THREAD_REGISTRY_PATH", def = "/tmp/degenbot-thread-registry-{pid}.json",
+            doc = "Watchdog thread-registry dump path; `{pid}` is substituted with the process id at use.";
+    }
+
+    pump PumpConfig {
+        delivery_lag_trip_blocks [opt u64] = None, env = "DEGENBOT_DELIVERY_LAG_TRIP_BLOCKS", def = "(unset)",
+            doc = "Delivery-lag trip threshold in blocks (`> 0`; unset = report-only, no abort trip).";
+        desync_dump_dir [path] = std::path::PathBuf::from("logs/desync"), env = "DEGENBOT_DESYNC_DUMP_DIR", def = "logs/desync",
+            doc = "Root directory for desync repro dumps (overridden for test isolation).";
+        pump_debounce_ms [ms] = 50, env = "DEGENBOT_PUMP_DEBOUNCE_MS", def = "50",
+            doc = "Publish-debounce settle window in ms (`> 0`; bad values historically fall back to 50 at the site).";
+        early_slice_ms [ms] = 25, env = "DEGENBOT_EARLY_SLICE_MS", def = "25",
+            doc = "Early-slice window in ms; `0` valid and disables the slice (settle-only parity).";
+        streaming_delivery [bool] = true, env = "DEGENBOT_STREAMING_DELIVERY", def = "true",
+            doc = "Stream solved arms immediately (T3 default); `0` opts out to the debounce sweep.";
+        ws_completeness [bool] = true, env = "DEGENBOT_WS_COMPLETENESS", def = "true",
+            doc = "WS completeness gating (newHeads + logs double-delivery check); `0` disables.";
+    }
+
+    trace TraceConfig {
+        dispatch [bool] = false, env = "DEGENBOT_TRACE_DISPATCH", def = "false",
+            doc = "Trace pump dispatch fan-out (presence historically enabled; loader parses a bool).";
+        drain_dbg [opt string] = None, env = "DEGENBOT_DRAIN_DBG", def = "(unset)",
+            doc = "Per-pool drain/pump debug trace for the given pool hex address (no 0x or with).";
+        dump_call_trace [bool] = true, env = "DEGENBOT_DUMP_CALL_TRACE", def = "true",
+            doc = "Dump simulator call traces (default ON; `0` disables).";
+        dump_tick_maps [bool] = false, env = "DEGENBOT_DUMP_TICK_MAPS", def = "false",
+            doc = "Dump assembled tick maps for offline comparison (UO3JM4 re-assembly aid).";
+        trace_liquidity [bool] = false, env = "DEGENBOT_TRACE_LIQUIDITY", def = "false",
+            doc = "Global liquidity-events trace for EVERY V3/V4 liquidity mutation across all pools.";
+        trace_register_seed [bool] = false, env = "DEGENBOT_TRACE_REGISTER_SEED", def = "false",
+            doc = "Trace pool registration seeding progress.";
+        trace_solve_anchor [bool] = false, env = "DEGENBOT_TRACE_SOLVE_ANCHOR", def = "false",
+            doc = "Strict per-hop solve-anchor probe (operator opt-in).";
+        trace_staged_clock [bool] = false, env = "DEGENBOT_TRACE_STAGED_CLOCK", def = "false",
+            doc = "Staged-clock probe in the strict verifier (operator opt-in).";
+        trace_tick [opt i32] = None, env = "DEGENBOT_TRACE_TICK", def = "(unset)",
+            doc = "Watch one known-divergent tick (signed decimal) across mutations in the pin/drain probes.";
+        ws_trace [bool] = false, env = "DEGENBOT_WS_TRACE", def = "false",
+            doc = "Catch-all WS-log trace (one line per relevant log; high volume by design).";
+        gate_trace [bool] = false, env = "DEGENBOT_GATE_TRACE", def = "false",
+        doc = "T5 profit-envelope compose tracing gate (profit_envelope TRACE).";
+        hotpath [bool] = false, env = "DEGENBOT_HOTPATH", def = "false",
+            doc = "Construct the hotpath profiling guard (default OFF; build must enable the profiling feature too).";
+    }
+
+    solve SolveConfig {
+        solve_cpus [opt usize] = None, env = "DEGENBOT_SOLVE_CPUS", def = "(unset)",
+            doc = "Override the detected solve CPU budget (worker bin count).";
+        solve_headroom [opt usize] = None, env = "DEGENBOT_SOLVE_HEADROOM", def = "(unset)",
+            doc = "Override the I/O headroom carved out of the CPU budget before solve bins.";
+        executor [enum SolveExecutor Tokio Rayon] = SolveExecutor::Tokio, env = "DEGENBOT_SOLVE_EXECUTOR", def = "tokio",
+            doc = "Solve fan-out executor: tokio (low-priority dedicated runtime, production default) or rayon.";
+        solve_inline_sim [bool] = true, env = "DEGENBOT_SOLVE_INLINE_SIM", def = "true",
+            doc = "Inline-sim stance (T2 worker-side clamp path); `0`/`false` disables.";
+        solve_resolve_par [bool] = true, env = "DEGENBOT_SOLVE_RESOLVE_PAR", def = "true",
+            doc = "Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables.";
+        solve_sim_inflight [opt usize] = None, env = "DEGENBOT_SOLVE_SIM_INFLIGHT", def = "(unset; derived from CPU budget)",
+            doc = "Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation.";
+        inline_sim_workers [opt usize] = None, env = "DEGENBOT_INLINE_SIM_WORKERS", def = "(unset; derived from CPU budget)",
+            doc = "Inline-sim worker count (clamped 1..=32; unparsable falls back to derived default at the site).";
+        detached_solves [bool] = false, env = "DEGENBOT_DETACHED_SOLVES", def = "false",
+            doc = "Route solve arms through detached (out-of-cycle) workers (`1` enables).";
+        min_profit_wei [u128] = 0, env = "DEGENBOT_MIN_PROFIT_WEI", def = "0",
+            doc = "Minimum path profit floor in wei (decimal text; TOML: quoted string).";
+        walk_event_solver_legacy [bool_not] = false, env = "DEGENBOT_WALK_EVENT_SOLVER", def = "false",
+            doc = "Legacy event-solver path is enabled by `DEGENBOT_WALK_EVENT_SOLVER=0` (inverted flag).";
+        walk_event_census [bool] = false, env = "DEGENBOT_WALK_EVENT_CENSUS", def = "false",
+            doc = "Loop-15 nested event census counters in the CL walker (`1` enables).";
+        walk_anchor_sweep [enum AnchorSweep Off CenterOnly Full] = AnchorSweep::Full, env = "DEGENBOT_WALK_ANCHOR_SWEEP", def = "full",
+            doc = "Walk anchor-sweep posture: `off` (0), `center-only` (2), or `full` (default/anything else).";
+        envelope_max_tangent_lines [usize] = 32, env = "DEGENBOT_ENVELOPE_MAX_TANGENT_LINES", def = "32",
+            doc = "Profit-envelope max tangent lines cap.";
+        envelope_sampled_compose_lines [usize] = 48, env = "DEGENBOT_ENVELOPE_SAMPLED_COMPOSE_LINES", def = "48",
+            doc = "Profit-envelope sampled-compose lines cap.";
+        solver_walk_memo [bool] = false, env = "DEGENBOT_SOLVER_WALK_MEMO", def = "false",
+            doc = "CL-solver walk memo (result caching) (`1` enables).";
+        solver_walk_memo_stats [bool] = false, env = "DEGENBOT_SOLVER_WALK_MEMO_STATS", def = "false",
+            doc = "Walk-memo recomposition census (`1` enables).";
+        cl_projection_cache [bool] = true, env = "DEGENBOT_CL_PROJECTION_CACHE", def = "true",
+            doc = "CL projection memo cache; `0`/`off`/`false`/`disabled` disables.";
+        lpt_partition [bool] = true, env = "DEGENBOT_LPT_PARTITION", def = "true",
+            doc = "K-slowest-path LPT partitioning of solve bins; `0`/`false`/`off` disables.";
+    }
+
+    capture CaptureConfig {
+        gate_capture [bool] = false, env = "DEGENBOT_GATE_CAPTURE", def = "false",
+            doc = "Gate degenerate-path capture (presence gates; loader parses a bool).";
+        gate_capture_out [path] = std::path::PathBuf::from("/tmp/gate_degenerate.jsonl"), env = "DEGENBOT_GATE_CAPTURE_OUT", def = "/tmp/gate_degenerate.jsonl",
+            doc = "Gate-capture output JSONL path.";
+        gate_capture_cap [usize] = 50, env = "DEGENBOT_GATE_CAPTURE_CAP", def = "50",
+            doc = "Max paths captured per gate-capture run.";
+        solver_capture [bool] = false, env = "DEGENBOT_SOLVER_CAPTURE", def = "false",
+            doc = "Heavy CL-path solve capture (presence gates; loader parses a bool).";
+        solver_capture_cap [usize] = 16, env = "DEGENBOT_SOLVER_CAPTURE_CAP", def = "16",
+            doc = "Max captures per run (deduped by path id).";
+        solver_capture_min_sims [u64] = 2000, env = "DEGENBOT_SOLVER_CAPTURE_MIN_SIMS", def = "2000",
+            doc = "Capture only paths with at least this many walk sims.";
+        solver_capture_min_us [u64] = 50000, env = "DEGENBOT_SOLVER_CAPTURE_MIN_US", def = "50000",
+            doc = "Capture only paths whose solve time is at least this many microseconds.";
+        solver_capture_out [opt path] = None, env = "DEGENBOT_SOLVER_CAPTURE_OUT", def = "(unset; site picks a working-file default)",
+            doc = "Solver-capture output JSONL path (site-specific fallback).";
+        swap_capture_probe [bool] = false, env = "DEGENBOT_SWAP_CAPTURE_PROBE", def = "false",
+            doc = "Swap-capture correctness example gate (`1` enables).";
+    }
+
+    verify VerifyConfig {
+        verify_dbg [bool] = true, env = "DEGENBOT_VERIFY_DBG", def = "true",
+            doc = "Structural visibility probes diagnosing liquidity-map verification misses (default ON; `0` disables).";
+        verify_spotcheck_permyriad [u64] = 0, env = "DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD", def = "0",
+            doc = "Per-myriad (1/10_000) sampling rate for verify spot-checks (0 = off).";
+        assert_solver_state [bool] = false, env = "DEGENBOT_ASSERT_SOLVER_STATE", def = "false",
+            doc = "Strict per-hop verifier tripwire (operator opt-in; heavy).";
+        solver_divergence_scan [bool] = false, env = "DEGENBOT_SOLVER_DIVERGENCE_SCAN", def = "false",
+            doc = "Strict-gate divergence scan companion (operator opt-in).";
+        solver_staleness_blocks [opt u64] = None, env = "DEGENBOT_SOLVER_STALENESS_BLOCKS", def = "(unset; default 3)",
+            doc = "CL staleness threshold in blocks (dry-run MTBF knob); unset = 3 (MAX_CL_STALENESS_BLOCKS).";
+    }
+
+    simulation SimulationConfig {
+        sim_divergence_log [bool] = false, env = "DEGENBOT_SIM_DIVERGENCE_LOG", def = "false",
+            doc = "Log engine-vs-RPC divergence probes on failed sims (`1` enables).";
+        sim_execute_gas [opt u64] = None, env = "DEGENBOT_SIM_EXECUTE_GAS", def = "(unset; EIP-7825 TX_GAS_LIMIT_CAP)",
+            doc = "Override the execute() gas limit (decimal u64; garbage/0 falls back at the site while migrating).";
+        sim_exit_on_fail [bool] = false, env = "DEGENBOT_SIM_EXIT_ON_FAIL", def = "false",
+            doc = "Abort the process when a sim fails (the live trap used to capture V3-hop fixtures).";
+        sim_log_reverted_swaps [bool] = true, env = "DEGENBOT_SIM_LOG_REVERTED_SWAPS", def = "true",
+            doc = "Log reverted-swap pools during sims (default ON; `0` disables).";
+        sim_serve_engine_state [bool] = false, env = "DEGENBOT_SIM_SERVE_ENGINE_STATE", def = "false",
+            doc = "Serve engine state to the sim/evm layer (`1` enables; behavior change, default off).";
+        probe_fixture [opt path] = None, env = "DEGENBOT_PROBE_FIXTURE", def = "(unset)",
+            doc = "Corpus fixture for the offline executor A/B probe (ignore-listed test).";
+        probe_ns [string] = String::from("1,2,4,8,16"), env = "DEGENBOT_PROBE_NS", def = "1,2,4,8,16",
+            doc = "Comma-separated thread-count arms for the offline executor A/B probe.";
+        probe_passes [usize] = 3, env = "DEGENBOT_PROBE_PASSES", def = "3",
+            doc = "Passes per arm for the offline executor A/B probe.";
+    }
+
+    aave AaveConfig {
+        aave_evtrace [bool] = false, env = "DEGENBOT_AAVE_EVTRACE", def = "false",
+            doc = "Trace Aave transaction-processor events (`1` enables).";
+        aave_tx_trace [bool] = false, env = "DEGENBOT_AAVE_TX_TRACE", def = "false",
+            doc = "Trace Aave updater transaction application (`1` enables).";
+        bridge_probe [bool] = false, env = "DEGENBOT_BRIDGE_PROBE", def = "false",
+            doc = "In-tree bridge-probe observation surface in the arbitrage simulator (presence gates).";
+    }
+
+    offline OfflineConfig {
+        clcap_rpc [opt string] = None, env = "DEGENBOT_CLCAP_RPC", def = "(unset; required by the capture examples)",
+            doc = "RPC URL for the offline CL capture/boundary-scan examples (network-gated).";
+        clcap_block [opt u64] = None, env = "DEGENBOT_CLCAP_BLOCK", def = "(unset)",
+            doc = "Pinned block for the CL capture generator.";
+        clcap_max_fetches [usize] = 320, env = "DEGENBOT_CLCAP_MAX_FETCHES", def = "320",
+            doc = "Max active-set fetches backfilled by the CL capture generator.";
+        clcap_path_cap [usize] = 12, env = "DEGENBOT_CLCAP_PATH_CAP", def = "12",
+            doc = "Per-block path cap for the CL capture generator.";
+        scan_block [opt u64] = None, env = "DEGENBOT_SCAN_BLOCK", def = "(unset)",
+            doc = "Block for the CL boundary-scan examples.";
+        fixture_db [opt path] = None, env = "DEGENBOT_FIXTURE_DB", def = "(unset)",
+            doc = "Database path for the standalone-consumer fixture example.";
+        v3_fixture_rpc [opt string] = None, env = "DEGENBOT_V3_FIXTURE_RPC", def = "(unset)",
+            doc = "Network-gated V3 IIA fixture reproduction RPC endpoint (test-only).";
+        v3_fixture_block [opt u64] = None, env = "DEGENBOT_V3_FIXTURE_BLOCK", def = "(unset)",
+            doc = "Network-gated V3 IIA fixture reproduction block (test-only).";
+    }
+
+    test_hooks TestHookConfig {
+        alloc_track [bool] = false, env = "DEGENBOT_ALLOC_TRACK", def = "false",
+            doc = "Allocation-tracking gate for the math/pools bench suites (`1` enables).";
+        desync_test_stance [string] = String::new(), env = "DEGENBOT_DESYNC_TEST_STANCE", def = "(empty)",
+            doc = "Block-pump desync hatch stance hash (test-only scaffolding).";
+        self_abort_test [bool] = false, env = "DEGENBOT_SELF_ABORT_TEST", def = "false",
+            doc = "Block-pump self-abort hatch (presence gates in tests).";
+        no_progress_abort_test [bool] = false, env = "DEGENBOT_NO_PROGRESS_ABORT_TEST", def = "false",
+            doc = "No-progress abort hatch gate (test scaffolding; `1` enables).";
+        unused_test_flag [bool] = true, env = "DEGENBOT_UNUSED_TEST_FLAG", def = "true",
+            doc = "Default-ON flag-parse probe (asserted by the bot-core unit tests).";
+    }
+
+}
+
+// Dynamic per-chain vars (documented, intentionally NOT static schema keys):
+//   DEGENBOT_RPC_WS_CHAINID_<chain_id> — per-chain WS RPC override, the
+//   suffix is the numeric chain id (see block_pump chain-id plumbing).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_paths_are_wellformed_and_unique() {
+        let mut seen_toml = std::collections::BTreeSet::new();
+        let mut seen_env = std::collections::BTreeSet::new();
+        for k in SCHEMA {
+            assert!(!k.section.is_empty() && !k.field.is_empty());
+            assert!(
+                k.env.starts_with("DEGENBOT_"),
+                "env must be DEGENBOT_-prefixed"
+            );
+            assert!(
+                seen_toml.insert(k.toml_path),
+                "duplicate toml path {}",
+                k.toml_path
+            );
+            assert!(seen_env.insert(k.env), "duplicate env name {}", k.env);
+            assert!(
+                !k.description.is_empty(),
+                "missing description for {}",
+                k.toml_path
+            );
+        }
+    }
+}
