@@ -219,7 +219,10 @@ fn main() {
         let mut path_pieces: Vec<(Vec<usize>, U256)> = Vec::new();
         for _ in 0..iters {
             let t0 = std::time::Instant::now();
-            let out = degenbot_solvers::mobius_v3_int::solve_cl_derived(refs.as_slice());
+            let out = degenbot_solvers::mobius_v3_int::solve_cl_derived(
+                refs.as_slice(),
+                &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+            );
             times.push(t0.elapsed().as_micros());
             last_stats = Some(out.stats);
             path_pieces = out.census_pieces;

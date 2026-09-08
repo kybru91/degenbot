@@ -125,7 +125,12 @@ fn assert_dominates(seq: &IntV3TickRangeSequence) {
     let view = [Some(HopMath::cl_derived(seq))];
     for &x in &SWEEP {
         let x = U256::from(x);
-        let bound = path_output_bound_at(&view, &x).expect("derives");
+        let bound = path_output_bound_at(
+            &view,
+            &x,
+            &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+        )
+        .expect("derives");
         let truth = ref_walk(seq, x).expect("oracle walks");
         assert!(
             bound >= truth,
@@ -200,7 +205,12 @@ fn v2_envelope_dominates_true_mobius() {
     let (r_in, r_out) = (U512::from(hop.reserve_in), U512::from(hop.reserve_out));
     for &x in &SWEEP {
         let x = U256::from(x);
-        let bound = path_output_bound_at(&view, &x).expect("derives");
+        let bound = path_output_bound_at(
+            &view,
+            &x,
+            &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+        )
+        .expect("derives");
         // True Möbius: γ·r_out·x / (r_in + γ·x)
         let num = U512::from(x) * U512::from(997_000u64) * r_out;
         let den = r_in * U512::from(1_000_000u64) + U512::from(x) * U512::from(997_000u64);
@@ -233,7 +243,12 @@ fn mixed_v2_cl_path_pointwise_dominance() {
     ];
     for &x in &SWEEP {
         let x = U256::from(x);
-        let bound = path_output_bound_at(&views, &x).expect("derives");
+        let bound = path_output_bound_at(
+            &views,
+            &x,
+            &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+        )
+        .expect("derives");
         // Chain the oracles: V2 → CL → V2.
         let y1 = mobius(v2.reserve_in, v2.reserve_out, 997_000, 1_000_000, x);
         let y1_u = narrow512(y1).expect("V2 output within U256");
@@ -268,7 +283,12 @@ fn unsupported_family_poisons_bound() {
         path_profit_bound(&[None], &GateDeps::offline()),
         Envelope::Unsupported(GateSkipCause::UnmappedHop)
     ));
-    assert!(path_output_bound_at(&[None], &U256::from(1u64)).is_none());
+    assert!(path_output_bound_at(
+        &[None],
+        &U256::from(1u64),
+        &degenbot_solvers::runtime::SolveRuntimeConfig::default()
+    )
+    .is_none());
 }
 
 #[test]
@@ -285,7 +305,12 @@ fn m6776w_overflow_paths_compose_without_poisoning() {
     let bound = bound(&views).expect("reduced compose must not overflow");
     // Soundness: the bound must still dominate the real output at any x.
     let x = U256::from(1_000_000u64);
-    let out_bound = path_output_bound_at(&views, &x).expect("bound at x");
+    let out_bound = path_output_bound_at(
+        &views,
+        &x,
+        &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+    )
+    .expect("bound at x");
     // True output of 4 identical V2 hops: r_out*(gamma*x/(r_in+gamma*x))^4.
     // True CHAINED output of 4 identical V2 hops (each hop's output feeds
     // the next — NOT the fourth power of a single hop).
@@ -323,8 +348,12 @@ fn m6776w_balancer_weighted_3hop_no_overflow() {
     };
     let views = vec![Some(hop); 3];
     // Must return Some (not None = unsupported — the overflow case).
-    let bound = path_output_bound_at(&views, &U256::from(100u64))
-        .expect("reduced 3-hop weighted compose must not overflow");
+    let bound = path_output_bound_at(
+        &views,
+        &U256::from(100u64),
+        &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+    )
+    .expect("reduced 3-hop weighted compose must not overflow");
     // The weighted pool with equal weights/balances is symmetric — output
     // is always <= input (fee-only). Bound must be >= true output (which is
     // less than input after fees). A bound of at least 99 suffices.
@@ -692,7 +721,12 @@ fn bound_dominates_golden_profit_on_heavy_cl_captures() {
         if bound < golden_profit {
             for (ih, ys) in gh.iter().enumerate() {
                 let so: U256 = ys.as_str().expect("hop output str").parse().unwrap();
-                let sb = path_output_bound_at(&views[..=ih], &go_in).unwrap();
+                let sb = path_output_bound_at(
+                    &views[..=ih],
+                    &go_in,
+                    &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+                )
+                .unwrap();
                 eprintln!(
                     "[bind-fail] hop{ih} truth={so} bound_at={sb} (def {})",
                     sb.saturating_sub(so)
@@ -749,6 +783,7 @@ fn m6776w_capture_harness_writes_jsonl_for_zero_liq_rejection() {
         prefix_cache: false,
         capture: Some(&capture_cfg),
         walk_memo: None,
+        runtime: degenbot_solvers::runtime::SolveRuntimeConfig::default(),
     };
     assert!(matches!(
         path_profit_bound(&views, &deps),

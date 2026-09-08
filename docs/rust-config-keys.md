@@ -65,6 +65,7 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `DEGENBOT_TRACE_TICK` | `trace.trace_tick` | `Option<i32>` | `(unset)` | Watch one known-divergent tick (signed decimal) across mutations in the pin/drain probes. |
 | `DEGENBOT_WS_TRACE` | `trace.ws_trace` | `bool` | `false` | Catch-all WS-log trace (one line per relevant log; high volume by design). |
 | `DEGENBOT_GATE_TRACE` | `trace.gate_trace` | `bool` | `false` | T5 profit-envelope compose tracing gate (profit_envelope TRACE). |
+| `DEGENBOT_V2_CALC_TRACE` | `trace.v2_calc_trace` | `bool` | `true` | V2-calc slot-8 read probe in the arbitrage dispatcher (KAHU5W: added during the env migration — previously an undeclared key parsed by a generic presence/flag helper at the site; conservative default ON, falsey opts out). |
 | `DEGENBOT_HOTPATH` | `trace.hotpath` | `bool` | `false` | Construct the hotpath profiling guard (default OFF; build must enable the profiling feature too). |
 ## `solve`
 

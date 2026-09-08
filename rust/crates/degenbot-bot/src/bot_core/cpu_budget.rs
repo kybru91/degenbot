@@ -221,8 +221,11 @@ pub(crate) fn solve_worker_count() -> usize {
     static SOLVE_WORKERS: OnceLock<usize> = OnceLock::new();
     *SOLVE_WORKERS.get_or_init(|| {
         let budget = effective_cpu_budget();
-        let override_cpu = std::env::var("DEGENBOT_SOLVE_CPUS").ok();
-        let override_headroom = std::env::var("DEGENBOT_SOLVE_HEADROOM").ok();
+        // KAHU5W: typed schema overrides (`solve.solve_cpus` /
+        // `solve.solve_headroom`); the loader owns the env read.
+        let cfg = crate::bot_core::stance::config().solve.clone();
+        let override_cpu = cfg.solve_cpus.map(|v| v.to_string());
+        let override_headroom = cfg.solve_headroom.map(|v| v.to_string());
         let workers = solve_worker_count_from(
             override_cpu.as_deref(),
             override_headroom.as_deref(),

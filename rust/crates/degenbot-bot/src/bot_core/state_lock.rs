@@ -51,16 +51,15 @@ static START: LazyLock<Instant> = LazyLock::new(Instant::now);
 /// operators/tests may adjust it at runtime (`set_warn_threshold_ms`).
 static WARN_THRESHOLD_MS: AtomicU64 = AtomicU64::new(0);
 static THRESHOLD_INIT: LazyLock<()> = LazyLock::new(|| {
-    let raw = std::env::var("DEGENBOT_LOCK_WARN_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(500);
+    // KAHU5W: typed schema key (`state_lock.warn_ms` / DEGENBOT_LOCK_WARN_MS).
+    let raw = crate::bot_core::stance::config().state_lock.warn_ms;
     WARN_THRESHOLD_MS.store(raw.max(1), Ordering::Relaxed);
 });
 
-/// Full backtraces captured at acquire when `DEGENBOT_LOCK_TRACE=1`.
+/// Full backtraces captured at acquire when `state_lock.trace` is on
+/// (`DEGENBOT_LOCK_TRACE`).
 static TRACE_BACKTRACES: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("DEGENBOT_LOCK_TRACE").is_ok_and(|v| v == "1"));
+    LazyLock::new(|| crate::bot_core::stance::config().state_lock.trace);
 
 /// 1 when hold-tracking diagnostics are enabled (`DEGENBOT_STATE_LOCK_DIAG=1`),
 /// resolved once at first consultation. Default 0: the pump-path read
@@ -69,7 +68,7 @@ static TRACE_BACKTRACES: LazyLock<bool> =
 /// Follows the `WARN_THRESHOLD_MS` resolution pattern so tests can force a mode.
 static DIAG: AtomicU64 = AtomicU64::new(0);
 static DIAG_INIT: LazyLock<()> = LazyLock::new(|| {
-    let enabled = std::env::var("DEGENBOT_STATE_LOCK_DIAG").is_ok_and(|v| v == "1");
+    let enabled = crate::bot_core::stance::config().state_lock.diag;
     DIAG.store(u64::from(enabled), Ordering::Relaxed);
 });
 

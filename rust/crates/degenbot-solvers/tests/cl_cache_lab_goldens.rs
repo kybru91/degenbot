@@ -58,7 +58,11 @@ fn solve_prepared<S: ClCacheStrategy + ?Sized>(
 ) -> Option<(U256, U256, Vec<U256>)> {
     let prepared: Vec<PreparedHop> = strategy.refill(seqs, event);
     if prepared.is_empty() {
-        return degenbot_solvers::mobius_v3_int::solve_cl_derived(seq_refs).result;
+        return degenbot_solvers::mobius_v3_int::solve_cl_derived(
+            seq_refs,
+            &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+        )
+        .result;
     }
     let prepared_hops: Vec<degenbot_solvers::mobius_v3_int::ClPrepared> = prepared
         .iter()
@@ -67,7 +71,13 @@ fn solve_prepared<S: ClCacheStrategy + ?Sized>(
             profiles: std::sync::Arc::clone(p),
         })
         .collect();
-    int_solve_cl_path(seq_refs, &prepared_hops, None).result
+    int_solve_cl_path(
+        seq_refs,
+        &prepared_hops,
+        None,
+        &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+    )
+    .result
 }
 
 fn price_move(seqs: &mut [IntV3TickRangeSequence], i: usize) {
@@ -149,7 +159,11 @@ fn golden_epochs_and_transitioned_epochs_stay_exact() {
 
         // Golden epoch: strategies on the captured state + two-sided gate.
         let seq_refs: Vec<&IntV3TickRangeSequence> = baseline.iter().collect();
-        let reference = degenbot_solvers::mobius_v3_int::solve_cl_derived(&seq_refs).result;
+        let reference = degenbot_solvers::mobius_v3_int::solve_cl_derived(
+            &seq_refs,
+            &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+        )
+        .result;
         for s in &mut catalog {
             let t = solve_prepared(s.as_mut(), &baseline, &CacheEvent::Fresh, &seq_refs);
             assert_eq!(
@@ -221,7 +235,11 @@ fn golden_epochs_and_transitioned_epochs_stay_exact() {
                 }
             };
             let refs2: Vec<&IntV3TickRangeSequence> = seqs.iter().collect();
-            let reference = degenbot_solvers::mobius_v3_int::solve_cl_derived(&refs2).result;
+            let reference = degenbot_solvers::mobius_v3_int::solve_cl_derived(
+                &refs2,
+                &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+            )
+            .result;
             for s in &mut catalog {
                 if s.name() == "S0_full_rebuild" {
                     let _ = s.refill(&seqs, &event); // keep counters honest

@@ -81,8 +81,12 @@ fn probe_enabled() -> bool {
             return forced != 0;
         }
     }
-    *PROBE_ENABLED
-        .get_or_init(|| std::env::var_os(SIM_DIVERGENCE_LOG_ENV).is_some_and(|v| v == "1"))
+    // KAHU5W: typed schema key `simulation.sim_divergence_log`.
+    *PROBE_ENABLED.get_or_init(|| {
+        ::degenbot_config::holder::config()
+            .simulation
+            .sim_divergence_log
+    })
 }
 
 /// Test-only gate override (`-1`/unset → use the env cache, `0` → off, `1` →

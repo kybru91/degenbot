@@ -536,8 +536,8 @@ thread_local! {
 
 /// Census gate from the injected runtime config (T4: no env read here —
 /// the owner packs the stance at construction).
-fn event_census_on() -> bool {
-    crate::runtime::runtime().walk_event_census
+fn event_census_on(cfg: &SolveRuntimeConfig) -> bool {
+    cfg.walk_event_census
 }
 
 fn event_census_bucket(d: U256) -> usize {
@@ -554,8 +554,14 @@ fn event_census_bucket(d: U256) -> usize {
 
 /// Record one piece: `x_r = Some(lo)` with `hi` above (bracket `[lo+1, hi]`)
 /// when bounded, `None` for a terminal piece.
-fn event_census_record(hops: &[WalkHop], ks: &[usize], x_r: Option<U256>, hi: U256) {
-    if !event_census_on() {
+fn event_census_record(
+    hops: &[WalkHop],
+    ks: &[usize],
+    x_r: Option<U256>,
+    hi: U256,
+    cfg: &SolveRuntimeConfig,
+) {
+    if !event_census_on(cfg) {
         return;
     }
     let pred = walk_event_first_above_predicted(hops, ks);
@@ -1247,10 +1253,10 @@ fn piece_window_right_edge(hops: &[WalkHop], ks: &[usize], hint: U256) -> Option
 /// 0 misses of any size.
 // Rollout gate + anchor-sweep stance come from the injected runtime config
 // (SU7MAE T4) — the owner packs the env stances at construction.
-use crate::runtime::AnchorSweep;
+use crate::runtime::{AnchorSweep, SolveRuntimeConfig};
 
-fn anchor_sweep_mode() -> AnchorSweep {
-    crate::runtime::runtime().anchor_sweep
+fn anchor_sweep_mode(cfg: &SolveRuntimeConfig) -> AnchorSweep {
+    cfg.anchor_sweep
 }
 
 fn piece_window_right_edge_evented(
@@ -1259,10 +1265,11 @@ fn piece_window_right_edge_evented(
     hint: U256,
     lo_seed: Option<U256>,
     hi_seed: Option<U256>,
+    cfg: &SolveRuntimeConfig,
 ) -> (Option<U256>, U256) {
     // Rollout gate: the runtime config's stance forces the legacy grow +
     // bisection (A/B toggle; packed by the owner at construction).
-    if crate::runtime::runtime().event_solver_legacy {
+    if cfg.event_solver_legacy {
         return piece_window_right_edge_seeded(hops, ks, hint, lo_seed, hi_seed);
     }
     if let Some(pa) = walk_event_first_above_predicted(hops, ks) {
@@ -1654,13 +1661,13 @@ const SOLVE_TELEMETRY_PIECES_WARN: usize = 500;
 const SOLVE_TELEMETRY_SIMS_WARN: usize = 50_000;
 
 #[hotpath::measure(label = "cl_solve.active_set")]
-fn solve_active_set_path(hops: &[WalkHop]) -> WalkOutcome {
+fn solve_active_set_path(hops: &[WalkHop], cfg: &SolveRuntimeConfig) -> WalkOutcome {
     let s_t0 = std::time::Instant::now();
     // SU7MAE T2: the walk drains its own counters at entry — the solve
     // caller no longer resets, and the returned outcome carries THIS path's
     // telemetry (no frozen thread-locals on the read-back path).
     reset_walk_stats();
-    let out = solve_active_set_path_inner(hops);
+    let out = solve_active_set_path_inner(hops, cfg);
     WALK_SOLVE_NS_TOTAL.fetch_add(
         u64::try_from(s_t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
         std::sync::atomic::Ordering::Relaxed,
@@ -1675,7 +1682,10 @@ fn solve_active_set_path(hops: &[WalkHop]) -> WalkOutcome {
 }
 
 #[expect(clippy::too_many_lines)]
-fn solve_active_set_path_inner(hops: &[WalkHop]) -> Option<(U256, U256, Vec<U256>)> {
+fn solve_active_set_path_inner(
+    hops: &[WalkHop],
+    cfg: &SolveRuntimeConfig,
+) -> Option<(U256, U256, Vec<U256>)> {
     /// Advance the landed tuple one piece past the window's right edge
     /// (the edge-bisection bracket is ≤4 wide, so scan a few steps).
     fn landed_beyond(hops: &[WalkHop], right_edge: U256, ks: &[usize]) -> Option<Vec<usize>> {
@@ -1702,6 +1712,7 @@ fn solve_active_set_path_inner(hops: &[WalkHop]) -> Option<(U256, U256, Vec<U256
         hint: U256,
         rec: &mut WalkRecorder,
         refine_neighbor: bool,
+        cfg: &SolveRuntimeConfig,
     ) {
         let hi_current = x_r.unwrap_or_else(|| {
             hint.saturating_mul(U256::from(4u64))
@@ -1729,7 +1740,7 @@ fn solve_active_set_path_inner(hops: &[WalkHop]) -> Option<(U256, U256, Vec<U256
                 return;
             };
             let n_l = xr + U256::from(1u64);
-            let n_r = piece_window_right_edge_evented(hops, &next, hint, None, None).0;
+            let n_r = piece_window_right_edge_evented(hops, &next, hint, None, None, cfg).0;
             let n_hi = n_r.unwrap_or_else(|| {
                 hint.saturating_mul(U256::from(4u64))
                     .max(n_l.saturating_mul(U256::from(2u64)))
@@ -1831,7 +1842,7 @@ fn solve_active_set_path_inner(hops: &[WalkHop]) -> Option<(U256, U256, Vec<U256
         // Loop-17 A/B (EXPERIMENTAL, default ON): `DEGENBOT_WALK_ANCHOR_SWEEP=0`
         // disables the ±2 probe set to measure its value. The anchor VALUE is
         // still computed and used as the window-edge hint either way.
-        let sweep = anchor_sweep_mode();
+        let sweep = anchor_sweep_mode(cfg);
         let anchor_all_t0 = std::time::Instant::now();
         let anchor_build_t0 = std::time::Instant::now();
         let anchor_pieces = build_shifted_piece_hops(hops, &ks);
@@ -1993,11 +2004,12 @@ fn solve_active_set_path_inner(hops: &[WalkHop]) -> Option<(U256, U256, Vec<U256
             anchor,
             right_bracket.map(|b| b.0),
             right_bracket.map(|b| b.1),
+            cfg,
         );
         // Loop-15 census (`DEGENBOT_WALK_EVENT_CENSUS=1`): the nested
         // ceil-inversion's prediction vs this bisection bracket. No-op
         // (one bool load) when the gate is unset.
-        event_census_record(hops, &ks, x_r, right_confirm_hi);
+        event_census_record(hops, &ks, x_r, right_confirm_hi, cfg);
         re_mk.commit(
             &WALK_CENSUS_REDGE_NS,
             &WALK_CENSUS_REDGE_SIMS,
@@ -2006,7 +2018,7 @@ fn solve_active_set_path_inner(hops: &[WalkHop]) -> Option<(U256, U256, Vec<U256
         let Some(xr) = x_r else {
             // Terminal piece (unbounded right): refine and finish.
             let term_mk = Mark::start();
-            refine_at_stop(hops, &ks, x_l, None, anchor, &mut rec, false);
+            refine_at_stop(hops, &ks, x_l, None, anchor, &mut rec, false, cfg);
             term_mk.commit(
                 &WALK_CENSUS_REFINE_NS,
                 &WALK_CENSUS_REFINE_SIMS,
@@ -2046,7 +2058,7 @@ fn solve_active_set_path_inner(hops: &[WalkHop]) -> Option<(U256, U256, Vec<U256
             continue;
         }
         let term_mk = Mark::start();
-        refine_at_stop(hops, &ks, x_l, Some(xr), anchor, &mut rec, climbing);
+        refine_at_stop(hops, &ks, x_l, Some(xr), anchor, &mut rec, climbing, cfg);
         term_mk.commit(
             &WALK_CENSUS_REFINE_NS,
             &WALK_CENSUS_REFINE_SIMS,
@@ -2107,8 +2119,9 @@ fn solve_active_set_path_inner(hops: &[WalkHop]) -> Option<(U256, U256, Vec<U256
 pub fn int_solve_v3_v3(
     seq1: &IntV3TickRangeSequence,
     seq2: &IntV3TickRangeSequence,
+    cfg: &SolveRuntimeConfig,
 ) -> WalkOutcome {
-    solve_active_set_path(&[cl_walk_hop(seq1, None), cl_walk_hop(seq2, None)])
+    solve_active_set_path(&[cl_walk_hop(seq1, None), cl_walk_hop(seq2, None)], cfg)
 }
 
 /// Pre-compute the crossing data for every ending-range index of a CL
@@ -2247,9 +2260,12 @@ impl ClPrepared {
 /// golden-reference harnesses): derives the tables per call (cost is the
 /// caller's) and runs the entry with no memo.
 #[must_use]
-pub fn solve_cl_derived(sequences: &[&IntV3TickRangeSequence]) -> WalkOutcome {
+pub fn solve_cl_derived(
+    sequences: &[&IntV3TickRangeSequence],
+    cfg: &SolveRuntimeConfig,
+) -> WalkOutcome {
     let prepared: Vec<ClPrepared> = sequences.iter().map(|s| ClPrepared::derive(s)).collect();
-    int_solve_cl_path(sequences, &prepared, None)
+    int_solve_cl_path(sequences, &prepared, None, cfg)
 }
 
 /// Stage-1 all-CL solve consuming the projection's precomputed crossing
@@ -2267,6 +2283,7 @@ pub fn int_solve_cl_path(
     sequences: &[&IntV3TickRangeSequence],
     prepared: &[ClPrepared],
     memo: Option<&WalkMemo>,
+    cfg: &SolveRuntimeConfig,
 ) -> WalkOutcome {
     if sequences.is_empty() || prepared.len() != sequences.len() {
         return WalkOutcome::none();
@@ -2281,19 +2298,20 @@ pub fn int_solve_cl_path(
             if let Some(hit) = memo.probe(fp) {
                 return WalkOutcome::from_result(Some(hit));
             }
-            let outcome = int_solve_cl_path_inner(sequences, prepared);
+            let outcome = int_solve_cl_path_inner(sequences, prepared, cfg);
             memo.note_cost(fp, outcome.stats.sims as u64);
             memo.store(fp, outcome.result.as_ref());
             return outcome;
         }
     }
-    int_solve_cl_path_inner(sequences, prepared)
+    int_solve_cl_path_inner(sequences, prepared, cfg)
 }
 
 /// The memo-less solve body (the memo hook is the only difference).
 fn int_solve_cl_path_inner(
     sequences: &[&IntV3TickRangeSequence],
     prepared: &[ClPrepared],
+    cfg: &SolveRuntimeConfig,
 ) -> WalkOutcome {
     let hops: Vec<WalkHop> = (0..sequences.len())
         .map(|i| WalkHop::Cl {
@@ -2301,7 +2319,7 @@ fn int_solve_cl_path_inner(
             profiles: Arc::clone(&prepared[i].profiles),
         })
         .collect();
-    solve_active_set_path(&hops)
+    solve_active_set_path(&hops, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -2573,6 +2591,7 @@ pub fn exact_solve_mixed_v2_v3_sequence(
     v2_hops: &[IntHopState],
     v3_sequence: &IntV3TickRangeSequence,
     v3_first: bool,
+    cfg: &SolveRuntimeConfig,
 ) -> WalkOutcome {
     let mut hops: Vec<WalkHop> = Vec::with_capacity(v2_hops.len() + 1);
     let cl_hop = cl_walk_hop(v3_sequence, None);
@@ -2583,7 +2602,7 @@ pub fn exact_solve_mixed_v2_v3_sequence(
         hops.extend(v2_hops.iter().map(WalkHop::ConstantProduct));
         hops.push(cl_hop);
     }
-    solve_active_set_path(&hops)
+    solve_active_set_path(&hops, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -2751,6 +2770,7 @@ fn int_simulate_mixed_path_n(
 /// the caller's cost, the offline/replay shape).
 #[must_use]
 #[hotpath::measure(label = "cl_solve.exact_solve_mixed_path_n")]
+#[expect(clippy::too_many_arguments)]
 pub fn exact_solve_mixed_path_n(
     v2_hops: &[Option<IntHopState>],
     // RLVDUP T1: borrowed sequences - the walk only READS a sequence
@@ -2759,6 +2779,7 @@ pub fn exact_solve_mixed_path_n(
     cl_sequences: &[Option<&IntV3TickRangeSequence>],
     cl_prepared: &[Option<ClPrepared>],
     hop_order: &[bool], // true = V2, false = CL
+    cfg: &SolveRuntimeConfig,
 ) -> WalkOutcome {
     let n_hops = hop_order.len();
     if n_hops < 2 || v2_hops.len() != n_hops || cl_sequences.len() != n_hops {
@@ -2793,7 +2814,7 @@ pub fn exact_solve_mixed_path_n(
             });
         }
     }
-    solve_active_set_path(&hops)
+    solve_active_set_path(&hops, cfg)
 }
 
 // ---------------------------------------------------------------------------
@@ -3022,7 +3043,13 @@ mod tests {
 
         let v3_seq = IntV3TickRangeSequence::new(vec![v3_hop]).unwrap();
 
-        let result = exact_solve_mixed_v2_v3_sequence(&[v2_hop], &v3_seq, true).result;
+        let result = exact_solve_mixed_v2_v3_sequence(
+            &[v2_hop],
+            &v3_seq,
+            true,
+            &SolveRuntimeConfig::default(),
+        )
+        .result;
         // Key thing is no panics.
         let _ = result;
     }
@@ -3214,7 +3241,7 @@ mod tests {
         let hop2 = make_v3_hop_at_1to1(10_000_000_000_000u128, false);
         let seq1 = IntV3TickRangeSequence::new(vec![hop1]).unwrap();
         let seq2 = IntV3TickRangeSequence::new(vec![hop2]).unwrap();
-        let result = int_solve_v3_v3(&seq1, &seq2).result;
+        let result = int_solve_v3_v3(&seq1, &seq2, &SolveRuntimeConfig::default()).result;
         assert!(
             result.is_none(),
             "Same-price pools should not be profitable"
@@ -3259,7 +3286,7 @@ mod tests {
 
         let seq1 = IntV3TickRangeSequence::new(vec![hop1]).unwrap();
         let seq2 = IntV3TickRangeSequence::new(vec![hop2]).unwrap();
-        let _ = int_solve_v3_v3(&seq1, &seq2).result;
+        let _ = int_solve_v3_v3(&seq1, &seq2, &SolveRuntimeConfig::default()).result;
     }
 
     #[test]
@@ -3310,7 +3337,7 @@ mod tests {
 
         let seq1 = IntV3TickRangeSequence::new(vec![range1_0, range1_1]).unwrap();
         let seq2 = IntV3TickRangeSequence::new(vec![range2_0]).unwrap();
-        let _ = int_solve_v3_v3(&seq1, &seq2).result;
+        let _ = int_solve_v3_v3(&seq1, &seq2, &SolveRuntimeConfig::default()).result;
     }
 
     // ── Per-hop output tests ──────────────────────────────────────
@@ -3443,8 +3470,8 @@ mod tests {
         let seq1 = IntV3TickRangeSequence::new(vec![hop1]).unwrap();
         let seq2 = IntV3TickRangeSequence::new(vec![hop2]).unwrap();
 
-        let result_cl = solve_cl_derived(&[&seq1, &seq2]).result;
-        let result_v3v3 = int_solve_v3_v3(&seq1, &seq2).result;
+        let result_cl = solve_cl_derived(&[&seq1, &seq2], &SolveRuntimeConfig::default()).result;
+        let result_v3v3 = int_solve_v3_v3(&seq1, &seq2, &SolveRuntimeConfig::default()).result;
 
         assert_eq!(result_cl, result_v3v3);
     }
@@ -3478,7 +3505,8 @@ mod tests {
         let seq3 = IntV3TickRangeSequence::new(vec![hop3]).unwrap();
 
         // Same-product 3-hop — should not be profitable
-        let result = solve_cl_derived(&[&seq1, &seq2, &seq3]).result;
+        let result =
+            solve_cl_derived(&[&seq1, &seq2, &seq3], &SolveRuntimeConfig::default()).result;
         assert!(
             result.is_none(),
             "Same-product 3-hop should not be profitable"
@@ -3551,7 +3579,8 @@ mod tests {
         let seq2 = IntV3TickRangeSequence::new(vec![hop2]).unwrap();
         let seq3 = IntV3TickRangeSequence::new(vec![hop3]).unwrap();
 
-        let result = solve_cl_derived(&[&seq1, &seq2, &seq3]).result;
+        let result =
+            solve_cl_derived(&[&seq1, &seq2, &seq3], &SolveRuntimeConfig::default()).result;
 
         // This should produce a result — there's genuine price disagreement
         // across the three pools. However, fees may eat all profit.
@@ -3602,6 +3631,7 @@ mod tests {
             &[None, Some(&v3_seq)],
             &[None, None], // offline shape: tables derive here
             &[true, false],
+            &SolveRuntimeConfig::default(),
         );
 
         // Just verify no panic; profit depends on specific reserves
@@ -3633,8 +3663,14 @@ mod tests {
                 profiles: Arc::clone(&p2),
             },
         ];
-        let cached = int_solve_cl_path(&[&seq1, &seq2], &prepared, None).result;
-        let offline = solve_cl_derived(&[&seq1, &seq2]).result;
+        let cached = int_solve_cl_path(
+            &[&seq1, &seq2],
+            &prepared,
+            None,
+            &SolveRuntimeConfig::default(),
+        )
+        .result;
+        let offline = solve_cl_derived(&[&seq1, &seq2], &SolveRuntimeConfig::default()).result;
         assert_eq!(cached, offline);
         assert!(cached.is_some(), "late-liquidity fixture is profitable");
     }
@@ -3667,10 +3703,21 @@ mod tests {
 
         // Projection-backed cached tables must equal the offline build
         // (byte-identical mixed-path math).
-        let cached =
-            exact_solve_mixed_path_n(&v2_hops, &cl_sequences, &cl_prepared, &[true, false]);
-        let offline =
-            exact_solve_mixed_path_n(&v2_hops, &cl_sequences, &[None, None], &[true, false]).result;
+        let cached = exact_solve_mixed_path_n(
+            &v2_hops,
+            &cl_sequences,
+            &cl_prepared,
+            &[true, false],
+            &SolveRuntimeConfig::default(),
+        );
+        let offline = exact_solve_mixed_path_n(
+            &v2_hops,
+            &cl_sequences,
+            &[None, None],
+            &[true, false],
+            &SolveRuntimeConfig::default(),
+        )
+        .result;
         assert_eq!(cached.result, offline);
         assert!(
             cached.result.is_some(),
@@ -3702,6 +3749,7 @@ mod tests {
             &[None, Some(&v3_seq), None],
             &[None, None, None],  // offline shape: tables derive here
             &[true, false, true], // V2 → CL → V2
+            &SolveRuntimeConfig::default(),
         );
 
         // Price disagreement: V2 pool 1 sells 1 WETH at 2000 USDC,
@@ -3754,13 +3802,19 @@ mod tests {
             None,
         ];
 
-        let cached =
-            exact_solve_mixed_path_n(&v2_hops, &cl_sequences, &cl_prepared, &[true, false, true]);
+        let cached = exact_solve_mixed_path_n(
+            &v2_hops,
+            &cl_sequences,
+            &cl_prepared,
+            &[true, false, true],
+            &SolveRuntimeConfig::default(),
+        );
         let offline = exact_solve_mixed_path_n(
             &v2_hops,
             &cl_sequences,
             &[None, None, None],
             &[true, false, true],
+            &SolveRuntimeConfig::default(),
         )
         .result;
         assert_eq!(cached.result, offline);
@@ -4892,9 +4946,10 @@ mod tests {
             "oracle sanity: the corner-blind reference must find NOTHING here ({reference:?})"
         );
 
-        let (x, profit, _hop_outputs) = solve_cl_derived(&[&seq1, &seq2])
-            .result
-            .expect("the active-set walk must find the deep range-10/11 profit");
+        let (x, profit, _hop_outputs) =
+            solve_cl_derived(&[&seq1, &seq2], &SolveRuntimeConfig::default())
+                .result
+                .expect("the active-set walk must find the deep range-10/11 profit");
 
         // Non-vacuity floor: a coarse ×2 grid scan of the same path already
         // shows ≥ 1.2e8 profit; the walk's refined optimum must clear it.
@@ -4945,6 +5000,7 @@ mod tests {
             &[None, Some(&cl_seq)],
             &[None, None],
             &[true, false],
+            &SolveRuntimeConfig::default(),
         );
 
         // Not exact equality: the reference's ±2 sweep around its piecewise
@@ -4982,7 +5038,8 @@ mod tests {
                 liquidities.push(1_000_000_000u128);
                 let seq2 = multi_range_sequence(0, 60, false, &liquidities);
 
-                let solver = solve_cl_derived(&[&seq1, &seq2]).result;
+                let solver =
+                    solve_cl_derived(&[&seq1, &seq2], &SolveRuntimeConfig::default()).result;
                 let reference = reference_uncapped_cl_solve(&[&seq1, &seq2]);
                 let solver_profit = solver.map_or(U256::ZERO, |(_, profit, _)| profit);
                 let reference_profit = reference.map_or(U256::ZERO, |(_, profit, _)| profit);
@@ -5025,7 +5082,7 @@ mod tests {
 
         WALK_PIECES_VISITED.with(|c| c.set(0));
         WALK_PATH_SIMULATIONS.with(|c| c.set(0));
-        let result = solve_cl_derived(&[&seq1, &seq2]).result;
+        let result = solve_cl_derived(&[&seq1, &seq2], &SolveRuntimeConfig::default()).result;
         assert!(result.is_some());
         let pieces = WALK_PIECES_VISITED.with(std::cell::Cell::get);
         let sims = WALK_PATH_SIMULATIONS.with(std::cell::Cell::get);
@@ -5055,7 +5112,7 @@ mod tests {
         let s3 = multi_range_sequence(100, 60, true, &[5_000_000_000_000u128; 8]);
         WALK_PIECES_VISITED.with(|c| c.set(0));
         WALK_PATH_SIMULATIONS.with(|c| c.set(0));
-        let _ = solve_cl_derived(&[&s1, &s2, &s3]).result;
+        let _ = solve_cl_derived(&[&s1, &s2, &s3], &SolveRuntimeConfig::default()).result;
         let pieces = WALK_PIECES_VISITED.with(std::cell::Cell::get);
         let sims = WALK_PATH_SIMULATIONS.with(std::cell::Cell::get);
         let refine_sims = WALK_REFINE_SIMS.with(std::cell::Cell::get);
@@ -5136,7 +5193,7 @@ mod tests {
                 let seqs = [&seq1, &seq2];
                 let hops = [cl_walk_hop(&seq1, None), cl_walk_hop(&seq2, None)];
                 let oracle = grid_oracle_profit(&hops);
-                let solver = solve_cl_derived(&seqs).result;
+                let solver = solve_cl_derived(&seqs, &SolveRuntimeConfig::default()).result;
                 let solver_profit = solver.map_or(U256::ZERO, |(_, p, _)| p);
                 eprintln!(
                     "[grid] deep_liquidity={deep_liquidity} deep_index={deep_index}:                      oracle={oracle} solver={solver_profit}"
@@ -5184,14 +5241,14 @@ mod tests {
         let sr1 = multi_range_sequence(-100, 200, true, &[5_000_000_000_000u128]);
         let sr2 = multi_range_sequence(0, 200, false, &[10_000_000_000_000u128]);
         time_solve("2-hop single-range", || {
-            let _ = solve_cl_derived(&[&sr1, &sr2]).result;
+            let _ = solve_cl_derived(&[&sr1, &sr2], &SolveRuntimeConfig::default()).result;
         });
 
         // 8-range 2-hop
         let mr2h1 = multi_range_sequence(-100, 60, true, &[5_000_000_000_000u128; 8]);
         let mr2h2 = multi_range_sequence(0, 60, false, &[10_000_000_000_000u128; 8]);
         time_solve("2-hop 8-range", || {
-            let _ = solve_cl_derived(&[&mr2h1, &mr2h2]).result;
+            let _ = solve_cl_derived(&[&mr2h1, &mr2h2], &SolveRuntimeConfig::default()).result;
         });
 
         // 3-hop 8-range each
@@ -5199,7 +5256,8 @@ mod tests {
         let mr3h2 = multi_range_sequence(0, 60, false, &[10_000_000_000_000u128; 8]);
         let mr3h3 = multi_range_sequence(100, 60, true, &[5_000_000_000_000u128; 8]);
         time_solve("3-hop 8-range", || {
-            let _ = solve_cl_derived(&[&mr3h1, &mr3h2, &mr3h3]).result;
+            let _ =
+                solve_cl_derived(&[&mr3h1, &mr3h2, &mr3h3], &SolveRuntimeConfig::default()).result;
         });
 
         // Legacy-style enumeration (uncapped) on the same 8-range 2-hop —
@@ -5215,7 +5273,7 @@ mod tests {
             let _ = Relaxed;
             WALK_PATH_SIMULATIONS.with(|c| c.set(0));
             WALK_PIECES_VISITED.with(|c| c.set(0));
-            let _ = solve_cl_derived(&[&mr2h1, &mr2h2]).result;
+            let _ = solve_cl_derived(&[&mr2h1, &mr2h2], &SolveRuntimeConfig::default()).result;
             eprintln!(
                 "[bench] 2-hop 8-range walk: pieces={} sims={}",
                 WALK_PIECES_VISITED.with(std::cell::Cell::get),
@@ -5288,7 +5346,9 @@ mod tests {
                         *l = deep_liquidity;
                     }
                     let seq2 = multi_range_sequence(0, 60, false, &liquidities);
-                    let Some((x_star, profit, _)) = solve_cl_derived(&[&seq1, &seq2]).result else {
+                    let Some((x_star, profit, _)) =
+                        solve_cl_derived(&[&seq1, &seq2], &SolveRuntimeConfig::default()).result
+                    else {
                         continue;
                     };
                     assert!(!profit.is_zero());
@@ -5645,7 +5705,9 @@ mod tests {
             anchor > x_sat,
             "cell sanity: requires anchor > x_sat (got anchor={anchor}, x_sat={x_sat})"
         );
-        let Some((x, profit, _)) = solve_cl_derived(&[&seq1, &seq2]).result else {
+        let Some((x, profit, _)) =
+            solve_cl_derived(&[&seq1, &seq2], &SolveRuntimeConfig::default()).result
+        else {
             panic!(
                 "F1 silent under-shoot: solver=None while the saturation corner x={x_sat} is worth {corner_profit} (anchor={anchor}); the single-piece terminal refine must bracket the corner"
             );
@@ -5708,7 +5770,9 @@ mod tests {
             corner_profit > U256::from(1_000_000u64),
             "cell needs a substantial hop1-binding profit (got {corner_profit})"
         );
-        let Some((x, profit, _)) = solve_cl_derived(&[&seq0, &seq1]).result else {
+        let Some((x, profit, _)) =
+            solve_cl_derived(&[&seq0, &seq1], &SolveRuntimeConfig::default()).result
+        else {
             panic!(
                 "hop1-binding kink dropped: solver=None while x_cap={x_cap} is worth {corner_profit}; the terminal refine must not silently skip it"
             );
@@ -5794,7 +5858,9 @@ mod tests {
         }
 
         let eps = U256::from(REFINE_BRACKET_WEI);
-        let Some((xr, profit, _)) = solve_cl_derived(&[&seq0, &seq1]).result else {
+        let Some((xr, profit, _)) =
+            solve_cl_derived(&[&seq0, &seq1], &SolveRuntimeConfig::default()).result
+        else {
             panic!("solver=None on a dense path while the fine oracle is {oracle_profit}");
         };
         assert!(

@@ -201,70 +201,21 @@ pub(crate) static SOLVE_EXECUTOR_TOKIO: std::sync::atomic::AtomicBool =
 pub(crate) static DETACHED_SOLVES_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// `DEGENBOT_SOLVE_EXECUTOR` parse: "tokio" routes the solve fan-out through
-/// the dedicated low-priority runtime; "rayon" (and the default/unset, plus
-/// unknown values, which warn) keeps today's rayon-scope path. Pure so the
-/// unit tests can exercise it without env races.
-fn solve_executor_stance_from_env() -> bool {
-    match std::env::var("DEGENBOT_SOLVE_EXECUTOR") {
-        // T4 default flip (epic BXUSGL): the dedicated tokio executor is now
-        // the production default - equal-or-better makespan at every measured
-        // thread count, same-bin join barrier removed, and the lower-priority
-        // runtime isolates the block clock / WS tasks from solve CPU (see the
-        // probe table in logs/t4_executor_ab_matrix.csv + RAYPAR lab).
-        // Opt OUT (any 40-item fixture or A/B anomaly) with
-        // DEGENBOT_SOLVE_EXECUTOR=rayon; the rayon arm stays bit-identical.
-        Err(_) => true,
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "tokio" => true,
-            "rayon" => false,
-            other => {
-                tracing::warn!(
-                    value = %other,
-                    "[solve-executor] unknown DEGENBOT_SOLVE_EXECUTOR - defaulting to tokio"
-                );
-                true
-            }
-        },
-    }
-}
-
-/// `DEGENBOT_STREAMING_DELIVERY` parse (epic SRQEK5 T3 default flip): `0`
-/// opts out to the debounce sweep (A/B / opt-out); unset — the shipped
-/// default — and any other value stream. Pure over the env value so the unit
-/// tests exercise the policy matrix without env races.
-fn streaming_delivery_stance_from_env(raw: Option<&str>) -> bool {
-    raw != Some("0")
+/// KAHU5W: solve-executor stance comes from the typed schema enum
+/// (`solve.executor`); the fail-open "unknown value warns and defaults"
+/// legacy parse is gone — the loader is fail-closed (Q6 breaking change,
+/// recorded). "tokio" routes the solve fan-out through the dedicated
+/// low-priority runtime; "rayon" keeps the rayon-scope path.
+#[must_use]
+fn solve_executor_tokio(cfg: &::degenbot_config::BotConfig) -> bool {
+    matches!(cfg.solve.executor, ::degenbot_config::SolveExecutor::Tokio)
 }
 
 #[cfg(test)]
 mod streaming_stance_tests {
-    /// Epic SRQEK5 T3 (SF3QLP) policy matrix: unset routes to STREAMING (the
-    /// intended shipped default with detached cycles); `0` opts out to the
-    /// debounce sweep (A/B); explicit `1` and unknown values stream.
-    #[test]
-    fn streaming_delivery_stance_policy_matrix() {
-        assert!(
-            super::streaming_delivery_stance_from_env(None),
-            "unset DEGENBOT_STREAMING_DELIVERY must route to streaming mode"
-        );
-        assert!(
-            !super::streaming_delivery_stance_from_env(Some("0")),
-            "DEGENBOT_STREAMING_DELIVERY=0 must keep the debounce sweep (opt-out)"
-        );
-        assert!(super::streaming_delivery_stance_from_env(Some("1")));
-        assert!(
-            super::streaming_delivery_stance_from_env(Some("true")),
-            "unknown non-zero values stream with the default"
-        );
-        assert!(
-            super::streaming_delivery_stance_from_env(Some("")),
-            "an empty value streams with the default"
-        );
-    }
-
-    /// The static default must agree with the flipped policy (an engine built
-    /// before `install_engine_env_stances` runs loads the static's initial).
+    /// KAHU5W (presence-gated bools resolved): `pump.streaming_delivery` is
+    /// now a plain schema bool; the env-parse policy matrix above is obsolete
+    /// (the loader owns the words). The static default stays streaming.
     #[test]
     fn streaming_delivery_static_default_is_streaming() {
         assert!(super::STREAMING_DELIVERY_ENABLED.load(std::sync::atomic::Ordering::Relaxed,));
@@ -272,97 +223,81 @@ mod streaming_stance_tests {
 }
 
 /// Degenerate-path capture config parse (M6776W) — the owner side of the
-/// `DEGENBOT_GATE_CAPTURE*` env family (the gate itself reads no env).
+/// `capture` config section (the gate itself reads no env). KAHU5W:
+/// `gate_capture` is a typed bool (the presence-gated
+/// `DEGENBOT_GATE_CAPTURE` legacy is retired; `0`/false disables).
 #[must_use]
-fn gate_capture_from_env() -> Option<::degenbot_solvers::profit_envelope::GateCaptureCfg> {
-    std::env::var_os("DEGENBOT_GATE_CAPTURE")?;
-    let out_path = std::env::var("DEGENBOT_GATE_CAPTURE_OUT").map_or_else(
-        |_| std::path::PathBuf::from("/tmp/gate_degenerate.jsonl"),
-        std::path::PathBuf::from,
-    );
-    let max_paths = std::env::var("DEGENBOT_GATE_CAPTURE_CAP")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(50);
-    Some(::degenbot_solvers::profit_envelope::GateCaptureCfg {
-        out_path,
-        max_paths,
-    })
+fn gate_capture_from_cfg(
+    cfg: &::degenbot_config::BotConfig,
+) -> Option<::degenbot_solvers::profit_envelope::GateCaptureCfg> {
+    cfg.capture
+        .gate_capture
+        .then(|| ::degenbot_solvers::profit_envelope::GateCaptureCfg {
+            out_path: cfg.capture.gate_capture_out.clone(),
+            max_paths: u64::try_from(cfg.capture.gate_capture_cap).unwrap_or(u64::MAX),
+        })
 }
 
-/// T4: the ONE env-parsing point for the engine's runtime stances — called
-/// once at engine construction; hot paths read the parsed statics/config.
-pub fn install_engine_env_stances() {
+/// KAHU5W: the solver crate's runtime stance is INSTANCE-SCOPED — built
+/// fresh per engine from the typed config and passed down; no OnceLock.
+#[must_use]
+pub fn solve_runtime_config_from_cfg(
+    cfg: &::degenbot_config::BotConfig,
+) -> ::degenbot_solvers::runtime::SolveRuntimeConfig {
+    ::degenbot_solvers::runtime::SolveRuntimeConfig {
+        event_solver_legacy: cfg.solve.walk_event_solver_legacy,
+        walk_event_census: cfg.solve.walk_event_census,
+        anchor_sweep: match cfg.solve.walk_anchor_sweep {
+            ::degenbot_config::AnchorSweep::Off => ::degenbot_solvers::runtime::AnchorSweep::Off,
+            ::degenbot_config::AnchorSweep::CenterOnly => {
+                ::degenbot_solvers::runtime::AnchorSweep::CenterOnly
+            }
+            ::degenbot_config::AnchorSweep::Full => ::degenbot_solvers::runtime::AnchorSweep::Full,
+        },
+        max_tangent_lines: cfg.solve.envelope_max_tangent_lines,
+        sampled_compose_lines: cfg.solve.envelope_sampled_compose_lines,
+        memo_on: cfg.solve.solver_walk_memo,
+        memo_stats: cfg.solve.solver_walk_memo_stats,
+        gate_trace: cfg.trace.gate_trace,
+    }
+}
+
+/// T4 (KAHU5W): the ONE config parse point for the engine's runtime stances —
+/// called at engine construction with the typed `BotConfig`; hot paths read
+/// the parsed statics. The crate performs ZERO environment reads: every stance
+/// is a schema key (env or TOML loads into it via the degenbot-config loader).
+/// The solver-runtime stance is NOT installed globally anymore — the engine
+/// holds an instance value built by [`solve_runtime_config_from_cfg`] and
+/// threads it down (KAHU5W: the solver OnceLock is retired).
+pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
     LPT_PARTITION_ENABLED.store(
-        std::env::var("DEGENBOT_LPT_PARTITION").map_or(true, |s| {
-            s != "0" && !s.eq_ignore_ascii_case("false") && !s.eq_ignore_ascii_case("off")
-        }),
+        cfg.solve.lpt_partition,
         std::sync::atomic::Ordering::Relaxed,
     );
     SOLVE_EXECUTOR_TOKIO.store(
-        solve_executor_stance_from_env(),
+        solve_executor_tokio(cfg),
         std::sync::atomic::Ordering::Relaxed,
     );
     STREAMING_DELIVERY_ENABLED.store(
-        streaming_delivery_stance_from_env(
-            std::env::var("DEGENBOT_STREAMING_DELIVERY").ok().as_deref(),
-        ),
+        cfg.pump.streaming_delivery,
         std::sync::atomic::Ordering::Relaxed,
     );
     DETACHED_SOLVES_ENABLED.store(
-        std::env::var("DEGENBOT_DETACHED_SOLVES").as_deref() == Ok("1"),
+        cfg.solve.detached_solves,
         std::sync::atomic::Ordering::Relaxed,
     );
     INLINE_SIM_ENABLED.store(
-        solve_inline_stance_from_env(std::env::var("DEGENBOT_SOLVE_INLINE_SIM").ok().as_deref()),
+        cfg.solve.solve_inline_sim,
         std::sync::atomic::Ordering::Relaxed,
     );
-
-    let min_profit = std::env::var("DEGENBOT_MIN_PROFIT_WEI")
-        .ok()
-        .and_then(|s| s.parse::<U256>().ok())
-        .unwrap_or(U256::ZERO);
+    let min_profit = U256::from(cfg.solve.min_profit_wei);
     let _ = MIN_PROFIT_FLOOR_WEI.set(min_profit);
-    let memo_on = std::env::var("DEGENBOT_SOLVER_WALK_MEMO").as_deref() == Ok("1");
-    let memo_stats = std::env::var("DEGENBOT_SOLVER_WALK_MEMO_STATS").as_deref() == Ok("1");
-    let projection_memo = match std::env::var("DEGENBOT_CL_PROJECTION_CACHE") {
-        Ok(raw) => !matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false" | "disabled"
-        ),
-        Err(_) => true,
-    };
-    crate::bot_core::resolve::install_projection_memo_stance(projection_memo);
+    crate::bot_core::resolve::install_projection_memo_stance(cfg.solve.cl_projection_cache);
     // 7LV6VN T2: chunked parallel resolve stance, parsed once at construction.
     RESOLVE_PAR_STANCE.store(
-        match std::env::var("DEGENBOT_SOLVE_RESOLVE_PAR") {
-            Ok(raw) => !matches!(
-                raw.trim().to_ascii_lowercase().as_str(),
-                "0" | "off" | "false" | "disabled"
-            ),
-            Err(_) => true,
-        },
+        cfg.solve.solve_resolve_par,
         std::sync::atomic::Ordering::Relaxed,
     );
-    ::degenbot_solvers::runtime::set_runtime(::degenbot_solvers::runtime::SolveRuntimeConfig {
-        event_solver_legacy: std::env::var("DEGENBOT_WALK_EVENT_SOLVER").as_deref() == Ok("0"),
-        walk_event_census: std::env::var("DEGENBOT_WALK_EVENT_CENSUS").as_deref() == Ok("1"),
-        anchor_sweep: match std::env::var("DEGENBOT_WALK_ANCHOR_SWEEP").as_deref() {
-            Ok("0") => ::degenbot_solvers::runtime::AnchorSweep::Off,
-            Ok("2") => ::degenbot_solvers::runtime::AnchorSweep::CenterOnly,
-            _ => ::degenbot_solvers::runtime::AnchorSweep::Full,
-        },
-        max_tangent_lines: std::env::var("DEGENBOT_ENVELOPE_MAX_TANGENT_LINES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32),
-        sampled_compose_lines: std::env::var("DEGENBOT_ENVELOPE_SAMPLED_COMPOSE_LINES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(48),
-        memo_on,
-        memo_stats,
-    });
 }
 
 /// K-slowest-path attribution record: (`time_us`, `pieces_visited`,
@@ -405,6 +340,7 @@ pub(crate) fn solve_one_path(
         prefix_cache: true,
         capture: ctx.gate_capture.as_ref(),
         walk_memo: Some(&*ctx.walk_memo),
+        runtime: ctx.runtime,
     };
     let _solve_ctx = solve_span.enter();
     // MQUKB6-T2: per-path child span. Created BEFORE the walk (the exported
@@ -583,10 +519,6 @@ pub(crate) fn solve_one_path(
 /// the inline stance. Later 0.7 hardening may remove the env entirely.
 pub(crate) static INLINE_SIM_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
-
-fn solve_inline_stance_from_env(raw: Option<&str>) -> bool {
-    !matches!(raw, Some("0" | "false"))
-}
 
 /// SIMPIPE2 T2: the WORKER-side clamp — drive the merge-site-identical
 /// clamp from the solve worker's `to_solve`-aligned pool-ref snapshot, so a
@@ -908,11 +840,13 @@ fn flush_tokio_item(
 /// per cycle so a worker handle is static for the dedicated-executor
 /// arm; the caller retains its own Arc for the drain + tail telemetry.
 pub(crate) struct SolveCycleShared {
-    /// The cycle target block (capture rows) and cache epoch.
     solve_block: u64,
     epoch: u64,
     gate_capture: Option<::degenbot_solvers::profit_envelope::GateCaptureCfg>,
     walk_memo: std::sync::Arc<::degenbot_solvers::mobius_v3_int::WalkMemo>,
+    /// KAHU5W: the instance-scoped solver runtime stance, threaded down —
+    /// the solver crate has no process-global config anymore.
+    runtime: ::degenbot_solvers::runtime::SolveRuntimeConfig,
     capture: Option<std::sync::Arc<HeavyClPathCapture>>,
     capture_mixed: Option<std::sync::Arc<HeavyMixedPathCapture>>,
     path_times: parking_lot::Mutex<PathTimesHeap>,
@@ -2001,17 +1935,17 @@ impl ArbitrageEngine {
         // at the owner; the gate itself reads no environment. The prefix-
         // composition cache is generationed by the block epoch inside the
         // gate deps (no public reset to call anymore).
-        let gate_capture = gate_capture_from_env();
+        let gate_capture = gate_capture_from_cfg(&self.cfg);
         // Optional offline CL-solver capture (DEGENBOT_SOLVER_CAPTURE=1): dump
         // the exact all-CL pool state the solver consumed for heavy paths so
         // the CL solver can be optimized offline. None (no-op) unless gated.
-        let capture = HeavyClPathCapture::from_env();
+        let capture = HeavyClPathCapture::from_capture(&self.cfg.capture);
         // Optional mixed V2+CL solver capture (same gate): heavy
         // mixed paths (e.g. path 7042 V2->V3->V3) dispatch to
         // `exact_solve_mixed_path_n_cached`, which the all-CL capture skips.
         // Defaults OUT of the fixtures dir (loop-18: working rows never
         // accrete there; goldens are produced only by cl_capture_gen).
-        let capture_mixed = HeavyMixedPathCapture::from_env();
+        let capture_mixed = HeavyMixedPathCapture::from_capture(&self.cfg.capture);
         // SIMPIPE2 T2: pool-ref snapshot aligned to `to_solve` order (the
         // worker clamp's pool list) — captured under this cycle's engine
         // Mutex so it cannot interleave with a re-registration.
@@ -2032,6 +1966,7 @@ impl ArbitrageEngine {
             metadata: *metadata,
             gate_capture,
             walk_memo: std::sync::Arc::clone(&self.walk_memo),
+            runtime: self.runtime_cfg,
             capture: capture.map(std::sync::Arc::new),
             capture_mixed: capture_mixed.map(std::sync::Arc::new),
             path_times,
@@ -2749,8 +2684,11 @@ impl ArbitrageEngine {
 
         // Cold start: no capture wiring — deps with the registered-epoch
         // guard + the engine's walk-memo handle.
-        let mut gate_deps =
-            ::degenbot_solvers::profit_envelope::GateDeps::per_block(self.results_block, None);
+        let mut gate_deps = ::degenbot_solvers::profit_envelope::GateDeps::per_block_with(
+            self.results_block,
+            None,
+            self.runtime_cfg,
+        );
         gate_deps.walk_memo = Some(&self.walk_memo);
         let (tx, rx) = std::sync::mpsc::channel();
         rayon::scope(|s| {
@@ -2815,23 +2753,14 @@ struct HeavyClPathCapture {
 }
 
 impl HeavyClPathCapture {
-    fn from_env() -> Option<Self> {
-        std::env::var_os("DEGENBOT_SOLVER_CAPTURE")?;
-        Some(Self {
-            min_us: std::env::var("DEGENBOT_SOLVER_CAPTURE_MIN_US")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50_000),
-            min_sims: std::env::var("DEGENBOT_SOLVER_CAPTURE_MIN_SIMS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2_000),
-            max_captures: std::env::var("DEGENBOT_SOLVER_CAPTURE_CAP")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16),
-            out_path: std::env::var("DEGENBOT_SOLVER_CAPTURE_OUT").map_or_else(
-                |_| {
+    fn from_capture(capture: &::degenbot_config::schema::CaptureConfig) -> Option<Self> {
+        capture.solver_capture.then_some(()).map(|()| Self {
+            min_us: capture.solver_capture_min_us,
+            min_sims: capture.solver_capture_min_sims,
+            max_captures: u64::try_from(capture.solver_capture_cap).unwrap_or(u64::MAX),
+            out_path: match capture.solver_capture_out.clone() {
+                Some(p) => p,
+                None => {
                     // Loop-18: production captures are WORKING rows (state and
                     // recorded answer come from different contexts) — they
                     // must NEVER accrete into the exact-wei fixtures: that
@@ -2841,9 +2770,8 @@ impl HeavyClPathCapture {
                     // cl_capture_gen (see its doc: the sanctioned producer).
                     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                         .join("../../../logs/solver_capture/cl_heavy_paths.jsonl")
-                },
-                std::path::PathBuf::from,
-            ),
+                }
+            },
             seen: std::sync::Mutex::new(std::collections::HashSet::new()),
             count: std::sync::atomic::AtomicU64::new(0),
         })
@@ -2971,41 +2899,31 @@ struct HeavyMixedPathCapture {
 }
 
 impl HeavyMixedPathCapture {
-    fn from_env() -> Option<Self> {
-        std::env::var_os("DEGENBOT_SOLVER_CAPTURE")?;
-        Some(Self {
-            min_us: std::env::var("DEGENBOT_SOLVER_CAPTURE_MIN_US")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(50_000),
-            min_sims: std::env::var("DEGENBOT_SOLVER_CAPTURE_MIN_SIMS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(2_000),
-            max_captures: std::env::var("DEGENBOT_SOLVER_CAPTURE_CAP")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(16),
-            out_path: std::env::var("DEGENBOT_SOLVER_CAPTURE_OUT").map_or_else(
-                |_| {
-                    // Loop-18: mixed captures default OUT of the fixtures dir
-                    // (working rows; see the Cl-side comment).
-                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../../logs/solver_capture/cl_mixed_paths.jsonl")
-                },
-                |p| {
+    fn from_capture(capture: &::degenbot_config::schema::CaptureConfig) -> Option<Self> {
+        capture.solver_capture.then_some(()).map(|()| Self {
+            min_us: capture.solver_capture_min_us,
+            min_sims: capture.solver_capture_min_sims,
+            max_captures: u64::try_from(capture.solver_capture_cap).unwrap_or(u64::MAX),
+            out_path: match capture.solver_capture_out.clone() {
+                Some(p) => {
                     // If the caller overrides the out path for both captures,
                     // disambiguate the mixed corpus into a sibling filename
                     // rather than overwriting the all-CL fixture.
-                    let mut pb = std::path::PathBuf::from(p);
+                    let mut pb = p;
                     if pb.extension().and_then(|e| e.to_str()) == Some("jsonl") {
                         if let Some(stem) = pb.file_stem().and_then(|s| s.to_str()) {
                             pb.set_file_name(format!("{stem}_mixed.jsonl"));
                         }
                     }
                     pb
-                },
-            ),
+                }
+                None => {
+                    // Loop-18: mixed captures default OUT of the fixtures dir
+                    // (working rows; see the Cl-side comment).
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../../logs/solver_capture/cl_mixed_paths.jsonl")
+                }
+            },
             seen: std::sync::Mutex::new(std::collections::HashSet::new()),
             count: std::sync::atomic::AtomicU64::new(0),
         })
@@ -3313,6 +3231,7 @@ mod profit_clamp_recompute_tests {
             solve_block: 0,
             epoch: 0,
             metadata: BlockMetadata::default(),
+            runtime: ::degenbot_solvers::runtime::SolveRuntimeConfig::default(),
             gate_capture: None,
             walk_memo: Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
                 false, false,
@@ -4016,6 +3935,7 @@ mod executor_ab_probe {
             solve_block: 0,
             epoch: 0,
             metadata: BlockMetadata::default(),
+            runtime: ::degenbot_solvers::runtime::SolveRuntimeConfig::default(),
             gate_capture: None,
             walk_memo: Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
                 false, false,

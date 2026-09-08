@@ -82,8 +82,12 @@ fn serve_enabled() -> bool {
             return forced != 0;
         }
     }
-    *SERVE_ENABLED
-        .get_or_init(|| std::env::var_os(SIM_SERVE_ENGINE_STATE_ENV).is_some_and(|v| v == "1"))
+    // KAHU5W: typed schema key `simulation.sim_serve_engine_state`.
+    *SERVE_ENABLED.get_or_init(|| {
+        ::degenbot_config::holder::config()
+            .simulation
+            .sim_serve_engine_state
+    })
 }
 
 /// Test-only gate override (`-1`/unset → use the env cache, `0` → off, `1` →

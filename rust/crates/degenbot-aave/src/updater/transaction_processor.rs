@@ -529,7 +529,7 @@ fn build_scaled_event_chunk_event(
     // `balance_increase`, `index`) can be audited per event — narrows the
     // exact rounding/raw_amount site for a divergent position. Keys via
     // `log_index` (cross-ref the per-tx balance trace).
-    if std::env::var("DEGENBOT_AAVE_EVTRACE").as_deref() == Ok("1") {
+    if ::degenbot_config::holder::config().aave.aave_evtrace {
         #[expect(clippy::print_stderr)] // env-gated event trace
         {
             eprintln!(

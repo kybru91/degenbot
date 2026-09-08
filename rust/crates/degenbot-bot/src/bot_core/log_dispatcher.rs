@@ -428,6 +428,12 @@ impl LogDecoder for V4ModifyLiquidityDecoder {
 pub struct LogDispatcher {
     decoders: Vec<Box<dyn LogDecoder>>,
     subscribers: parking_lot::Mutex<HashMap<u64, Vec<Weak<dyn PoolStateSubscriber>>>>,
+    /// KAHU5W: strict decode-miss hard-fault gate. Historically the
+    /// presence-gated `DEGENBOT_WS_COMPLETENESS` env var; now the typed
+    /// `pump.ws_completeness` schema default AND'ed with the owning pump's
+    /// per-pump opt-out (tests set the field OFF deterministically, keeping
+    /// the synthetic-fixture streams decode-miss-neutral).
+    strict_decode_fault: std::sync::atomic::AtomicBool,
 }
 
 impl LogDispatcher {
@@ -437,7 +443,18 @@ impl LogDispatcher {
         Self {
             decoders: Vec::new(),
             subscribers: parking_lot::Mutex::new(HashMap::new()),
+            strict_decode_fault: std::sync::atomic::AtomicBool::new(
+                crate::bot_core::stance::config().pump.ws_completeness,
+            ),
         }
+    }
+
+    /// Per-pump opt-out for the strict decode-miss fault (the test pumps
+    /// disable the completeness machinery deterministically; production
+    /// keeps the schema default ON).
+    pub fn set_strict_decode_fault(&self, on: bool) {
+        self.strict_decode_fault
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Construct a dispatcher pre-loaded with the 6 Uniswap (V2/V3/V4)
@@ -560,7 +577,9 @@ impl LogDispatcher {
             // defaulted, and it has no per-pump opt-out here to keep the
             // synthetic-fixture tests deterministic.
             assert!(
-                std::env::var("DEGENBOT_WS_COMPLETENESS").is_err()
+                !self
+                    .strict_decode_fault
+                    .load(std::sync::atomic::Ordering::Relaxed)
                     || !is_known_pool_topic(log.topics().first()),
                 "dispatch: relevant-topic log failed to decode (malformed event?): \
                  block={block:?} tx={tx:?} log_index={idx:?} topic0={t0:x?} address={addr}",
@@ -686,7 +705,7 @@ impl LogDispatcher {
             // learns the pool changed - solver reads stay stale forever while
             // BotState advances (the frozen-update_block signature). Silent
             // before this trace; env-gated like its siblings.
-            if std::env::var("DEGENBOT_TRACE_DISPATCH").is_ok() {
+            if crate::bot_core::stance::config().trace.dispatch {
                 tracing::warn!(
                     pool_id,
                     "dispatch: NOTIFY MISS - state applied but no subscriber attached"

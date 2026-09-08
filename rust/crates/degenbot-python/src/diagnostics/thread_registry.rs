@@ -169,8 +169,13 @@ pub(crate) fn note_current_thread(span_name: &str, span_loc: Option<&str>) {
 /// GIL; safe to call during a permanent GIL deadlock).
 pub fn dump_to_file() -> Option<std::path::PathBuf> {
     let pid = std::process::id();
-    let path = std::env::var("DEGENBOT_THREAD_REGISTRY_PATH")
-        .unwrap_or_else(|_| format!("/tmp/degenbot-thread-registry-{pid}.json"));
+    // KAHU5W: typed schema key `state_lock.thread_registry_path`
+    // (`DEGENBOT_THREAD_REGISTRY_PATH`; `{pid}` expands here at use time).
+    let path = ::degenbot_config::holder::config()
+        .state_lock
+        .thread_registry_path
+        .to_string_lossy()
+        .replace("{pid}", &pid.to_string());
 
     let mut os_threads: Vec<serde_json::Value> = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/proc/self/task") {

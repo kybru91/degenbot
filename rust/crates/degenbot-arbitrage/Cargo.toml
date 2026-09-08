@@ -19,6 +19,7 @@ workspace = true
 # stays thin + generic; the settlement-arbitrage bundle is this strategy's concern, not the
 # engine's.
 degenbot-simulation.workspace = true
+degenbot-config.workspace = true
 # `BotState` (ADR-003 state owner) — the snapshot surface the dispatch
 # fan-out reads via `BlockSimHandle`.
 degenbot-bot.workspace = true

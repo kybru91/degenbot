@@ -1,12 +1,14 @@
 //! The solver crate's injected runtime config (SU7MAE T4 / Q7b+Q13a): the
 //! tunables the perf campaign kept re-reading from the process environment
-//! become ONE plain-data config, packed by the outer owner (the engine
-//! parses env at construction; the engine crate owns the env→config
-//! mapping). Internals read the set-once holder — data, never the
-//! environment — so tests construct the config directly and A/B per run.
+//! become ONE plain-data config, packed by the outer owner and passed
+//! down through the call chain (KAHU5W: the RUNTIME OnceLock is deleted;
+//! the config is instance-scoped and threaded). Internals read the
+//! passed-in config — data, never the environment — so tests construct
+//! the config directly and A/B per run.
 
-//! This is the ADR-021 tripwire pattern ("reads no environment: the pump
-//! packs the env stances into one config value at construction").
+//! This is the ADR-021 tripwire pattern ("reads no environment: the owner
+//! packs the config stances into one value at construction and threads it
+//! to every solve").
 
 #[derive(Clone, Copy, Debug)]
 pub enum AnchorSweep {
@@ -39,6 +41,8 @@ pub struct SolveRuntimeConfig {
     pub memo_on: bool,
     /// DEGENBOT_SOLVER_WALK_MEMO_STATS (recomposition census).
     pub memo_stats: bool,
+    /// DEGENBOT_GATE_TRACE: opt-in compose tracing in the profit envelope.
+    pub gate_trace: bool,
 }
 
 impl Default for SolveRuntimeConfig {
@@ -51,28 +55,7 @@ impl Default for SolveRuntimeConfig {
             sampled_compose_lines: 48,
             memo_on: false,
             memo_stats: false,
+            gate_trace: false,
         }
     }
-}
-
-static RUNTIME: std::sync::OnceLock<SolveRuntimeConfig> = std::sync::OnceLock::new();
-
-/// Install the runtime config (the engine calls this ONCE at construction;
-/// the first caller wins and later calls are ignored — a second engine in
-/// the same process reuses the process-wide stance).
-pub fn set_runtime(config: SolveRuntimeConfig) {
-    let _ = RUNTIME.set(config);
-}
-
-/// The process-wide config (defaults until [`set_runtime`]).
-#[must_use]
-pub fn runtime() -> &'static SolveRuntimeConfig {
-    RUNTIME.get_or_init(SolveRuntimeConfig::default)
-}
-
-/// True while no owner has installed a config (the engine checks so its
-/// construction-time env parse runs exactly once per process).
-#[must_use]
-pub fn runtime_is_default() -> bool {
-    RUNTIME.get().is_none()
 }

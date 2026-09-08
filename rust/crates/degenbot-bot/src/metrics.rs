@@ -144,7 +144,14 @@ fn read_request_path(stream: &mut TcpStream) -> Option<String> {
 /// override is not a valid socket address — a boot-time config fault, surfaced
 /// at init rather than silently binding somewhere unexpected.
 pub fn metrics_addr_from_env() -> Result<SocketAddr, MetricsInitError> {
-    let raw = std::env::var(METRICS_ADDR_ENV).unwrap_or_else(|_| DEFAULT_METRICS_ADDR.to_owned());
+    // KAHU5W: the address is a typed schema key (`telemetry.metrics_addr` /
+    // `DEGENBOT_METRICS_ADDR`); the loader owns any env read.
+    // KAHU5W: typed schema key `telemetry.metrics_addr`; the loader owns
+    // the env read — no direct env access here.
+    let raw = crate::bot_core::stance::config()
+        .telemetry
+        .metrics_addr
+        .clone();
     raw.parse().map_err(|e| {
         MetricsInitError::Bind(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

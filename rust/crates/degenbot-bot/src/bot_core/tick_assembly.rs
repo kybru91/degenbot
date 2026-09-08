@@ -167,7 +167,7 @@ pub(crate) fn dump_tick_map_seed(
     pool_ident: &str,
     seed: &(HashMap<i32, TickInfo>, PoolTickCoverage),
 ) {
-    if crate::bot_core::bot_env_flag_default_off("DEGENBOT_DUMP_TICK_MAPS") {
+    if crate::bot_core::stance::config().trace.dump_tick_maps {
         tracing::info!(
             target: crate::telemetry::DIAGNOSTIC_TARGET,
             pool = %pool_ident,

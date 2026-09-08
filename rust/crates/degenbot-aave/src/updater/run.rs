@@ -1804,7 +1804,7 @@ async fn process_chunk_on_conn(
         //     deferring it to end-of-chunk. The end-of-chunk GREEN compare
         //     (exact-zero) remains the rigorous gate; this trace is the
         //     narrowing tool, not the gate.
-        if std::env::var("DEGENBOT_AAVE_TX_TRACE").as_deref() == Ok("1") {
+        if ::degenbot_config::holder::config().aave.aave_tx_trace {
             let mut seen: std::collections::HashSet<(bool, i64)> = std::collections::HashSet::new();
             for ev in &op_events {
                 match ev {

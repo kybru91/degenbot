@@ -279,6 +279,7 @@ pub fn solve_path_inner(
                 &int_sequences,
                 &prepared,
                 gate.walk_memo(),
+                &gate.runtime,
             );
             (
                 out.result.map(|(optimal_input, _profit, hop_outputs)| {
@@ -360,7 +361,7 @@ pub fn solve_path_inner(
         (None, crate::mobius_v3_int::WalkStats::default())
     } else {
         // Mixed V2 + CL (V3 or V4)
-        solve_mixed_path_int(resolved)
+        solve_mixed_path_int(resolved, gate)
     };
 
     // V4 int128 guard: reject paths where any V4 hop's consumed input or
@@ -439,6 +440,7 @@ pub fn solve_path_inner(
 /// approximation when swaps exceed the current tick range capacity.
 fn solve_mixed_path_int(
     resolved: &ResolvedMixedPath,
+    gate: &GateDeps<'_>,
 ) -> (Option<SolvePathResult>, crate::mobius_v3_int::WalkStats) {
     if resolved.hops.len() < 2 {
         return (None, crate::mobius_v3_int::WalkStats::default());
@@ -502,6 +504,7 @@ fn solve_mixed_path_int(
         &int_v3_sequences,
         &cl_prepared,
         &hop_order,
+        &gate.runtime,
     );
     (
         out.result.map(|(optimal_input, profit, hop_outputs)| {
@@ -1564,7 +1567,7 @@ mod gate_tests {
                 reserve_in: U256::from(rin),
                 reserve_out: U256::from(rout),
             };
-            let bound = path_output_bound_at(&[Some(hop)], &U256::from(x))
+            let bound = path_output_bound_at(&[Some(hop)], &U256::from(x), &crate::runtime::SolveRuntimeConfig::default())
                 .unwrap_or(U256::ZERO);
             let state = crate::mixed::SolidlyHopState {
                 reserves_0: U256::from(r0),
@@ -1595,7 +1598,7 @@ mod gate_tests {
         ) {
             let reserve_out = if token_in == 0 { r1 } else { r0 };
             let hop = HopMath::ReserveCap { reserve_out: U256::from(reserve_out) };
-            let bound = path_output_bound_at(&[Some(hop)], &U256::from(x))
+            let bound = path_output_bound_at(&[Some(hop)], &U256::from(x), &crate::runtime::SolveRuntimeConfig::default())
                 .unwrap_or(U256::ZERO);
             let state = crate::mixed::SolidlyHopState {
                 reserves_0: U256::from(r0),
@@ -1652,7 +1655,7 @@ mod gate_tests {
             let hop = HopMath::ReserveCap {
                 reserve_out: U256::from(balances[j]),
             };
-            let bound = path_output_bound_at(&[Some(hop)], &U256::from(x))
+            let bound = path_output_bound_at(&[Some(hop)], &U256::from(x), &crate::runtime::SolveRuntimeConfig::default())
                 .unwrap_or(U256::ZERO);
             let state = crate::mixed::CurveStableswapHopState {
                 amp: U256::from(1000u64),
@@ -1708,7 +1711,7 @@ mod gate_tests {
                 scaling_in: state.scaling_factor_in,
                 scaling_out: state.scaling_factor_out,
             };
-            let bound = path_output_bound_at(&[Some(hop)], &U256::from(x))
+            let bound = path_output_bound_at(&[Some(hop)], &U256::from(x), &crate::runtime::SolveRuntimeConfig::default())
                 .unwrap_or(U256::ZERO);
             let true_out = simulate_balancer_weighted_hop(U256::from(x), &state);
             // Skip cases the math leaf itself rejects (returns 0 with x>0):

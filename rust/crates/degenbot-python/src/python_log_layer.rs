@@ -220,79 +220,6 @@ pub(crate) fn resolve_otlp_endpoint(
     }
 }
 
-/// Read one string key from the `[otel]` table of the user config file.
-/// A malformed file is treated as absent (warn + `None`), matching
-/// [`resolve_otlp_endpoint`]'s fail-open rule.
-#[cfg(feature = "otel")]
-#[must_use]
-fn otel_config_str(config_file: Option<&Path>, key: &str) -> Option<String> {
-    let path = config_file?;
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return None;
-    };
-    match text.parse::<toml::Table>() {
-        Ok(table) => table
-            .get("otel")
-            .and_then(|otel| otel.get(key))
-            .and_then(|v| v.as_str())
-            .map(str::to_owned),
-        Err(e) => {
-            tracing::warn!(%e, path = %path.display(), "user config.toml failed to parse - otel.{key} ignored");
-            None
-        }
-    }
-}
-
-/// Read one boolean key from the `[otel]` table of the user config file.
-#[cfg(feature = "otel")]
-#[must_use]
-fn otel_config_bool(config_file: Option<&Path>, key: &str) -> Option<bool> {
-    let path = config_file?;
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return None;
-    };
-    match text.parse::<toml::Table>() {
-        Ok(table) => table
-            .get("otel")
-            .and_then(|otel| otel.get(key))
-            .and_then(toml::Value::as_bool),
-        Err(e) => {
-            tracing::warn!(%e, path = %path.display(), "user config.toml failed to parse - otel.{key} ignored");
-            None
-        }
-    }
-}
-
-/// Resolve whether `OTel` telemetry is enabled. Precedence (first wins):
-///
-/// 1. `DEGENBOT_OTEL` env var — `"0"` (or empty) disables, any other value
-///    enables (explicit env always wins),
-/// 2. `otel.enabled` in the user config file,
-/// 3. `true` — the dev default (RMH23E/T5: ON whenever the feature compiles).
-#[cfg(feature = "otel")]
-#[must_use]
-pub(crate) fn resolve_otel_enabled(env_raw: Option<&str>, config_file: Option<&Path>) -> bool {
-    match env_raw {
-        Some(v) => v != "0" && !v.is_empty(),
-        None => otel_config_bool(config_file, "enabled").unwrap_or(true),
-    }
-}
-
-/// Resolve the Prometheus scrape endpoint. Precedence (first wins):
-///
-/// 1. `DEGENBOT_METRICS_ADDR` env var,
-/// 2. `otel.metrics_addr` in the user config file,
-/// 3. the default `127.0.0.1:9464`.
-#[cfg(feature = "otel")]
-#[must_use]
-pub(crate) fn resolve_metrics_addr(env_raw: Option<&str>, config_file: Option<&Path>) -> String {
-    if let Some(v) = env_raw.filter(|s| !s.is_empty()) {
-        return v.to_owned();
-    }
-    otel_config_str(config_file, "metrics_addr")
-        .unwrap_or_else(|| degenbot_bot::metrics::DEFAULT_METRICS_ADDR.to_owned())
-}
-
 /// Read the `[failure_policy]` override table from the user config file
 /// (ADR-040 D3): `kind` or `kind.reason` → action string. Malformed FILE →
 /// no overrides (warn + continue, matching the config helpers' fail-open
@@ -776,10 +703,10 @@ pub fn init_logging_subscriber() {
                 Some(url) => degenbot_bot::otel::provider_from_endpoint(url),
                 None => degenbot_bot::otel::provider_from_env_endpoint(),
             };
-            let otel_enabled = resolve_otel_enabled(
-                std::env::var("DEGENBOT_OTEL").ok().as_deref(),
-                user_config_path().as_deref(),
-            );
+            // KAHU5W: typed schema key `telemetry.otel` (`DEGENBOT_OTEL`).
+            // The legacy per-key `~/.config/degenbot/config.toml` fallback is
+            // subsumed by the typed loader's `--config` layer.
+            let otel_enabled = ::degenbot_config::holder::config().telemetry.otel;
             let otel_layer = if otel_enabled {
                 match build_provider() {
                     Ok((provider, tracer)) => {
@@ -796,7 +723,9 @@ pub fn init_logging_subscriber() {
                     }
                 }
             } else {
-                tracing::debug!("OTel span layer inactive (set DEGENBOT_OTEL=0 to opt out)");
+                tracing::debug!(
+                    "OTel span layer inactive (set telemetry.otel = false / DEGENBOT_OTEL=0 to opt out)"
+                );
                 None
             };
             // T1: metrics ride the same DEGENBOT_OTEL gate — the Prometheus
@@ -804,12 +733,10 @@ pub fn init_logging_subscriber() {
             // serves whatever instruments the drain path records. Fail-open:
             // a bind failure logs and the bot runs without scrapeable metrics.
             if otel_layer.is_some() {
-                // Scrape endpoint: DEGENBOT_METRICS_ADDR env > otel.metrics_addr
-                // in config.toml > default 127.0.0.1:9464.
-                let metrics_raw = resolve_metrics_addr(
-                    std::env::var("DEGENBOT_METRICS_ADDR").ok().as_deref(),
-                    user_config_path().as_deref(),
-                );
+                // Scrape endpoint (KAHU5W): typed schema key
+                // `telemetry.metrics_addr` / `DEGENBOT_METRICS_ADDR`.
+                let metrics_raw =
+                    ::degenbot_config::holder::config().telemetry.metrics_addr.clone();
                 match metrics_raw.parse::<std::net::SocketAddr>() {
                     Ok(addr) => match degenbot_bot::metrics::init_global_metrics_with_addr(addr) {
                         Ok(()) => tracing::info!(addr = %addr, "Prometheus metrics endpoint active"),
@@ -1044,116 +971,6 @@ mod tests {
                 .any(|(target, level)| target.starts_with("degenbot") && *level == Level::INFO),
             "degenbot's own INFO records must not be throttled"
         );
-    }
-
-    // T5/RMH23E: the otel runtime gate defaults ON in dev builds (the otel
-    // feature only exists there); DEGENBOT_OTEL=0 is the explicit opt-out.
-    #[cfg(feature = "otel")]
-    #[test]
-    fn resolve_otel_enabled_env_semantics() {
-        // env always wins when set.
-        assert!(resolve_otel_enabled(Some("1"), None), "explicit 1 enables");
-        assert!(
-            !resolve_otel_enabled(Some(""), None),
-            "empty is treated as opt-out"
-        );
-        assert!(
-            !resolve_otel_enabled(Some("0"), None),
-            "DEGENBOT_OTEL=0 opts out"
-        );
-    }
-
-    // RMH23E follow-up: otel.enabled config key. Env wins when set; config
-    // bool applies when env unset; default ON.
-    #[cfg(feature = "otel")]
-    #[test]
-    fn resolve_otel_enabled_config_precedence() {
-        let dir = std::env::temp_dir().join(format!("degenbot-otel-cfg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = dir.join("config.toml");
-        std::fs::write(
-            &cfg,
-            "[otel]
-enabled = false
-",
-        )
-        .unwrap();
-
-        // Config false + env unset -> disabled.
-        assert!(
-            !resolve_otel_enabled(None, Some(&cfg)),
-            "config enabled=false must disable"
-        );
-        // Env overrides config in both directions.
-        assert!(
-            resolve_otel_enabled(Some("1"), Some(&cfg)),
-            "env beats config disable"
-        );
-        std::fs::write(
-            &cfg,
-            "[otel]
-enabled = true
-",
-        )
-        .unwrap();
-        assert!(resolve_otel_enabled(None, Some(&cfg)));
-        assert!(
-            !resolve_otel_enabled(Some("0"), Some(&cfg)),
-            "env opt-out beats config enable"
-        );
-        // Missing enabled key -> dev default ON.
-        std::fs::write(
-            &cfg,
-            "[otel]
-endpoint = \"http://localhost:4318\"
-",
-        )
-        .unwrap();
-        assert!(
-            resolve_otel_enabled(None, Some(&cfg)),
-            "missing key defaults ON"
-        );
-        // Malformed config -> fail-open ON (must not silence telemetry).
-        std::fs::write(&cfg, "not toml at all [[[").unwrap();
-        assert!(
-            resolve_otel_enabled(None, Some(&cfg)),
-            "malformed config fails open"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(feature = "otel")]
-    #[test]
-    fn resolve_metrics_addr_precedence() {
-        let dir = std::env::temp_dir().join(format!("degenbot-metrics-cfg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = dir.join("config.toml");
-        std::fs::write(
-            &cfg,
-            "[otel]
-metrics_addr = \"0.0.0.0:9465\"
-",
-        )
-        .unwrap();
-
-        assert_eq!(
-            resolve_metrics_addr(None, Some(&cfg)).as_str(),
-            "0.0.0.0:9465",
-            "config addr applies when env unset"
-        );
-        assert_eq!(
-            resolve_metrics_addr(Some("127.0.0.1:9999"), Some(&cfg)).as_str(),
-            "127.0.0.1:9999",
-            "env beats config"
-        );
-        assert_eq!(
-            resolve_metrics_addr(None, None).as_str(),
-            degenbot_bot::metrics::DEFAULT_METRICS_ADDR,
-            "default without config"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // T5/RMH23E: OTLP endpoint precedence - env var beats config file;

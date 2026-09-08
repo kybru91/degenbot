@@ -28,6 +28,7 @@ alloy = { version = "^2.4", features = ["full"] }
 # Tick-map fixtures mirror the pools hashbrown maps.
 hashbrown.workspace = true
 degenbot-core.workspace = true
+degenbot-config.workspace = true
 # `WarmupSlots` + `compute_simulation_warmup_slots` + `mapping_slot` + the
 # `encode_cmd_stream`/`PathInfo`/`HopInfo`/`EncodeOptions` types the sim
 # orchestration consumes — crossed from the executor leaf.
