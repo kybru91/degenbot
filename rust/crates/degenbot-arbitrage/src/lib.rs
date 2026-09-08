@@ -84,10 +84,10 @@ pub use pool_divergence::{
 };
 pub use simulator::{
     compute_priority_fee, execute_gas_limit, fits_int128, simulate_in_process_with_db,
-    simulate_path_on_evm, FailBuckets, RevertingFrame, SimFailure, SimResult, SimulateContext,
-    SimulatePath, AGE_DECAY_CONSTANT, BALANCE_CALL_GAS_LIMIT, EXECUTE_GAS_ENV, GAS_SAFETY_MARGIN,
-    INITIAL_EXECUTE_GAS, INT128_MAX, INT128_MIN, MAX_PRIORITY_FEE_PERCENTILE,
-    MIN_PRIORITY_FEE_PERCENTILE, TARGET_PROFIT_RATIO,
+    simulate_path_on_evm, simulate_path_on_evm_in_span, FailBuckets, RevertingFrame, SimFailure,
+    SimResult, SimulateContext, SimulatePath, AGE_DECAY_CONSTANT, BALANCE_CALL_GAS_LIMIT,
+    EXECUTE_GAS_ENV, GAS_SAFETY_MARGIN, INITIAL_EXECUTE_GAS, INT128_MAX, INT128_MIN,
+    MAX_PRIORITY_FEE_PERCENTILE, MIN_PRIORITY_FEE_PERCENTILE, TARGET_PROFIT_RATIO,
 };
 // The swap-event-capture inspector's decoded per-swap struct (ergo epic
 // 63I7WJ). Re-exported here so the PyO3 wrapper (`degenbot-python` outcome)

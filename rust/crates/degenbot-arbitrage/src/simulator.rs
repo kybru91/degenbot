@@ -1019,21 +1019,43 @@ where
         > + InspectEvm<Inspector = SimInspector>,
     <E as ExecuteEvm>::Error: std::fmt::Display,
 {
-    // SIMPIPE T1 lab: per-candidate wall clock (the per-sim share of the
-    // serial tail that M1 parallelizes across solve workers).
-    let (result, sim_dur) = degenbot_simulation::sim::evm::sim_metrics::timed(|| {
-        simulate_path_on_evm_inner(evm, ctx, path, fail_buckets)
-    });
-    degenbot_simulation::sim::evm::sim_metrics::record_sim(sim_dur);
-    result
+    // G6HSIS: the shared sim seam opens its own `degenbot.bundle.simulate`
+    // span for callers that don't already hold one (the dispatch fan-out, the
+    // in-process DB sim). The worker-inline arm re-uses the caller-held span
+    // of the same name via `simulate_path_on_evm_in_span` instead.
+    let span = tracing::info_span!(
+        "degenbot.bundle.simulate",
+        path_id = path.path_id,
+        simulate.verdict = tracing::field::Empty,
+        simulate.expected_profit = tracing::field::Empty,
+        simulate.error_reason = tracing::field::Empty,
+    );
+    simulate_path_on_evm_in_span(evm, ctx, path, fail_buckets, span)
 }
 
-#[expect(clippy::too_many_lines)] // moved off the timed wrapper — SIMPIPE T1 extraction left this as the 350-line body
-fn simulate_path_on_evm_inner<E>(
+/// SIMSPANDUP (trace 73604143 cleanup): run the sim under the CALLER-HELD
+/// span. The worker-inline arm enters its `degenbot.bundle.simulate` before
+/// the runtime hop; letting the seam open a second span of the same name
+/// nested under `degenbot.simulate.inline` tripled every Jaeger sim
+/// (`bundle.simulate -> simulate.inline -> bundle.simulate`, once per
+/// candidate). With the caller's span entered here, the verdict and
+/// error_reason records land on it via [`SimSpanVerdict`], and one inline
+/// sim emits exactly TWO spans (`bundle.simulate -> simulate.inline`).
+///
+/// A disabled/no-op `span` degrades safely (enter/record are no-ops) — the
+/// sim body then runs untraced rather than forking an orphan trace root.
+///
+/// # Errors
+///
+/// Returns `Ok(None)` for non-profitable / reverted outcomes (bucket tallied).
+/// Returns `Err` only on an unrecoverable revm `transact` error (a DB
+/// cold-miss RPC failure — `rpc-failed`).
+pub fn simulate_path_on_evm_in_span<E>(
     evm: &mut E,
     ctx: &SimulateContext<'_>,
     path: &SimulatePath,
     fail_buckets: &mut FailBuckets,
+    span: tracing::Span,
 ) -> ProviderResult<Option<SimResult>>
 where
     E: ExecuteEvm<
@@ -1043,12 +1065,31 @@ where
         > + InspectEvm<Inspector = SimInspector>,
     <E as ExecuteEvm>::Error: std::fmt::Display,
 {
-    let span = tracing::info_span!(
-        "degenbot.bundle.simulate",
-        path_id = path.path_id,
-        simulate.verdict = tracing::field::Empty,
-        simulate.expected_profit = tracing::field::Empty,
-    );
+    // SIMPIPE T1 lab: per-candidate wall clock (the per-sim share of the
+    // serial tail that M1 parallelizes across solve workers).
+    let (result, sim_dur) = degenbot_simulation::sim::evm::sim_metrics::timed(|| {
+        simulate_path_on_evm_seam(evm, ctx, path, fail_buckets, span)
+    });
+    degenbot_simulation::sim::evm::sim_metrics::record_sim(sim_dur);
+    result
+}
+
+#[expect(clippy::too_many_lines)] // moved off the timed wrapper — SIMPIPE T1 extraction left this as the 350-line body
+fn simulate_path_on_evm_seam<E>(
+    evm: &mut E,
+    ctx: &SimulateContext<'_>,
+    path: &SimulatePath,
+    fail_buckets: &mut FailBuckets,
+    span: tracing::Span,
+) -> ProviderResult<Option<SimResult>>
+where
+    E: ExecuteEvm<
+            Tx = TxEnv,
+            ExecutionResult = revm::context_interface::result::ExecutionResult,
+            State = revm::state::EvmState,
+        > + InspectEvm<Inspector = SimInspector>,
+    <E as ExecuteEvm>::Error: std::fmt::Display,
+{
     let _enter = span.enter();
     let mut guard = SimSpanVerdict {
         span: span.clone(),
@@ -2907,6 +2948,77 @@ mod tests {
             mine[0].1.get("simulate.verdict").map(String::as_str),
             Some("not_profitable"),
             "reverted path is not_profitable; fields: {:?}",
+            mine[0].1
+        );
+    }
+
+    /// SIMSPANDUP (trace 73604143 cleanup): the worker-inline arm hands the
+    /// caller-held `degenbot.bundle.simulate` span to
+    /// [`simulate_path_on_evm_in_span`] — the seam must REUSE it (records the
+    /// verdict on it) rather than open a duplicate same-named span nested
+    /// under `degenbot.simulate.inline`.
+    #[test]
+    fn caller_held_sim_span_is_reused_not_duplicated() {
+        const UNIQUE_PATH_ID: u64 = 991_235;
+        let cap = span_capture::global();
+        let asserter = Asserter::new();
+        let provider = smoke_provider(&asserter);
+        let ctx = smoke_ctx(&provider);
+        let mut cache_db: CacheDB<EmptyDB> = CacheDB::new(EmptyDB::default());
+        degenbot_simulation::apply_simulation_overrides(&mut cache_db, &ctx.override_params())
+            .expect("overrides apply over EmptyDB");
+        let mut buckets = FailBuckets::new();
+
+        let path = smoke_v2_path(UNIQUE_PATH_ID);
+        // The caller (worker arm analog) holds a span of the seam name with
+        // the declared `simulate.*` fields, exactly as solver_dispatch's
+        // worker arms open before the runtime hop.
+        let caller = tracing::info_span!(
+            "degenbot.bundle.simulate",
+            path_id = UNIQUE_PATH_ID,
+            sim.path = "worker_inline",
+            simulate.verdict = tracing::field::Empty,
+            simulate.expected_profit = tracing::field::Empty,
+            simulate.error_reason = tracing::field::Empty,
+        );
+        let _enter = caller.enter();
+
+        // Build the EVM exactly as `simulate_in_process_with_db` does so the
+        // seam is reached directly under the caller-held span.
+        let mut revm_ctx = revm::context::Context::mainnet();
+        revm_ctx.cfg.disable_nonce_check = true;
+        let mut evm = revm_ctx
+            .with_db(cache_db)
+            .build_mainnet_with_inspector(SimInspector::default());
+        evm.ctx.modify_block(|block| {
+            block.basefee = u64::try_from(ctx.base_fee_next).unwrap_or(u64::MAX);
+            block.number = U256::from(ctx.current_block);
+            block.timestamp = U256::from(ctx.block_timestamp);
+        });
+        let result =
+            simulate_path_on_evm_in_span(&mut evm, &ctx, &path, &mut buckets, caller.clone())
+                .unwrap();
+        assert!(result.is_none(), "reverting execute returns None");
+
+        let mine: Vec<_> = cap
+            .snapshot()
+            .into_iter()
+            .filter(|(name, fields)| {
+                name == "degenbot.bundle.simulate"
+                    && fields.get("path_id").map(String::as_str)
+                        == Some(UNIQUE_PATH_ID.to_string().as_str())
+            })
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "caller-held sim span is reused, not duplicated; all: {:?}",
+            cap.snapshot()
+        );
+        assert_eq!(
+            mine[0].1.get("simulate.verdict").map(String::as_str),
+            Some("not_profitable"),
+            "verdict lands on the caller-held span; fields: {:?}",
             mine[0].1
         );
     }

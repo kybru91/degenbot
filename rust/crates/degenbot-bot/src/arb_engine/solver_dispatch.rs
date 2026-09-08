@@ -600,6 +600,9 @@ fn inline_sim_payload(
         sim_block = ctx.solve_block,
         simulate.verdict = tracing::field::Empty,
         simulate.expected_profit = tracing::field::Empty,
+        // SIMSPANDUP: declared so the seam-reused span keeps the ADR-040
+        // error classification on the inline arm too.
+        simulate.error_reason = tracing::field::Empty,
     );
     let _enter = span.enter();
     let payload = sim.simulate_path(crate::arb_engine::inline_sim::InlineSimRequest {
@@ -615,14 +618,13 @@ fn inline_sim_payload(
         parent_gas_used: ctx.metadata.gas_used,
         parent_gas_limit: ctx.metadata.gas_limit,
     })?;
-    span.record(
-        "simulate.verdict",
-        if payload.failure.is_some() {
-            "not_profitable"
-        } else {
-            "profitable"
-        },
-    );
+    // SIMSPANDUP: on failure the seam's SimSpanVerdict Drop (inside the
+    // inline hook's task) already stamped this span with
+    // `not_profitable`/`error` (+ error_reason) before the payload returns -
+    // don't clobber the richer classification with the bare string.
+    if payload.failure.is_none() {
+        span.record("simulate.verdict", "profitable");
+    }
     span.record(
         "simulate.expected_profit",
         tracing::field::display(result.profit),
@@ -700,17 +702,20 @@ impl PipelinedSims {
                     sim_block = request.sim_block,
                     simulate.verdict = tracing::field::Empty,
                     simulate.expected_profit = tracing::field::Empty,
+                    // SIMSPANDUP: declared so the seam-reused span keeps the
+                    // ADR-040 error classification on the inline arm too.
+                    simulate.error_reason = tracing::field::Empty,
                 );
                 let _enter = span.enter();
                 let payload = sim.simulate_path(request);
-                span.record(
-                    "simulate.verdict",
-                    if payload.as_ref().is_some_and(|p| p.failure.is_none()) {
-                        "profitable"
-                    } else {
-                        "not_profitable"
-                    },
-                );
+                // SIMSPANDUP: as in the sync arm - the seam's SimSpanVerdict
+                // Drop stamps the failure verdict (`not_profitable`/`error` +
+                // error_reason) before the payload returns; not clobbering it
+                // keeps the richer classification. A `None` payload = hook
+                // miss (no sim ran), so honestly no verdict stamp at all.
+                if payload.as_ref().is_some_and(|p| p.failure.is_none()) {
+                    span.record("simulate.verdict", "profitable");
+                }
                 span.record(
                     "simulate.expected_profit",
                     tracing::field::display(expected_profit),

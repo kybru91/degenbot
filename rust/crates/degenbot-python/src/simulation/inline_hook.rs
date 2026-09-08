@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use alloy::primitives::{Bytes, U256};
 use degenbot_arbitrage::{
-    simulate_path_on_evm, FailBuckets, SimResult, SimulateContext, SimulatePath, SolveStep,
+    simulate_path_on_evm_in_span, FailBuckets, SimResult, SimulateContext, SimulatePath, SolveStep,
 };
 use degenbot_bot::arb_engine::inline_sim::{
     AccessListRow, CapturedSwapRow, InlineSimFailure, InlineSimRequest, InlineSimulator,
@@ -445,26 +445,30 @@ impl InlineSimulator for InlineSimHook {
             // `degenbot.bundle.simulate`) BEFORE the runtime hop; the helper
             // re-enters it inside the spawned task so `degenbot.simulate.inline`
             // joins the block trace instead of forking an orphan root.
+            // SIMSPANDUP: the same capture is ALSO the seam span the sim body
+            // reuses (see `simulate_path_on_evm_in_span`) — the seam no longer
+            // opens a second same-named span under `degenbot.simulate.inline`.
             let sim_task_parent = tracing::Span::current();
+            let seam_span = tracing::Span::current();
             let sim_future = async move {
                 spawn_sim_task(sim_task_parent, async move {
-                    // SIMPIPE2 M1 span parity: the engine-side sim gets the
-                    // same Jaeger visibility the retired FFI fan-out had -
-                    // named `degenbot.simulate.inline`, nested under the
-                    // spawning solve worker's span context (the T1 helper
-                    // forwards the caller's span across the tokio::spawn).
-                    // One span per sim: closes the Jaeger-invisibility gap
-                    // the T4 soak found.
+                    // SIMPIPE2 M1 span parity: the engine-side sim stays
+                    // Jaeger-visible via `degenbot.simulate.inline`, nested
+                    // under the spawning solve worker's span context (the
+                    // T1 helper forwards the caller's span across the
+                    // tokio::spawn). The `degenbot.bundle.simulate` span the
+                    // worker already holds is REUSED by the seam body
+                    // (SIMSPANDUP) - one inline sim = two spans, no duplicate.
                     let req = req_task;
-                    let _sim_span = tracing::info_span!(
+                    let inline_span = tracing::info_span!(
                         target: "degenbot::solver",
                         "degenbot.simulate.inline",
                         path_id = req.path_id,
                         sim_block = req.sim_block,
                         hops = req.hops.len(),
                         sim_ok = false,
-                    )
-                    .entered();
+                    );
+                    let _sim_span = inline_span.clone().entered();
                     let ctx = SimulateContext {
                         provider: &provider,
                         executor_owner,
@@ -493,10 +497,19 @@ impl InlineSimulator for InlineSimHook {
                         verify_divergence,
                     ) {
                         let mut buckets = FailBuckets::new();
-                        let result =
-                            simulate_path_on_evm(handle.evm_mut(), &ctx, &sim_path, &mut buckets)
-                                .map_err(|e| format!("{e}"));
-                        tracing::Span::current().record(
+                        // SIMSPANDUP: the sim body rides the CALLER-HELD
+                        // `degenbot.bundle.simulate` span (captured before the
+                        // runtime hop below) — the seam must not open a
+                        // same-named duplicate nested under this span.
+                        let result = simulate_path_on_evm_in_span(
+                            handle.evm_mut(),
+                            &ctx,
+                            &sim_path,
+                            &mut buckets,
+                            seam_span,
+                        )
+                        .map_err(|e| format!("{e}"));
+                        inline_span.record(
                             "sim_ok",
                             result.as_ref().ok().and_then(|o| o.as_ref()).is_some(),
                         );
