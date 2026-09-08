@@ -51,7 +51,7 @@ pub struct SolveAnchor {
 impl SolveAnchor {
     /// Resolve the anchor from a request block and a pure state head
     /// (`max(base, state_head)` — the backfill-ahead desync rule, module
-    /// docs). The `PumpFSM` path: the FSM is I/O-free and receives the head
+    /// docs). The `StageMachine` path: the FSM is I/O-free and receives the head
     /// as data.
     #[must_use]
     pub fn for_head(base: u64, state_head: u64) -> Self {

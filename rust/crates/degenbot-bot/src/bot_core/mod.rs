@@ -15,7 +15,6 @@ pub mod apply_telemetry;
 pub mod balance_vector_orchestration;
 pub mod balancer_stable_state;
 pub mod balancer_weighted_state;
-pub mod block_clock;
 pub mod block_clock_pipe;
 pub mod block_pump;
 pub mod bot;
@@ -34,7 +33,6 @@ pub mod event_dispatch;
 pub mod liquidity_verifier;
 pub mod log_dispatcher;
 pub mod pool_builder;
-pub mod pump_fsm;
 pub mod pump_telemetry;
 pub mod registration_lifecycle;
 pub mod reorg_coordinator;
@@ -45,6 +43,7 @@ pub mod snapshot_verify;
 pub(crate) mod solve_anchor;
 pub mod solve_coordinator;
 pub mod stage_handlers;
+pub mod stage_machine;
 /// KAHU5W: the process-wide typed BotConfig holder. The degenbot-config
 /// loader (the ONLY environment-reading site in the workspace) produces the
 /// value once at startup; every formerly env-reading call site below reads
@@ -103,9 +102,15 @@ pub use ::degenbot_pools::v4_state::{
 // typed-narrowed.
 pub use ::degenbot_pools::tick_map::{TickMap, TickMapMut};
 
-// Re-export the ADR-008 per-block state machine core (pure; the pump drives
-// it — see `bot_core/block_clock.rs`).
-pub use block_clock::{BlockClock, BlockState, HeaderDecision, LogDecision};
+// Re-export the unified block stage machine (ergo 7NFYQW, ADR-041): the
+// per-block state map + decision producer + watchdogs + gates in ONE pure
+// machine; the pump drives it (see `bot_core/stage_machine.rs`). The
+// retired `BlockClock`/`PumpFSM` types are gone (hard cutover, Q6) —
+// their sub-state lives inside `StageMachine`.
+pub use stage_machine::{
+    BlockState, CompletenessDecision, HeaderDecision, LogDecision, StageDecision, StageMachine,
+    WatchdogPhase,
+};
 
 // ---------------------------------------------------------------------------
 // Pool state types
@@ -5985,7 +5990,7 @@ mod tests {
     // Asserts the WIRING the probes rely on: a tracked V3 pool's pump
     // Mint/Burn is counted by `v3_buffer.pump_count_at_or_below` through the
     // `BotState` field, `advance_pump_complete_cutoff` advances the shared
-    // pump-completeness cutoff (the BlockClock tombstone, 3M5PO5), and
+    // pump-completeness cutoff (the StageMachine tombstone, 3M5PO5), and
     // `pin_v3_post_drain_snapshot` +
     // `set_v3_pool_live` remain behavior-preserving under the buffered
     // tail (the apply path executes regardless of the gate — the

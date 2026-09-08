@@ -701,7 +701,7 @@ impl BotState {
             return;
         };
         // YLYJM2: drain ONLY fully-completed blocks. The cutoff is the pump's
-        // `BlockClock` tombstone cutoff (3M5PO5) — a block is complete when
+        // `StageMachine` tombstone cutoff (3M5PO5) — a block is complete when
         // the first log of N+1 closes N; a drain mid-block would pin
         // `update_block=N` missing a later same-block log. Events for the
         // in-progress block stay buffered.
@@ -1685,7 +1685,7 @@ impl BotState {
             return;
         };
         // YLYJM2: drain ONLY fully-completed blocks. The cutoff is the pump's
-        // `BlockClock` tombstone cutoff (3M5PO5) — a block is complete when
+        // `StageMachine` tombstone cutoff (3M5PO5) — a block is complete when
         // the first log of N+1 closes N; a drain mid-block would pin
         // `update_block=N` missing a later same-block log.
         let cutoff = self.pump_complete_cutoff;

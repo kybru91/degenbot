@@ -33,9 +33,14 @@ pub fn install(cfg: Arc<BotConfig>) -> bool {
 #[must_use]
 pub fn config() -> &'static BotConfig {
     static DEFAULT: OnceLock<Box<BotConfig>> = OnceLock::new();
-    CFG.get()
-        .map(|a| &**a)
-        .unwrap_or_else(|| DEFAULT.get_or_init(|| Box::new(BotConfig::default())))
+    CFG.get().map_or_else(
+        || {
+            DEFAULT
+                .get_or_init(|| Box::new(BotConfig::default()))
+                .as_ref()
+        },
+        |a| a.as_ref(),
+    )
 }
 
 /// Was a config installed by a real boot (vs test defaults)?

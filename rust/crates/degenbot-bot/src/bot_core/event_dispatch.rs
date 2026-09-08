@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::bot_core::drain_sink::DrainSink;
-use crate::bot_core::{BlockContext, BlockMetadata};
+use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
 
 /// A deferred drain-sink operation to the background drainer task: the sink's
 /// solve/dispatch/finalize run via these messages so the WS poller is never
@@ -43,7 +43,7 @@ use crate::bot_core::{BlockContext, BlockMetadata};
 /// atomically in the pump (single-writer).
 ///
 /// T6IYKY: every item carries its work block as a [`BlockContext`] — the ONE
-/// coordinate (block + rewind generation, minted by `PumpFSM::context_for`).
+/// coordinate (block + rewind generation, minted by `StageMachine::context_for`).
 /// The old loose `block`/`open` + `metadata` field pairs are gone.
 pub enum DrainWork {
     /// Eager solve of every dirty path at the context's block.
@@ -53,6 +53,20 @@ pub enum DrainWork {
     /// The quiesce-gated publish: flush the sink's `on_send` to Python with
     /// the log-driven quiesced context.
     Publish { context: BlockContext },
+}
+
+/// I3 (7NFYQW / T6IYKY review Q2 edge): the item's epoch when it is
+/// REORG-FLYING — its rewind generation sits below the stage machine's
+/// current one, so the drainer must drop it loudly instead of silently
+/// consuming `epoch.block()` into drain/finalize bookkeeping. The fresh
+/// generation's stream re-delivers the block's work. `None` = current, apply.
+fn reorg_flying_stale(work: &DrainWork, observed_seq: u64) -> Option<Epoch> {
+    let epoch = match work {
+        DrainWork::Drain { context }
+        | DrainWork::Finalize { context }
+        | DrainWork::Publish { context } => context.epoch(),
+    };
+    (epoch.seq() < observed_seq).then_some(epoch)
 }
 
 /// Shared progress counters giving the WS poller feedback on the background
@@ -286,6 +300,12 @@ pub struct DispatchOwner {
     /// `header_to_solved` latency histogram — the drainer stamps elapsed time
     /// when a Drain/Finalize item completes.
     header_ms: Arc<AtomicU64>,
+    /// The unified stage machine's current rewind generation, mirrored by the
+    /// pump (7NFYQW; I3). The drainer compares each queued item's epoch
+    /// against it: a reorg-flying item (minted pre-bump) is dropped with a
+    /// loud WARN instead of silently consuming `epoch.block()` (T6IYKY
+    /// review Q2 edge).
+    current_rewind_seq: Arc<AtomicU64>,
 }
 
 impl DispatchOwner {
@@ -298,9 +318,11 @@ impl DispatchOwner {
             tokio::sync::mpsc::unbounded_channel::<(DrainWork, tracing::Span, u64)>();
         let health = Arc::new(DrainerHealth::new());
         let header_ms = Arc::new(AtomicU64::new(0));
+        let current_rewind_seq = Arc::new(AtomicU64::new(0));
         let sink_clone = Arc::clone(&sink);
         let health_clone = Arc::clone(&health);
         let header_ms_clone = Arc::clone(&header_ms);
+        let rewind_seq_clone = Arc::clone(&current_rewind_seq);
         let _drainer = tokio::spawn(async move {
             while let Some((work, parent, enqueued_ms)) = rx.recv().await {
                 // Picked up: this item left the FIFO (the B3 depth signal).
@@ -324,6 +346,28 @@ impl DispatchOwner {
                 // sample header_to_solved (previously it recorded boundary-
                 // only latencies whenever a block's settle gate skipped).
                 let carries_solve = matches!(work, DrainWork::Drain { .. });
+                // 7NFYQW (I3, T6IYKY review Q2 edge): a reorg-flying item — its
+                // epoch's rewind generation is below the stage machine's
+                // current one — is dropped LOUDLY here instead of silently
+                // consuming `epoch.block()`. The fresh generation's stream
+                // re-delivers the block's work; applying a pre-rewind context
+                // would silently apply a rewound chain view (never — fail
+                // loud, ADR-021).
+                if let Some(stale_epoch) =
+                    reorg_flying_stale(&work, rewind_seq_clone.load(Ordering::Relaxed))
+                {
+                    tracing::warn!(
+                        item_block = stale_epoch.block(),
+                        item_seq = stale_epoch.seq(),
+                        observed_seq = rewind_seq_clone.load(Ordering::Relaxed),
+                        "reorg-flying drain item: stale epoch dropped instead of consuming epoch.block() (I3)"
+                    );
+                    if let Some(p) = crate::instruments::pipeline() {
+                        p.count_reorg_recovery_dropped();
+                    }
+                    health_clone.processed.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 match work {
                     DrainWork::Drain { context } => {
                         sink_clone.on_drain(&context);
@@ -407,6 +451,18 @@ impl DispatchOwner {
             drainer_health: health,
             stall_watch,
             header_ms,
+            current_rewind_seq,
+        }
+    }
+
+    /// 7NFYQW: mirror the unified stage machine's current rewind generation
+    /// (the pump calls this whenever the machine bumps — every header/log arm
+    /// refresh is cheap and idempotent). The drainer drops pre-bump items
+    /// with a loud WARN instead of consuming their stale epoch (I3).
+    pub fn observe_rewind_seq(&self, seq: u64) {
+        let observed = self.current_rewind_seq.load(Ordering::Relaxed);
+        if seq > observed {
+            self.current_rewind_seq.store(seq, Ordering::Relaxed);
         }
     }
 
@@ -892,5 +948,55 @@ mod tests {
                 "expected the child killed by SIGABRT, got {status:?}"
             );
         }
+    }
+
+    /// 7NFYQW (I3, T6IYKY review Q2 edge): a reorg-flying drain item — its
+    /// epoch's rewind generation is below the machine's current one — is
+    /// dropped LOUDLY by the drainer (WARN) instead of silently consuming
+    /// `epoch.block()` into drain/finalize bookkeeping. The fresh work
+    /// item minted after the bump is applied normally.
+    #[tokio::test]
+    async fn drainer_warns_and_drops_reorg_flying_stale_epoch_work() {
+        let sink = Arc::new(RecordingSink::new());
+        let owner = owner_for(&sink);
+
+        // Item minted in the pre-rewind generation (gen 0), enqueued first.
+        owner.dispatch(DrainWork::Finalize {
+            context: BlockContext::new(Epoch::with_generation(100, 0), BlockMetadata::default()),
+        });
+        owner.dispatch(DrainWork::Drain {
+            context: BlockContext::new(Epoch::with_generation(100, 0), BlockMetadata::default()),
+        });
+        // The stage machine rewinds: the generation bumps to 1 and the pump
+        // mirrors it (I2).
+        owner.observe_rewind_seq(1);
+        // A fresh item minted post-rewind rides the bumped generation.
+        owner.dispatch(DrainWork::Finalize {
+            context: BlockContext::new(Epoch::with_generation(100, 1), BlockMetadata::default()),
+        });
+
+        // The fresh item completes; the two stale ones are dropped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let processed = owner.health().processed();
+            let enqueued = owner.health().enqueued();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drainer did not settle within timeout: processed={processed} enqueued={enqueued}"
+            );
+            if enqueued == 3 && processed == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Exactly ONE finalize reached the sink (the post-rewind item); both
+        // gen-0 items were dropped stale; the gen-0 Drain never solved.
+        assert_eq!(*sink.finalized.lock(), vec![100]);
+        assert!(
+            sink.drained.lock().is_empty(),
+            "the reorg-flying Drain must be dropped, never solved: {:?}",
+            sink.drained.lock()
+        );
     }
 }
