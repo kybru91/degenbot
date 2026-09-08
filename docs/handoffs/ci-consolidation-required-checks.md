@@ -31,6 +31,9 @@ uses the new names.
 3. `Python 3.14`
 4. (Optional) `Tier-3 On-Chain Accuracy Oracle` if it was previously required; its name is unchanged but its skip behavior is now path-dependent.
 
+> Related: release publishing was later consolidated into `release.yml` —
+> see [release-workflow-consolidation.md](release-workflow-consolidation.md).
+>
 > Note: a path-gated job that is skipped reports success to branch protection,
 > so requiring it does NOT block docs-only PRs.
 

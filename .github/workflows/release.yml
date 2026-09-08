@@ -1,25 +1,23 @@
-name: Publish to crates.io
-
-# Tag-driven crates.io release (ergo MYYV2X, publishing epic 5UWNO3).
-# Mirrors .github/workflows/publish-to-pypi.yaml: validate-branch -> publish.
-# No `test-*` tags for crates.io — a test crates.io release would be
-# irreversibly public; pre-releases are handled by the tag<->version match
-# guard (the FIRST release is the 0.6.0-alpha.5 pre-release itself).
-#
-# Token: repo secret `CRATES_IO_TOKEN` (crates.io -> Account -> API Tokens),
-# exposed as CARGO_REGISTRY_TOKEN (cargo's native env name).
+# Single ordered release pipeline (merges the former publish-to-pypi.yaml +
+# publish-to-crates-io.yml, which raced each other on the same v* tag and
+# could split the version across registries). On a v* tag:
+#   validate-branch, build-wheels + build-sdist (parallel)
+#     -> crates.io publish (failure-prone leg runs first; failure = nothing published)
+#     -> PyPI publish (needs crates leg succeeded)
+#     -> GitHub Release (needs both pushes; the clean-completion signal)
+# test-* tags publish only to Test PyPI (crates.io release is policy-forbidden there).
+name: Release
 
 on:
   push:
     tags:
-      - 'v*'
 
-concurrency:
-  group: publish-crates-io-${{ github.ref }}
-  cancel-in-progress: false
+      - 'v*'
+      - 'test-*'
 
 jobs:
   validate-branch:
+    # Shared by both former workflows (identical bodies).
     name: Verify tag is on main
     runs-on: ubuntu-latest
     steps:
@@ -27,7 +25,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check tag is on main branch
+      - name: Check tag is on main
         run: |
           if ! git merge-base --is-ancestor ${{ github.sha }} origin/main; then
             echo "Tag ${{ github.ref_name }} is not on main branch"
@@ -35,9 +33,149 @@ jobs:
           fi
           echo "Tag ${{ github.ref_name }} is on main branch"
 
-  publish:
+  build-wheels:
+    name: Build wheels on ${{ matrix.os }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (manylinux_2_28 for broader compatibility)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: 2_28
+            args: ""
+          # Linux ARM64 (manylinux_2_28)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: 2_28
+            args: ""
+          # macOS universal2 (single wheel for both Intel and Apple Silicon)
+          - os: macos-14
+            target: universal2-apple-darwin
+            args: "--target universal2-apple-darwin"
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            args: ""
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up QEMU
+        if: runner.os == 'Linux' && matrix.target != 'x86_64-unknown-linux-gnu'
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: all
+
+      - name: Build wheels with maturin
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          # `--features pyo3/extension-module` OVERRIDES the dev `[tool.maturin]
+          # features` list (which adds `degenbot-bot/hotpath` for local profiling)
+          # so the shipped wheel excludes hotpath — its `#[hotpath::measure]`
+          # macros expand to no-op `lib_off` stubs, zero runtime penalty. See
+          # rust/crates/degenbot-bot/src/profiling.rs.
+          args: --release --out dist --features pyo3/extension-module ${{ matrix.args }}
+          sccache: 'true'
+          # Pin the native (non-manylinux) legs to the same Rust as ci.yml's
+          # dtolnay jobs. Unpinned, each runner image builds with its own
+          # preinstalled rustc (the macos-14 image's older one left a
+          # `#[expect(dead_code)]` in degenbot-db unfulfilled and broke the
+          # wheel build under the workspace's `warnings = "deny"`).
+          rust-toolchain: stable
+          working-directory: .
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build sdist with maturin
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: .
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish-to-test-pypi:
+    name: Publish to Test PyPI
+    if: startsWith(github.ref, 'refs/tags/test-')
+    needs: [validate-branch, build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/degenbot
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: '*'
+          merge-multiple: true
+
+      - name: List distribution files
+        run: ls -la dist/
+
+      - name: Publish to Test PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-to-pypi:
+    name: Publish to PyPI
+    # Ordering: needs the crates.io leg, so a crates.io failure skips the PyPI
+    # push entirely — the upstream registries can no longer split on a tag.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate-branch, build-wheels, build-sdist, publish-crates-io]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/degenbot
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: '*'
+          merge-multiple: true
+
+      - name: List distribution files
+        run: ls -la dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-crates-io:
+    # Former standalone publish-to-crates-io.yml `publish` job (body verbatim).
+    # Ordering: the crates.io leg runs FIRST because it is the failure-prone
+    # one (new-crate rate limits, lockstep checks) — a failure here publishes
+    # nothing anywhere, and a re-tag after a fix is cheap. PyPI holds the
+    # wheel artifacts and is the recoverable leg (a tag-driven retry republishes).
     name: Publish (cargo-native order + new-crate rate-limit retries)
-    needs: validate-branch
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate-branch, build-wheels, build-sdist]
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
@@ -176,3 +314,47 @@ jobs:
           done
           echo "::error::30 rounds exhausted (new-crate rate limit longer than expected) — re-tag to continue; partial releases are recoverable at the same version"
           exit 1
+
+
+  github-release:
+    name: Create GitHub Release
+    # Final "release completed cleanly" signal: only created when BOTH upstream
+    # pushes succeeded.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [publish-to-pypi, publish-crates-io]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: '*'
+          merge-multiple: true
+
+      - name: Sign with Sigstore
+        uses: sigstore/gh-action-sigstore-python@v3.5.0
+        with:
+          inputs: >-
+            ./dist/*.tar.gz
+            ./dist/*.whl
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create
+          '${{ github.ref_name }}'
+          --repo '${{ github.repository }}'
+          --notes ""
+
+      - name: Upload artifacts to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload
+          '${{ github.ref_name }}' dist/**
+          --repo '${{ github.repository }}'

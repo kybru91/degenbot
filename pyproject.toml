@@ -287,7 +287,7 @@ bindings = "pyo3"
 # cache-keys) is ~5x faster: 149s (release) → ~30s (dev). This setting is
 # consumed ONLY by the local editable-install build path (`uv sync` /
 # `maturin develop`); the published wheel is built by the PyO3/maturin-action
-# in .github/workflows/publish-to-pypi.yaml, which passes `--release`
+# in .github/workflows/release.yml, which passes `--release`
 # explicitly and OVERRIDES the features list — so the shipped artifact is
 # unaffected by this setting and stays fully optimized. See
 # rust/PERF_RESULTS.md "dev-vs-release profile" lever.
@@ -295,7 +295,7 @@ profile = "dev"
 # Dev builds compile hotpath in (toggle at runtime via DEGENBOT_HOTPATH=1 —
 # see rust/crates/degenbot-bot/src/profiling.rs). Release wheels override this
 # list with `--features pyo3/extension-module` (see
-# .github/workflows/publish-to-pypi.yaml) so the shipped artifact excludes
+# .github/workflows/release.yml) so the shipped artifact excludes
 # hotpath — macros are no-op `lib_off`, zero runtime penalty.
 features = ["pyo3/extension-module", "degenbot-bot/hotpath", "degenbot-solvers/hotpath", "degenbot-bot/allocator-ctrl", "otel", "mimalloc"]
 python-packages = ["degenbot"]
