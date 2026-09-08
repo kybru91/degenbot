@@ -1,3151 +1,3368 @@
 {
- "title": "degenbot observability overview",
- "uid": "degenbot-overview",
- "schemaVersion": 39,
- "refresh": "5s",
- "time": {
-  "from": "now-30m",
-  "to": "now"
- },
- "tags": [
-  "degenbot",
-  "mev"
- ],
- "panels": [
-  {
-   "id": 1,
-   "title": "Registered paths",
-   "type": "stat",
-   "gridPos": {
-    "h": 4,
-    "w": 4,
-    "x": 0,
-    "y": 0
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_engine_registered_paths",
-     "legendFormat": "__auto",
-     "refId": "A",
-     "instant": true,
-     "range": false
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "",
-     "values": false
-    },
-    "colorMode": "value",
-    "graphMode": "area",
-    "justifyMode": "auto"
-   }
-  },
-  {
-   "id": 2,
-   "title": "Solve stragglers in flight",
-   "description": "Successor of the retired degenbot_drain_queue_depth gauge (DispatchOwner era, removed SZJUKL): detached-solve straggers awaiting the sidecar merge. Sits at 0 healthy; sustained non-zero is backpressure, cap 8 = wedged (see the DegenbotDrainerStall alert).",
-   "type": "stat",
-   "gridPos": {
-    "h": 4,
-    "w": 4,
-    "x": 4,
-    "y": 0
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_detached_in_flight",
-     "legendFormat": "__auto",
-     "refId": "A",
-     "instant": true,
-     "range": false
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "green",
-        "value": null
-       },
-       {
-        "color": "red",
-        "value": 1
-       }
-      ]
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "",
-     "values": false
-    },
-    "colorMode": "background",
-    "graphMode": "area",
-    "justifyMode": "auto"
-   }
-  },
-  {
-   "id": 3,
-   "title": "State head lag (blocks)",
-   "type": "stat",
-   "gridPos": {
-    "h": 4,
-    "w": 4,
-    "x": 8,
-    "y": 0
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_state_head_lag_blocks",
-     "legendFormat": "__auto",
-     "refId": "A",
-     "instant": true,
-     "range": false
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "green",
-        "value": null
-       },
-       {
-        "color": "yellow",
-        "value": 1
-       },
-       {
-        "color": "red",
-        "value": 5
-       }
-      ]
-     },
-     "decimals": 0
-    },
-    "overrides": [],
-    "default": {
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "red",
-        "value": -10
-       },
-       {
-        "color": "yellow",
-        "value": -4
-       },
-       {
-        "color": "green",
-        "value": -2
-       },
-       {
-        "color": "yellow",
-        "value": 2
-       },
-       {
-        "color": "red",
-        "value": 6
-       }
-      ]
-     }
-    }
-   },
-   "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "",
-     "values": false
-    },
-    "colorMode": "background",
-    "graphMode": "area",
-    "justifyMode": "auto"
-   },
-   "description": "pool_state_head minus the engine clock (pump clock). Healthy runs sit around -1 (pools sit one block behind the still-open current block). A freeze drives it MORE NEGATIVE as the clock advances on headers while pools stop applying - 0/positive is a restart/coverage artifact, not the freeze. See the pump liveness row for the real freeze signal."
-  },
-  {
-   "id": 4,
-   "title": "Solves (last 5m)",
-   "type": "stat",
-   "gridPos": {
-    "h": 4,
-    "w": 4,
-    "x": 12,
-    "y": 0
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(increase(degenbot_solves_executed_total[5m]))",
-     "legendFormat": "__auto",
-     "refId": "A",
-     "instant": true,
-     "range": false
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "",
-     "values": false
-    },
-    "colorMode": "value",
-    "graphMode": "area",
-    "justifyMode": "auto"
-   }
-  },
-  {
-   "id": 5,
-   "title": "Header → published (p95 5m)",
-   "type": "stat",
-   "gridPos": {
-    "h": 4,
-    "w": 4,
-    "x": 16,
-    "y": 0
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
-     "legendFormat": "__auto",
-     "refId": "A",
-     "instant": true,
-     "range": false
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "green",
-        "value": null
-       },
-       {
-        "color": "yellow",
-        "value": 2
-       },
-       {
-        "color": "red",
-        "value": 5
-       }
-      ]
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "",
-     "values": false
-    },
-    "colorMode": "background",
-    "graphMode": "area",
-    "justifyMode": "auto"
-   },
-   "description": "The epoch race (ADR-041 §3.1): header accept → Published-stage dispatch, the edge where submission/delivery subscribe. Succeeds the retired drain-era \"Block-to-solve\" stat — solve is no longer the race endpoint (degenbot_block_header_to_solved family retired with the stage machine; hard cutover)."
-  },
-  {
-   "id": 6,
-   "title": "Epoch stale-drop share (5m)",
-   "type": "stat",
-   "gridPos": {
-    "h": 4,
-    "w": 4,
-    "x": 20,
-    "y": 0
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_epoch_stale_drops_total[5m])) / clamp_min(sum(rate(degenbot_solves_executed_total[5m])), 0.001) or vector(0)",
-     "legendFormat": "__auto",
-     "refId": "A",
-     "instant": true,
-     "range": false
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "percentunit",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "green",
-        "value": null
-       },
-       {
-        "color": "yellow",
-        "value": 0.01
-       },
-       {
-        "color": "red",
-        "value": 0.1
-       }
-      ]
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "",
-     "values": false
-    },
-    "colorMode": "background",
-    "graphMode": "area",
-    "justifyMode": "auto"
-   },
-   "description": "Share of solve cycles whose work was dropped as a stale epoch (I3 reorg-flying fail-fast, degenbot_epoch_stale_drops) — chronic stage-cycle spillover into the next header that the p95 tail alone hides. Sits at 0 healthy; sustained non-zero means publishes are chronically racing the next header."
-  },
-  {
-   "id": 7,
-   "type": "row",
-   "title": "Health & Accounting",
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 4
-   },
-   "panels": []
-  },
-  {
-   "id": 8,
-   "title": "Log funnel (per block)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 5
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_epoch_logs_applied",
-     "legendFormat": "applied",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_epoch_logs_ignored",
-     "legendFormat": "ignored",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "clamp_min(degenbot_epoch_logs_seen - degenbot_epoch_logs_received, 0)",
-     "legendFormat": "not relevant",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_epoch_logs_seen",
-     "legendFormat": "seen (total)",
-     "refId": "D"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "bars",
-      "lineWidth": 0,
-      "fillOpacity": 100,
-      "stacking": {
-       "group": "A",
-       "mode": "normal"
-      },
-      "showPoints": "never"
-     }
-    },
-    "overrides": [
-     {
-      "matcher": {
-       "id": "byName",
-       "options": "seen (total)"
-      },
-      "properties": [
-       {
-        "id": "custom.drawStyle",
-        "value": "line"
-       },
-       {
-        "id": "custom.fillOpacity",
-        "value": 0
-       },
-       {
-        "id": "custom.lineWidth",
-        "value": 1
-       },
-       {
-        "id": "color",
-        "value": {
-         "mode": "fixed",
-         "fixedColor": "yellow"
-        }
-       }
-      ]
-     }
-    ]
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   },
-   "description": "Per-block log accounting, sampled by the pump at each header epilogue (NO4DIW EpochLogTally). Stacked composition of one block: applied (reached a registered pool) + ignored (undecoded + decoded-but-no-pool) + not relevant (suppressed by the topic filter; seen minus received). The yellow line is the seen total; received = the bar top without the not-relevant segment. X is time at one-block cadence — block numbers cannot label a Prometheus series (unbounded cardinality); a spike in ignored is a decoder/registry drift signal (drill into the epoch's trace in Jaeger)."
-  },
-  {
-   "id": 10,
-   "title": "Blocks observed (cumulative)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 13
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_blocks_observed_total",
-     "legendFormat": "cumulative blocks",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8,
-      "lineInterpolation": "linear",
-      "showPoints": "never",
-      "stacking": {
-       "group": "A",
-       "mode": "none"
-      }
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 11,
-   "title": "Solve straggler backlog (detached in-flight)",
-   "description": "Successor of the retired degenbot_drain_queue_depth (SZJUKL): per-epoch queue age now rides the degenbot.stage.* SPANS (queue.age_us attr); degenbot_detached_in_flight is the surviving metric backpressure gauge for the sidecar merge.",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 5
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_detached_in_flight",
-     "legendFormat": "detached in-flight stragglers",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8,
-      "lineInterpolation": "linear",
-      "showPoints": "never",
-      "stacking": {
-       "group": "A",
-       "mode": "none"
-      }
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 13,
-   "type": "row",
-   "title": "Latency - the race",
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 25
-   },
-   "panels": []
-  },
-  {
-   "id": 14,
-   "title": "Header → published latency (p50/p90/p95/p99)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 26
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.90, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p90",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.99, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p99",
-     "refId": "D"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 15,
-   "title": "Solve duration (p50/p90/p95/p99)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 26
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.90, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p90",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.99, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p99",
-     "refId": "D"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 16,
-   "title": "Header → published latency distribution",
-   "type": "heatmap",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 42
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "refId": "A",
-     "expr": "sum(increase(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le)",
-     "legendFormat": "{{le}}",
-     "format": "heatmap"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s"
-    },
-    "overrides": []
-   },
-   "options": {
-    "calculate": false,
-    "cellGap": 1,
-    "color": {
-     "mode": "opacity",
-     "scheme": "Oranges",
-     "steps": 64
-    },
-    "yAxis": {
-     "axisLabel": "Latency (s)",
-     "unit": "s",
-     "axisPlacement": "left"
-    },
-    "legend": {
-     "show": true
-    }
-   }
-  },
-  {
-   "id": 17,
-   "title": "Solve duration distribution",
-   "type": "heatmap",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 42
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "refId": "A",
-     "expr": "sum(increase(degenbot_solve_duration_seconds_bucket[5m])) by (le)",
-     "legendFormat": "{{le}}",
-     "format": "heatmap"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s"
-    },
-    "overrides": []
-   },
-   "options": {
-    "calculate": false,
-    "cellGap": 1,
-    "color": {
-     "mode": "opacity",
-     "scheme": "Oranges",
-     "steps": 64
-    },
-    "yAxis": {
-     "axisLabel": "Latency (s)",
-     "unit": "s",
-     "axisPlacement": "left"
-    },
-    "legend": {
-     "show": true
-    }
-   }
-  },
-  {
-   "id": 18,
-   "type": "row",
-   "title": "Pump & pipeline",
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 58
-   },
-   "panels": []
-  },
-  {
-   "id": 19,
-   "title": "Log decode (p95)",
-   "description": "queue-wait column replaced: degenbot_drain_queue_wait_seconds is retired (SZJUKL); per-epoch queue age rides the degenbot.stage.* span attrs (queue.age_us), and degenbot_stage_publish_cycle_seconds owns the cycle view.",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 8,
-    "x": 0,
-    "y": 59
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_log_decode_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 20,
-   "title": "Throughput: blocks / logs received / logs applied",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 59
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_blocks_observed_total[1m])",
-     "legendFormat": "blocks/s",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_logs_received_total[1m])",
-     "legendFormat": "logs received/s",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_logs_applied_total[1m])",
-     "legendFormat": "logs applied/s",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_backfills_executed_total[5m])",
-     "legendFormat": "backfills/min",
-     "refId": "D"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "ops",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 21,
-   "type": "row",
-   "title": "Solve & simulate",
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 67
-   },
-   "panels": []
-  },
-  {
-   "id": 22,
-   "title": "Solver load: solve cycles vs candidates (rate/min)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 68
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_solves_executed_total[1m])",
-     "legendFormat": "solves/min",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_candidates_found_total[1m])",
-     "legendFormat": "candidates/min",
-     "refId": "C"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 23,
-   "title": "Simulate verdict mix",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 68
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_simulate_verdicts_total[5m])) by (outcome)",
-     "legendFormat": "{{outcome}}",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 24,
-   "type": "row",
-   "title": "Submission & P&L",
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 76
-   },
-   "panels": []
-  },
-  {
-   "id": 25,
-   "title": "Submit outcomes by reason",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 77
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_submit_outcomes_total[5m])) by (outcome)",
-     "legendFormat": "{{outcome}}",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 26,
-   "title": "Cumulative P&L: realized vs missed",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 77
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_profit_realized_total / 1e9",
-     "legendFormat": "realized (confirmed)",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_profit_missed_total / 1e9",
-     "legendFormat": "missed (found, unsubmitted)",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "gwei",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 27,
-   "title": "Monitor outcomes (confirmed / expired)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 85
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_monitor_outcomes_total[5m])) by (outcome)",
-     "legendFormat": "{{outcome}}",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 28,
-   "type": "row",
-   "title": "Liveness & errors",
-   "collapsed": false,
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 93
-   },
-   "panels": []
-  },
-  {
-   "id": 30,
-   "title": "Recorded failures by kind",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 78
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_errors_total[5m])) by (kind)",
-     "legendFormat": "{{kind}}",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(increase(degenbot_errors_total[30m])) by (kind)",
-     "legendFormat": "{{kind}} (30m)",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 32,
-   "type": "row",
-   "title": "Pump liveness (freeze detection)",
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 102
-   },
-   "panels": [],
-   "collapsed": false
-  },
-  {
-   "id": 33,
-   "title": "Liveness: header age + apply age (sit at 0; a freeze climbs them)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 24,
-    "x": 0,
-    "y": 103
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "expr": "max(degenbot_pump_seconds_since_header)",
-     "legend": "Header age (s) - feed liveness",
-     "refId": "A",
-     "datasource": null
-    },
-    {
-     "expr": "max(degenbot_pump_seconds_since_apply)",
-     "legend": "Apply age (s) - state-advance liveness",
-     "refId": "B",
-     "datasource": null
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8,
-      "lineInterpolation": "linear",
-      "showPoints": "never",
-      "stacking": {
-       "group": "A",
-       "mode": "none"
-      },
-      "thresholdsStyle": {
-       "mode": "line",
-       "colorMode": "var"
-      }
-     },
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "green",
-        "value": null
-       },
-       {
-        "color": "yellow",
-        "value": 4
-       },
-       {
-        "color": "red",
-        "value": 5
-       }
-      ]
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   },
-   "description": "Seconds since the newest newHeads header (feed liveness) and since the newest log applied to state (apply liveness). Healthy = both pinned at ~0. A feed stall lifts the header age; a drain freeze lifts the apply age while the header age stays low and head-lag goes negative. Red at >=30s is a genuine freeze window."
-  },
-  {
-   "id": 34,
-   "title": "Per-path solver metrics",
-   "type": "row",
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 111
-   },
-   "panels": []
-  },
-  {
-   "id": 35,
-   "title": "Per-path solve duration (p50/p90/p95/p99)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 111
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_solve_path_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.90, sum(rate(degenbot_solve_path_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p90",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_solve_path_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.99, sum(rate(degenbot_solve_path_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p99",
-     "refId": "D"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 36,
-   "title": "Per-path gate duration (p50/p90/p95/p99)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 111
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.90, sum(rate(degenbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p90",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.99, sum(rate(degenbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p99",
-     "refId": "D"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 37,
-   "title": "Gate: paths solved vs skipped (rate/min)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 24,
-    "x": 0,
-    "y": 119
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_solves_executed_total[1m])",
-     "legendFormat": "solves/min",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_solve_path_duration_seconds_count[1m]) * 60",
-     "legendFormat": "paths evaluated/min",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 38,
-   "title": "Solve execution (tokio executor + detached cycles)",
-   "type": "row",
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 127
-   },
-   "panels": []
-  },
-  {
-   "id": 40,
-   "title": "Detached cycle: stragglers in flight + applied vs stale-dropped",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 128
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_detached_in_flight",
-     "legendFormat": "in-flight stragglers",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_detached_applied_total[1m])",
-     "legendFormat": "applied/s",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_detached_stale_dropped_total[1m])",
-     "legendFormat": "stale dropped/s",
-     "refId": "C"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 41,
-   "title": "Solver audit: solver clamps",
-   "description": "The verify-blocks / state-checks series (degenbot_solver_verify_blocks_total / degenbot_solver_state_checks_total) are RETIRED (MROOY7 2UVG3E): the ADR-021 per-solve tripwire is gone and solver-state verification is on-demand (sim-failure-armed divergence probe). Desync containment surfaces via degenbot_errors_total and the degenbot_engine_quarantined_pools gauge; per-block verify context rides the degenbot.epoch / degenbot.stage.* spans.",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 136
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_solver_clamps_total[1m])",
-     "legendFormat": "clamps/s",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 42,
-   "title": "Dispatch economics: mean gross / net (wei) + gas",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 136
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_dispatch_gross_profit_sum[5m]) / rate(degenbot_dispatch_gross_profit_count[5m])",
-     "legendFormat": "mean gross wei",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_dispatch_net_profit_sum[5m]) / rate(degenbot_dispatch_net_profit_count[5m])",
-     "legendFormat": "mean net wei",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_dispatch_gas_used_sum[5m]) / rate(degenbot_dispatch_gas_used_count[5m])",
-     "legendFormat": "mean gas",
-     "refId": "C"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 43,
-   "title": "Trace view: how to read the solve span tree",
-   "type": "text",
-   "gridPos": {
-    "h": 8,
-    "w": 24,
-    "x": 0,
-    "y": 144
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [],
-   "fieldConfig": {
-    "defaults": {},
-    "overrides": []
-   },
-   "options": {
-    "mode": "markdown",
-    "content": "## Jaeger drill-down - span tree (stage-table shape, BF43PM/AJIOCU)\n\n    degenbot.epoch                  (trace ROOT per block epoch: epoch.block, epoch.seq,\n    |                                pregap.logs / header_to_first_log_us / log_burst_us / settle_wait_us)\n    +-- degenbot.stage.streaming     (open: first relevant log -> quiesce; queue.age_us at close)\n    +-- degenbot.stage.quiesced      (point: quiesce transition)\n    +-- degenbot.arb.solve           (solver cycle - fanout / lpt / resolve / path / merge children unchanged)\n    +-- degenbot.stage.publish       (point: publish decision; metric degenbot_stage_publish_cycle_seconds)\n    +-- degenbot.stage.finalize      (point: epoch finalized)\n    Rewind epochs hold degenbot.stage.rewind OPEN across the reorg window (metrics\n    degenbot_stage_rewind_total / degenbot_stage_rewind_duration_seconds); the next epoch\n    root carries epoch.seq + 1.\n\n**Jaeger queries** (service `degenbot-bot`, host `host.docker.internal:16686`):\n\n- Epoch waterfall: `operation=degenbot.epoch&limit=20&lookback=1h`\n- Stage transitions: `operation=degenbot.stage.streaming` / `degenbot.stage.publish` / `degenbot.stage.finalize` (attrs `stage.from`, `stage.to`, `queue.age_us`)\n- Phase attribution: the `fanout` / `lpt` / `resolve` / `merge` children of a solve trace (unchanged)\n- Rewind story: read `epoch.seq` across epoch roots - a bumped seq is the reorg generation\n- RETIRED spans (BF43PM/AJIOCU, epic MROOY7): `degenbot.pump.block` / `pump.log_wait` / `pump.apply_stream` are discontinued\n\nThe **Header → published** panels are the epoch race (ADR-041 §3.1): header\naccept → Published-stage dispatch, where submission/delivery subscribe. The\nretired drain-era header→solved stamp measured the solve endpoint; a solve that\ncompletes but publishes after the next header's accept shows up in the\n**Epoch stale-drop share** stat, not the p95. The Engine-Mutex hold panel is\nRETIRED (§3.4): the engine Mutex left the solve path with the stage machine.\nThe **Detached cycle** panel is the sidecar-merge health (Q1a): in-flight is the\nun-merged-straggler backpressure gauge (cap 8), and stale-dropped stragglers are\nEXPECTED under pool churn - a sustained drop rate with zero applied means the\nsidecar pipe is wedged.",
-    "code": {
-     "language": "plaintext",
-     "showLineNumbers": false
-    }
-   }
-  },
-  {
-   "id": 45,
-   "title": "Epoch race dissolve: pre-solve phase means vs header→published mean",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 50
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "(sum(rate(degenbot_block_header_to_first_log_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_header_to_first_log_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_block_log_burst_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_log_burst_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_block_settle_wait_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_settle_wait_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_stage_streaming_age_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_stage_streaming_age_seconds_count[5m])), 0.000000001))",
-     "legendFormat": "pre-solve phase means (sum)",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_epoch_header_to_publish_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_epoch_header_to_publish_seconds_count[5m])), 0.000000001)",
-     "legendFormat": "header→published (mean)",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    },
-    "description": "Residual check: the summed pre-solve phase means vs the total epoch race mean. A growing gap between the lines means unbudgeted time (resolve/simulate/gate queueing, submit queue); large negative drift means phases overlap epochs (stale drops — see the stale-drop share stat)."
-   }
-  },
-  {
-   "id": 46,
-   "title": "State-lock pressure (K4ETHF T2)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 160
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum by (le, site) (rate(degenbot_state_lock_wait_seconds_bucket[$__rate_interval])))",
-     "legendFormat": "wait p95 {{site}}",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum by (le, site) (rate(degenbot_state_lock_hold_seconds_bucket[$__rate_interval])))",
-     "legendFormat": "hold p95 {{site}}",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum by (le, site) (rate(degenbot_state_lock_hold_seconds_bucket[$__rate_interval])))",
-     "legendFormat": "hold p50 {{site}}",
-     "refId": "C"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s"
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "displayMode": "table",
-     "placement": "right",
-     "calcs": [
-      "lastNotNull"
-     ]
-    }
-   }
-  },
-  {
-   "id": 47,
-   "title": "Process RSS - registry drift watch (FRKBGP)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 176
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_process_rss_bytes / 1073741824",
-     "legendFormat": "RSS (GiB)",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "GiB"
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "displayMode": "list",
-     "placement": "bottom",
-     "calcs": [
-      "lastNotNull",
-      "max"
-     ]
-    }
-   }
-  },
-  {
-   "id": 49,
-   "title": "Quarantine transitions (30m)",
-   "type": "stat",
-   "gridPos": {
-    "h": 4,
-    "w": 8,
-    "x": 0,
-    "y": 21
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "changes(degenbot_engine_quarantined_pools[30m])",
-     "legendFormat": "__auto",
-     "refId": "A",
-     "instant": true,
-     "range": false
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "thresholds"
-     },
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "green",
-        "value": null
-       },
-       {
-        "color": "red",
-        "value": 1
-       }
-      ]
-     }
-    }
-   },
-   "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "",
-     "values": false
-    },
-    "colorMode": "background",
-    "graphMode": "area"
-   },
-   "description": "ADR-040 quarantine/release transitions in the last 30m. SUCCESSOR of the retired solver_state_desync errors kind: the ADR-021 per-solve publish tripwire was retired with MROOY7 task 2UVG3E, and containment now lives in the resolve-seam quarantine gate (degenbot_engine_quarantined_pools, maintained by BotState::quarantine_pool / release_pool). The bot keeps trading its other paths; the DegenbotDesyncQuarantine alert pages while any containment is active."
-  },
-  {
-   "id": 50,
-   "title": "Quarantined pools (solve-invisible)",
-   "type": "stat",
-   "gridPos": {
-    "h": 4,
-    "w": 8,
-    "x": 8,
-    "y": 21
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_engine_quarantined_pools",
-     "legendFormat": "__auto",
-     "refId": "A",
-     "instant": true,
-     "range": false
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "thresholds"
-     },
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "green",
-        "value": null
-       },
-       {
-        "color": "red",
-        "value": 1
-       }
-      ]
-     }
-    }
-   },
-   "options": {
-    "reduceOptions": {
-     "calcs": [
-      "lastNotNull"
-     ],
-     "fields": "",
-     "values": false
-    },
-    "colorMode": "background",
-    "graphMode": "area"
-   },
-   "description": "ADR-040: pools currently quarantine-excluded from solve resolution. PROMETHEUS NAME COUPLING with instruments.rs (degenbot.engine.quarantined_pools)."
-  },
-  {
-   "id": 48,
-   "title": "Alerts (Grafana-managed, ADR-040)",
-   "type": "alertlist",
-   "gridPos": {
-    "h": 4,
-    "w": 8,
-    "x": 16,
-    "y": 21
-   },
-   "options": {
-    "stateFilter": {
-     "firing": true,
-     "pending": true,
-     "noData": true,
-     "error": true,
-     "normal": false,
-     "recovering": false
-    },
-    "maxItems": 10,
-    "sortOrder": 5,
-    "groupMode": "default",
-    "groupBy": [
-     "severity"
+    "title": "degenbot observability overview",
+    "uid": "degenbot-overview",
+    "schemaVersion": 39,
+    "refresh": "5s",
+    "time": {
+        "from": "now-30m",
+        "to": "now"
+    },
+    "tags": [
+        "degenbot",
+        "mev"
     ],
-    "alertName": "",
-    "alertInstanceLabelFilter": "",
-    "showInstances": true,
-    "showInactiveAlerts": false,
-    "dashboardAlerts": false,
-    "folder": {
-     "uid": "",
-     "title": ""
-    },
-    "datasource": "",
-    "viewMode": "list",
-    "statColorMode": "background",
-    "statThresholds": {
-     "mode": "absolute",
-     "steps": [
-      {
-       "color": "green",
-       "value": null
-      },
-      {
-       "color": "red",
-       "value": 80
-      }
-     ]
-    },
-    "statValueMappings": []
-   }
-  },
-  {
-   "id": 51,
-   "title": "Reorg handling (WAJEQP)",
-   "type": "row",
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 184
-   },
-   "collapsed": false,
-   "panels": []
-  },
-  {
-   "id": 53,
-   "title": "Reorg episodes entered",
-   "type": "timeseries",
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 185
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(increase(degenbot_reorg_windows_total[5m]))",
-     "legendFormat": "windows/5m",
-     "refId": "A"
+    "panels": [
+        {
+            "id": 1,
+            "title": "Registered paths",
+            "type": "stat",
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 0,
+                "y": 0
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_engine_registered_paths",
+                    "legendFormat": "__auto",
+                    "refId": "A",
+                    "instant": true,
+                    "range": false
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "colorMode": "value",
+                "graphMode": "area",
+                "justifyMode": "auto"
+            }
+        },
+        {
+            "id": 2,
+            "title": "Solve stragglers in flight",
+            "description": "Successor of the retired degenbot_drain_queue_depth gauge (DispatchOwner era, removed SZJUKL): detached-solve straggers awaiting the sidecar merge. Sits at 0 healthy; sustained non-zero is backpressure, cap 8 = wedged (see the DegenbotDrainerStall alert).",
+            "type": "stat",
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 4,
+                "y": 0
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_detached_in_flight",
+                    "legendFormat": "__auto",
+                    "refId": "A",
+                    "instant": true,
+                    "range": false
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "red",
+                                "value": 1
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "colorMode": "background",
+                "graphMode": "area",
+                "justifyMode": "auto"
+            }
+        },
+        {
+            "id": 3,
+            "title": "State head lag (blocks)",
+            "type": "stat",
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 8,
+                "y": 0
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_state_head_lag_blocks",
+                    "legendFormat": "__auto",
+                    "refId": "A",
+                    "instant": true,
+                    "range": false
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 1
+                            },
+                            {
+                                "color": "red",
+                                "value": 5
+                            }
+                        ]
+                    },
+                    "decimals": 0
+                },
+                "overrides": [],
+                "default": {
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "red",
+                                "value": -10
+                            },
+                            {
+                                "color": "yellow",
+                                "value": -4
+                            },
+                            {
+                                "color": "green",
+                                "value": -2
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 2
+                            },
+                            {
+                                "color": "red",
+                                "value": 6
+                            }
+                        ]
+                    }
+                }
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "colorMode": "background",
+                "graphMode": "area",
+                "justifyMode": "auto"
+            },
+            "description": "pool_state_head minus the engine clock (pump clock). Healthy runs sit around -1 (pools sit one block behind the still-open current block). A freeze drives it MORE NEGATIVE as the clock advances on headers while pools stop applying - 0/positive is a restart/coverage artifact, not the freeze. See the pump liveness row for the real freeze signal."
+        },
+        {
+            "id": 4,
+            "title": "Solves (last 5m)",
+            "type": "stat",
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 12,
+                "y": 0
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(increase(degenbot_solves_executed_total[5m]))",
+                    "legendFormat": "__auto",
+                    "refId": "A",
+                    "instant": true,
+                    "range": false
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "colorMode": "value",
+                "graphMode": "area",
+                "justifyMode": "auto"
+            }
+        },
+        {
+            "id": 5,
+            "title": "Header \u2192 published (p95 5m)",
+            "type": "stat",
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 16,
+                "y": 0
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "__auto",
+                    "refId": "A",
+                    "instant": true,
+                    "range": false
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 2
+                            },
+                            {
+                                "color": "red",
+                                "value": 5
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "colorMode": "background",
+                "graphMode": "area",
+                "justifyMode": "auto"
+            },
+            "description": "The epoch race (ADR-041 \u00a73.1): header accept \u2192 Published-stage dispatch, the edge where submission/delivery subscribe. Succeeds the retired drain-era \"Block-to-solve\" stat \u2014 solve is no longer the race endpoint (degenbot_block_header_to_solved family retired with the stage machine; hard cutover)."
+        },
+        {
+            "id": 6,
+            "title": "Epoch stale-drop share (5m)",
+            "type": "stat",
+            "gridPos": {
+                "h": 4,
+                "w": 4,
+                "x": 20,
+                "y": 0
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(degenbot_epoch_stale_drops_total[5m])) / clamp_min(sum(rate(degenbot_solves_executed_total[5m])), 0.001) or vector(0)",
+                    "legendFormat": "__auto",
+                    "refId": "A",
+                    "instant": true,
+                    "range": false
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "percentunit",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 0.01
+                            },
+                            {
+                                "color": "red",
+                                "value": 0.1
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "colorMode": "background",
+                "graphMode": "area",
+                "justifyMode": "auto"
+            },
+            "description": "Share of solve cycles whose work was dropped as a stale epoch (I3 reorg-flying fail-fast, degenbot_epoch_stale_drops) \u2014 chronic stage-cycle spillover into the next header that the p95 tail alone hides. Sits at 0 healthy; sustained non-zero means publishes are chronically racing the next header."
+        },
+        {
+            "id": 7,
+            "type": "row",
+            "title": "Health & Accounting",
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 4
+            },
+            "panels": []
+        },
+        {
+            "id": 8,
+            "title": "Log funnel (per block)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 5
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_epoch_logs_applied",
+                    "legendFormat": "applied",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_epoch_logs_ignored",
+                    "legendFormat": "ignored",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "clamp_min(degenbot_epoch_logs_seen - degenbot_epoch_logs_received, 0)",
+                    "legendFormat": "not relevant",
+                    "refId": "C"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_epoch_logs_seen",
+                    "legendFormat": "seen (total)",
+                    "refId": "D"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "bars",
+                        "lineWidth": 0,
+                        "fillOpacity": 100,
+                        "stacking": {
+                            "group": "A",
+                            "mode": "normal"
+                        },
+                        "showPoints": "never"
+                    }
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "seen (total)"
+                        },
+                        "properties": [
+                            {
+                                "id": "custom.drawStyle",
+                                "value": "line"
+                            },
+                            {
+                                "id": "custom.fillOpacity",
+                                "value": 0
+                            },
+                            {
+                                "id": "custom.lineWidth",
+                                "value": 1
+                            },
+                            {
+                                "id": "color",
+                                "value": {
+                                    "mode": "fixed",
+                                    "fixedColor": "yellow"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            },
+            "description": "Per-block log accounting, sampled by the pump at each header epilogue (NO4DIW EpochLogTally). Stacked composition of one block: applied (reached a registered pool) + ignored (undecoded + decoded-but-no-pool) + not relevant (suppressed by the topic filter; seen minus received). The yellow line is the seen total; received = the bar top without the not-relevant segment. X is time at one-block cadence \u2014 block numbers cannot label a Prometheus series (unbounded cardinality); a spike in ignored is a decoder/registry drift signal (drill into the epoch's trace in Jaeger)."
+        },
+        {
+            "id": 66,
+            "gridPos": {
+                "h": 9,
+                "w": 24,
+                "x": 0,
+                "y": 18
+            },
+            "type": "xychart",
+            "title": "Log funnel vs block number (applied / ignored / seen)",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "eea7hc2lizlz4d"
+            },
+            "description": "Per-epoch log ledger with block numbers on the X axis (one dot per scrape sample; every sample also records its closing header via degenbot_epoch_logs_block). Companion to the stacked per-block bars above.",
+            "links": [],
+            "targets": [
+                {
+                    "refId": "A",
+                    "expr": "degenbot_epoch_logs_applied{instance=~\"$instance\"}",
+                    "legendFormat": "applied",
+                    "instant": false,
+                    "format": "time_series",
+                    "queryType": "range",
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "eea7hc2lizlz4d"
+                    }
+                },
+                {
+                    "refId": "B",
+                    "expr": "degenbot_epoch_logs_ignored{instance=~\"$instance\"}",
+                    "legendFormat": "ignored",
+                    "instant": false,
+                    "format": "time_series",
+                    "queryType": "range",
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "eea7hc2lizlz4d"
+                    }
+                },
+                {
+                    "refId": "C",
+                    "expr": "degenbot_epoch_logs_seen{instance=~\"$instance\"}",
+                    "legendFormat": "seen",
+                    "instant": false,
+                    "format": "time_series",
+                    "queryType": "range",
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "eea7hc2lizlz4d"
+                    }
+                },
+                {
+                    "refId": "D",
+                    "expr": "degenbot_epoch_logs_block{instance=~\"$instance\"}",
+                    "legendFormat": "block",
+                    "instant": false,
+                    "format": "time_series",
+                    "queryType": "range",
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "eea7hc2lizlz4d"
+                    }
+                }
+            ],
+            "transformations": [
+                {
+                    "id": "joinByField",
+                    "options": {
+                        "byField": "Time",
+                        "mode": "outer"
+                    }
+                }
+            ],
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "showLegend": true
+                },
+                "tooltip": {
+                    "mode": "single",
+                    "sort": "none",
+                    "hideZeros": false
+                },
+                "mapping": "manual",
+                "series": [
+                    {
+                        "frame": {
+                            "matcher": {
+                                "id": "byIndex",
+                                "options": 0
+                            }
+                        },
+                        "x": {
+                            "matcher": {
+                                "id": "byName",
+                                "options": "block"
+                            }
+                        },
+                        "y": {
+                            "matcher": {
+                                "id": "byName",
+                                "options": "applied"
+                            }
+                        },
+                        "name": {
+                            "fixed": "applied"
+                        }
+                    },
+                    {
+                        "frame": {
+                            "matcher": {
+                                "id": "byIndex",
+                                "options": 0
+                            }
+                        },
+                        "x": {
+                            "matcher": {
+                                "id": "byName",
+                                "options": "block"
+                            }
+                        },
+                        "y": {
+                            "matcher": {
+                                "id": "byName",
+                                "options": "ignored"
+                            }
+                        },
+                        "name": {
+                            "fixed": "ignored"
+                        }
+                    },
+                    {
+                        "frame": {
+                            "matcher": {
+                                "id": "byIndex",
+                                "options": 0
+                            }
+                        },
+                        "x": {
+                            "matcher": {
+                                "id": "byName",
+                                "options": "block"
+                            }
+                        },
+                        "y": {
+                            "matcher": {
+                                "id": "byName",
+                                "options": "seen"
+                            }
+                        },
+                        "name": {
+                            "fixed": "seen"
+                        }
+                    }
+                ]
+            },
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "axisBorderShow": false,
+                        "axisCenteredZero": false,
+                        "axisColorMode": "text",
+                        "axisLabel": "",
+                        "axisPlacement": "auto",
+                        "fillOpacity": 50,
+                        "hideFrom": {
+                            "legend": false,
+                            "tooltip": false,
+                            "viz": false
+                        },
+                        "pointShape": "circle",
+                        "pointSize": {
+                            "fixed": 5
+                        },
+                        "pointStrokeWidth": 1,
+                        "show": "points"
+                    }
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "block"
+                        },
+                        "properties": [
+                            {
+                                "id": "unit",
+                                "value": "none"
+                            },
+                            {
+                                "id": "decimals",
+                                "value": 0
+                            }
+                        ]
+                    }
+                ]
+            },
+            "pluginVersion": "13.2.1"
+        },
+        {
+            "id": 10,
+            "title": "Blocks observed (cumulative)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 13
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_blocks_observed_total",
+                    "legendFormat": "cumulative blocks",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8,
+                        "lineInterpolation": "linear",
+                        "showPoints": "never",
+                        "stacking": {
+                            "group": "A",
+                            "mode": "none"
+                        }
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 11,
+            "title": "Solve straggler backlog (detached in-flight)",
+            "description": "Successor of the retired degenbot_drain_queue_depth (SZJUKL): per-epoch queue age now rides the degenbot.stage.* SPANS (queue.age_us attr); degenbot_detached_in_flight is the surviving metric backpressure gauge for the sidecar merge.",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 5
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_detached_in_flight",
+                    "legendFormat": "detached in-flight stragglers",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8,
+                        "lineInterpolation": "linear",
+                        "showPoints": "never",
+                        "stacking": {
+                            "group": "A",
+                            "mode": "none"
+                        }
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 13,
+            "type": "row",
+            "title": "Latency - the race",
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 25
+            },
+            "panels": []
+        },
+        {
+            "id": 14,
+            "title": "Header \u2192 published latency (p50/p90/p95/p99)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 26
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.90, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p90",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "C"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.99, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p99",
+                    "refId": "D"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 15,
+            "title": "Solve duration (p50/p90/p95/p99)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 26
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.90, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p90",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "C"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.99, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p99",
+                    "refId": "D"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 16,
+            "title": "Header \u2192 published latency distribution",
+            "type": "heatmap",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 42
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "refId": "A",
+                    "expr": "sum(increase(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le)",
+                    "legendFormat": "{{le}}",
+                    "format": "heatmap"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "options": {
+                "calculate": false,
+                "cellGap": 1,
+                "color": {
+                    "mode": "opacity",
+                    "scheme": "Oranges",
+                    "steps": 64
+                },
+                "yAxis": {
+                    "axisLabel": "Latency (s)",
+                    "unit": "s",
+                    "axisPlacement": "left"
+                },
+                "legend": {
+                    "show": true
+                }
+            }
+        },
+        {
+            "id": 17,
+            "title": "Solve duration distribution",
+            "type": "heatmap",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 42
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "refId": "A",
+                    "expr": "sum(increase(degenbot_solve_duration_seconds_bucket[5m])) by (le)",
+                    "legendFormat": "{{le}}",
+                    "format": "heatmap"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "options": {
+                "calculate": false,
+                "cellGap": 1,
+                "color": {
+                    "mode": "opacity",
+                    "scheme": "Oranges",
+                    "steps": 64
+                },
+                "yAxis": {
+                    "axisLabel": "Latency (s)",
+                    "unit": "s",
+                    "axisPlacement": "left"
+                },
+                "legend": {
+                    "show": true
+                }
+            }
+        },
+        {
+            "id": 18,
+            "type": "row",
+            "title": "Pump & Pipeline",
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 58
+            },
+            "panels": []
+        },
+        {
+            "id": 19,
+            "title": "Log decode (p95)",
+            "description": "queue-wait column replaced: degenbot_drain_queue_wait_seconds is retired (SZJUKL); per-epoch queue age rides the degenbot.stage.* span attrs (queue.age_us), and degenbot_stage_publish_cycle_seconds owns the cycle view.",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 0,
+                "y": 59
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_log_decode_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 20,
+            "title": "Throughput: blocks / logs received / logs applied",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 59
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_blocks_observed_total[1m])",
+                    "legendFormat": "blocks/s",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_logs_received_total[1m])",
+                    "legendFormat": "logs received/s",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_logs_applied_total[1m])",
+                    "legendFormat": "logs applied/s",
+                    "refId": "C"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_backfills_executed_total[5m])",
+                    "legendFormat": "backfills/min",
+                    "refId": "D"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "ops",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 21,
+            "type": "row",
+            "title": "Solve & simulate",
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 67
+            },
+            "panels": []
+        },
+        {
+            "id": 22,
+            "title": "Solver load: solve cycles vs candidates (rate/min)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 68
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_solves_executed_total[1m])",
+                    "legendFormat": "solves/min",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_candidates_found_total[1m])",
+                    "legendFormat": "candidates/min",
+                    "refId": "C"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 23,
+            "title": "Simulate verdict mix",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 68
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(degenbot_simulate_verdicts_total[5m])) by (outcome)",
+                    "legendFormat": "{{outcome}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 24,
+            "type": "row",
+            "title": "Submission & P&L",
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 76
+            },
+            "panels": []
+        },
+        {
+            "id": 25,
+            "title": "Submit outcomes by reason",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 77
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(degenbot_submit_outcomes_total[5m])) by (outcome)",
+                    "legendFormat": "{{outcome}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 26,
+            "title": "Cumulative P&L: realized vs missed",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 77
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_profit_realized_total / 1e9",
+                    "legendFormat": "realized (confirmed)",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_profit_missed_total / 1e9",
+                    "legendFormat": "missed (found, unsubmitted)",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "gwei",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 27,
+            "title": "Monitor outcomes (confirmed / expired)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 85
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(degenbot_monitor_outcomes_total[5m])) by (outcome)",
+                    "legendFormat": "{{outcome}}",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 28,
+            "type": "row",
+            "title": "Liveness & errors",
+            "collapsed": false,
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 93
+            },
+            "panels": []
+        },
+        {
+            "id": 30,
+            "title": "Recorded failures by kind",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 78
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(degenbot_errors_total[5m])) by (kind)",
+                    "legendFormat": "{{kind}}",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(increase(degenbot_errors_total[30m])) by (kind)",
+                    "legendFormat": "{{kind}} (30m)",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 32,
+            "type": "row",
+            "title": "Pump liveness (freeze detection)",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 102
+            },
+            "panels": [],
+            "collapsed": false
+        },
+        {
+            "id": 33,
+            "title": "Liveness: header age + apply age (sit at 0; a freeze climbs them)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 103
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "expr": "max(degenbot_pump_seconds_since_header)",
+                    "legend": "Header age (s) - feed liveness",
+                    "refId": "A",
+                    "datasource": null
+                },
+                {
+                    "expr": "max(degenbot_pump_seconds_since_apply)",
+                    "legend": "Apply age (s) - state-advance liveness",
+                    "refId": "B",
+                    "datasource": null
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8,
+                        "lineInterpolation": "linear",
+                        "showPoints": "never",
+                        "stacking": {
+                            "group": "A",
+                            "mode": "none"
+                        },
+                        "thresholdsStyle": {
+                            "mode": "line",
+                            "colorMode": "var"
+                        }
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "yellow",
+                                "value": 4
+                            },
+                            {
+                                "color": "red",
+                                "value": 5
+                            }
+                        ]
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            },
+            "description": "Seconds since the newest newHeads header (feed liveness) and since the newest log applied to state (apply liveness). Healthy = both pinned at ~0. A feed stall lifts the header age; a drain freeze lifts the apply age while the header age stays low and head-lag goes negative. Red at >=30s is a genuine freeze window."
+        },
+        {
+            "id": 34,
+            "title": "Per-path solver metrics",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 111
+            },
+            "panels": []
+        },
+        {
+            "id": 35,
+            "title": "Per-path solve duration (p50/p90/p95/p99)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 111
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum(rate(degenbot_solve_path_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.90, sum(rate(degenbot_solve_path_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p90",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_solve_path_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "C"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.99, sum(rate(degenbot_solve_path_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p99",
+                    "refId": "D"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 36,
+            "title": "Per-path gate duration (p50/p90/p95/p99)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 111
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum(rate(degenbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.90, sum(rate(degenbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p90",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "C"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.99, sum(rate(degenbot_solve_gate_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p99",
+                    "refId": "D"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 37,
+            "title": "Gate: paths solved vs skipped (rate/min)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 119
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_solves_executed_total[1m])",
+                    "legendFormat": "solves/min",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_solve_path_duration_seconds_count[1m]) * 60",
+                    "legendFormat": "paths evaluated/min",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 38,
+            "title": "Solve execution (tokio executor + detached cycles)",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 127
+            },
+            "panels": []
+        },
+        {
+            "id": 40,
+            "title": "Detached cycle: stragglers in flight + applied vs stale-dropped",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 128
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_detached_in_flight",
+                    "legendFormat": "in-flight stragglers",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_detached_applied_total[1m])",
+                    "legendFormat": "applied/s",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_detached_stale_dropped_total[1m])",
+                    "legendFormat": "stale dropped/s",
+                    "refId": "C"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 41,
+            "title": "Solver audit: solver clamps",
+            "description": "The verify-blocks / state-checks series (degenbot_solver_verify_blocks_total / degenbot_solver_state_checks_total) are RETIRED (MROOY7 2UVG3E): the ADR-021 per-solve tripwire is gone and solver-state verification is on-demand (sim-failure-armed divergence probe). Desync containment surfaces via degenbot_errors_total and the degenbot_engine_quarantined_pools gauge; per-block verify context rides the degenbot.epoch / degenbot.stage.* spans.",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 136
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_solver_clamps_total[1m])",
+                    "legendFormat": "clamps/s",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 42,
+            "title": "Dispatch economics: mean gross / net (wei) + gas",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 136
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_dispatch_gross_profit_sum[5m]) / rate(degenbot_dispatch_gross_profit_count[5m])",
+                    "legendFormat": "mean gross wei",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_dispatch_net_profit_sum[5m]) / rate(degenbot_dispatch_net_profit_count[5m])",
+                    "legendFormat": "mean net wei",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_dispatch_gas_used_sum[5m]) / rate(degenbot_dispatch_gas_used_count[5m])",
+                    "legendFormat": "mean gas",
+                    "refId": "C"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 43,
+            "title": "Trace view: how to read the solve span tree",
+            "type": "text",
+            "gridPos": {
+                "h": 8,
+                "w": 24,
+                "x": 0,
+                "y": 144
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [],
+            "fieldConfig": {
+                "defaults": {},
+                "overrides": []
+            },
+            "options": {
+                "mode": "markdown",
+                "content": "## Jaeger drill-down - span tree (stage-table shape, BF43PM/AJIOCU)\n\n    degenbot.epoch                  (trace ROOT per block epoch: epoch.block, epoch.seq,\n    |                                pregap.logs / header_to_first_log_us / log_burst_us / settle_wait_us)\n    +-- degenbot.stage.streaming     (open: first relevant log -> quiesce; queue.age_us at close)\n    +-- degenbot.stage.quiesced      (point: quiesce transition)\n    +-- degenbot.arb.solve           (solver cycle - fanout / lpt / resolve / path / merge children unchanged)\n    +-- degenbot.stage.publish       (point: publish decision; metric degenbot_stage_publish_cycle_seconds)\n    +-- degenbot.stage.finalize      (point: epoch finalized)\n    Rewind epochs hold degenbot.stage.rewind OPEN across the reorg window (metrics\n    degenbot_stage_rewind_total / degenbot_stage_rewind_duration_seconds); the next epoch\n    root carries epoch.seq + 1.\n\n**Jaeger queries** (service `degenbot-bot`, host `host.docker.internal:16686`):\n\n- Epoch waterfall: `operation=degenbot.epoch&limit=20&lookback=1h`\n- Stage transitions: `operation=degenbot.stage.streaming` / `degenbot.stage.publish` / `degenbot.stage.finalize` (attrs `stage.from`, `stage.to`, `queue.age_us`)\n- Phase attribution: the `fanout` / `lpt` / `resolve` / `merge` children of a solve trace (unchanged)\n- Rewind story: read `epoch.seq` across epoch roots - a bumped seq is the reorg generation\n- RETIRED spans (BF43PM/AJIOCU, epic MROOY7): `degenbot.pump.block` / `pump.log_wait` / `pump.apply_stream` are discontinued\n\nThe **Header \u2192 published** panels are the epoch race (ADR-041 \u00a73.1): header\naccept \u2192 Published-stage dispatch, where submission/delivery subscribe. The\nretired drain-era header\u2192solved stamp measured the solve endpoint; a solve that\ncompletes but publishes after the next header's accept shows up in the\n**Epoch stale-drop share** stat, not the p95. The Engine-Mutex hold panel is\nRETIRED (\u00a73.4): the engine Mutex left the solve path with the stage machine.\nThe **Detached cycle** panel is the sidecar-merge health (Q1a): in-flight is the\nun-merged-straggler backpressure gauge (cap 8), and stale-dropped stragglers are\nEXPECTED under pool churn - a sustained drop rate with zero applied means the\nsidecar pipe is wedged.",
+                "code": {
+                    "language": "plaintext",
+                    "showLineNumbers": false
+                }
+            }
+        },
+        {
+            "id": 45,
+            "title": "Epoch race dissolve: pre-solve phase means vs header\u2192published mean",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 50
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "(sum(rate(degenbot_block_header_to_first_log_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_header_to_first_log_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_block_log_burst_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_log_burst_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_block_settle_wait_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_settle_wait_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_stage_streaming_age_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_stage_streaming_age_seconds_count[5m])), 0.000000001))",
+                    "legendFormat": "pre-solve phase means (sum)",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(degenbot_epoch_header_to_publish_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_epoch_header_to_publish_seconds_count[5m])), 0.000000001)",
+                    "legendFormat": "header\u2192published (mean)",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                },
+                "description": "Residual check: the summed pre-solve phase means vs the total epoch race mean. A growing gap between the lines means unbudgeted time (resolve/simulate/gate queueing, submit queue); large negative drift means phases overlap epochs (stale drops \u2014 see the stale-drop share stat)."
+            }
+        },
+        {
+            "id": 46,
+            "title": "State-lock pressure (K4ETHF T2)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 160
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum by (le, site) (rate(degenbot_state_lock_wait_seconds_bucket[$__rate_interval])))",
+                    "legendFormat": "wait p95 {{site}}",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum by (le, site) (rate(degenbot_state_lock_hold_seconds_bucket[$__rate_interval])))",
+                    "legendFormat": "hold p95 {{site}}",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum by (le, site) (rate(degenbot_state_lock_hold_seconds_bucket[$__rate_interval])))",
+                    "legendFormat": "hold p50 {{site}}",
+                    "refId": "C"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s"
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "table",
+                    "placement": "right",
+                    "calcs": [
+                        "lastNotNull"
+                    ]
+                }
+            }
+        },
+        {
+            "id": 47,
+            "title": "Process RSS - registry drift watch (FRKBGP)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 176
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_process_rss_bytes / 1073741824",
+                    "legendFormat": "RSS (GiB)",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "GiB"
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "calcs": [
+                        "lastNotNull",
+                        "max"
+                    ]
+                }
+            }
+        },
+        {
+            "id": 49,
+            "title": "Quarantine transitions (30m)",
+            "type": "stat",
+            "gridPos": {
+                "h": 4,
+                "w": 8,
+                "x": 0,
+                "y": 21
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "changes(degenbot_engine_quarantined_pools[30m])",
+                    "legendFormat": "__auto",
+                    "refId": "A",
+                    "instant": true,
+                    "range": false
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "thresholds"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "red",
+                                "value": 1
+                            }
+                        ]
+                    }
+                }
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "colorMode": "background",
+                "graphMode": "area"
+            },
+            "description": "ADR-040 quarantine/release transitions in the last 30m. SUCCESSOR of the retired solver_state_desync errors kind: the ADR-021 per-solve publish tripwire was retired with MROOY7 task 2UVG3E, and containment now lives in the resolve-seam quarantine gate (degenbot_engine_quarantined_pools, maintained by BotState::quarantine_pool / release_pool). The bot keeps trading its other paths; the DegenbotDesyncQuarantine alert pages while any containment is active."
+        },
+        {
+            "id": 50,
+            "title": "Quarantined pools (solve-invisible)",
+            "type": "stat",
+            "gridPos": {
+                "h": 4,
+                "w": 8,
+                "x": 8,
+                "y": 21
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "degenbot_engine_quarantined_pools",
+                    "legendFormat": "__auto",
+                    "refId": "A",
+                    "instant": true,
+                    "range": false
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "color": {
+                        "mode": "thresholds"
+                    },
+                    "thresholds": {
+                        "mode": "absolute",
+                        "steps": [
+                            {
+                                "color": "green",
+                                "value": null
+                            },
+                            {
+                                "color": "red",
+                                "value": 1
+                            }
+                        ]
+                    }
+                }
+            },
+            "options": {
+                "reduceOptions": {
+                    "calcs": [
+                        "lastNotNull"
+                    ],
+                    "fields": "",
+                    "values": false
+                },
+                "colorMode": "background",
+                "graphMode": "area"
+            },
+            "description": "ADR-040: pools currently quarantine-excluded from solve resolution. PROMETHEUS NAME COUPLING with instruments.rs (degenbot.engine.quarantined_pools)."
+        },
+        {
+            "id": 48,
+            "title": "Alerts (Grafana-managed, ADR-040)",
+            "type": "alertlist",
+            "gridPos": {
+                "h": 4,
+                "w": 8,
+                "x": 16,
+                "y": 21
+            },
+            "options": {
+                "stateFilter": {
+                    "firing": true,
+                    "pending": true,
+                    "noData": true,
+                    "error": true,
+                    "normal": false,
+                    "recovering": false
+                },
+                "maxItems": 10,
+                "sortOrder": 5,
+                "groupMode": "default",
+                "groupBy": [
+                    "severity"
+                ],
+                "alertName": "",
+                "alertInstanceLabelFilter": "",
+                "showInstances": true,
+                "showInactiveAlerts": false,
+                "dashboardAlerts": false,
+                "folder": {
+                    "uid": "",
+                    "title": ""
+                },
+                "datasource": "",
+                "viewMode": "list",
+                "statColorMode": "background",
+                "statThresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                        {
+                            "color": "green",
+                            "value": null
+                        },
+                        {
+                            "color": "red",
+                            "value": 80
+                        }
+                    ]
+                },
+                "statValueMappings": []
+            }
+        },
+        {
+            "id": 51,
+            "title": "Reorg handling (WAJEQP)",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 184
+            },
+            "collapsed": false,
+            "panels": []
+        },
+        {
+            "id": 53,
+            "title": "Reorg episodes entered",
+            "type": "timeseries",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 185
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(increase(degenbot_reorg_windows_total[5m]))",
+                    "legendFormat": "windows/5m",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineInterpolation": "linear"
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            }
+        },
+        {
+            "id": 55,
+            "title": "Reorg rollback depth at entry (blocks)",
+            "type": "timeseries",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 185
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(increase(degenbot_reorg_depth_blocks_ratio_sum[1h])) / clamp_min(sum(increase(degenbot_reorg_depth_blocks_ratio_count[1h])), 1)",
+                    "legendFormat": "mean depth",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineInterpolation": "linear"
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            }
+        },
+        {
+            "id": 57,
+            "title": "Reorg unwind activity",
+            "type": "timeseries",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 193
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(increase(degenbot_reorg_unwound_pools_total[5m]))",
+                    "legendFormat": "unwound pools / 5m",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(increase(degenbot_reorg_recovery_dropped_total[5m]))",
+                    "legendFormat": "recovery drops / 5m",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "short",
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineInterpolation": "linear"
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list"
+                },
+                "tooltip": {
+                    "mode": "multi"
+                }
+            }
+        },
+        {
+            "id": 58,
+            "title": "Epoch accounting (stage-cycle health)",
+            "type": "row",
+            "gridPos": {
+                "h": 1,
+                "w": 24,
+                "x": 0,
+                "y": 201
+            },
+            "collapsed": false,
+            "panels": []
+        },
+        {
+            "id": 59,
+            "title": "Epoch work: headers vs solve cycles vs candidates (rate/s)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 202
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_blocks_observed_total[5m])",
+                    "legendFormat": "headers/s",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_solves_executed_total[5m])",
+                    "legendFormat": "solve cycles/s",
+                    "refId": "B"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "rate(degenbot_candidates_found_total[5m])",
+                    "legendFormat": "candidates/s",
+                    "refId": "C"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "ops",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 60,
+            "title": "Rewind episodes (rate) + recovery drops",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 202
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(rate(degenbot_stage_rewind_total[5m]))",
+                    "legendFormat": "rewind episodes/s",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "sum(increase(degenbot_reorg_recovery_dropped_total[5m]))",
+                    "legendFormat": "recovery drops /5m",
+                    "refId": "C"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                },
+                "description": "Rewind frequency (one per EnterReorg) and unwind-window duration p95 (degenbot.stage.rewind_duration). The drain-era liveness role of these panels is the degenbot.epoch trace root with bumped epoch.seq."
+            }
+        },
+        {
+            "id": 44,
+            "title": "Gap: header \u2192 first log (p50/p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 6,
+                "x": 0,
+                "y": 34
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                },
+                "description": "Stage-cycle gap decomposition (ADR-041 pre-solve legs; Jaeger span fields: header_to_first_log_us / log_burst_us / settle_wait_us / queue.age_us)"
+            }
+        },
+        {
+            "id": 70,
+            "title": "Gap: log burst (p50/p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 6,
+                "x": 6,
+                "y": 34
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_log_burst_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_log_burst_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                },
+                "description": ""
+            }
+        },
+        {
+            "id": 71,
+            "title": "Gap: settle wait (p50/p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 6,
+                "x": 12,
+                "y": 34
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                },
+                "description": ""
+            }
+        },
+        {
+            "id": 72,
+            "title": "Gap: streaming age (p50/p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 6,
+                "x": 18,
+                "y": 34
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.50, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p50",
+                    "refId": "A"
+                },
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "B"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                },
+                "description": ""
+            }
+        },
+        {
+            "id": 62,
+            "title": "State apply (p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 8,
+                "y": 59
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_state_apply_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 61,
+            "title": "Publish cycle (p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 8,
+                "x": 16,
+                "y": 59
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_publish_cycle_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 63,
+            "title": "Simulate duration (p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 68
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_simulate_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 64,
+            "title": "Submit latency (p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 12,
+                "y": 85
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_submit_latency_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                }
+            }
+        },
+        {
+            "id": 65,
+            "title": "Rewind duration (p95)",
+            "type": "timeseries",
+            "gridPos": {
+                "h": 8,
+                "w": 12,
+                "x": 0,
+                "y": 210
+            },
+            "datasource": {
+                "type": "prometheus",
+                "uid": "${DS_PROMETHEUS}"
+            },
+            "targets": [
+                {
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "${DS_PROMETHEUS}"
+                    },
+                    "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_rewind_duration_seconds_bucket[5m])) by (le))",
+                    "legendFormat": "p95",
+                    "refId": "A"
+                }
+            ],
+            "fieldConfig": {
+                "defaults": {
+                    "unit": "s",
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "line",
+                        "lineWidth": 1,
+                        "fillOpacity": 8
+                    }
+                },
+                "overrides": []
+            },
+            "options": {
+                "legend": {
+                    "showLegend": true,
+                    "displayMode": "list",
+                    "placement": "bottom"
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "desc"
+                },
+                "description": "Rewind open \u2192 close unwind-window duration p95 (degenbot.stage.rewind_duration). Frequency and context: the Rewind episodes panel and the degenbot.epoch trace roots (bumped epoch.seq)."
+            }
+        }
+    ],
+    "templating": {
+        "list": [
+            {
+                "name": "DS_PROMETHEUS",
+                "type": "datasource",
+                "query": "prometheus",
+                "label": "Prometheus",
+                "current": {
+                    "selected": false,
+                    "text": "prometheus",
+                    "value": "eea7hc2lizlz4d"
+                },
+                "options": [
+                    {
+                        "selected": true,
+                        "text": "prometheus",
+                        "value": "eea7hc2lizlz4d"
+                    }
+                ]
+            },
+            {
+                "name": "instance",
+                "label": "Instance",
+                "type": "query",
+                "datasource": {
+                    "type": "prometheus",
+                    "uid": "${DS_PROMETHEUS}"
+                },
+                "definition": "label_values(degenbot_blocks_observed_total, instance)",
+                "query": {
+                    "query": "label_values(degenbot_blocks_observed_total, instance)",
+                    "refId": "A"
+                },
+                "includeAll": true,
+                "allValue": ".*",
+                "refresh": 1,
+                "sort": 1,
+                "regex": "",
+                "multi": false,
+                "hide": 0,
+                "current": {},
+                "options": [],
+                "defaultValue": null
+            }
+        ]
     }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "custom": {
-      "drawStyle": "line",
-      "lineInterpolation": "linear"
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "displayMode": "list"
-    },
-    "tooltip": {
-     "mode": "multi"
-    }
-   }
-  },
-  {
-   "id": 55,
-   "title": "Reorg rollback depth at entry (blocks)",
-   "type": "timeseries",
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 185
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(increase(degenbot_reorg_depth_blocks_ratio_sum[1h])) / clamp_min(sum(increase(degenbot_reorg_depth_blocks_ratio_count[1h])), 1)",
-     "legendFormat": "mean depth",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "custom": {
-      "drawStyle": "line",
-      "lineInterpolation": "linear"
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "displayMode": "list"
-    },
-    "tooltip": {
-     "mode": "multi"
-    }
-   }
-  },
-  {
-   "id": 57,
-   "title": "Reorg unwind activity",
-   "type": "timeseries",
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 193
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(increase(degenbot_reorg_unwound_pools_total[5m]))",
-     "legendFormat": "unwound pools / 5m",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(increase(degenbot_reorg_recovery_dropped_total[5m]))",
-     "legendFormat": "recovery drops / 5m",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "custom": {
-      "drawStyle": "line",
-      "lineInterpolation": "linear"
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "displayMode": "list"
-    },
-    "tooltip": {
-     "mode": "multi"
-    }
-   }
-  },
-  {
-   "id": 58,
-   "title": "Epoch accounting (stage-cycle health)",
-   "type": "row",
-   "gridPos": {
-    "h": 1,
-    "w": 24,
-    "x": 0,
-    "y": 201
-   },
-   "collapsed": false,
-   "panels": []
-  },
-  {
-   "id": 59,
-   "title": "Epoch work: headers vs solve cycles vs candidates (rate/s)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 202
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_blocks_observed_total[5m])",
-     "legendFormat": "headers/s",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_solves_executed_total[5m])",
-     "legendFormat": "solve cycles/s",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_candidates_found_total[5m])",
-     "legendFormat": "candidates/s",
-     "refId": "C"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "ops",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 60,
-   "title": "Rewind episodes (rate) + recovery drops",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 202
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_stage_rewind_total[5m]))",
-     "legendFormat": "rewind episodes/s",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(increase(degenbot_reorg_recovery_dropped_total[5m]))",
-     "legendFormat": "recovery drops /5m",
-     "refId": "C"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    },
-    "description": "Rewind frequency (one per EnterReorg) and unwind-window duration p95 (degenbot.stage.rewind_duration). The drain-era liveness role of these panels is the degenbot.epoch trace root with bumped epoch.seq."
-   }
-  },
-  {
-   "id": 44,
-   "title": "Gap: header → first log (p50/p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 6,
-    "x": 0,
-    "y": 34
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    },
-    "description": "Stage-cycle gap decomposition (ADR-041 pre-solve legs; Jaeger span fields: header_to_first_log_us / log_burst_us / settle_wait_us / queue.age_us)"
-   }
-  },
-  {
-   "id": 70,
-   "title": "Gap: log burst (p50/p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 6,
-    "x": 6,
-    "y": 34
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_log_burst_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_log_burst_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    },
-    "description": ""
-   }
-  },
-  {
-   "id": 71,
-   "title": "Gap: settle wait (p50/p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 6,
-    "x": 12,
-    "y": 34
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    },
-    "description": ""
-   }
-  },
-  {
-   "id": 72,
-   "title": "Gap: streaming age (p50/p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 6,
-    "x": 18,
-    "y": 34
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    },
-    "description": ""
-   }
-  },
-  {
-   "id": 62,
-   "title": "State apply (p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 8,
-    "x": 8,
-    "y": 59
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_state_apply_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 61,
-   "title": "Publish cycle (p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 8,
-    "x": 16,
-    "y": 59
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_publish_cycle_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 63,
-   "title": "Simulate duration (p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 68
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_simulate_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 64,
-   "title": "Submit latency (p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 85
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_submit_latency_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
-   "id": 65,
-   "title": "Rewind duration (p95)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 210
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_rewind_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p95",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    },
-    "description": "Rewind open → close unwind-window duration p95 (degenbot.stage.rewind_duration). Frequency and context: the Rewind episodes panel and the degenbot.epoch trace roots (bumped epoch.seq)."
-   }
-  }
- ],
- "templating": {
-  "list": [
-   {
-    "name": "DS_PROMETHEUS",
-    "type": "datasource",
-    "query": "prometheus",
-    "label": "Prometheus"
-   },
-   {
-    "name": "instance",
-    "label": "Instance",
-    "type": "query",
-    "datasource": {
-     "type": "prometheus",
-     "uid": "${DS_PROMETHEUS}"
-    },
-    "definition": "label_values(degenbot_blocks_observed_total, instance)",
-    "query": {
-     "query": "label_values(degenbot_blocks_observed_total, instance)",
-     "refId": "A"
-    },
-    "includeAll": true,
-    "allValue": ".*",
-    "refresh": 1,
-    "sort": 1,
-    "regex": "",
-    "multi": false,
-    "hide": 0,
-    "current": {},
-    "options": [],
-    "defaultValue": null
-   }
-  ]
- }
 }

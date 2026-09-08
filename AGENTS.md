@@ -44,3 +44,21 @@ The database schema is **Alembic-owned during the 0.6.x point releases** and bec
 - the `ALEMBIC_HEAD` constant in `rust/crates/degenbot-db/src/schema.rs`;
 - the `alembic_version`-reading branch of `rust/crates/degenbot-db/src/migrate.rs::ensure_schema`;
 - the `PRAGMA query_only=on` setting on the `AlembicCurrent` path in `DegenbotDb::open`.
+
+## Grafana dashboard sync (do not edit provisioned dashboards via API)
+
+The dashboards in `docs/grafana/` are the **source of truth**. A systemd **path unit** on the host
+(`update-grafana-dashboards.path` → `update-grafana-dashboards.service`) watches those JSON files and
+re-syncs them into the Grafana container within ~15s of any change. Consequences that have burned sessions:
+
+- **Editing a dashboard through the Grafana HTTP API (`/api/dashboards/db`) is lost within seconds** for any
+  dashboard that lives in `docs/grafana/` — the sync silently overwrites it from the repo file. Edits to
+  dashboards NOT present in `docs/grafana/` (e.g. scratch/experiment dashboards) stick, which makes the
+  failure look random.
+- To make lasting changes to a synced dashboard, edit the JSON file in `docs/grafana/` directly and let the
+  path unit pick it up (wait ~15s, or `systemctl --user start update-grafana-dashboards.service`).
+- A hanging panel that shows **"Loading plugin panel..." forever is a corrupted/stale panel JSON symptom**
+  (e.g. empty `pluginVersion`, empty `options`, or wrong target property names after an upgrade) — not a
+  plugin problem. Normalize the panel JSON to the current Grafana schema (`pluginVersion` set to the running
+  version, full `options`/`fieldConfig`, correct target keys) and it loads on a fresh page. When in doubt,
+  edit a clone of a panel that renders and copy its exact shape.
