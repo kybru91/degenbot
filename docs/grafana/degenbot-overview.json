@@ -887,7 +887,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 34
+    "y": 42
    },
    "datasource": {
     "type": "prometheus",
@@ -937,7 +937,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 34
+    "y": 42
    },
    "datasource": {
     "type": "prometheus",
@@ -988,20 +988,20 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 42
+    "y": 58
    },
    "panels": []
   },
   {
    "id": 19,
-   "title": "Pipeline phase durations (p95): decode / apply / publish cycle",
+   "title": "Log decode (p95)",
    "description": "queue-wait column replaced: degenbot_drain_queue_wait_seconds is retired (SZJUKL); per-epoch queue age rides the degenbot.stage.* span attrs (queue.age_us), and degenbot_stage_publish_cycle_seconds owns the cycle view.",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
-    "w": 12,
+    "w": 8,
     "x": 0,
-    "y": 43
+    "y": 59
    },
    "datasource": {
     "type": "prometheus",
@@ -1014,26 +1014,8 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "expr": "histogram_quantile(0.95, sum(rate(degenbot_log_decode_seconds_bucket[5m])) by (le))",
-     "legendFormat": "log decode",
+     "legendFormat": "p95",
      "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_state_apply_seconds_bucket[5m])) by (le))",
-     "legendFormat": "state apply",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_publish_cycle_seconds_bucket[5m])) by (le))",
-     "legendFormat": "publish cycle p95",
-     "refId": "C"
     }
    ],
    "fieldConfig": {
@@ -1070,7 +1052,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 43
+    "y": 59
    },
    "datasource": {
     "type": "prometheus",
@@ -1149,34 +1131,25 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 51
+    "y": 67
    },
    "panels": []
   },
   {
    "id": 22,
-   "title": "Solver load: registered paths / solves / candidates",
+   "title": "Solver load: solve cycles vs candidates (rate/min)",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 52
+    "y": 68
    },
    "datasource": {
     "type": "prometheus",
     "uid": "${DS_PROMETHEUS}"
    },
    "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_engine_registered_paths",
-     "legendFormat": "registered paths",
-     "refId": "A"
-    },
     {
      "datasource": {
       "type": "prometheus",
@@ -1224,13 +1197,13 @@
   },
   {
    "id": 23,
-   "title": "Simulate: duration p95 + verdict mix",
+   "title": "Simulate verdict mix",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 52
+    "y": 68
    },
    "datasource": {
     "type": "prometheus",
@@ -1242,36 +1215,9 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_simulate_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "simulate p95",
+     "expr": "sum(rate(degenbot_simulate_verdicts_total[5m])) by (outcome)",
+     "legendFormat": "{{outcome}}",
      "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_simulate_verdicts_total{outcome=\"profitable\"}[5m]))",
-     "legendFormat": "profitable",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_simulate_verdicts_total{outcome=\"not_profitable\"}[5m]))",
-     "legendFormat": "not profitable",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_simulate_verdicts_total{outcome=\"error\"}[5m]))",
-     "legendFormat": "error",
-     "refId": "D"
     }
    ],
    "fieldConfig": {
@@ -1309,7 +1255,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 60
+    "y": 76
    },
    "panels": []
   },
@@ -1321,7 +1267,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 61
+    "y": 77
    },
    "datasource": {
     "type": "prometheus",
@@ -1372,7 +1318,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 61
+    "y": 77
    },
    "datasource": {
     "type": "prometheus",
@@ -1426,13 +1372,13 @@
   },
   {
    "id": 27,
-   "title": "Monitor outcomes + submit latency p95",
+   "title": "Monitor outcomes (confirmed / expired)",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
-    "w": 24,
+    "w": 12,
     "x": 0,
-    "y": 69
+    "y": 85
    },
    "datasource": {
     "type": "prometheus",
@@ -1445,17 +1391,8 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "expr": "sum(rate(degenbot_monitor_outcomes_total[5m])) by (outcome)",
-     "legendFormat": "monitor {{outcome}}",
+     "legendFormat": "{{outcome}}",
      "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_submit_latency_seconds_bucket[5m])) by (le))",
-     "legendFormat": "submit latency p95",
-     "refId": "B"
     }
    ],
    "fieldConfig": {
@@ -1493,7 +1430,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 77
+    "y": 93
    },
    "panels": []
   },
@@ -1506,7 +1443,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 78
+    "y": 94
    },
    "datasource": {
     "type": "prometheus",
@@ -1557,7 +1494,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 78
+    "y": 94
    },
    "datasource": {
     "type": "prometheus",
@@ -1617,7 +1554,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 86
+    "y": 102
    },
    "panels": [],
    "collapsed": false
@@ -1630,7 +1567,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 87
+    "y": 103
    },
    "datasource": {
     "type": "prometheus",
@@ -1712,7 +1649,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 95
+    "y": 111
    },
    "panels": []
   },
@@ -1724,7 +1661,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 95
+    "y": 111
    },
    "datasource": {
     "type": "prometheus",
@@ -1802,7 +1739,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 95
+    "y": 111
    },
    "datasource": {
     "type": "prometheus",
@@ -1880,7 +1817,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 103
+    "y": 119
    },
    "datasource": {
     "type": "prometheus",
@@ -1940,7 +1877,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 111
+    "y": 127
    },
    "panels": []
   },
@@ -1952,7 +1889,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 112
+    "y": 128
    },
    "datasource": {
     "type": "prometheus",
@@ -2022,7 +1959,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 120
+    "y": 136
    },
    "datasource": {
     "type": "prometheus",
@@ -2073,7 +2010,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 120
+    "y": 136
    },
    "datasource": {
     "type": "prometheus",
@@ -2142,7 +2079,7 @@
     "h": 8,
     "w": 24,
     "x": 0,
-    "y": 128
+    "y": 144
    },
    "datasource": {
     "type": "prometheus",
@@ -2163,14 +2100,14 @@
    }
   },
   {
-   "id": 44,
-   "title": "Stage-cycle gap: delivery / burst / settle / streaming-age (p50/p95)",
+   "id": 45,
+   "title": "Epoch race dissolve: pre-solve phase means vs header→published mean",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 34
+    "y": 50
    },
    "datasource": {
     "type": "prometheus",
@@ -2182,8 +2119,8 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
-     "legendFormat": "delivery p50",
+     "expr": "(sum(rate(degenbot_block_header_to_first_log_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_header_to_first_log_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_block_log_burst_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_log_burst_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_block_settle_wait_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_block_settle_wait_seconds_count[5m])), 0.000000001) + sum(rate(degenbot_stage_streaming_age_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_stage_streaming_age_seconds_count[5m])), 0.000000001))",
+     "legendFormat": "pre-solve phase means (sum)",
      "refId": "A"
     },
     {
@@ -2191,63 +2128,9 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
-     "legendFormat": "delivery p95",
+     "expr": "sum(rate(degenbot_epoch_header_to_publish_seconds_sum[5m])) / clamp_min(sum(rate(degenbot_epoch_header_to_publish_seconds_count[5m])), 0.000000001)",
+     "legendFormat": "header→published (mean)",
      "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_log_burst_seconds_bucket[5m])) by (le))",
-     "legendFormat": "burst p50",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_log_burst_seconds_bucket[5m])) by (le))",
-     "legendFormat": "burst p95",
-     "refId": "D"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
-     "legendFormat": "settle p50",
-     "refId": "E"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
-     "legendFormat": "settle p95",
-     "refId": "F"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
-     "legendFormat": "streaming-age p50",
-     "refId": "G"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
-     "legendFormat": "streaming-age p95",
-     "refId": "H"
     }
    ],
    "fieldConfig": {
@@ -2274,86 +2157,7 @@
      "mode": "multi",
      "sort": "desc"
     },
-    "description": "Pre-solve gap decomposition (phases recorded at each settle point): header-to-first-log = WS delivery latency; log_burst = diffusion of the block logs across the feed (first-to-last); settle_wait = debounce/quiesce hold after the last log; streaming_age = first relevant log → quiesce (the epoch-stage wait, degenbot.stage.streaming_age). Jaeger: the same values ride as span fields (header_to_first_log_us, log_burst_us, settle_wait_us, queue.age_us) on the degenbot.epoch trace root."
-   }
-  },
-  {
-   "id": 45,
-   "title": "Pre-solve gap means vs header-to-published (mean dissolve)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 34
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_block_header_to_first_log_seconds_sum[5m])) / sum(rate(degenbot_block_header_to_first_log_seconds_count[5m]))",
-     "legendFormat": "delivery (mean)",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_block_log_burst_seconds_sum[5m])) / sum(rate(degenbot_block_log_burst_seconds_count[5m]))",
-     "legendFormat": "burst (mean)",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_block_settle_wait_seconds_sum[5m])) / sum(rate(degenbot_block_settle_wait_seconds_count[5m]))",
-     "legendFormat": "settle (mean)",
-     "refId": "C"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "sum(rate(degenbot_epoch_header_to_publish_seconds_sum[5m])) / sum(rate(degenbot_epoch_header_to_publish_seconds_count[5m]))",
-     "legendFormat": "header-to-published (mean)",
-     "refId": "D"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    },
-    "description": "Mean phase durations vs the total epoch race. delivery + burst + settle + solve should approximately equal header-to-published (ADR-041: the race ends at the Published edge); a residual means unbudgeted time (resolve/simulate/gate queueing, submit queue)."
+    "description": "Residual check: the summed pre-solve phase means vs the total epoch race mean. A growing gap between the lines means unbudgeted time (resolve/simulate/gate queueing, submit queue); large negative drift means phases overlap epochs (stale drops — see the stale-drop share stat)."
    }
   },
   {
@@ -2364,7 +2168,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 144
+    "y": 160
    },
    "datasource": {
     "type": "prometheus",
@@ -2423,7 +2227,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 160
+    "y": 176
    },
    "datasource": {
     "type": "prometheus",
@@ -2640,7 +2444,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 168
+    "y": 184
    },
    "collapsed": false,
    "panels": []
@@ -2657,7 +2461,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 169
+    "y": 185
    },
    "targets": [
     {
@@ -2700,8 +2504,8 @@
    "gridPos": {
     "h": 8,
     "w": 12,
-    "x": 12,
-    "y": 169
+    "x": 0,
+    "y": 185
    },
    "targets": [
     {
@@ -2745,7 +2549,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 177
+    "y": 193
    },
    "targets": [
     {
@@ -2794,7 +2598,7 @@
     "h": 1,
     "w": 24,
     "x": 0,
-    "y": 185
+    "y": 201
    },
    "collapsed": false,
    "panels": []
@@ -2807,7 +2611,7 @@
     "h": 8,
     "w": 12,
     "x": 0,
-    "y": 186
+    "y": 202
    },
    "datasource": {
     "type": "prometheus",
@@ -2870,13 +2674,13 @@
   },
   {
    "id": 60,
-   "title": "Rewind pressure: episodes/s + duration p95",
+   "title": "Rewind episodes (rate) + recovery drops",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 186
+    "y": 202
    },
    "datasource": {
     "type": "prometheus",
@@ -2891,15 +2695,6 @@
      "expr": "sum(rate(degenbot_stage_rewind_total[5m]))",
      "legendFormat": "rewind episodes/s",
      "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_rewind_duration_seconds_bucket[5m])) by (le))",
-     "legendFormat": "rewind duration p95",
-     "refId": "B"
     },
     {
      "datasource": {
@@ -2936,6 +2731,506 @@
      "sort": "desc"
     },
     "description": "Rewind frequency (one per EnterReorg) and unwind-window duration p95 (degenbot.stage.rewind_duration). The drain-era liveness role of these panels is the degenbot.epoch trace root with bumped epoch.seq."
+   }
+  },
+  {
+   "id": 44,
+   "title": "Gap: header → first log (p50/p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 0,
+    "y": 34
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_header_to_first_log_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "description": "Stage-cycle gap decomposition (ADR-041 pre-solve legs; Jaeger span fields: header_to_first_log_us / log_burst_us / settle_wait_us / queue.age_us)"
+   }
+  },
+  {
+   "id": 70,
+   "title": "Gap: log burst (p50/p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 6,
+    "y": 34
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_log_burst_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_log_burst_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "description": ""
+   }
+  },
+  {
+   "id": 71,
+   "title": "Gap: settle wait (p50/p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 12,
+    "y": 34
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "description": ""
+   }
+  },
+  {
+   "id": 72,
+   "title": "Gap: streaming age (p50/p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 6,
+    "x": 18,
+    "y": 34
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p50",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "description": ""
+   }
+  },
+  {
+   "id": 62,
+   "title": "State apply (p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 8,
+    "y": 59
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_state_apply_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 61,
+   "title": "Publish cycle (p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 8,
+    "x": 16,
+    "y": 59
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_publish_cycle_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 63,
+   "title": "Simulate duration (p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 68
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_simulate_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 64,
+   "title": "Submit latency (p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 85
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_submit_latency_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 65,
+   "title": "Rewind duration (p95)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 210
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_rewind_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "p95",
+     "refId": "A"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "description": "Rewind open → close unwind-window duration p95 (degenbot.stage.rewind_duration). Frequency and context: the Rewind episodes panel and the degenbot.epoch trace roots (bumped epoch.seq)."
    }
   }
  ],
