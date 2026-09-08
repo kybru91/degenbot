@@ -20,9 +20,11 @@ mkdir -p "$LOGDIR"
 # Every invocation — run_bot.sh, a hand-run, a CI/harness — gets loud failure
 # by default; there is no liberal default posture anymore. Flags that follow
 # are all default-ON in code via `bot_env_flag_default_on` (opt OUT with =0):
-#   DEGENBOT_ASSERT_SOLVER_STATE (ADR-021 publish tripwire, fatal on desync)
-#     — script-DISABLED here for the fast path (see export block below); the
-#       code default remains ON for hand-runs/harness.
+#   (RETIRED: DEGENBOT_ASSERT_SOLVER_STATE — the ADR-021 per-solve solver-state
+#     tripwire is GONE with MROOY7 task 2UVG3E and the key no longer exists in
+#     the config schema (docs/rust-config-keys.md). Standing verification is
+#     on-demand: sim failures arm a divergence probe (DEGENBOT_SIM_DIVERGENCE_LOG)
+#     and DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD adds random ops spot-checks.)
 #   DEGENBOT_VERIFY_DBG          (structural verify diagnostics / divergence set)
 #   DEGENBOT_DUMP_CALL_TRACE     (full revm call trace on sim failure)
 #   DEGENBOT_V2_CALC_TRACE       (V2 reserves slot8 before each sim)
@@ -83,16 +85,29 @@ export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-1}"
 # settle tax. 15 ms cuts ~33 ms/block with no extra solve cycles observed.
 # Code default stays 50 ms; invalid/zero env values fall back to 50 ms.
 export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
-# Solver-state verification policy: ON (loud fail-stop tripwire, ADR-021) —
-# every published block is judged against chain state on the detached verifier
-# VERIFY2 T1 (2026-09-05): the per-solve solver-state verifier is now OFF by
-# default - the overnight scan measured 29k tripwire WARNs and tens-of-
-# seconds verify spans (per-hop RPC scalar reads for every published path
-# set) with zero caught desyncs in 6.5h. Standing verification moved to
-# on-demand: sim failures arm a divergence probe on the failing path's next
-# sim (and DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD adds random spot-checks for
-# operators). DEGENBOT_ASSERT_SOLVER_STATE=1 re-enables the strict per-hop
-# gate per block for a run (operator opt-in).
+# Typed-config parity (KAHU5W): every DEGENBOT_* env above still works
+# (12-factor parity) but each key also has a typed TOML path — these exports
+# map to telemetry.otel, solve.solve_inline_sim, simulation.sim_exit_on_fail,
+# trace.ws_trace, and pump.pump_debounce_ms in config.toml; the full key
+# table lives in docs/rust-config-keys.md. Observability note (MROOY7): the
+# retired pump/queue surface (spans degenbot.pump.block / pump.log_wait /
+# pump.apply_stream, series degenbot_drain_queue_depth) is succeeded by the
+# stage telemetry — spans degenbot.epoch + degenbot.stage.{streaming,quiesced,
+# publish,finalize,rewind}, series degenbot_stage_publish_cycle_seconds /
+# degenbot_stage_rewind_total / _duration_seconds; the metrics endpoint is
+# DEGENBOT_METRICS_ADDR (default 127.0.0.1:9464).
+# Solver-state verification policy: ON-DEMAND ONLY (the ADR-021 publish
+# tripwire and its DEGENBOT_ASSERT_SOLVER_STATE knob are RETIRED — MROOY7
+# task 2UVG3E: the overnight scan measured 29k tripwire WARNs and tens-of-
+# seconds verify spans with zero caught desyncs in 6.5h, and the knob is no
+# longer in the config schema, so exporting it here would be a dead knob).
+# Standing verification: sim failures arm a divergence probe on the failing
+# path's next sim (DEGENBOT_SIM_DIVERGENCE_LOG=1 merges the engine-vs-RPC
+# divergence logs), DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD adds random spot-
+# checks for operators, and DEGENBOT_WS_COMPLETENESS (default ON) aborts
+# loudly on a dropped WS log before state can drift. Desync containment runs
+# through the resolve-seam quarantine gate (watch the
+# degenbot_engine_quarantined_pools gauge / DegenbotDesyncQuarantine alert).
 
 # Two-runtime contract (7LV6VN T5): solve bins, rayon resolve, sim runtime,
 # and the sim-driver cap all derive from the detected cgroup budget inside

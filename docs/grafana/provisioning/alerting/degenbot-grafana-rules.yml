@@ -78,13 +78,18 @@ groups:
         condition: C
         for: 5m
         annotations:
-          summary: degenbot drainer stall
+          summary: degenbot drainer stall - detached solve stragglers at cap
+          description: >-
+            Successor of the retired degenbot_drain_queue_depth gauge
+            (DispatchOwner queue, removed SZJUKL): the detached-solve straggler
+            backlog sits AT CAP 8 - the sidecar merge is wedged and solves are
+            not landing. Healthy runs sit at 0 and drop stragglers stale.
         data:
           - refId: A
             relativeTimeRange: { from: 5m, to: 0s }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: 'degenbot_drain_queue_depth{init!="true"} >= 2'
+              expression: 'degenbot_detached_in_flight >= 8'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true
@@ -130,9 +135,11 @@ groups:
         annotations:
           summary: degenbot recorded failures (any kind)
           description: >-
-            At least one failure recorded in 5m. Per ADR-040 a
-            solver_state_desync kind means a QUARANTINE fired - open the
-            logs/desync/ JSON dump from the event for reproduction state.
+            At least one failure recorded in 5m. The kind label is the CLOSED
+            SET telemetry::error_kind (ws_completeness sim_failure
+            submit_failure monitor_failure verify_mismatch drain_stall
+            drain_dead); an active quarantine ALSO surfaces via
+            DegenbotDesyncQuarantine (degenbot_engine_quarantined_pools).
         data:
           - refId: A
             relativeTimeRange: { from: 15m, to: 0s }
@@ -156,17 +163,20 @@ groups:
         annotations:
           summary: solver-state desync quarantined a pool
           description: >-
-            A verified desync quarantined a pool (ADR-040 default reaction).
-            Urgent root-cause work: the repro dump (logs/desync/*.json) has the
-            full state. The bot keeps trading its other paths.
+            A quarantine-excluded pool was active in the last 30m (ADR-040
+            containment via the resolve-seam quarantine gate, gauge
+            degenbot_engine_quarantined_pools). The retired
+            degenbot_quarantine_events_total counter and the
+            solver_state_desync errors kind are gone: the ADR-021 publish
+            tripwire was retired with MROOY7 task 2UVG3E. Urgent root-cause
+            work: enable DEGENBOT_SIM_DIVERGENCE_LOG for the engine-vs-RPC
+            divergence dump. The bot keeps trading its other paths.
         data:
           - refId: A
             relativeTimeRange: { from: 15m, to: 0s }
             datasourceUid: eea7hc2lizlz4d
             model:
-              expression: >-
-                sum(increase(degenbot_errors_total{kind="solver_state_desync"}[30m])) > 0
-                or increase(degenbot_quarantine_events_total[30m]) > 0
+              expression: 'max_over_time(degenbot_engine_quarantined_pools[30m]) > 0'
               datasource: { type: prometheus, uid: eea7hc2lizlz4d }
               editorMode: code
               instant: true

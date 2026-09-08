@@ -9,7 +9,8 @@ the Jaeger-side investigation guide.
 Sources of truth:
 
 - Spans/events: `rust/crates/degenbot-bot/src/arb_engine/solver_dispatch.rs`
-  (the `[solve-phase]` family), `bot_core/block_pump.rs` (`degenbot.pump.block`),
+  (the `[solve-phase]` family), `bot_core/block_pump.rs` (`degenbot.epoch` root + pre-solve
+  gap fields), `bot_core/stage_telemetry.rs` (`degenbot.stage.*` per-transition spans),
   `arb_engine/engine_handle.rs` (`degenbot.arb.solve`).
 - Metrics: `rust/crates/degenbot-bot/src/instruments.rs` (`degenbot_*` families).
 - OTel setup (event cap, exporter): `rust/crates/degenbot-bot/src/otel.rs`.
@@ -61,7 +62,8 @@ OTel context: simulate/bundle spans exported as ROOT traces, correlated only
 by the `current_block` tag. The bridge (`telemetry::publish_block_context` at
 batch send + `telemetry::simulate_dispatch_span` at the Python seam) parents
 the dispatch fan-out to the published block's span, so ONE Jaeger trace now
-carries `pump.block → arb.solve → simulate.dispatch → bundle.*`. The lookup
+carries `degenbot.epoch → arb.solve → simulate.dispatch → bundle.*` (the per-epoch
+`degenbot.epoch` root succeeded the retired `pump.block` waterfall, BF43PM). The lookup
 falls back to the closest earlier block because Python's `current_block` can
 be one ahead (the batch is dispatched after the next header arrives). If
 simulate spans reappear as roots, the registry capture (batch send) or the
@@ -181,16 +183,20 @@ twin simulators are `v3_simulate_swap`/`v4_simulate_swap` in degenbot-pools.
 
 ### S5. Pump block span ≫ solve span total
 
-`degenbot.pump.block` should wrap the drain tightly. If block duration exceeds
+`degenbot.epoch` (successor of the retired `degenbot.pump.block`) should wrap the epoch tightly.
+If epoch duration exceeds
 the sum of child solves by a lot, time is going to: header decode, log decode,
 state apply (each has a Prometheus histogram: `degenbot_log_decode`,
-`degenbot_state_apply`), or queue wait (`degenbot_drain_queue_wait`). Cross-
+`degenbot_state_apply_seconds`), or the settle wait (`degenbot_block_settle_wait_seconds`;
+ the DispatchOwner queue-wait series `degenbot_drain_queue_wait_seconds`/`_depth` are
+ RETIRED, SZJUKL — queue age now rides the `degenbot.stage.*` span attrs as `queue.age_us`).
+Cross-
 check the matching metric histogram percentiles in Prometheus before adding
 new spans.
 
 ### S7. header_to_solved dominated by a flat settle wait
 
-Decompose the pump-side gap first — `degenbot.pump.block` fields:
+Decompose the pre-solve gap first — `degenbot.epoch` root fields (recorded at the settle point):
 `header_to_first_log_us` (header → first relevant log), `log_burst_us`
 (first → last relevant log, i.e. the apply work), `settle_wait_us` (last log →
 settle decision). The settle wait is the publish debounce — it costs roughly
@@ -232,9 +238,12 @@ Known incident class, not a bot bug:
 
 ## Telemetry inventory (quick reference)
 
-Jaeger spans: `degenbot.pump.block` (root, per drained block),
-`degenbot.arb.solve` (child, per solve cycle), `degenbot.path.register`
-(registration worker). Lifecycle tier (once per run / per log, named via
+Jaeger spans: `degenbot.epoch` (trace ROOT per block epoch, attrs
+`epoch.block`/`epoch.seq`), `degenbot.stage.{streaming,quiesced,publish,finalize,rewind}`
+(one span per ADR-041 stage transition; `streaming`/`rewind` hold open, the rest are point
+spans), `degenbot.arb.solve` (child, per solve cycle), `degenbot.path.register`
+(registration worker). RETIRED (BF43PM/AJIOCU, epic MROOY7):
+`degenbot.pump.block` / `pump.log_wait` / `pump.apply_stream`. Lifecycle tier (once per run / per log, named via
 `#[tracing::instrument(name = ...)]` — the pre-convention tier kept on bare
 function names before the 2026-09-04 rename):
 `degenbot.pump.subscribe`+`degenbot.pump.resume` (WS handshake + snapshot-
@@ -244,8 +253,10 @@ full sweep). Span events carry `code.line.number` — use it to confirm binary
 freshness against current source.
 
 Key Prometheus families (`instruments.rs`): `degenbot_solve_duration_seconds`,
-`degenbot_header_to_solved_seconds`, `degenbot_drain_queue_wait_seconds` /
-`_depth`, `degenbot_log_decode_seconds`, `degenbot_state_apply_seconds`,
+`degenbot_header_to_solved_seconds`, `degenbot_stage_publish_cycle_seconds` /
+`degenbot_stage_rewind_total` / `_duration_seconds` (the DispatchOwner
+`degenbot_drain_queue_wait_seconds` / `_depth` families are RETIRED, SZJUKL),
+`degenbot_log_decode_seconds`, `degenbot_state_apply_seconds`,
 `degenbot_state_head_lag_blocks`, `degenbot_candidates_found_total`,
 `degenbot_submit_latency_seconds`. Alert rules + thresholds:
 [`ALERTS.md`](grafana/ALERTS.md).

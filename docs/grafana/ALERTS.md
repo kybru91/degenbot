@@ -27,11 +27,12 @@ Headers stopped arriving; the pump cannot see new blocks. First observed live
 kept advancing - this alert would have fired within 2 minutes.
 
 ### Drainer stall (solve/dispatch not advancing)
-    expr: degenbot_drain_queue_depth >= 2
+    expr: degenbot_detached_in_flight >= 8
     for: 5m
-A persistent backlog means the solver cannot keep up or the drainer froze.
-(The Rust-side B3 backstop aborts at 30s; this catches the slow-degradation
-case before the abort.)
+SUCCESSOR (MROOY7): the DispatchOwner queue gauge `degenbot_drain_queue_depth`
+is retired (SZJUKL); the detached-solve straggler backlog owns the signal now.
+Stragglers sit at 0 healthy and are dropped stale under churn; a sustained
+in-flight count at cap 8 means the sidecar merge is wedged.
 
 ### State head divergence (freeze signature, ergo 3YA7ZJ)
     expr: abs(degenbot_state_head_lag_blocks) >= 3
@@ -62,10 +63,12 @@ More than 80% of found profit is being left on the table (unsubmitted).
 
 ### Recorded failures (epic D63GSE)
     expr: sum(rate(degenbot_errors_total[5m])) > 0
-Any failure surfaced through `telemetry::record_exception` (solver-state
-desync, WS log drop, sim failure, submit/monitor failure, verify mismatch,
-drain stall) increments `degenbot_errors_total{kind=...}`. The `kind` label is
-a CLOSED SET (`telemetry::error_kind`) — triage with e.g.
+Any failure surfaced through `telemetry::record_exception` increments
+`degenbot_errors_total{kind=...}`. The `kind` label is the CLOSED SET
+(`telemetry::error_kind`: ws_completeness, sim_failure, submit_failure,
+monitor_failure, verify_mismatch, drain_stall, drain_dead — the
+`solver_state_desync` kind retired with the ADR-021 tripwire, MROOY7 2UVG3E) —
+triage with e.g.
 `degenbot_errors_total{kind="sim_failure"}`. Full context lives in Jaeger:
 filter traces by tag `error=true` (service `degenbot-bot`); the failed span
 carries an `exception` event with `exception_type` / `exception_message`.
@@ -87,8 +90,11 @@ shared instruments.
 - Import `docs/grafana/degenbot-overview.json` for the companion dashboard;
   point it at the Prometheus data source scraping the bot endpoint.
 - Traces: Jaeger UI, service `degenbot-bot`. Per-block traces root at
-  `degenbot.pump.block`; solves nest via the drain-pipe span propagation
-  (`DrainWork` carries the dispatch-time span).
+  `degenbot.epoch` (attrs `epoch.block` / `epoch.seq` plus the pre-solve gap
+  fields); the ADR-041 stage spans (`degenbot.stage.streaming` / `quiesced` /
+  `publish` / `finalize` / `rewind`) and the solve arm nest under it. The
+  `degenbot.pump.block` / `pump.log_wait` / `pump.apply_stream` spans are
+  RETIRED (BF43PM/AJIOCU, epic MROOY7).
 
 
 
@@ -120,7 +126,8 @@ Rule inventory (10 rules, 2 groups, 60s evaluation):
 - **DegenbotHeaderStall**: rate(blocks)==0 while target up. Healthy-state
   normalized: every comparison rule ends `or vector(0)` so Grafana reads
   Normal instead of NoData.
-- **DegenbotDrainerStall** (drain_queue_depth >= 2 for 5m).
+- **DegenbotDrainerStall** (degenbot_detached_in_flight >= 8 for 5m — successor
+  of the retired `drain_queue_depth` gauge, MROOY7).
 - **DegenbotStateHeadDivergence** (abs(state_head_lag) >= 3 for 1m).
 
 ### Warning (degraded but not bleeding money)
@@ -129,9 +136,13 @@ Rule inventory (10 rules, 2 groups, 60s evaluation):
   now means a QUARANTINE fired (ADR-040 default): open the newest
   logs/desync/desync-*.json for the reproduction state; the bot is still
   trading its other paths.
-- **DegenbotDesyncQuarantine** (NEW) - dedicated quarantine signal
-  (degenbot_quarantine_events_total + the errors-kind), so a containment is
-  visible as its OWN event, not buried in the any-error rate.
+- **DegenbotDesyncQuarantine** - dedicated quarantine signal, now
+  `max_over_time(degenbot_engine_quarantined_pools[30m]) > 0`. The retired
+  `degenbot_quarantine_events_total` counter and the `solver_state_desync`
+  errors kind are gone (ADR-021 publish tripwire retired, MROOY7 2UVG3E;
+  containment moved to the resolve-seam quarantine gate gauge), so a
+  containment is still visible as its OWN event, not buried in the any-error
+  rate.
 - **DegenbotSubmitFailures**, **DegenbotMonitorExpirySpike** (>50% expired
   15m), **DegenbotProfitEfficiencyDrop** (>80% left on table),
   **DegenbotSimulateErrorRate** (>10% error outcomes 10m) - severity
