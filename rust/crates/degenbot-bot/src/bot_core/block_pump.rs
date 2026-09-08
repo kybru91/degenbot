@@ -3,7 +3,7 @@
 //!
 //! Holds `Arc<Bot>` + `Arc<dyn StageHandlers>` — the ONE engine seam. Per WS
 //! log, the pump calls `bot.dispatch_log(log)` (decode → apply to `BotState`
-//! → EpochDelta byproduct; the retired `EngineSubscriber` classification is
+//! → `EpochDelta` byproduct; the retired `EngineSubscriber` classification is
 //! GONE — touched-pool tracking is the ledger's job since LXDY4C). At the
 //! machine's decision points the pump drives the engine's stage hooks
 //! directly (`on_resolve` → `on_solve`, `on_publish` at the Published edge,
@@ -1705,7 +1705,7 @@ impl BlockPump {
         let StageDecision::Drain { block, metadata } = fsm.drain_decision(state_head) else {
             unreachable!("drain_decision always drains when called");
         };
-        self.drive_solve(&fsm, fsm.context_for(block, metadata));
+        self.drive_solve(fsm, fsm.context_for(block, metadata));
         // T2: header→solved latency for solve-carrying work items (the
         // dissolved `DispatchOwner` drainer stamp; single-writer inline now).
         let header_ms = self.header_ms.load(std::sync::atomic::Ordering::Relaxed);
@@ -1723,6 +1723,10 @@ impl BlockPump {
     /// `epoch.block()` into solve/finalize bookkeeping; the fresh
     /// generation's stream re-delivers the block's work. Returns true when
     /// the item was dropped.
+    #[expect(
+        clippy::unused_self,
+        reason = "driver-side hook kept on the pump for seam discoverability; the stage machine owns all state the check reads"
+    )]
     fn reorg_flying_stale(&self, fsm: &StageMachine, ctx: &crate::bot_core::BlockContext) -> bool {
         let observed_seq = fsm.rewind_seq();
         let epoch = ctx.epoch();
@@ -1818,7 +1822,7 @@ impl BlockPump {
         }
         if let Err(error) = self.engine.on_finalize(&Finalize {
             ctx,
-            published: published.clone(),
+            published: *published,
         }) {
             tracing::error!(%error, "stage Finalize failed — boundary not stamped");
         }
@@ -4130,8 +4134,7 @@ mod tests {
         };
         // The solve issued before resume anchors the cursor to W (SZJUKL:
         // the engine's own cursor; the dissolved coordinator cursor is gone).
-        use crate::bot_core::Solve as TestSolve;
-        let _ = sink.on_solve(&TestSolve {
+        let _ = sink.on_solve(&crate::bot_core::Solve {
             ctx: BlockContext::new(w, meta_w),
             paths: crate::bot_core::AffectedPaths::default(),
         });
@@ -4190,7 +4193,7 @@ mod tests {
     /// SZJUKL port of the dissolved `event_dispatch` test
     /// `drainer_warns_and_drops_reorg_flying_stale_epoch_work`: the stale-epoch
     /// drop is now the DRIVER-side `reorg_flying_stale` check at each work
-    /// site — the DispatchOwner FIFO is gone. A work item minted in the
+    /// site — the `DispatchOwner` FIFO is gone. A work item minted in the
     /// pre-rewind generation is dropped LOUDLY (WARN + metric) instead of
     /// silently consuming `epoch.block()` into solve/finalize bookkeeping;
     /// the post-rewind item minted in the bumped generation is applied.

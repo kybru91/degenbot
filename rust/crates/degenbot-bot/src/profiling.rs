@@ -43,7 +43,7 @@
 //! "Rust-is-the-engine" layer (ADR-005 / ADR-006): a tokio task driving WS
 //! `newHeads` + `logs` through the ONE stage seam (`StageHandlers`, SZJUKL) —
 //! solution hooks hold the engine `Mutex` (enqueue-length under the detached
-//! posture) and take the `BotState` RwLock internally. It is where
+//! posture) and take the `BotState` `RwLock` internally. It is where
 //! latency = lost MEV, and it combines every hotpath capability relevant
 //! here: tokio runtime, the result-batch mpsc channel, three nested locks,
 //! and CPU-bound solve work. See `docs/architecture/rust-owned-bot.md` for the

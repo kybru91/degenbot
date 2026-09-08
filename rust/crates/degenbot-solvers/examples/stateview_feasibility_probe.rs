@@ -2,9 +2,8 @@
 // Lives only for this spike; deleted after supervisor sign-off per
 // docs/architecture/stateview-feasibility.md §7. Lint-exempt wholesale: it is
 // diagnostic-only and never ships.
-#![allow(
+#![expect(
     clippy::print_stdout,
-    clippy::unnecessary_wraps,
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

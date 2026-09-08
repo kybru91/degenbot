@@ -1704,6 +1704,10 @@ fn solve_active_set_path_inner(
     /// maxima cannot beat the walk's terminal region under concavity); the
     /// neighbor refinement covers a peak straddling the edge that the ±1-wei
     /// staircase-tolerant direction test could mis-attribute.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "walk-domain refinement carry (window pair + hint + recorder + neighbor switch + runtime stance) is coherent as a flat signature"
+    )]
     fn refine_at_stop(
         hops: &[WalkHop],
         ks: &[usize],
@@ -2770,7 +2774,6 @@ fn int_simulate_mixed_path_n(
 /// the caller's cost, the offline/replay shape).
 #[must_use]
 #[hotpath::measure(label = "cl_solve.exact_solve_mixed_path_n")]
-#[expect(clippy::too_many_arguments)]
 pub fn exact_solve_mixed_path_n(
     v2_hops: &[Option<IntHopState>],
     // RLVDUP T1: borrowed sequences - the walk only READS a sequence

@@ -28,7 +28,7 @@
 //! machine's watchdogs already abort on — there is no separate drainer
 //! task left to go silently dead.
 //!
-//! **Lock order:** engine `Mutex` alone (the driver runs between BotState
+//! **Lock order:** engine `Mutex` alone (the driver runs between `BotState`
 //! touches; the engine takes its own core read/write internally). The
 //! block-clock send takes only its own mutex (never the engine).
 //!
@@ -282,7 +282,7 @@ impl StageHandlers for EngineStages {
 
     /// Solved row: the engine's solve cycle over the affected keys. The
     /// in-process simulation (ADR-019) and the gate (ADR-040) run INSIDE
-    /// this engine cycle (solve_dirty → solver dispatch + inline sim);
+    /// this engine cycle (`solve_dirty` → solver dispatch + inline sim);
     /// results stream on the delivery channel, not on the hook return.
     fn on_solve(&self, work: &Solve) -> Result<SolveOutcome, StageError> {
         self.run_solve_cycle(&work.paths.0, work.ctx.block(), work.ctx.metadata());

@@ -1,10 +1,10 @@
-//! KAHU5W acceptance gate: std::env::var / env::var_os must appear ONLY
+//! KAHU5W acceptance gate: `std::env::var` / `env::var_os` must appear ONLY
 //! inside the degenbot-config loader (the one env-reading site) plus
 //! explicitly enumerated infra + test-only stances.
 //!
 //! A stray re-introduced env read fails this test loudly with the file and
 //! the variable name, so config drift cannot sneak back in (Q6 fail-closed
-//! posture: those keys must load through BotConfig instead).
+//! posture: those keys must load through `BotConfig` instead).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 /// Files outside degenbot-config where env reads are permitted, with the
 /// exact names allowed per file. A NEW env read in a library file must add
-/// an entry here (with justification) or be migrated onto BotConfig.
+/// an entry here (with justification) or be migrated onto `BotConfig`.
 fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
     static MAP: OnceLock<BTreeMap<&'static str, &'static [&'static str]>> = OnceLock::new();
     MAP.get_or_init(|| {
@@ -77,6 +77,10 @@ fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
     })
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: CARGO_MANIFEST_DIR depth is fixed at compile time; loud failure beats a dummy root"
+)]
 fn workspace_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -122,9 +126,7 @@ fn env_var_name(line: &str) -> Option<String> {
     let rest = &line[pos + "env::var".len()..];
     let rest = rest.trim_start_matches(|c: char| c == '_' || c.is_ascii_alphanumeric());
     let rest = rest.trim_start();
-    let Some(rest) = rest.strip_prefix('(') else {
-        return None;
-    };
+    let rest = rest.strip_prefix('(')?;
     let rest = rest.trim_start();
     if let Some(q) = rest.strip_prefix('"') {
         let name: String = q.chars().take_while(|c| *c != '"').collect();
@@ -146,7 +148,7 @@ fn env_var_name(line: &str) -> Option<String> {
 fn no_stray_env_reads_outside_the_config_loader() {
     let root = workspace_root();
     let mut files = Vec::new();
-    collect_rs_files(&root, &mut files);
+    collect_rs_files(root, &mut files);
     assert!(
         files
             .iter()
@@ -163,12 +165,14 @@ fn no_stray_env_reads_outside_the_config_loader() {
             // When cargo runs from rust/ the manifest parents land on the
             // repo root; normalize to a crate-relative path either way.
             .strip_prefix("rust/")
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                path.strip_prefix(root)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default()
-            });
+            .map_or_else(
+                || {
+                    path.strip_prefix(root)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                },
+                str::to_string,
+            );
         // The one sanctioned env-reading crate.
         if rel.starts_with("crates/degenbot-config/") {
             continue;
@@ -177,7 +181,7 @@ fn no_stray_env_reads_outside_the_config_loader() {
         if rel.contains("/tests/") || rel.contains("/examples/") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
         let allow = allowed().get(rel.as_str());
@@ -229,8 +233,7 @@ fn config_crate_env_reads_confined_to_the_loader() {
             .map(|p| p.display().to_string())
             .unwrap_or_default()
             .strip_prefix("rust/")
-            .map(str::to_string)
-            .unwrap_or_else(|| path.display().to_string());
+            .map_or_else(|| path.display().to_string(), str::to_string);
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };

@@ -253,7 +253,7 @@ fn gate_capture_from_cfg(
 }
 
 /// KAHU5W: the solver crate's runtime stance is INSTANCE-SCOPED — built
-/// fresh per engine from the typed config and passed down; no OnceLock.
+/// fresh per engine from the typed config and passed down; no `OnceLock`.
 #[must_use]
 pub fn solve_runtime_config_from_cfg(
     cfg: &::degenbot_config::BotConfig,
@@ -282,7 +282,7 @@ pub fn solve_runtime_config_from_cfg(
 /// is a schema key (env or TOML loads into it via the degenbot-config loader).
 /// The solver-runtime stance is NOT installed globally anymore — the engine
 /// holds an instance value built by [`solve_runtime_config_from_cfg`] and
-/// threads it down (KAHU5W: the solver OnceLock is retired).
+/// threads it down (KAHU5W: the solver `OnceLock` is retired).
 pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
     LPT_PARTITION_ENABLED.store(
         cfg.solve.lpt_partition,

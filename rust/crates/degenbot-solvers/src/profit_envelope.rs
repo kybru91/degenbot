@@ -182,7 +182,6 @@ const COMPOSE_TARGET_BITS: u32 = 240;
 /// (the loop-9/16 production values); the owner overrides at construction.
 /// Higher caps = tighter (lower) envelope = fewer missed opportunities,
 /// more compose time.
-
 /// Magnitude bit length of an `I512` by direct limb scan (loop-16: the
 /// `Signed::bits()` route cost ~90ns per call; this is ~5ns).
 #[inline]
