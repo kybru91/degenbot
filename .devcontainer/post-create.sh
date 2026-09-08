@@ -42,6 +42,10 @@ uv sync
 # Code treats its own commit as never-installed and re-downloads on every
 # attach. Normalize ownership to `dev` so the install completes once and sticks.
 sudo chown -R dev:dev /vscode/vscode-server 2>/dev/null || true
+# Self-heal the ~/.config parent: podman auto-creates missing bind-mount
+# parents as root:root, which blocks sibling dotfile dirs (chromium/crashpad
+# hit EACCES here and every Chrome launch in the container dies).
+sudo chown dev:dev /home/dev/.config 2>/dev/null || true
 
 # Self-heal a poisoned editable install. uv's rebuild-on-`uv run` (driven by
 # [tool.uv] cache-keys watching the .rs sources) only fires when the editable

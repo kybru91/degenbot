@@ -99,6 +99,7 @@ ENV PATH="/home/${USERNAME}/go/bin:/home/${USERNAME}/.foundry/bin:/home/${USERNA
 # the dev user from writing sibling dotfile dirs under ~/.config (and leaves
 # the dir as root-owned with a sticky bit).
 RUN mkdir -p "${HOME}/.config" "${HOME}/.local/bin" \
+    && chown ${USERNAME}:${USERNAME} "${HOME}/.config" "${HOME}/.local/bin" \
     && npm config set prefix "${HOME}/.local"
 
 # Foundry (forge/cast/anvil/chisel). No dnf package, so curl-install foundryup
