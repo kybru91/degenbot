@@ -2080,6 +2080,7 @@ dependencies = [
  "degenbot-execution",
  "degenbot-executor",
  "degenbot-fork",
+ "degenbot-ingestion",
  "degenbot-math",
  "degenbot-order-index",
  "degenbot-pathfinding",
@@ -2166,6 +2167,7 @@ dependencies = [
  "degenbot-db",
  "degenbot-decoders",
  "degenbot-executor",
+ "degenbot-ingestion",
  "degenbot-math",
  "degenbot-pools",
  "degenbot-rpc",
@@ -2283,6 +2285,19 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "degenbot-ingestion"
+version = "0.6.0-alpha.8"
+dependencies = [
+ "alloy",
+ "degenbot-core",
+ "degenbot-decoders",
+ "degenbot-rpc",
+ "futures-util",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2480,6 +2495,7 @@ dependencies = [
  "degenbot-execution",
  "degenbot-executor",
  "degenbot-fork",
+ "degenbot-ingestion",
  "degenbot-math",
  "degenbot-pathfinding",
  "degenbot-pool-updater",

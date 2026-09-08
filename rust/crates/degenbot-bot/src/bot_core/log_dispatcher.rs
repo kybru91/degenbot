@@ -33,12 +33,12 @@ use degenbot_decoders::v4_modify_liquidity_decoder::decode_v4_modify_liquidity_l
 use degenbot_decoders::v4_swap_decoder::decode_v4_swap_log;
 
 /// Whether `topic0` is one of the six degenbot pool-event signatures we
-/// dispatch on (`crate::bot_core::block_pump::RELEVANT_TOPICS`). A log carrying
+/// dispatch on (`crate::bot_core::RELEVANT_TOPICS`). A log carrying
 /// a KNOWN signature that nonetheless fails every decoder is malformed event
 /// data — a silent-drop class `dispatch` asserts on loudly rather than silently
 /// skipping (the WS-decoder-drop failure mode).
 fn is_known_pool_topic(topic0: Option<&alloy::primitives::B256>) -> bool {
-    matches!(topic0, Some(t) if crate::bot_core::block_pump::RELEVANT_TOPICS.contains(t))
+    matches!(topic0, Some(t) if crate::bot_core::RELEVANT_TOPICS.contains(t))
 }
 
 /// A subscriber to pool-state updates (ADR-006 D4).

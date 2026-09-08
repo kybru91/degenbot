@@ -80,6 +80,7 @@ degenbot-decoders = { version = "0.6.0-alpha.8", path = "crates/degenbot-decoder
 degenbot-execution = { version = "0.6.0-alpha.8", path = "crates/degenbot-execution" }
 degenbot-executor = { version = "0.6.0-alpha.8", path = "crates/degenbot-executor" }
 degenbot-fork = { version = "0.6.0-alpha.8", path = "crates/degenbot-fork" }
+degenbot-ingestion = { version = "0.6.0-alpha.8", path = "crates/degenbot-ingestion" }
 degenbot-math = { version = "0.6.0-alpha.8", path = "crates/degenbot-math" }
 degenbot-order-index = { version = "0.6.0-alpha.8", path = "crates/degenbot-order-index" }
 degenbot-pathfinding = { version = "0.6.0-alpha.8", path = "crates/degenbot-pathfinding" }
@@ -116,6 +117,7 @@ members = [
     "crates/degenbot-execution-sample",
     "crates/degenbot-executor",
     "crates/degenbot-fork",
+    "crates/degenbot-ingestion",
     "crates/degenbot-math",
     "crates/degenbot-pathfinding",
     "crates/degenbot-pool-updater",

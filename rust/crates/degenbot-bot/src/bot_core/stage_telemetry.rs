@@ -2,12 +2,12 @@
 //! ADR-041 stage transition, parented per block epoch (ergo `BF43PM`, epic
 //! `MROOY7`).
 //!
-//! Replaces the legacy `degenbot.pump.block` / `degenbot.pump.log_wait`
+//! Replaces the legacy `pump.block` / `pump.log_wait`
 //! waterfall shape (which attributed whole stretches of the per-block trace to
 //! opaque children) with the machine's stage cycle rendered directly:
 //!
 //! - `degenbot.epoch` — one trace ROOT per block epoch. This is the renamed
-//!   per-header beat span (was `degenbot.pump.block`), now carrying the epoch
+//!   per-header beat span (was the `pump.block` beat), now carrying the epoch
 //!   context (`epoch.block` + `epoch.seq`) every span below answers to.
 //!   `seq` is the rewind generation: a reorg epoch reads as a fresh root with
 //!   a bumped `epoch.seq`, so Jaeger/Grafana tell the migration's regression

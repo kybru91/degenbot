@@ -18,9 +18,12 @@
 use std::sync::Arc;
 
 use degenbot_bot::arb_engine::{ArbitrageEngine, EnginePhase, EngineStages};
-use degenbot_bot::bot_core::block_pump::{BlockPump, WsEvent};
+// (5WTYYQ) The pump’s stream element type is the ingestion crate’s
+// IngestEvent; the PyO3 layer consumes it like any other sink-side event.
+use degenbot_bot::bot_core::block_pump::BlockPump;
 use degenbot_bot::bot_core::reorg_coordinator::ReorgCoordinator;
 use degenbot_bot::bot_core::{Bot, StageHandlers};
+use degenbot_ingestion::IngestEvent as WsEvent;
 use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;

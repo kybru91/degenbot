@@ -15,7 +15,7 @@ workspace = true
 alloy = { version = "^2.4" }
 tracing = { version = "^0.1" }
 thiserror = { version = "^2.0" }
-tokio = { version = "^1.53", features = ["rt-multi-thread"] }
+tokio = { version = "^1.53", features = ["rt-multi-thread", "sync"] }
 
 # Optional: enables `From<*> for PyErr` conversions in `errors`.
 # Gated (not default) so pure-Rust consumers build without pulling pyo3.

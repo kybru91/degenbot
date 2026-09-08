@@ -39,7 +39,6 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::bot_core::block_clock_pipe::BlockClockPipe;
 use crate::bot_core::stage_handlers::StageHandlers;
 use crate::bot_core::{
     stage_handlers::{
@@ -48,6 +47,7 @@ use crate::bot_core::{
     },
     BlockMetadata, Epoch, EpochDelta, Rewind, RewindOutcome,
 };
+use degenbot_core::block_clock_pipe::{BlockClockPipe, BlockNotification};
 
 use degenbot_solvers::affected_keys::AffectedKey;
 
@@ -353,7 +353,13 @@ impl StageHandlers for EngineStages {
     fn notify_block(&self, block: u64, metadata: &BlockMetadata) {
         // Direct, non-FIFO dispatch: one send per accepted header, never
         // queued behind solver work (B2). NOT taking the engine lock.
-        self.block_clock.lock().notify(block, metadata);
+        self.block_clock.lock().notify(BlockNotification {
+            number: block,
+            timestamp: metadata.timestamp,
+            base_fee_per_gas: metadata.base_fee_per_gas,
+            gas_used: metadata.gas_used,
+            gas_limit: metadata.gas_limit,
+        });
     }
 
     fn on_pump_ended(&self) {

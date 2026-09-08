@@ -36,6 +36,8 @@ bump-version version:
 # `cargo add degenbot` showcase binary AND a CI-runnable assertion.
 test-standalone:
     cargo run --manifest-path rust/Cargo.toml -p degenbot --example standalone_consumer
+    # MROOY7 5WTYYQ: the WS-ingestion crate's headless boot (no Python, no net).
+    cargo run --manifest-path rust/Cargo.toml -p degenbot-ingestion --example headless_boot
 
 # ========== Tests ==========
 #
@@ -137,7 +139,7 @@ fmt-check:
 check-no-pyo3-in-cores:
     #!/usr/bin/env bash
     set -euo pipefail
-    for crate in degenbot-core degenbot-math degenbot-abi degenbot-rpc degenbot-bot degenbot-decoders degenbot-uniswap degenbot-pathfinding degenbot degenbot-price degenbot-db degenbot-pool-updater degenbot-aave degenbot-execution degenbot-executor degenbot-submission degenbot-simulation degenbot-pools degenbot-solvers degenbot-order-index degenbot-arbitrage degenbot-fork degenbot-execution-sample; do
+    for crate in degenbot-core degenbot-math degenbot-abi degenbot-rpc degenbot-ingestion degenbot-bot degenbot-decoders degenbot-uniswap degenbot-pathfinding degenbot degenbot-price degenbot-db degenbot-pool-updater degenbot-aave degenbot-execution degenbot-executor degenbot-submission degenbot-simulation degenbot-pools degenbot-solvers degenbot-order-index degenbot-arbitrage degenbot-fork degenbot-execution-sample; do
         if cargo tree --manifest-path rust/Cargo.toml -p "$crate" 2>/dev/null | grep -qi 'pyo3 v'; then
             echo "ERROR: $crate pulls pyo3 under default features (must be feature-gated)." >&2
             exit 1

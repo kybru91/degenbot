@@ -21,11 +21,15 @@
 //!
 //! `apply_log` routes ALL log application through `Bot::dispatch_log`.
 //!
-//! The pump's **mechanics stay unchanged** from the `BlockPump` era: dual
-//! `newHeads` + `logs` subscription, Rust-side topic+address filtering, block-
-//! boundary detection, 50ms send-result debounce, gap/timeout `eth_getLogs`
-//! backfill. Only the owner (`Bot`, via the wiring layer) + the per-block
-//! dispatch targets changed.
+//! (Epic MROOY7, 5WTYYQ) The WS transport moved OUT of this module into the
+//! pyo3-free `degenbot-ingestion` crate: the dual `newHeads` + `logs`
+//! subscriptions, the MJXP5Z one-stream handshake, Rust-side topic filtering
+//! ([`degenbot_ingestion::RELEVANT_TOPICS`]), gap-backfill `eth_getLogs`
+//! fetching, and the header/logs watchdog windows all live there now. This
+//! driver consumes the crate's `IngestEvent` stream (header + `PoolEvent`
+//! emission) and owns ONLY the runtime half: the `StageMachine` + stage
+//! driving + log application + debounce. The `PyO3` layer is just another sink
+//! at the Published edge.
 //!
 //! # Two-Phase Lifecycle
 //!
@@ -55,7 +59,13 @@ use crate::bot_core::stance;
 use crate::bot_core::{CompletenessDecision, StageDecision, StageMachine};
 
 use alloy::primitives::B256;
-use alloy::rpc::types::{Filter, Log, Topic};
+use alloy::rpc::types::Log;
+// (5WTYYQ) The event/fetch surface of the ingestion crate. `PoolEvent` +
+// `build_backfill_filter` are imported by the test module below.
+use degenbot_ingestion::{
+    IngestEvent as WsEvent, Watchdog, WsIngestor, BACKFILL_TIMEOUT_SECS,
+    DEFAULT_BACKFILL_CHUNK_SIZE, RELEVANT_TOPICS,
+};
 use futures_util::{stream, StreamExt};
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -65,92 +75,12 @@ use crate::bot_core::{
     stage_handlers::{Finalize, GateOutcome, Publish, PublishOutcome, Resolve, Solve},
     BlockMetadata, Bot, Epoch, StageHandlers,
 };
-use degenbot_decoders::v2_sync_decoder::V2_SYNC_TOPIC;
-use degenbot_decoders::v3_mint_burn_decoder::{V3_BURN_TOPIC, V3_MINT_TOPIC};
-use degenbot_decoders::v3_pancakeswap_swap_decoder::V3_PANCAKESWAP_SWAP_TOPIC;
-use degenbot_decoders::v3_swap_decoder::V3_SWAP_TOPIC;
-use degenbot_decoders::v4_modify_liquidity_decoder::V4_MODIFY_LIQUIDITY_TOPIC;
-use degenbot_decoders::v4_swap_decoder::V4_SWAP_TOPIC;
-use degenbot_rpc::provider::AlloyProvider;
+// (the topic-import list, the backfill/idle + handshake constants, and the
+// header/log watchdog windows all live in degenbot-ingestion now — 5WTYYQ.)
 
-/// How long to wait with no activity before assuming the connection is dead.
-const BACKFILL_TIMEOUT_SECS: u64 = 60;
-
-/// After the first dirty WS log for a block, wait this long for more logs
-/// before solving and dispatching results to Python. Each new log resets
-/// the timer. This debouncing ensures one dispatch per burst of logs
-/// rather than one per individual log.
-///
 // KAHU5W: the debounce / early-slice defaults moved into the typed schema
 // (pump.pump_debounce_ms = 50, pump.early_slice_ms = 25; the loader validates
 // debounce > 0). The fail-open parse helpers disappeared with them.
-
-/// If no block header arrives within this window, poll `eth_blockNumber`
-/// and backfill the gap — independent of log activity.
-///
-/// The `newHeads` WS subscription can die silently while `logs` keeps
-/// flowing. `stream::select` masks a dead block stream as long as logs
-/// arrive every `< BACKFILL_TIMEOUT_SECS` (the combined-stream-silence
-/// backfill path never fires). Because only headers advance `current_block`,
-/// every result batch would then be stamped with a frozen block while
-/// prices keep updating from the live log applies — looking like the bot is
-/// running but making no block progress. This watchdog independently
-/// detects header staleness (capped `wait_timeout` wakes the loop by the
-/// deadline even under dense log pressure) and runs the same
-/// `handle_timeout_eager` catch-up the no-activity path uses.
-const HEADER_STALENESS_SECS: u64 = 30;
-
-/// Default window (seconds) for the logs-subscription liveness watchdog: if
-/// headers keep flowing (`newHeads` fresh) but the pump has received NO log
-/// from the `eth_subscribe "logs"` arm within this window, the logs
-/// subscription is presumed dead/stalled and a warning is emitted. This is
-/// the INVERSE of `header_staleness` (a dead `newHeads`): it catches a
-/// dead/stalled LOGS sub while the blocks sub is alive — the failure mode
-/// Alternative B's header-only handshake no longer catches at startup (the
-/// handshake never touches the data plane by design). Runs for the whole
-/// pump lifetime, not only at startup. Overridable in tests via
-/// `set_log_silence_for_test`.
-const LOG_SILENCE_SECS: u64 = 60;
-
-/// Default backfill chunk size (blocks per `eth_getLogs` request) for the
-/// snapshot→WS gap closed automatically inside `resume_from_subscribe`
-/// (J3FMDO). Mirrors the `pyo3` `backfill_from_snapshot` default (`chunk_size` = 2000):
-/// the per-chunk response size stays under `eth_getLogs` payload caps.
-const DEFAULT_BACKFILL_CHUNK_SIZE: u64 = 2000;
-
-/// How long the subscribe handshake waits for the WS `logs` stream to deliver
-/// its first log after the head is header-confirmed, before falling back to the
-/// header-confirmed boundary. Bounds startup latency on a quiet/log-free chain
-/// while still capturing the log stream's true live-from block on active ones.
-const LOG_CATCHUP_SETTLE_SECS: u64 = 15;
-
-/// Whether a log confirms that a tracked header block is "complete".
-///
-/// Block data sent from the pump to Python via the watch channel.
-/// Topics we care about — used for in-Rust filtering of incoming logs.
-pub const RELEVANT_TOPICS: [B256; 7] = [
-    V2_SYNC_TOPIC,
-    V3_SWAP_TOPIC,
-    V3_PANCAKESWAP_SWAP_TOPIC,
-    V3_MINT_TOPIC,
-    V3_BURN_TOPIC,
-    V4_SWAP_TOPIC,
-    V4_MODIFY_LIQUIDITY_TOPIC,
-];
-
-/// Events from the two WS subscriptions.
-pub enum WsEvent {
-    /// A new block header arrived.
-    BlockHeader {
-        number: u64,
-        timestamp: u64,
-        base_fee_per_gas: Option<u64>,
-        gas_used: u64,
-        gas_limit: u64,
-    },
-    /// A log event arrived from the logs subscription.
-    Log(Log),
-}
 
 /// Microseconds -> seconds with a 32-bit guard (the cast lint is the point —
 /// overflow callers get a saturated bucket, never a precision-lost value).
@@ -196,32 +126,22 @@ pub struct BlockPump {
     /// routed through the engine seam — reorg is a `Bot` concern, parallel
     /// to `dispatch_log`).
     reorg_coordinator: Arc<crate::bot_core::reorg_coordinator::ReorgCoordinator>,
-    /// The Alloy provider (created from the RPC URL)
-    provider: Arc<AlloyProvider>,
+    /// (5WTYYQ) The WS transport handle — subscriptions + handshake +
+    /// gap-backfill fetching live in `degenbot-ingestion`; this driver only
+    /// consumes the emitted `IngestEvent` stream and calls the fetch API.
+    ingestor: WsIngestor,
     /// Shutdown flag — set by `stop()` or by a too-deep reorg (graceful exit)
     shutdown: Arc<AtomicBool>,
-    /// If no header arrives within this window, poll `eth_blockNumber` and
-    /// backfill regardless of log activity (dead-`newHeads` recovery — see
-    /// `HEADER_STALENESS_SECS`). Overridable in tests via
-    /// `set_header_staleness_for_test`.
-    header_staleness: Duration,
     /// SONJQA: max age of a held stage-span interval before the pump
     /// force-closes it (with a stall warning) — the G3 stall lesson, see
     /// `STAGE_MAX_AGE_SECS` / `stage_telemetry`. Default 5s; the tick
     /// granularity is the 500ms timed-exit interval. Tests may set the field
     /// directly (`pump_for_test` construction + assignment) - no env race.
     stage_max_age: Duration,
-    /// If no log arrives within this window WHILE headers stay fresh, the
-    /// `eth_subscribe "logs"` subscription is presumed dead/stalled and the
-    /// logs-silence watchdog emits a `[pump] logs subscription silent`
-    /// warning (see `LOG_SILENCE_SECS`). Overridable in tests via
-    /// `set_log_silence_for_test`.
-    log_silence: Duration,
-    /// Count of logs-silence alarms fired since the pump started. Incremented
-    /// once per silence episode (re-armed when the next `WsEvent::Log` resumes
-    /// the sub) so the liveness watchdog is test-observable without depending
-    /// on log-capture infrastructure.
-    log_silence_alarms: u64,
+    /// (5WTYYQ) The watchdog windows + silence-alarm accounting (owned by
+    /// `degenbot-ingestion::Watchdog`). The tokio intervals stay in the
+    /// driver's select (the FSM decides, the driver executes — ADR-008).
+    watchdog: Watchdog,
     /// Wall-clock ms of the last accepted header — the anchor the driver
     /// measures `header_to_solved` latency against (the T2 metric the
     /// dissolved `DispatchOwner` owned; single-writer: the pump task).
@@ -288,41 +208,21 @@ impl BlockPump {
         reorg_coordinator: Arc<crate::bot_core::reorg_coordinator::ReorgCoordinator>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<(Self, SubscribeState), String> {
-        let provider = AlloyProvider::new(rpc_url, 3)
-            .await
-            .map_err(|e| format!("BlockPump: failed to create provider: {e}"))?;
+        // (5WTYYQ) Transport connect + subscribe + MJXP5Z handshake all live in
+        // degenbot-ingestion; the driver receives the fused, re-injected
+        // `IngestEvent` stream + keeps the handle for gap-backfill fetching.
+        let ingestor = WsIngestor::connect(rpc_url).await?;
 
-        let provider_arc = provider.provider_arc();
-
-        // Subscribe to block headers
-        let block_stream = provider_arc
-            .subscribe_blocks()
-            .await
-            .map_err(|e| format!("BlockPump: failed to subscribe to blocks: {e}"))?
-            .into_stream();
-
-        // Subscribe to logs — unfiltered. All filtering happens in Rust.
-        let log_filter = Filter::new();
-        let log_stream = provider_arc
-            .subscribe_logs(&log_filter)
-            .await
-            .map_err(|e| format!("BlockPump: failed to subscribe to logs: {e}"))?
-            .into_stream();
-
-        let combined = stream_select(block_stream, log_stream).boxed();
-
-        let mut pump = Self {
+        let pump = Self {
             bot,
             engine,
             reorg_coordinator,
-            provider: Arc::new(provider),
-            shutdown,
-            header_staleness: Duration::from_secs(HEADER_STALENESS_SECS),
+            ingestor,
+            shutdown: Arc::clone(&shutdown),
+            watchdog: Watchdog::new(),
             stage_max_age: Duration::from_secs(super::stage_telemetry::STAGE_MAX_AGE_SECS),
-            log_silence: Duration::from_secs(LOG_SILENCE_SECS),
-            log_silence_alarms: 0,
-            header_ms: std::sync::atomic::AtomicU64::new(0),
             ws_completeness_enabled: stance::config().pump.ws_completeness,
+            header_ms: std::sync::atomic::AtomicU64::new(0),
             debounce_ms: stance::config().pump.pump_debounce_ms,
             early_slice_ms: stance::config().pump.early_slice_ms,
         };
@@ -333,202 +233,21 @@ impl BlockPump {
             .set_strict_decode_fault(pump.ws_completeness_enabled);
 
         // MJXP5Z (Alternative B): single-stream handshake - NO resubscribe.
-        // `subscribe_with_stream` hands the SAME `combined` onward, re-injecting
-        // any logs consumed during header-only polling. One WS, one handoff.
-        pump.subscribe_with_stream(combined)
-            .await
-            .map(|state| (pump, state))
-    }
-
-    /// Single-stream handshake seam (MJXP5Z / Alternative B): runs
-    /// Single-stream handshake seam (MJXP5Z / Alternative B): runs
-    /// `observe_complete_block` against `combined` (polling headers ONLY until
-    /// two consecutive headers confirm the boundary, collecting any logs the
-    /// fused stream interleaves during the handshake and re-injecting them),
-    /// then hands the SAME `combined` onward. One WS connection, one handoff,
-    /// no resubscribe — making a structurally lost log impossible (the
-    /// handshake never touches the data plane).
-    ///
-    /// The logs consumed during header polling are re-injected via
-    /// `stream::iter(pending).chain(combined)` so `run_with_stream` receives
-    /// every log the node pushed during the handshake window.
-    pub(crate) async fn subscribe_with_stream(
-        &mut self,
-        mut combined: stream::BoxStream<'static, WsEvent>,
-    ) -> Result<SubscribeState, String> {
-        let (first_block, first_timestamp, pending) =
-            self.observe_complete_block(&mut combined).await;
-        // Re-inject any logs the handshake consumed while polling for headers.
-        let combined = if pending.is_empty() {
-            combined
-        } else {
-            stream::iter(pending).chain(combined).boxed()
-        };
-        Ok(SubscribeState {
-            first_block,
-            first_timestamp,
-            combined_stream: Some(combined),
-        })
-    }
-
-    /// Handshake (MJXP5Z / Alternative B) that confirms the boundary from the
-    /// LOG STREAM's actual liveness, not headers alone (DFQYM5). Polls the
-    /// fused stream until (a) two consecutive distinct headers confirm the
-    /// head is near/finalized AND (b) the `logs` sub has delivered at least one
-    /// log — the block of that first log (`first_log_block`) is where the log
-    /// stream is PROVABLY live. The boundary `W` returned is `first_log_block`
-    /// (falls back to the header-confirmed head if the log stream stays silent
-    /// past `LOG_CATCHUP_SETTLE_SECS`).
-    ///
-    /// Why this matters: the node's `logs` sub can become live one or more
-    /// blocks AFTER the header stream confirms the boundary (headers confirm
-    /// the moment a block finalizes; the log sub registration lags). A
-    /// header-only boundary then leaves `[W+1, logs_sub_live_from-1]` delivered
-    /// by NEITHER the backfill (stops at W) NOR the WS (starts at `live_from`) —
-    /// the systematic delivery hole the WS-completeness abort caught. Anchoring
-    /// the boundary on the first-delivered log closes it: backfill owns
-    /// `[S+1, W]`, the live WS owns `[W+1, ∞)` with no gap.
-    ///
-    /// Any `WsEvent::Log` the fused stream interleaves is collected into
-    /// `pending` (preserving arrival order) for `subscribe_with_stream` to
-    /// re-inject — the handshake never loses, matches, or drops a log.
-    ///
-    /// No events are buffered to pool state here. The backfill
-    /// (`backfill_from_snapshot`) is the sole authority for blocks S+1..W
-    /// (inclusive), and the pump (resume phase) is the sole authority for W+1
-    /// onward.
-    ///
-    /// Returns (`first_block` W, `timestamp_of_W`, `pending_logs`).
-    async fn observe_complete_block(
-        &self,
-        combined: &mut stream::BoxStream<'static, WsEvent>,
-    ) -> (u64, u64, Vec<WsEvent>) {
-        let mut prev_header: Option<u64> = None;
-        let mut prev_timestamp: u64 = 0;
-        // The block of the FIRST log the WS `logs` sub delivers — the earliest
-        // proof the log stream is provably LIVE. The resume boundary + backfill
-        // inclusive target = this block (DFQYM5).
-        let mut first_log_block: Option<u64> = None;
-        // The highest header-confirmed-finalized block (two consecutive
-        // headers). Advances as headers flow; used to know we're near the head
-        // and that the chosen boundary is (or will be) finalized.
-        let mut confirmed_head: Option<u64> = None;
-        // Deadline to keep waiting for the log stream's first log after the
-        // head is header-confirmed. Falls back to the header boundary on a
-        // genuinely quiet/log-free head so the handshake cannot hang.
-        let mut settle_deadline: Option<tokio::time::Instant> = None;
-        let mut pending: Vec<WsEvent> = Vec::new();
-
-        loop {
-            if self.shutdown.load(Ordering::Relaxed) {
-                tracing::info!("BlockPump: shutting down during subscribe phase");
-                return (0, 0, pending);
-            }
-
-            let event = timeout(Duration::from_secs(BACKFILL_TIMEOUT_SECS), combined.next()).await;
-
-            match event {
-                Err(_) => {
-                    // Timeout — fall back to eth_blockNumber RPC (degraded path).
-                    tracing::warn!("BlockPump: timeout during subscribe, fetching current block");
-                    match self.provider.provider_arc().get_block_number().await {
-                        Ok(block) => {
-                            tracing::info!(
-                                block,
-                                "BlockPump: subscribe observed block via RPC (degraded - no two-header confirmation)"
-                            );
-                            return (block, 0, pending);
-                        }
-                        Err(e) => {
-                            tracing::error!(%e, "BlockPump: can't get block number during subscribe");
-                        }
-                    }
-                }
-
-                Ok(Some(WsEvent::BlockHeader {
-                    number,
-                    timestamp,
-                    base_fee_per_gas: _,
-                    gas_used: _,
-                    gas_limit: _,
-                })) => {
-                    if let Some(prev) = prev_header {
-                        if number == prev + 1 {
-                            // Two consecutive headers: `prev` confirmed
-                            // finalized. Advance the confirmed head (and arm
-                            // the log-catch-up settle deadline on first
-                            // confirmation).
-                            if confirmed_head.is_none() {
-                                settle_deadline = Some(
-                                    tokio::time::Instant::now()
-                                        + Duration::from_secs(LOG_CATCHUP_SETTLE_SECS),
-                                );
-                            }
-                            confirmed_head = Some(prev);
-                            prev_timestamp = timestamp;
-                            tracing::info!(
-                                prev,
-                                number,
-                                "BlockPump: subscribe confirmed head at {prev} (header {number})"
-                            );
-                        } else if number > prev {
-                            // Gap or jump - re-anchor on the newer header.
-                            prev_header = Some(number);
-                            prev_timestamp = timestamp;
-                        }
-                        // else: duplicate/stale header for the same block - ignore.
-                    } else {
-                        // First header ever observed.
-                        prev_header = Some(number);
-                        prev_timestamp = timestamp;
-                    }
-                }
-
-                Ok(Some(WsEvent::Log(log))) => {
-                    if first_log_block.is_none() {
-                        if let Some(lb) = log.block_number {
-                            first_log_block = Some(lb);
-                        }
-                    }
-                    // Collect every log observed during the handshake; the
-                    // handshake never touches the data plane (some may be for
-                    // the boundary block and are already backfilled).
-                    pending.push(WsEvent::Log(log));
-                }
-
-                Ok(None) => {
-                    tracing::warn!("BlockPump: subscription streams ended during subscribe");
-                    return (prev_header.unwrap_or(0), prev_timestamp, pending);
-                }
-            }
-
-            // Finalize once we're near the head (headers confirmed) AND we know
-            // the log stream's live-from block — or the settle window elapsed.
-            if let Some(head) = confirmed_head {
-                let deadline_passed =
-                    settle_deadline.is_some_and(|d| tokio::time::Instant::now() >= d);
-                let boundary_ok = match first_log_block {
-                    // Boundary (first_log_block) is finalizable once the
-                    // confirmed head reaches it; accept past the deadline.
-                    Some(l) => l <= head || deadline_passed,
-                    None => deadline_passed,
-                };
-                if boundary_ok {
-                    let boundary = first_log_block.unwrap_or(head);
-                    tracing::info!(
-                        confirmed_head = head,
-                        boundary,
-                        source = if first_log_block.is_some() {
-                            "first-delivered-log"
-                        } else {
-                            "header-fallback"
-                        },
-                        "BlockPump: subscribe boundary set to {boundary}"
-                    );
-                    return (boundary, prev_timestamp, pending);
-                }
-            }
-        }
+        // The ingestion handshake hands the SAME merged stream onward,
+        // re-injecting any logs consumed during header-only polling. One WS,
+        // one handoff.
+        let boundary = pump
+            .ingestor
+            .subscribe_with_handshake(Arc::clone(&shutdown))
+            .await?;
+        Ok((
+            pump,
+            SubscribeState {
+                first_block: boundary.first_block,
+                first_timestamp: boundary.first_timestamp,
+                combined_stream: Some(boundary.stream),
+            },
+        ))
     }
 
     /// Resume the pump from a subscribe state — auto-backfilling the
@@ -907,7 +626,7 @@ impl BlockPump {
         // contention inside `on_drain`/`apply_buffer_v3`), the interval can't
         // advance — that residual unbounded risk is Option B's
         // notify-delocalization work, out of scope here.
-        let mut staleness_tick = tokio::time::interval(self.header_staleness);
+        let mut staleness_tick = tokio::time::interval(self.watchdog.header_staleness);
         staleness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         staleness_tick.tick().await; // discard the immediate first tick
                                      // A4: a monotonic ms epoch feeding the FSM's pure watchdog `Tick` input
@@ -1047,8 +766,8 @@ impl BlockPump {
                     // drives it. The driver executes the emitted decisions.
                     for decision in fsm.on_tick(
                         now_ms(),
-                        self.header_staleness.as_millis() as u64,
-                        self.log_silence.as_millis() as u64,
+                        self.watchdog.header_staleness.as_millis() as u64,
+                        self.watchdog.log_silence.as_millis() as u64,
                     ) {
                         match decision {
                             StageDecision::Recover => {
@@ -1066,11 +785,10 @@ impl BlockPump {
                                 // warning per silence episode (re-armed when
                                 // the next log resumes the sub).
                                 tracing::warn!(
-                                    silence_secs = self.log_silence.as_secs(),
+                                    silence_secs = self.watchdog.log_silence.as_secs(),
                                     "[pump] logs subscription silent: headers flowing but no log"
                                 );
-                                self.log_silence_alarms =
-                                    self.log_silence_alarms.saturating_add(1);
+                                self.watchdog.record_silence_alarm();
                             }
                             other => unreachable!(
                                 "on_tick only emits Recover|LogSilence, got {other:?}"
@@ -1367,7 +1085,11 @@ impl BlockPump {
                 // Got a log event from the combined stream — apply eagerly.
                 // Solve happens at the top of the next iteration. Batch send
                 // is debounced — the timer starts/resets on each log.
-                Ok(Some(WsEvent::Log(log))) => {
+                Ok(Some(WsEvent::Pool(pe))) => {
+                    // (5WTYYQ) The ingestion crate emits the structured
+                    // PoolEvent { epoch, log_index, payload }; the apply path
+                    // consumes the raw payload.
+                    let log = pe.payload;
                     // WS-delivery volume signal (pre topic-filter): pairs with
                     // `degenbot.logs.received` (relevant subset) so a WS feed
                     // that stops delivering relevant logs stays distinguishable
@@ -2108,7 +1830,7 @@ impl BlockPump {
             backfill_timeout_secs = BACKFILL_TIMEOUT_SECS,
             "BlockPump: no activity — attempting backfill"
         );
-        let latest_block = match self.provider.provider_arc().get_block_number().await {
+        let latest_block = match self.ingestor.latest_block().await {
             Ok(n) => n,
             Err(e) => {
                 tracing::error!(%e, "BlockPump: backfill failed — can't get block number");
@@ -2146,8 +1868,9 @@ impl BlockPump {
             p.count_backfill();
         }
 
-        let filter = build_backfill_filter(from_block, to_block);
-        let logs = match self.provider.provider_arc().get_logs(&filter).await {
+        // (5WTYYQ) The transport fetch is degenbot-ingestion's; the
+        // apply/solve loop below stays on the driver (its FSM + dispatch).
+        let logs = match self.ingestor.fetch_logs(from_block, to_block).await {
             Ok(logs) => logs,
             Err(e) => {
                 tracing::error!(%e, "BlockPump: backfill eth_getLogs failed");
@@ -2261,8 +1984,8 @@ impl BlockPump {
         block: u64,
         delivered_log_indices: std::collections::HashSet<u64>,
     ) {
-        let filter = build_backfill_filter(block, block);
-        let logs = match self.provider.provider_arc().get_logs(&filter).await {
+        // (5WTYYQ) The eth_getLogs transport call is the ingestion crate's.
+        let logs = match self.ingestor.fetch_logs(block, block).await {
             Ok(logs) => logs,
             Err(e) => {
                 tracing::error!(
@@ -2405,21 +2128,25 @@ impl BlockPump {
             chunk_size,
             "BlockPump::backfill_from_snapshot: fetching events"
         );
-        let provider = self.provider.provider_arc();
         let mut total_logs = 0usize;
         let mut chunk_start = from_block;
         while chunk_start <= to_block {
             let chunk_end = (chunk_start + chunk_size - 1).min(to_block);
-            let filter = build_backfill_filter(chunk_start, chunk_end);
             tracing::info!(
                 chunk_start,
                 chunk_end,
                 "BlockPump::backfill_from_snapshot: fetching chunk"
             );
             let t0 = std::time::Instant::now();
-            let logs = provider.get_logs(&filter).await.map_err(|e| {
-                format!("eth_getLogs failed for blocks {chunk_start}-{chunk_end}: {e}")
-            })?;
+            // (5WTYYQ) The eth_getLogs chunk fetch is the ingestion crate's;
+            // the apply loop stays on the driver.
+            let logs = self
+                .ingestor
+                .fetch_logs(chunk_start, chunk_end)
+                .await
+                .map_err(|e| {
+                    format!("eth_getLogs failed for blocks {chunk_start}-{chunk_end}: {e}")
+                })?;
             let n = logs.len();
             let fetch_ms = t0.elapsed().as_millis();
             tracing::info!(
@@ -2454,6 +2181,9 @@ impl BlockPump {
 }
 
 #[cfg(test)]
+use degenbot_rpc::provider::AlloyProvider;
+
+#[cfg(test)]
 impl BlockPump {
     /// Test-only constructor with an injected `AlloyProvider` (typically a
     /// mock transport) + a `Bot`/`sink`/`reorg_coordinator`. Lets tests drive
@@ -2477,12 +2207,12 @@ impl BlockPump {
             bot,
             engine,
             reorg_coordinator,
-            provider,
+            // (5WTYYQ) The injected mock provider rides inside the ingestion
+            // transport handle; tests that avoid timeouts never touch it.
+            ingestor: WsIngestor::with_provider(provider),
             shutdown,
-            header_staleness: Duration::from_secs(HEADER_STALENESS_SECS),
+            watchdog: Watchdog::new(),
             stage_max_age: Duration::from_secs(super::stage_telemetry::STAGE_MAX_AGE_SECS),
-            log_silence: Duration::from_secs(LOG_SILENCE_SECS),
-            log_silence_alarms: 0,
             header_ms: std::sync::atomic::AtomicU64::new(0),
             // Same per-pump opt-out for the WS-delivery completeness cross-check:
             // default-ON in production, deterministically OFF in tests so the
@@ -2523,7 +2253,7 @@ impl BlockPump {
     /// period instead of the 30s production default, so the select-arm fire
     /// is observable without a 30s wait.
     pub fn set_header_staleness_for_test(&mut self, staleness: Duration) {
-        self.header_staleness = staleness;
+        self.watchdog.header_staleness = staleness;
     }
 
     /// Test-only override of the early-slice window (PWPPAZ T2) — per-pump
@@ -2538,7 +2268,7 @@ impl BlockPump {
     /// the 60s production default. Pair with `set_header_staleness_for_test`
     /// so the staleness tick elapses often AND the silence threshold is short.
     pub fn set_log_silence_for_test(&mut self, silence: Duration) {
-        self.log_silence = silence;
+        self.watchdog.log_silence = silence;
     }
 
     /// Count of logs-silence alarms fired since the pump started (test
@@ -2547,55 +2277,8 @@ impl BlockPump {
     /// resumes the sub).
     #[must_use]
     pub fn log_silence_alarm_count(&self) -> u64 {
-        self.log_silence_alarms
+        self.watchdog.silence_alarm_count()
     }
-}
-
-/// The pump's solve anchor (`anchor = max(open, pool_state_head)`, BO5FBS +
-/// ADR-008 D2) is owned by `crate::bot_core::solve_anchor`: the LOG-DRIVEN
-/// settled block (`StageMachine::latest_observed`, falling back to the header
-/// `current_block`) floored by the pool-state head, with the future-hop rule.
-/// Its failure history (0x99ac8c false-abort, MQIZ5M +1-wei / IIA class) lives
-/// in that module's docs.
-///
-/// Build an Alloy `Filter` for backfill via `eth_getLogs`.
-///
-/// Uses topic filtering server-side to reduce response size. No address
-/// filter — all topic-filtered logs are passed through to the engine.
-#[must_use]
-pub fn build_backfill_filter(from_block: u64, to_block: u64) -> Filter {
-    let mut filter = Filter::new().from_block(from_block).to_block(to_block);
-
-    // Build a single Topic that matches ANY of the relevant event signatures.
-    // Alloy's event_signature() overwrites topics[0] on each call, so we must
-    // build the OR-list ourselves and set it once.
-    let mut topic: Topic = Topic::default();
-    for sig in &RELEVANT_TOPICS {
-        topic = topic.extend(*sig);
-    }
-    filter.topics[0] = topic;
-
-    filter
-}
-
-/// Merge a block header stream and a log stream into a single `WsEvent` stream.
-///
-/// Uses `stream::Select` to fairly interleave events from both subscriptions.
-/// Returns a boxed stream for storage in `SubscribeState`.
-fn stream_select(
-    block_stream: impl StreamExt<Item = alloy::rpc::types::Header> + Unpin + Send + 'static,
-    log_stream: impl StreamExt<Item = Log> + Unpin + Send + 'static,
-) -> stream::BoxStream<'static, WsEvent> {
-    let block_events = block_stream.map(|header| WsEvent::BlockHeader {
-        number: header.number,
-        timestamp: header.timestamp,
-        base_fee_per_gas: header.base_fee_per_gas,
-        gas_used: header.gas_used,
-        gas_limit: header.gas_limit,
-    });
-    let log_events = log_stream.map(WsEvent::Log);
-
-    stream::select(block_events, log_events).boxed()
 }
 
 #[expect(
@@ -2607,6 +2290,11 @@ fn stream_select(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use degenbot_decoders::v2_sync_decoder::V2_SYNC_TOPIC;
+    use degenbot_decoders::v3_mint_burn_decoder::{V3_BURN_TOPIC, V3_MINT_TOPIC};
+    use degenbot_decoders::v3_swap_decoder::V3_SWAP_TOPIC;
+    use degenbot_ingestion::{build_backfill_filter, PoolEvent};
+    use degenbot_rpc::provider::AlloyProvider;
     use std::sync::atomic::AtomicU64;
     use std::sync::Mutex;
 
@@ -2931,13 +2619,13 @@ mod tests {
                 gas_used: 10_000_001,
                 gas_limit: 30_000_001,
             },
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool,
                 alloy::primitives::U256::ZERO,
                 alloy::primitives::U256::ZERO,
                 101,
                 false,
-            )),
+            ))),
         ];
         let combined = stream::iter(events).boxed();
         pump.run_test_loop(combined, 100).await;
@@ -3210,7 +2898,13 @@ mod tests {
                     gas_limit: 0,
                 }
             } else {
-                WsEvent::Log(make_v2_sync_log(pool, U256::ZERO, U256::ZERO, block, false))
+                WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
+                    pool,
+                    U256::ZERO,
+                    U256::ZERO,
+                    block,
+                    false,
+                )))
             };
             Some((event, (block + u64::from(toggle), toggle ^ 1, pool)))
         })
@@ -3276,7 +2970,7 @@ mod tests {
                 gas_used: meta_102.gas_used,
                 gas_limit: meta_102.gas_limit,
             },
-            WsEvent::Log(tombstone_log),
+            WsEvent::Pool(PoolEvent::from_log(tombstone_log)),
         ];
         let combined = stream::iter(events).boxed();
         pump.run_test_loop(combined, 100).await;
@@ -3425,13 +3119,13 @@ mod tests {
                         gas_limit: 30_000_001,
                     }
                 } else {
-                    WsEvent::Log(make_v2_sync_log(
+                    WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                         pool,
                         U256::from(1_000),
                         U256::from(2_000),
                         101,
                         false,
-                    ))
+                    )))
                 };
                 (i <= logs).then_some((ev, i + 1))
             }
@@ -3688,37 +3382,37 @@ mod tests {
                 gas_limit: 30_000_001,
             },
             // Forward apply at 101: journal delta at 101.
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool,
                 U256::from(1_000),
                 U256::from(2_000),
                 101,
                 false,
-            )),
+            ))),
             // Removed at 101 → EnterReorg, journal pops the 101 delta.
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool,
                 U256::from(1_000),
                 U256::from(2_000),
                 101,
                 true,
-            )),
+            ))),
             // Duplicate removed replay → ContinueReorg, idempotent no-op.
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool,
                 U256::from(1_000),
                 U256::from(2_000),
                 101,
                 true,
-            )),
+            ))),
             // First forward above the window → CloseReorg{102}.
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool,
                 U256::from(900),
                 U256::from(1_800),
                 102,
                 false,
-            )),
+            ))),
         ];
         run_reorg_stream(capture.clone(), &mut pump, events);
 
@@ -3833,20 +3527,20 @@ mod tests {
             },
             // No forward apply at 101: the newest delta is the registration
             // (block 100), so this removed event is a guaranteed no-op.
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool,
                 U256::from(1_000),
                 U256::from(2_000),
                 101,
                 true,
-            )),
-            WsEvent::Log(make_v2_sync_log(
+            ))),
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool,
                 U256::from(900),
                 U256::from(1_800),
                 102,
                 false,
-            )),
+            ))),
         ];
         run_reorg_stream(capture.clone(), &mut pump, events);
 
@@ -3925,13 +3619,13 @@ mod tests {
                 gas_used: 10_000_001,
                 gas_limit: 30_000_001,
             },
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool,
                 alloy::primitives::U256::from(1_000),
                 alloy::primitives::U256::from(2_000),
                 101,
                 false,
-            )),
+            ))),
         ];
         let combined = stream::iter(events).boxed();
         pump.run_test_loop(combined, 100).await;
@@ -4049,7 +3743,7 @@ mod tests {
                 gas_used: meta_w1.gas_used,
                 gas_limit: meta_w1.gas_limit,
             },
-            WsEvent::Log(tombstone_log),
+            WsEvent::Pool(PoolEvent::from_log(tombstone_log)),
         ];
         let combined = stream::iter(events).boxed();
         pump.run_test_loop(combined, w).await;
@@ -4091,13 +3785,13 @@ mod tests {
         let events: Vec<WsEvent> = vec![
             header(w),
             header(w + 1),
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 Address::from([0xfcu8; 20]),
                 U256::from(1),
                 U256::from(2),
                 w + 1,
                 false,
-            )),
+            ))),
         ];
         pump1.run_test_loop(stream::iter(events).boxed(), w).await;
         assert_eq!(
@@ -4181,8 +3875,8 @@ mod tests {
         pump.run_test_loop(
             stream::iter(vec![
                 header(w + 1),
-                WsEvent::Log(dup_w),
-                WsEvent::Log(live_w1),
+                WsEvent::Pool(PoolEvent::from_log(dup_w)),
+                WsEvent::Pool(PoolEvent::from_log(live_w1)),
             ])
             .boxed(),
             w,
@@ -4256,7 +3950,11 @@ mod tests {
         // The WS re-delivers the removed boundary Sync (deep-reorg replay).
         let reorg_w = make_v2_sync_log(pool, U256::from(5_000u64), U256::from(1_000u64), w, true);
         pump.run_test_loop(
-            stream::iter(vec![header(w + 1), WsEvent::Log(reorg_w)]).boxed(),
+            stream::iter(vec![
+                header(w + 1),
+                WsEvent::Pool(PoolEvent::from_log(reorg_w)),
+            ])
+            .boxed(),
             w,
         )
         .await;
@@ -4328,13 +4026,13 @@ mod tests {
         pump.run_test_loop(
             stream::iter(vec![
                 header(w + 1),
-                WsEvent::Log(make_v2_sync_log(
+                WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                     pool,
                     U256::from(2_000u64),
                     U256::from(1_500u64),
                     w + 1,
                     false,
-                )),
+                ))),
             ])
             .boxed(),
             w,
@@ -4370,13 +4068,13 @@ mod tests {
             .run_test_loop(
                 stream::iter(vec![
                     header(w + 1),
-                    WsEvent::Log(make_v2_sync_log(
+                    WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                         pool,
                         U256::from(2_000u64),
                         U256::from(1_500u64),
                         w + 1,
                         true,
-                    )),
+                    ))),
                 ])
                 .boxed(),
                 w,
@@ -4394,128 +4092,6 @@ mod tests {
         assert!(
             sink2.sends().is_empty(),
             "reorg arm: no quiesce publish armed"
-        );
-    }
-
-    /// Resume-anchor contract: `on_drain(first_block)` anchors
-    /// `current_block` to the subscribe block W (mimics
-    /// `SolveCoordinator::on_drain` setting `last_drained_block`). With
-    /// `first_observed_block = W` (the real subscribe block, NOT the legacy
-    /// hard-coded `0`) the pump processes W+1, W+2 in order — the
-    /// "applies logs in block order against DB-snapshot-seeded engine state"
-    /// MJXP5Z (GREEN): the single-stream handshake does NOT drop block-W logs.
-    ///
-    /// `observe_complete_block` polls headers ONLY (two consecutive headers
-    /// W, W+1 confirm the boundary), collecting any `WsEvent::Log` the fused
-    /// stream interleaves and re-injecting it. With the OLD drop+resubscribe,
-    /// the Mint/Burn queued after the confirming log were lost (XBQNJ5 RED).
-    /// Under Alternative B they survive in `pending` and reach `run_with_stream`.
-    #[tokio::test]
-    async fn subscribe_with_stream_preserves_w_logs() {
-        let (mut pump, _sink) = pump_for_test(None);
-        let w = 21_500_000u64;
-        let pool = Address::from([0xaau8; 20]);
-
-        let header_w = WsEvent::BlockHeader {
-            number: w,
-            timestamp: 0,
-            base_fee_per_gas: None,
-            gas_used: 0,
-            gas_limit: 0,
-        };
-        let sync_log = make_v2_sync_log(pool, U256::ZERO, U256::ZERO, w, false);
-        let mint_log = make_v3_mint_log_with_block(pool, -100, 100, 1, w);
-        let burn_log = make_v3_burn_log_with_block(pool, -100, 100, 1, w);
-        let header_w_plus_1 = WsEvent::BlockHeader {
-            number: w + 1,
-            timestamp: 0,
-            base_fee_per_gas: None,
-            gas_used: 0,
-            gas_limit: 0,
-        };
-
-        let combined = stream::iter(vec![
-            header_w,
-            WsEvent::Log(sync_log),
-            WsEvent::Log(mint_log),
-            WsEvent::Log(burn_log),
-            header_w_plus_1,
-        ])
-        .boxed();
-
-        let state = pump.subscribe_with_stream(combined).await.unwrap();
-        assert_eq!(
-            state.first_block, w,
-            "handshake must anchor on block W (confirmed by W+1)"
-        );
-
-        let mut got_mint = false;
-        let mut got_burn = false;
-        let mut stream = state
-            .combined_stream
-            .expect("subscribe_with_stream must return a stream");
-        while let Some(ev) = stream.next().await {
-            if let WsEvent::Log(log) = ev {
-                match log.topics().first().copied() {
-                    Some(t) if t == V3_MINT_TOPIC => got_mint = true,
-                    Some(t) if t == V3_BURN_TOPIC => got_burn = true,
-                    _ => {}
-                }
-            }
-        }
-        assert!(
-            got_mint,
-            "block-W Mint MUST survive the handshake (Alternative B re-injects it)"
-        );
-        assert!(
-            got_burn,
-            "block-W Burn MUST survive the handshake (Alternative B re-injects it)"
-        );
-    }
-
-    /// MJXP5Z: the handshake consumes ONLY headers (and collects logs); it
-    /// never matches or interprets a log. Both W logs arrive between header(W)
-    /// and header(W+1) and must be re-injected into `pending` for the resume
-    /// stream.
-    #[tokio::test]
-    async fn observe_complete_block_does_not_consume_logs() {
-        let (mut pump, _sink) = pump_for_test(None);
-        let w = 42u64;
-        let pool = Address::from([0xbbu8; 20]);
-
-        let combined = stream::iter(vec![
-            WsEvent::BlockHeader {
-                number: w,
-                timestamp: 0,
-                base_fee_per_gas: None,
-                gas_used: 0,
-                gas_limit: 0,
-            },
-            WsEvent::Log(make_v3_mint_log_with_block(pool, -10, 10, 1, w)),
-            WsEvent::Log(make_v3_burn_log_with_block(pool, -10, 10, 1, w)),
-            WsEvent::BlockHeader {
-                number: w + 1,
-                timestamp: 0,
-                base_fee_per_gas: None,
-                gas_used: 0,
-                gas_limit: 0,
-            },
-        ])
-        .boxed();
-
-        let state = pump.subscribe_with_stream(combined).await.unwrap();
-        assert_eq!(state.first_block, w);
-
-        let mut logs = 0u32;
-        let mut stream = state.combined_stream.unwrap();
-        while let Some(ev) = stream.next().await {
-            if matches!(ev, WsEvent::Log(_)) {
-                logs += 1;
-            }
-        }
-        assert_eq!(
-            logs, 2,
-            "both Mint and Burn must be re-injected from pending"
         );
     }
 
@@ -4590,7 +4166,7 @@ mod tests {
                 gas_used: meta_w2.gas_used,
                 gas_limit: meta_w2.gas_limit,
             },
-            WsEvent::Log(tombstone_log),
+            WsEvent::Pool(PoolEvent::from_log(tombstone_log)),
         ];
         let combined = stream::iter(events).boxed();
         pump.run_test_loop(combined, w).await;
@@ -4935,7 +4511,7 @@ mod tests {
         assert!(!sink.pump_ended(), "no premature pump-ended signal");
         let forward = make_v2_sync_log(pool_addr, U256::from(1_000), U256::from(2_000), 7, false);
         // Stream ends immediately after the log -> Ok(None) arm.
-        let combined = stream::iter(vec![WsEvent::Log(forward)]).boxed();
+        let combined = stream::iter(vec![WsEvent::Pool(PoolEvent::from_log(forward))]).boxed();
         pump.run_test_loop(combined, 5).await;
         assert!(
             sink.pump_ended(),
@@ -4958,7 +4534,7 @@ mod tests {
         // Stream ends immediately after the log; the loop returns via the
         // `Ok(None)` arm (both subscription streams ended) once the reorg
         // branch `continue`s and the stream is exhausted.
-        let combined = stream::iter(vec![WsEvent::Log(forward)]).boxed();
+        let combined = stream::iter(vec![WsEvent::Pool(PoolEvent::from_log(forward))]).boxed();
         pump.run_test_loop(combined, 5).await;
 
         assert_eq!(notify_count(), 1, "forward Sync through the pump notified");
@@ -4983,7 +4559,7 @@ mod tests {
             7,
             true,
         );
-        let combined = stream::iter(vec![WsEvent::Log(reorg_log)]).boxed();
+        let combined = stream::iter(vec![WsEvent::Pool(PoolEvent::from_log(reorg_log))]).boxed();
         pump.run_test_loop(combined, 5).await;
 
         assert_eq!(
@@ -5018,7 +4594,7 @@ mod tests {
         // Removed-flag Sync at block 5 → coordinator restores before 5, which
         // is at the journal's genesis floor → `Err(NoStatePriorToBlock)`.
         let reorg_log = make_v2_sync_log(pool_addr, U256::from(1_500), U256::from(2_500), 5, true);
-        let combined = stream::iter(vec![WsEvent::Log(reorg_log)]).boxed();
+        let combined = stream::iter(vec![WsEvent::Pool(PoolEvent::from_log(reorg_log))]).boxed();
         pump.run_test_loop(combined, 5).await;
 
         assert!(
@@ -5049,7 +4625,11 @@ mod tests {
         let (mut pump, _sink, shutdown) = pump_for_test_with_bot(Arc::clone(&bot), Some(5));
         let s7 = make_v2_sync_log(pool_addr, U256::from(1_500), U256::from(2_500), 7, false);
         let s8 = make_v2_sync_log(pool_addr, U256::from(1_600), U256::from(2_600), 8, false);
-        let combined = stream::iter(vec![WsEvent::Log(s7), WsEvent::Log(s8)]).boxed();
+        let combined = stream::iter(vec![
+            WsEvent::Pool(PoolEvent::from_log(s7)),
+            WsEvent::Pool(PoolEvent::from_log(s8)),
+        ])
+        .boxed();
         pump.run_test_loop(combined, 5).await;
         assert_eq!(notify_count(), 2, "two forward syncs applied");
         assert_eq!(snapshot(), Some((U256::from(1_600), U256::from(2_600), 8)));
@@ -5061,8 +4641,12 @@ mod tests {
         let r8 = make_v2_sync_log(pool_addr, U256::from(9), U256::from(9), 8, true);
         let r7 = make_v2_sync_log(pool_addr, U256::from(9), U256::from(9), 7, true);
         let s9 = make_v2_sync_log(pool_addr, U256::from(1_700), U256::from(2_700), 9, false);
-        let combined =
-            stream::iter(vec![WsEvent::Log(r8), WsEvent::Log(r7), WsEvent::Log(s9)]).boxed();
+        let combined = stream::iter(vec![
+            WsEvent::Pool(PoolEvent::from_log(r8)),
+            WsEvent::Pool(PoolEvent::from_log(r7)),
+            WsEvent::Pool(PoolEvent::from_log(s9)),
+        ])
+        .boxed();
         pump.run_test_loop(combined, 5).await;
 
         // The reorg unwound 7 and 8 (restore to genesis), then the forward
@@ -5091,8 +4675,12 @@ mod tests {
         let s7 = make_v2_sync_log(pool_addr, U256::from(1_500), U256::from(2_500), 7, false);
         let s8 = make_v2_sync_log(pool_addr, U256::from(1_600), U256::from(2_600), 8, false);
         let late = make_v2_sync_log(pool_addr, U256::from(9_999), U256::from(9_999), 7, false);
-        let combined =
-            stream::iter(vec![WsEvent::Log(s7), WsEvent::Log(s8), WsEvent::Log(late)]).boxed();
+        let combined = stream::iter(vec![
+            WsEvent::Pool(PoolEvent::from_log(s7)),
+            WsEvent::Pool(PoolEvent::from_log(s8)),
+            WsEvent::Pool(PoolEvent::from_log(late)),
+        ])
+        .boxed();
         pump.run_test_loop(combined, 5).await;
 
         assert!(
@@ -5145,7 +4733,7 @@ mod tests {
                     )),
                     1 => {
                         tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some((WsEvent::Log(stale), 2))
+                        Some((WsEvent::Pool(PoolEvent::from_log(stale)), 2))
                     }
                     _ => None,
                 }
@@ -5202,10 +4790,10 @@ mod tests {
                     )),
                     1 => {
                         tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some((WsEvent::Log(s103), 2))
+                        Some((WsEvent::Pool(PoolEvent::from_log(s103)), 2))
                     }
-                    2 => Some((WsEvent::Log(s104), 3)),
-                    3 => Some((WsEvent::Log(late103), 4)),
+                    2 => Some((WsEvent::Pool(PoolEvent::from_log(s104)), 3)),
+                    3 => Some((WsEvent::Pool(PoolEvent::from_log(late103)), 4)),
                     _ => None,
                 }
             }
@@ -5292,13 +4880,13 @@ mod tests {
                         },
                         1,
                     )),
-                    1 => Some((WsEvent::Log(s102), 2)),
+                    1 => Some((WsEvent::Pool(PoolEvent::from_log(s102)), 2)),
                     2 => {
                         // Stall: let the watchdog catch up, then the WS resumes.
                         tokio::time::sleep(Duration::from_millis(250)).await;
-                        Some((WsEvent::Log(s104), 3))
+                        Some((WsEvent::Pool(PoolEvent::from_log(s104)), 3))
                     }
-                    3 => Some((WsEvent::Log(stale103), 4)),
+                    3 => Some((WsEvent::Pool(PoolEvent::from_log(stale103)), 4)),
                     _ => None,
                 }
             }
@@ -5434,7 +5022,11 @@ mod tests {
         // Feed: Mint@N (tick -100..7, +delta) then Swap@N+1 (tombstones N).
         let mint = make_v3_mint_log_with_block(pool_addr, -100, 7, delta, block_n);
         let swap = make_v3_swap_log_with_block(pool_addr, block_n + 1);
-        let combined = stream::iter(vec![WsEvent::Log(mint), WsEvent::Log(swap)]).boxed();
+        let combined = stream::iter(vec![
+            WsEvent::Pool(PoolEvent::from_log(mint)),
+            WsEvent::Pool(PoolEvent::from_log(swap)),
+        ])
+        .boxed();
         pump.run_test_loop(combined, block_n - 1).await;
 
         // The tombstone@N+1 set `last_complete_block = N`. Drain + pin.
@@ -5507,9 +5099,9 @@ mod tests {
         let mint_upper = make_v3_mint_log_with_block(pool_addr, 7, 8, amt_upper, block_n);
         let swap = make_v3_swap_log_with_block(pool_addr, block_n + 1);
         let combined = stream::iter(vec![
-            WsEvent::Log(mint_lower),
-            WsEvent::Log(mint_upper),
-            WsEvent::Log(swap),
+            WsEvent::Pool(PoolEvent::from_log(mint_lower)),
+            WsEvent::Pool(PoolEvent::from_log(mint_upper)),
+            WsEvent::Pool(PoolEvent::from_log(swap)),
         ])
         .boxed();
         pump.run_test_loop(combined, block_n - 1).await;
@@ -5564,7 +5156,11 @@ mod tests {
         // simulating the WS dropping exactly ONE of block N's Mints.
         let mint1 = make_v3_mint_log_with_block(pool_addr, -100, 7, delta1, block_n);
         let swap = make_v3_swap_log_with_block(pool_addr, block_n + 1);
-        let combined = stream::iter(vec![WsEvent::Log(mint1), WsEvent::Log(swap)]).boxed();
+        let combined = stream::iter(vec![
+            WsEvent::Pool(PoolEvent::from_log(mint1)),
+            WsEvent::Pool(PoolEvent::from_log(swap)),
+        ])
+        .boxed();
         pump.run_test_loop(combined, block_n - 1).await;
 
         let (tick_data, pinned_block) = {
@@ -5763,7 +5359,7 @@ mod tests {
                 pump_for_test_with_bot(Arc::clone(&bot), Some(min_block - 1));
             let ws_events: Vec<WsEvent> = expected_events
                 .iter()
-                .map(|(_, l)| WsEvent::Log(l.clone()))
+                .map(|(_, l)| WsEvent::Pool(PoolEvent::from_log(l.clone())))
                 .collect();
             let combined = stream::iter(ws_events).boxed();
             pump.run_test_loop(combined, min_block - 1).await;
@@ -5869,7 +5465,11 @@ mod tests {
         // to tombstone N (completes the block for the cutoff).
         let mint = make_v3_mint_log_with_block(pool_addr, -100, 7, MINT_DELTA, block_n);
         let swap = make_v3_swap_log_with_block(pool_addr, block_n + 1);
-        let combined = stream::iter(vec![WsEvent::Log(mint), WsEvent::Log(swap)]).boxed();
+        let combined = stream::iter(vec![
+            WsEvent::Pool(PoolEvent::from_log(mint)),
+            WsEvent::Pool(PoolEvent::from_log(swap)),
+        ])
+        .boxed();
         pump.run_test_loop(combined, block_n - 1).await;
 
         // LATE registration (crawl reaches the pool after block N completed):
@@ -5964,12 +5564,21 @@ mod tests {
             (0u8, Some(drain_done_rx), logs.into_iter()),
             |(phase, rx_opt, mut logs)| async move {
                 match phase {
-                    0 => Some((WsEvent::Log(logs.next().unwrap()), (1, rx_opt, logs))),
+                    0 => Some((
+                        WsEvent::Pool(PoolEvent::from_log(logs.next().unwrap())),
+                        (1, rx_opt, logs),
+                    )),
                     1 => {
                         let _ = rx_opt.unwrap().await; // park until drain completes
-                        Some((WsEvent::Log(logs.next().unwrap()), (2, None, logs)))
+                        Some((
+                            WsEvent::Pool(PoolEvent::from_log(logs.next().unwrap())),
+                            (2, None, logs),
+                        ))
                     }
-                    2 => Some((WsEvent::Log(logs.next().unwrap()), (3, None, logs))),
+                    2 => Some((
+                        WsEvent::Pool(PoolEvent::from_log(logs.next().unwrap())),
+                        (3, None, logs),
+                    )),
                     _ => None,
                 }
             },
@@ -6052,13 +5661,13 @@ mod tests {
         let (mut pump, sink) = pump_for_test(Some(100));
         let pool_addr = Address::from([0x55u8; 20]);
         let mk = |r0, r1| {
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 pool_addr,
                 U256::from(r0),
                 U256::from(r1),
                 101,
                 false,
-            ))
+            )))
         };
         // 3 same-block sync logs, then stream exhaustion. Under the wall-clock
         // debounce the timer never fires before Ok(None) returns → 0
@@ -6311,13 +5920,13 @@ mod tests {
         // pends forever to model a LIVE websocket (the drain must keep
         // running until the backfill completes, not bail on a closed stream).
         let live = vec![
-            WsEvent::Log(make_v2_sync_log(
+            WsEvent::Pool(PoolEvent::from_log(make_v2_sync_log(
                 alloy::primitives::Address::from([0xd1u8; 20]),
                 U256::ZERO,
                 U256::ZERO,
                 101,
                 false,
-            )),
+            ))),
             WsEvent::BlockHeader {
                 number: 101,
                 timestamp: 1_000_101,
@@ -6350,8 +5959,8 @@ mod tests {
                 .expect("re-injected event must arrive")
                 .expect("stream yields the drained event");
             match ev {
-                WsEvent::Log(l) => {
-                    assert_eq!((kind, l.block_number.unwrap()), ("log", number));
+                WsEvent::Pool(pe) => {
+                    assert_eq!((kind, pe.payload.block_number.unwrap()), ("log", number));
                 }
                 WsEvent::BlockHeader { number: n, .. } => {
                     assert_eq!((kind, n), ("header", number));

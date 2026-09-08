@@ -267,7 +267,7 @@ pub use crate::bot_core::BlockMetadata;
 // ADR-027 completion (2026-08-20 review): the block-clock pipe is
 // coordinator-owned; the type moved to bot_core. Re-exported so external
 // references keep working (same pattern as BlockMetadata above).
-pub use crate::bot_core::block_clock_pipe::BlockNotification;
+pub use degenbot_core::block_clock_pipe::BlockNotification;
 
 /// Incremental result batch pushed to Python via the result channel.
 ///
