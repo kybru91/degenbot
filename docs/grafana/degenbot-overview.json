@@ -173,7 +173,8 @@
         "value": 5
        }
       ]
-     }
+     },
+     "decimals": 0
     },
     "overrides": [],
     "default": {
@@ -508,87 +509,8 @@
    }
   },
   {
-   "id": 9,
-   "title": "State head lag (state - clock)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 12,
-    "y": 5
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_state_head_lag_blocks",
-     "legendFormat": "state head lag (blocks)",
-     "refId": "A"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8,
-      "lineInterpolation": "linear",
-      "showPoints": "never",
-      "stacking": {
-       "group": "A",
-       "mode": "none"
-      },
-      "thresholdsStyle": {
-       "mode": "line",
-       "colorMode": "var"
-      }
-     },
-     "thresholds": {
-      "mode": "absolute",
-      "steps": [
-       {
-        "color": "green",
-        "value": null
-       },
-       {
-        "color": "yellow",
-        "value": 4
-       },
-       {
-        "color": "red",
-        "value": 5
-       }
-      ]
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   },
-   "description": "pool_state_head - engine clock over time. Healthy = -1 (a thin, stable line; it may dip to 0 when a block tombstones, i.e. a coverage gap, and jump positive for a few points after a restart/missed apply). The freeze is a *sustained climb more negative*, paired with rising apply-age and solve stalls - not a single level."
-  },
-  {
    "id": 10,
-   "title": "Blocks observed (head tracking)",
+   "title": "Blocks observed (cumulative)",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -601,15 +523,6 @@
     "uid": "${DS_PROMETHEUS}"
    },
    "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_blocks_observed_total[5m])",
-     "legendFormat": "blocks rate/s",
-     "refId": "A"
-    },
     {
      "datasource": {
       "type": "prometheus",
@@ -661,7 +574,7 @@
     "h": 8,
     "w": 12,
     "x": 12,
-    "y": 13
+    "y": 5
    },
    "datasource": {
     "type": "prometheus",
@@ -1435,66 +1348,14 @@
    "panels": []
   },
   {
-   "id": 29,
-   "title": "Liveness: state head lag (freeze signature)",
-   "description": "Drain-queue target removed: degenbot_drain_queue_depth is retired (SZJUKL). Pump-side liveness is owned by the stage telemetry (degenbot.stage.* spans) and the header-age / apply-age gauges in the next panel.",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 94
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_state_head_lag_blocks",
-     "legendFormat": "state head lag (blocks)",
-     "refId": "B"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "short",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
    "id": 30,
    "title": "Recorded failures by kind",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
     "w": 12,
-    "x": 12,
-    "y": 94
+    "x": 0,
+    "y": 78
    },
    "datasource": {
     "type": "prometheus",
