@@ -126,6 +126,38 @@ impl BotConfigLoader {
         self
     }
 
+    /// Select the STANDARD file layer: the `DEGENBOT_CONFIG` env override when
+    /// set (missing file then fails the load — the operator asked for it),
+    /// else `$HOME/.config/degenbot/config.toml` when it exists, else no file
+    /// layer (12-factor: an absent user file is contractually defaults). The
+    /// env read lives HERE so std env stays confined to this crate.
+    #[must_use]
+    pub fn with_standard_file_paths(mut self) -> Self {
+        if let Some(p) = ::std::env::var("DEGENBOT_CONFIG")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            self.file = Some(p.into());
+            return self;
+        }
+        if let Some(home) = ::std::env::var_os("HOME") {
+            let path = ::std::path::Path::new(&home).join(".config/degenbot/config.toml");
+            if path.is_file() {
+                self.file = Some(path);
+            }
+        }
+        self
+    }
+
+    /// The file layer chosen by [`Self::with_config_path`] /
+    /// [`Self::with_standard_file_paths`], if any — so a caller that can only
+    /// read files through this crate (e.g. the `[failure_policy]` table) sees
+    /// the SAME file the loader did.
+    #[must_use]
+    pub fn file_path(&self) -> Option<&PathBuf> {
+        self.file.as_ref()
+    }
+
     /// Add one CLI / explicit override. The key may be the `DEGENBOT_*` env
     /// name OR the dotted TOML path (e.g. `solve.executor`).
     #[must_use]

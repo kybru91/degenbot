@@ -202,13 +202,42 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // batches events and flushes to Python `logging` via one `Python::attach`
     // per batch. Stays in the module init (not `c_api::register`) because it
     // is module-lifecycle setup, not symbol registration.
+    // KAHU5W boot wiring: install the typed BotConfig BEFORE any
+    // subscriber/failure-policy/engine code reads the holder. The loader is
+    // the ONLY env-reading site; without this install every production run
+    // observed schema defaults (metrics bound 127.0.0.1, default debounce),
+    // silently ignoring DEGENBOT_* and the user config file. File layer:
+    // DEGENBOT_CONFIG override, else $HOME/.config/degenbot/config.toml (the
+    // same file the failure-policy table reads below, via the loader's own
+    // path so the two can never diverge). Fail-loud on an INVALID file
+    // (boot-refused, matches the failure-policy seam below); a MISSING file
+    // is contractually defaults.
     // ADR-040 D3: per-bucket failure-policy overrides, boot-validated. An
     // invalid bucket/action is a boot ERROR (process exits) — the operator
     // asked for a specific containment stance; silently ignoring it would
-    // trade on a policy the process does not actually have.
-    match python_log_layer::read_failure_policy_overrides(
-        python_log_layer::user_config_path().as_deref(),
-    ) {
+    // trade on a policy the process does not actually have. Reads the file
+    // the loader chose above (DEGENBOT_CONFIG override coherent).
+    let failure_policy_file = {
+        let loader = ::degenbot_config::BotConfigLoader::new().with_standard_file_paths();
+        let user_file = loader.file_path().cloned();
+        match loader.load() {
+            Ok(loaded) => {
+                // First-wins: a test harness or an embedding that installed
+                // earlier keeps ITS config; this is the production boot path.
+                let _ = degenbot_bot::bot_core::stance::install(std::sync::Arc::new(loaded.config));
+                user_file
+            }
+            Err(e) => {
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!("[config] invalid configuration - boot refused: {e}");
+                }
+                #[expect(clippy::exit)]
+                std::process::exit(2);
+            }
+        }
+    };
+    match python_log_layer::read_failure_policy_overrides(failure_policy_file.as_deref()) {
         Ok(overrides) if !overrides.is_empty() => {
             let refs: Vec<(&str, &str)> = overrides
                 .iter()
