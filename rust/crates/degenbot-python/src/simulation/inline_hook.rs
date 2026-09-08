@@ -506,7 +506,7 @@ impl InlineSimulator for InlineSimHook {
                             &ctx,
                             &sim_path,
                             &mut buckets,
-                            seam_span,
+                            &seam_span,
                         )
                         .map_err(|e| format!("{e}"));
                         inline_span.record(

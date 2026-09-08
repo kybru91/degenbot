@@ -1030,7 +1030,7 @@ where
         simulate.expected_profit = tracing::field::Empty,
         simulate.error_reason = tracing::field::Empty,
     );
-    simulate_path_on_evm_in_span(evm, ctx, path, fail_buckets, span)
+    simulate_path_on_evm_in_span(evm, ctx, path, fail_buckets, &span)
 }
 
 /// SIMSPANDUP (trace 73604143 cleanup): run the sim under the CALLER-HELD
@@ -1055,7 +1055,7 @@ pub fn simulate_path_on_evm_in_span<E>(
     ctx: &SimulateContext<'_>,
     path: &SimulatePath,
     fail_buckets: &mut FailBuckets,
-    span: tracing::Span,
+    span: &tracing::Span,
 ) -> ProviderResult<Option<SimResult>>
 where
     E: ExecuteEvm<
@@ -1080,7 +1080,7 @@ fn simulate_path_on_evm_seam<E>(
     ctx: &SimulateContext<'_>,
     path: &SimulatePath,
     fail_buckets: &mut FailBuckets,
-    span: tracing::Span,
+    span: &tracing::Span,
 ) -> ProviderResult<Option<SimResult>>
 where
     E: ExecuteEvm<
@@ -2996,8 +2996,7 @@ mod tests {
             block.timestamp = U256::from(ctx.block_timestamp);
         });
         let result =
-            simulate_path_on_evm_in_span(&mut evm, &ctx, &path, &mut buckets, caller.clone())
-                .unwrap();
+            simulate_path_on_evm_in_span(&mut evm, &ctx, &path, &mut buckets, &caller).unwrap();
         assert!(result.is_none(), "reverting execute returns None");
 
         let mine: Vec<_> = cap
