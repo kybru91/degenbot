@@ -354,7 +354,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "sum(rate(degenbot_epoch_stale_drops_total[5m])) / clamp_min(sum(rate(degenbot_solves_executed_total[5m])), 0.001)",
+     "expr": "sum(rate(degenbot_epoch_stale_drops_total[5m])) / clamp_min(sum(rate(degenbot_solves_executed_total[5m])), 0.001) or vector(0)",
      "legendFormat": "__auto",
      "refId": "A",
      "instant": true,
