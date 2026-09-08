@@ -46,8 +46,6 @@ pub struct PipelineInstruments {
     /// Last relevant log → settle decision fires (debounce/quiesce wait —
     /// the pump-side hold before the drainer is engaged).
     settle_wait: Histogram<f64>,
-    /// Time a `DrainWork` item spent queued before the drainer picked it up.
-    drain_queue_wait: Histogram<f64>,
     /// Log decode phase duration.
     log_decode: Histogram<f64>,
     /// Log apply phase duration (successful applies only).
@@ -81,8 +79,6 @@ pub struct PipelineInstruments {
     reorg_recovery_dropped: Counter<u64>,
     /// Header-gap / settle backfills executed.
     backfills_executed: Counter<u64>,
-    /// Drain FIFO depth at dispatch time (approximate backlog signal).
-    drain_queue_depth: Gauge<f64>,
     /// `pool_state_head - engine clock` divergence.
     state_head_lag_blocks: Gauge<f64>,
     /// Seconds since the newest accepted `newHeads` header (pump/feed liveness).
@@ -210,12 +206,6 @@ impl PipelineInstruments {
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .with_description("Last relevant log to settle decision (debounce/quiesce wait)")
                 .build(),
-            drain_queue_wait: meter
-                .f64_histogram("degenbot.drain.queue_wait")
-                .with_unit("s")
-                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
-                .with_description("DrainWork queue time before the drainer picks it up")
-                .build(),
             log_decode: meter
                 .f64_histogram("degenbot.log.decode")
                 .with_unit("s")
@@ -281,10 +271,6 @@ impl PipelineInstruments {
             backfills_executed: meter
                 .u64_counter("degenbot.backfills.executed")
                 .with_description("Header-gap or settle backfills executed")
-                .build(),
-            drain_queue_depth: meter
-                .f64_gauge("degenbot.drain.queue_depth")
-                .with_description("Drain FIFO depth at dispatch time")
                 .build(),
             state_head_lag_blocks: meter
                 .f64_gauge("degenbot.state.head_lag_blocks")
@@ -473,12 +459,7 @@ impl PipelineInstruments {
         self.settle_wait.record(secs, &[]);
     }
 
-    /// Queue time of one drained work item.
-    pub fn observe_drain_queue_wait(&self, secs: f64) {
-        self.drain_queue_wait.record(secs, &[]);
-    }
-
-    /// Decode phase duration.
+    /// Log decode phase duration.
     pub fn observe_log_decode(&self, secs: f64) {
         self.log_decode.record(secs, &[]);
     }
@@ -561,12 +542,6 @@ impl PipelineInstruments {
     /// One executed backfill range.
     pub fn count_backfill(&self) {
         self.backfills_executed.add(1, &[]);
-    }
-
-    /// Current drain FIFO depth.
-    pub fn set_drain_queue_depth(&self, depth: u64) {
-        self.drain_queue_depth
-            .record(f64::from(u32::try_from(depth).unwrap_or(u32::MAX)), &[]);
     }
 
     /// Signed `pool_state_head - engine_clock` divergence in blocks. Block

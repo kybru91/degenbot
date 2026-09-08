@@ -1,15 +1,25 @@
-//! `BlockPump` — `Bot`'s WS transport + drain loop (ADR-006 D4).
+//! `BlockPump` — `Bot`'s WS transport + drain loop (ADR-006 D4), now the
+//! thin driver of the unified stage machine (epic MROOY7, 7NFYQW + SZJUKL).
 //!
-//! Generalized from the `BlockPump`: holds `Arc<Bot>` +
-//! `Arc<dyn DrainSink>` instead of `Arc<Mutex<ArbitrageEngine>>`. Per WS log,
-//! the pump calls `bot.dispatch_log(log)` (slice 4: decode → apply to
-//! `BotState` → notify the `EngineSubscriber`, which dirties the engine). At
-//! block boundaries / drain ticks / reorg the pump drives the `DrainSink`
-//! (`on_drain` / `on_send` / `finalize_block`).
+//! Holds `Arc<Bot>` + `Arc<dyn StageHandlers>` — the ONE engine seam. Per WS
+//! log, the pump calls `bot.dispatch_log(log)` (decode → apply to `BotState`
+//! → EpochDelta byproduct; the retired `EngineSubscriber` classification is
+//! GONE — touched-pool tracking is the ledger's job since LXDY4C). At the
+//! machine's decision points the pump drives the engine's stage hooks
+//! directly (`on_resolve` → `on_solve`, `on_publish` at the Published edge,
+//! `on_finalize` at the tombstone) — the drain FIFO/dispatch-owner
+//! indirection (`DispatchOwner`/`DrainWork`) is deleted: work executes
+//! INLINE in this driver, so the drainer liveness machinery
+//! (`DrainerHealth`/`StallWatch`) has no separate task left to police; a
+//! wedged driver IS a header-staleness stall the machine's watchdogs abort
+//! on (`StageMachine::watchdog_phase`).
 //!
-//! `apply_log` is gone — ALL log application routes through `Bot::dispatch_log`,
-//! so `process_block` / `process_block_and_send` decompose in the pump into
-//! `dispatch_log`-per-log + `on_drain` (the D4 goal).
+//! The stale-epoch drop the FIFO needed (7NFYQW I3: pre-rewind items must
+//! not consume `epoch.block()`) survives as the driver-side
+//! `reorg_flying_stale` check at each work site — same WARN + metric,
+//! no queue to check.
+//!
+//! `apply_log` routes ALL log application through `Bot::dispatch_log`.
 //!
 //! The pump's **mechanics stay unchanged** from the `BlockPump` era: dual
 //! `newHeads` + `logs` subscription, Rust-side topic+address filtering, block-
@@ -31,7 +41,7 @@
 //!    logs applied eagerly, solved + sent on block boundaries / debounce.
 //!
 //! **Critical ordering**: backfill must run AFTER `subscribe()` returns but
-//! BEFORE `resume_from_subscribe()`. The `DrainSink`'s
+//! BEFORE `resume_from_subscribe()`. The engine's
 //! `last_processed_block()` is the backfill-start boundary. (Pre-epic-P73ER6
 //! Python orchestrated this manually; the epic relocates backfill into the
 //! core, driven automatically by `resume`.)
@@ -50,9 +60,11 @@ use futures_util::{stream, StreamExt};
 use tokio::time::timeout;
 use tracing::Instrument;
 
-use crate::bot_core::event_dispatch::{DispatchOwner, DrainWork};
 use crate::bot_core::LogDecision;
-use crate::bot_core::{drain_sink::DrainSink, BlockMetadata, Bot, Epoch};
+use crate::bot_core::{
+    stage_handlers::{Finalize, GateOutcome, Publish, PublishOutcome, Resolve, Solve},
+    BlockMetadata, Bot, Epoch, StageHandlers,
+};
 use degenbot_decoders::v2_sync_decoder::V2_SYNC_TOPIC;
 use degenbot_decoders::v3_mint_burn_decoder::{V3_BURN_TOPIC, V3_MINT_TOPIC};
 use degenbot_decoders::v3_pancakeswap_swap_decoder::V3_PANCAKESWAP_SWAP_TOPIC;
@@ -148,11 +160,17 @@ pub enum WsEvent {
     Log(Log),
 }
 
-/// Microseconds -> seconds with a 32-bit guard (mirrors `ms_to_secs` in
-/// `event_dispatch`; the cast lint is the point - overflow callers get a
-/// saturated bucket, never a precision-lost value).
+/// Microseconds -> seconds with a 32-bit guard (the cast lint is the point —
+/// overflow callers get a saturated bucket, never a precision-lost value).
 fn us_to_secs(us: u64) -> f64 {
     f64::from(u32::try_from(us).unwrap_or(u32::MAX)) / 1_000_000.0
+}
+
+/// Milliseconds -> seconds with a 32-bit guard (the `event_dispatch`
+/// `ms_to_secs` helper, kept for the header→solved latency histogram the
+/// dissolved `DispatchOwner` drainer stamped).
+fn ms_to_secs(ms: u64) -> f64 {
+    f64::from(u32::try_from(ms).unwrap_or(u32::MAX)) / 1_000.0
 }
 
 /// Per-header pre-solve gap marks, tracked by the pump loop (the
@@ -178,11 +196,12 @@ pub struct BlockPump {
     /// `reorg_coordinator.dispatch_reorg_log(log)` (`removed: true`).
     /// ADR-006 D4 + slice 7.
     bot: Arc<Bot>,
-    /// The drain sink (slice 6: `SolveCoordinator` fanning to every
-    /// attached `Engine` under a `drain_lock`).
-    sink: Arc<dyn DrainSink>,
+    /// The engine's stage surface (SZJUKL: the ONE seam — the dissolved
+    /// `SolveCoordinator`/`DrainSink` fan-out collapsed onto the arb
+    /// engine's `StageHandlers` implementation; no `drain_lock`, no FIFO).
+    engine: Arc<dyn StageHandlers>,
     /// The per-event reorg coordinator (slice 7). Owned by the pump (not
-    /// routed through the `DrainSink` — reorg is a `Bot` concern, parallel
+    /// routed through the engine seam — reorg is a `Bot` concern, parallel
     /// to `dispatch_log`).
     reorg_coordinator: Arc<crate::bot_core::reorg_coordinator::ReorgCoordinator>,
     /// The Alloy provider (created from the RPC URL)
@@ -210,6 +229,10 @@ pub struct BlockPump {
     /// the sub) so the liveness watchdog is test-observable without depending
     /// on log-capture infrastructure.
     log_silence_alarms: u64,
+    /// Wall-clock ms of the last accepted header — the anchor the driver
+    /// measures `header_to_solved` latency against (the T2 metric the
+    /// dissolved `DispatchOwner` owned; single-writer: the pump task).
+    header_ms: std::sync::atomic::AtomicU64,
     /// Whether the per-block WS-delivery completeness cross-check runs
     /// (`assert_ws_block_complete` — aborts on any relevant-topic log that
     /// `eth_getLogs` has but the live websocket dropped). Conservative default
@@ -268,7 +291,7 @@ impl BlockPump {
     pub async fn subscribe(
         rpc_url: &str,
         bot: Arc<Bot>,
-        sink: Arc<dyn DrainSink>,
+        engine: Arc<dyn StageHandlers>,
         reorg_coordinator: Arc<crate::bot_core::reorg_coordinator::ReorgCoordinator>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<(Self, SubscribeState), String> {
@@ -297,7 +320,7 @@ impl BlockPump {
 
         let mut pump = Self {
             bot,
-            sink,
+            engine,
             reorg_coordinator,
             provider: Arc::new(provider),
             shutdown,
@@ -305,6 +328,7 @@ impl BlockPump {
             log_wait_max_age: Duration::from_secs(LOG_WAIT_MAX_AGE_SECS),
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
+            header_ms: std::sync::atomic::AtomicU64::new(0),
             ws_completeness_enabled: stance::config().pump.ws_completeness,
             debounce_ms: stance::config().pump.pump_debounce_ms,
             early_slice_ms: stance::config().pump.early_slice_ms,
@@ -735,11 +759,14 @@ impl BlockPump {
         // cursor when the snapshot→WS gap was closed inside resume; cold-start
         // otherwise). J3FMDO: the core `BlockPump::backfill_from_snapshot`
         // applies state via `BotState::process_backfill_logs`, which advances
-        // neither the sink's drain cursor (only `on_drain`/`finalize_block`
-        // do) nor the engine's `last_processed_block`. Hence on the
-        // post-backfill resume path the sink's `last_processed_block` is still
-        // `None` and the branch below re-anchors on `first_observed_block`.
-        let mut current_block: u64 = self.sink.last_processed_block().unwrap_or(0);
+        // neither the solve/finalize hooks' cursor nor the engine's
+        // `last_processed_block`. Hence on the post-backfill resume path the
+        // engine's `last_processed_block` is still `None` and the branch below
+        // re-anchors on `first_observed_block`. (SZJUKL: the dissolved
+        // coordinator cursor — `last_drained_block` under `drain_lock` — is
+        // gone; work runs inline in this single-writer driver, so the engine
+        // cursor IS the drained cursor.)
+        let mut current_block: u64 = self.engine.last_processed_block().unwrap_or(0);
 
         let snapshot_seed = self.bot.state_arc().read().snapshot_seed_block();
         if current_block == 0 && first_observed_block > 0 {
@@ -767,7 +794,7 @@ impl BlockPump {
         // guard fires only on a genuine advance (matching the prior local
         // init). A mid-flight-joining engine inherits via `set_last_solved_block`
         // (ADR-006 D4).
-        self.sink.set_last_solved_block(Epoch::at(current_block));
+        self.engine.set_last_solved_block(Epoch::at(current_block));
         // Seed the cold-start solve-results anchor to the settled resume
         // boundary (`current_block` = `first_observed_block` = backfill end):
         // `results_block` is 0 until the first real `on_drain` solve, but
@@ -778,7 +805,7 @@ impl BlockPump {
         // candidates deliver immediately at a valid, verification-safe solve
         // block — NOT the chain head, which a partially-applied live event could
         // race past the backfill window.
-        self.sink.set_solve_anchor(Epoch::at(current_block));
+        self.engine.set_solve_anchor(Epoch::at(current_block));
         // Whether we're past the first header after resume. The first
         // Epic A1: the pump's decision state now lives in the StageMachine; the
         // driver routes the decision arms through it. `current_block` seeds the FSM.
@@ -836,8 +863,8 @@ impl BlockPump {
 
         // ADR-008 per-block state machine. The clock is the authority for
         // block completeness (the tombstone) and the cursor; the pump loop is
-        // a thin async driver translating its decisions into sink calls +
-        // backfill + shutdown. A header alone NEVER advances the cursor —
+        // a thin async driver translating its decisions into stage-hook
+        // calls + backfill + shutdown. A header alone NEVER advances the cursor —
         // only `advance_to_drained` (after the tombstone) does.
 
         // Per-block metadata, snapshotted from each block's header. A block's
@@ -859,33 +886,17 @@ impl BlockPump {
         // (the logs-silence clock + re-arm alarm now live in the FSM, fed via
         // `record_log`; the telemetry seam owns the DIAG gap anchor).
 
-        // B4GX7C drain-decoupling: the sink's solve/dispatch/finalize calls run
-        // on this spawned background drainer task so the WS poller returns to
-        // `combined.next()` promptly instead of parking behind `Python::attach`
-        // / heavy Möbius solve. FIFO order + the engine/sink locks give the
-        // deferred work the inline semantics it replaced (the sole mode).
-        //
-        // The poller gets FEEDBACK on the drainer through `drainer_health`: a
-        // send into a closed channel (drainer task dead) aborts loudly, and the
-        // B3 no-progress detector aborts if the drainer is alive but makes no
-        // progress — a dead/stalled drainer must never silently lose every
-        // solve/dispatch/publish while the WS loop keeps advancing.
-        // One dispatch owner (epic B) owns the drain pipe + the drainer task.
-        // All sink work is deferred to the background drainer task (sole mode)
-        // so the WS poller never parks behind GIL-bound `Python::attach` /
-        // heavy Möbius solve. FIFO order + the engine/sink locks give the
-        // deferred work the inline semantics it replaced. A dead or stalled
-        // drainer never silently loses work.
-        let dispatch = DispatchOwner::new(Arc::clone(&self.sink));
-        // S53STH cooperative timed exit: arm the StallWatch cancel token when
-        // a hotpath timed window is configured so no watchdog sample lands
-        // between the post-loop OTel flush and teardown.
-        #[cfg(all(feature = "hotpath", feature = "otel"))]
-        let dispatch = if crate::profiling::timed_exit_window().is_some() {
-            dispatch.with_shutdown_token(tokio_util::sync::CancellationToken::new())
-        } else {
-            dispatch
-        };
+        // SZJUKL seam retirement: NO dispatch owner, NO drain FIFO, NO
+        // background drainer task. The stage hooks run INLINE at the
+        // machine's decision points (below), so the B4GX7C drainer-liveness
+        // machinery (`DrainerHealth`/`StallWatch`/closed-channel abort) has
+        // no separate task to police and is DELETED. The dissolved
+        // `DrainerHealth`'s no-progress obligation maps onto the machine's
+        // `WatchdogPhase` — a driver that stops making stall-window progress
+        // stops accepting headers, and the header-staleness watchdog
+        // (`StageDecision::Recover`) fires exactly as before; the logs-silence
+        // watchdog covers the inverse. There is no queue left to go silently
+        // dead while the loop advances.
 
         // JIABO3 Option A — header-staleness watchdog. A `tokio::time::interval`
         // selected against `combined.next()` (below) whose internal `Sleep`
@@ -910,16 +921,6 @@ impl BlockPump {
                                      // (time enters as data; the FSM owns no timer or `Instant`).
         let tick_epoch = tokio::time::Instant::now();
         let now_ms = || tick_epoch.elapsed().as_millis() as u64;
-
-        // B4GX7C drainer-liveness heartbeat: a 2s cadence that aborts if the
-        // background drainer has unacknowledged work and makes no progress for
-        // B3 no-progress liveness now lives INSIDE `DispatchOwner` (see
-        // `track_progress` + `dispatch`): a dead drainer aborts immediately on
-        // a closed-channel send; a frozen drainer aborts at
-        // `NO_PROGRESS_STRIKE_LIMIT` consecutive no-progress pushes; a drainer
-        // that progresses but falls behind only WARNs (lag metric). The old
-        // 30s `DRAINER_STALL_SECS` poll watchdog and the pump-side
-        // `drainer_check` timer are retired — no time-based knob remains.
 
         // MQUKB6-T0: the current block's span, replaced by each accepted header.
         let mut block_span: Option<tracing::Span> = None;
@@ -984,7 +985,7 @@ impl BlockPump {
             // must carry block context across an await are wrapped with
             // `.instrument(…)` instead.
             //
-            // Solve dispatch moved OUT of the loop head to the drained-settle
+            // Solve execution moved OUT of the loop head to the drained-settle
             // gate at the bottom of the loop (TQ7PD6 follow-up): the solver
             // must not fire while buffered WS events are still unprocessed —
             // the 2026-08-22 stall crash was exactly the loop-head solve
@@ -992,24 +993,18 @@ impl BlockPump {
 
             // ADR-008 D2: solver-release gate. `fsm.publish_pending` is set when a forward
             // log applies (block becomes quiesced). The flush below fires
-            // `on_send` (gated on `consume_quiesced`) only at a settle point —
-            // a timeout with no new event (coalescing a same-block burst into
-            // one publish at the tail) OR stream exhaustion. This replaces the
-            // wall-clock `DEBOUNCE_MS` send timer: publication is gated on the
-            // truth condition (all dispatched logs applied), not schedule.
+            // the Published-edge `on_publish` (gated on `consume_quiesced`) only at a
+            // settle point — a timeout with no new event (coalescing a
+            // same-block burst into one publish at the tail) OR stream
+            // exhaustion. This replaces the wall-clock `DEBOUNCE_MS` send
+            // timer: publication is gated on the truth condition (all
+            // dispatched logs applied), not schedule.
 
             // Check shutdown
             if self.shutdown.load(Ordering::Relaxed) {
                 tracing::info!("BlockPump: shutting down");
                 return;
             }
-
-            // 7NFYQW (I3): mirror the machine's rewind generation to the
-            // drainer once per iteration, so any reorg-flying item still in
-            // the FIFO is dropped loudly instead of consuming its stale
-            // epoch. Redundant with the log-arm refresh below; both are
-            // monotone max-updates (cheap, idempotent).
-            dispatch.observe_rewind_seq(fsm.rewind_seq());
 
             // Wait for the next event. Use a shorter settle window when a publish is
             // pending so the quiesce-gated flush fires promptly if no new log
@@ -1122,11 +1117,11 @@ impl BlockPump {
                         match decision {
                             StageDecision::Publish { open, metadata } => {
                                 // Option-A solver-state accuracy gate (AV42C7):
-                                // publish on_send to Python, then hand the
+                                // publish the debounced batch to Python (the
+                                // Published edge — delivery/submission/Python
+                                // subscribe HERE, SZJUKL), then hand the
                                 // quiesced `open` block + its change set to the
-                                // latest-wins verifier task. The publish defers
-                                // on_send to the drainer (so the WS poller never
-                                // parks behind the Python GIL). The anchor is
+                                // latest-wins verifier task. The anchor is
                                 // `open`, the LOG-DRIVEN quiesced block, NOT the
                                 // racing header.
                                 // Pre-solve gap decomposition (Jaeger span
@@ -1227,9 +1222,11 @@ impl BlockPump {
                                     );
                                 }
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
-                                dispatch.dispatch(DrainWork::Publish {
-                                    context: fsm.context_for(open, metadata),
-                                });
+                                self.drive_publish(
+                                    &fsm,
+                                    fsm.context_for(open, metadata),
+                                    &GateOutcome::default(),
+                                );
                             }
                             StageDecision::Backfill { from, to } => {
                                 // No activity for 60s — backfill `[from, to)`.
@@ -1337,7 +1334,10 @@ impl BlockPump {
                                 );
                             }
                         }
-                        dispatch.note_header_accepted();
+                        // T2: the header→solved latency anchor (the dissolved
+                        // DispatchOwner's note; single-writer pump task).
+                        self.header_ms
+                            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                     }
                     // ADR-028: THE header decision lives in the FSM. Feeding
                     // the header (metadata + a wall-clock `now_ms` for the
@@ -1379,12 +1379,14 @@ impl BlockPump {
                                 // to `block` already — mark it solved so the
                                 // first `finalize_block` guard no-ops.
                                 let _ctx = new_block_span.enter();
-                                self.sink.set_last_solved_block(block.into());
+                                self.engine.set_last_solved_block(Epoch::at(block));
                             }
                             StageDecision::Notify { block, metadata } => {
-                                // Python's block fsm tracks `newHeads`.
+                                // Python's block fsm tracks `newHeads` — the
+                                // block-clock pipe (delivery-to-Python at the
+                                // async boundary; never queued behind solve work).
                                 let _ctx = new_block_span.enter();
-                                dispatch.notify_block(block, &metadata);
+                                self.engine.notify_block(block, &metadata);
                             }
                             other => {
                                 unreachable!("on_header only emits Backfill|SetLastSolved|Notify, got {other:?}")
@@ -1517,10 +1519,11 @@ impl BlockPump {
                     // driver to execute the I/O.
                     let log_decision = fsm.on_log(log_block, log.removed);
                     // The reorg classification may have just bumped the
-                    // rewind generation (I2): mirror it to the drainer BEFORE
-                    // the same arm enqueues any DrainWork, so pre-rewind
-                    // items in flight fail loud (I3), never silently apply.
-                    dispatch.observe_rewind_seq(fsm.rewind_seq());
+                    // rewind generation (I2). SZJUKL: the dissolved FIFO's
+                    // `observe_rewind_seq` mirror is gone — the driver checks
+                    // each work item's epoch INLINE at its execution site
+                    // (`reorg_flying_stale`), so a stale item cannot slip
+                    // through a queue because its check happened pre-bump.
                     // Per-pool trace: log EVERY relevant-topic WS log for the
                     // `DEGENBOT_DRAIN_DBG` pool — block, log-index, tx-index,
                     // topic0, removed, and the fsm decision — so the
@@ -1743,9 +1746,11 @@ impl BlockPump {
                                 .block_metadata_for(prev)
                                 .unwrap_or(fsm.current_metadata());
                             let _ctx = block_span.as_ref().map(tracing::Span::enter);
-                            dispatch.dispatch(DrainWork::Finalize {
-                                context: fsm.context_for(prev, prev_meta),
-                            });
+                            self.drive_finalize(
+                                &fsm,
+                                fsm.context_for(prev, prev_meta),
+                                &PublishOutcome::default(),
+                            );
                         }
                         LogDecision::DispatchForward => {}
                         LogDecision::PanicLateForward(b) => {
@@ -1769,8 +1774,8 @@ impl BlockPump {
 
                     // Apply the log immediately to engine state (no solve yet).
                     // ADR-006 D4: routes through `Bot::dispatch_log` (decode →
-                    // apply to BotState → notify EngineSubscriber → dirty the
-                    // engine) — NOT `engine.apply_log`. The FSM's `on_log_applied`
+                    // apply to BotState → record the EpochDelta byproduct) —
+                    // NOT `engine.apply_log`. The FSM's `on_log_applied`
                     // records the clock's received/applied edges and arms the
                     // quiesce-gated publish (ADR-008 D2).
                     // One fact — a forward log applied to engine state — feeds
@@ -1793,7 +1798,7 @@ impl BlockPump {
 
                     // LEZJAS: engine owns `has_logs_this_block` now — routed
                     // through the sink so the next `finalize_block` sees it.
-                    self.sink.record_logs_this_block();
+                    self.engine.record_logs_this_block();
 
                     // [DIAG] count logs + emit periodic stats so we can see,
                     // during a freeze, that the pump IS polling logs while
@@ -1813,9 +1818,11 @@ impl BlockPump {
                         match decision {
                             StageDecision::Publish { open, metadata } => {
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
-                                dispatch.dispatch(DrainWork::Publish {
-                                    context: fsm.context_for(open, metadata),
-                                });
+                                self.drive_publish(
+                                    &fsm,
+                                    fsm.context_for(open, metadata),
+                                    &GateOutcome::default(),
+                                );
                             }
                             StageDecision::Stop => {}
                             other => {
@@ -1832,7 +1839,7 @@ impl BlockPump {
                     tracing::error!(
                         "BlockPump: WS subscription streams ended - pump is STOPPED. The bot will no longer process blocks (no reconnect). Check the WS endpoint / restart."
                     );
-                    self.sink.on_pump_ended();
+                    self.engine.on_pump_ended();
                     return;
                 }
             }
@@ -1860,7 +1867,7 @@ impl BlockPump {
             // the solve fires — coalescing all logs in the burst into one
             // solve. 50ms is well within the 12s block interval (same
             // `DEBOUNCE_MS` as the publish gate).
-            let dirty_now = self.sink.has_dirty_paths();
+            let dirty_now = self.engine.has_dirty_paths();
             // PWPPAZ T2 — designed first-slice trigger: remember when the
             // window's unsolved dirt was first observed. While the burst
             // outlives `early_slice_ms`, ONE bounded early Drain fires
@@ -1925,7 +1932,7 @@ impl BlockPump {
                     && slice_first_dirty.is_some_and(|first| {
                         first.elapsed() >= Duration::from_millis(self.early_slice_ms)
                     });
-                self.boundary_drain_dispatch(&fsm, &dispatch, block_span.as_ref());
+                self.boundary_drain_dispatch(&fsm, block_span.as_ref(), now_ms());
                 if slice_due {
                     // The bounded slice took its one shot this window.
                     slice_done = true;
@@ -1954,10 +1961,10 @@ impl BlockPump {
         }
     }
 
-    /// Shared strictly-synchronous solve dispatch for the drained-settle
+    /// Shared strictly-synchronous solve execution for the drained-settle
     /// gate's quiesce solve and the PWPPAZ T2 early slice (TQ7PD6: no await
-    /// inside — the caller enters the cursor block span long enough for
-    /// `dispatch()` to capture it as the drainer parent).
+    /// inside — the stage hooks run INLINE on this driver task, so their
+    /// spans nest under the entered cursor block span naturally).
     ///
     /// Pump-owned ACTIVE BLOCK promotion (QMSTSV/BO5FBS): the solve anchor is
     /// the LOG-DRIVEN settled block (`fsm.latest_observed()`, never a
@@ -1967,20 +1974,131 @@ impl BlockPump {
     fn boundary_drain_dispatch(
         &self,
         fsm: &StageMachine,
-        dispatch: &crate::bot_core::event_dispatch::DispatchOwner,
         block_span: Option<&tracing::Span>,
+        now_ms: u64,
     ) {
         let _solve_ctx = block_span.map(tracing::Span::enter);
         let state_head = self.bot.state_arc().read().pool_state_head();
         let StageDecision::Drain { block, metadata } = fsm.drain_decision(state_head) else {
             unreachable!("drain_decision always drains when called");
         };
-        dispatch.dispatch(DrainWork::Drain {
-            context: fsm.context_for(block, metadata),
-        });
-        // LEZJAS: engine owns `last_solved_block` now — mark this
-        // block solved so the next `finalize_block` guard no-ops.
-        self.sink.set_last_solved_block(block.into());
+        self.drive_solve(&fsm, fsm.context_for(block, metadata));
+        // T2: header→solved latency for solve-carrying work items (the
+        // dissolved `DispatchOwner` drainer stamp; single-writer inline now).
+        let header_ms = self.header_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if header_ms != 0 {
+            if let Some(p) = crate::instruments::pipeline() {
+                p.observe_header_to_solved(ms_to_secs(now_ms.saturating_sub(header_ms)));
+            }
+        }
+    }
+
+    /// The I3 stale-epoch drop (7NFYQW, T6IYKY review Q2 edge) — the
+    /// dissolved `DispatchOwner` FIFO drop, moved onto the driver: a work
+    /// item whose rewind generation sits BELOW the machine's current one is
+    /// reorg-flying. It is dropped LOUDLY here instead of silently consuming
+    /// `epoch.block()` into solve/finalize bookkeeping; the fresh
+    /// generation's stream re-delivers the block's work. Returns true when
+    /// the item was dropped.
+    fn reorg_flying_stale(&self, fsm: &StageMachine, ctx: &crate::bot_core::BlockContext) -> bool {
+        let observed_seq = fsm.rewind_seq();
+        let epoch = ctx.epoch();
+        if epoch.seq() < observed_seq {
+            tracing::warn!(
+                item_block = epoch.block(),
+                item_seq = epoch.seq(),
+                observed_seq,
+                "reorg-flying stage work: stale epoch dropped instead of consuming epoch.block() (I3)"
+            );
+            if let Some(p) = crate::instruments::pipeline() {
+                p.count_reorg_recovery_dropped();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Drive the Solved cycle (Quiesced → Resolved → Solved) for `ctx`:
+    /// the stage-table row order the drained-settle gate and the backfill
+    /// solve both express. The affected keys are the epoch delta's take
+    /// (`on_resolve`), consumed by `on_solve`. Marks the block solved
+    /// (LEZJAS) on success. Ignores `StageError`s the engine cannot produce
+    /// (its hooks are infallible; a hard failure logs loud, never silently
+    /// skips — ADR-021 posture).
+    fn drive_solve(&self, fsm: &StageMachine, ctx: crate::bot_core::BlockContext) {
+        if self.reorg_flying_stale(fsm, &ctx) {
+            return;
+        }
+        let delta = self.bot.active_delta();
+        let quiesced = match self.engine.on_streaming_complete(
+            &crate::bot_core::stage_handlers::StreamingComplete {
+                ctx,
+                delta: &delta,
+                backfill: None,
+            },
+        ) {
+            Ok(q) => q,
+            Err(error) => {
+                tracing::error!(%error, "stage StreamingComplete failed — solve skipped");
+                return;
+            }
+        };
+        let paths = match self.engine.on_resolve(&Resolve {
+            ctx,
+            quiesced: &quiesced,
+            delta: &delta,
+        }) {
+            Ok(p) => p,
+            Err(error) => {
+                tracing::error!(%error, "stage Resolve failed — solve skipped");
+                return;
+            }
+        };
+        if let Err(error) = self.engine.on_solve(&Solve { ctx, paths }) {
+            tracing::error!(%error, "stage Solve failed");
+        } else {
+            // LEZJAS: engine owns `last_solved_block` — mark this block
+            // solved so the next finalize guard no-ops.
+            self.engine.set_last_solved_block(ctx.epoch());
+        }
+    }
+
+    /// Drive the Published row: the delivery-to-Python edge for the
+    /// quiesce-gated publish (ADR-008 D2).
+    fn drive_publish(
+        &self,
+        fsm: &StageMachine,
+        ctx: crate::bot_core::BlockContext,
+        gated: &crate::bot_core::GateOutcome,
+    ) {
+        if self.reorg_flying_stale(fsm, &ctx) {
+            return;
+        }
+        if let Err(error) = self.engine.on_publish(&Publish {
+            ctx,
+            gated: gated.clone(),
+        }) {
+            tracing::error!(%error, "stage Publish failed — batch not delivered");
+        }
+    }
+
+    /// Drive the Finalized row: the tombstone boundary catch (VTWCIG
+    /// metadata; terminal publish supersedes the pending quiesce publish).
+    fn drive_finalize(
+        &self,
+        fsm: &StageMachine,
+        ctx: crate::bot_core::BlockContext,
+        published: &crate::bot_core::PublishOutcome,
+    ) {
+        if self.reorg_flying_stale(fsm, &ctx) {
+            return;
+        }
+        if let Err(error) = self.engine.on_finalize(&Finalize {
+            ctx,
+            published: published.clone(),
+        }) {
+            tracing::error!(%error, "stage Finalize failed — boundary not stamped");
+        }
     }
 
     /// Handle a 60s timeout by backfilling any missed blocks (eager variant).
@@ -2005,15 +2123,15 @@ impl BlockPump {
             // the engine-side solved boundary.
             fsm.on_backfill_range_done(latest_block);
             // LEZJAS: engine owns `last_solved_block` now — mark the backfilled
-            // range solved through the sink.
-            self.sink.set_last_solved_block(Epoch::at(latest_block));
+            // range solved through the engine seam.
+            self.engine.set_last_solved_block(Epoch::at(latest_block));
         }
     }
 
     /// Backfill a range of blocks via `eth_getLogs`, applying each backfilled
     /// log through the SAME per-block state machine as a live WS log (ADR-008
-    /// D4, single branch). The provider I/O (`get_logs`) and engine/sink I/O
-    /// (`dispatch_log`, `finalize_block`, `on_drain`) stay here on the driver;
+    /// D4, single branch). The provider I/O (`get_logs`) and engine I/O
+    /// (`dispatch_log`, `drive_finalize`, `drive_solve`) stay here on the driver;
     /// every FSM-state transition is routed through `StageMachine` methods
     /// (`on_log`, `on_log_applied`) — no fields are threaded out of the capsule.
     async fn backfill_range(&self, from_block: u64, to_block: u64, fsm: &mut StageMachine) {
@@ -2059,7 +2177,11 @@ impl BlockPump {
                 match fsm.on_log(block, log.removed) {
                     LogDecision::TombstonePrevious(prev) => {
                         let prev_meta = fsm.block_metadata_for(prev).unwrap_or_default();
-                        self.sink.finalize_block(&fsm.context_for(prev, prev_meta));
+                        self.drive_finalize(
+                            fsm,
+                            fsm.context_for(prev, prev_meta),
+                            &crate::bot_core::PublishOutcome::default(),
+                        );
                         self.bot.dispatch_log(log);
                         fsm.on_log_applied(block);
                     }
@@ -2084,8 +2206,11 @@ impl BlockPump {
                 }
             }
             if !block_logs.is_empty() {
-                self.sink
-                    .on_drain(&fsm.context_for(block, BlockMetadata::default()));
+                // The backfill solve: the Solved cycle at the block's default
+                // metadata — NO Published row (no `on_publish`): the
+                // backfill applies state without dispatching result batches
+                // (the `Backfilled` phase invariant, FD7NFG).
+                self.drive_solve(fsm, fsm.context_for(block, BlockMetadata::default()));
                 any_processed = true;
             }
         }
@@ -2338,7 +2463,7 @@ impl BlockPump {
     #[must_use]
     pub fn for_test(
         bot: Arc<Bot>,
-        sink: Arc<dyn DrainSink>,
+        engine: Arc<dyn StageHandlers>,
         reorg_coordinator: Arc<crate::bot_core::reorg_coordinator::ReorgCoordinator>,
         provider: Arc<AlloyProvider>,
         shutdown: Arc<AtomicBool>,
@@ -2349,7 +2474,7 @@ impl BlockPump {
         bot.dispatcher().set_strict_decode_fault(false);
         Self {
             bot,
-            sink,
+            engine,
             reorg_coordinator,
             provider,
             shutdown,
@@ -2357,6 +2482,7 @@ impl BlockPump {
             log_wait_max_age: Duration::from_secs(LOG_WAIT_MAX_AGE_SECS),
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
+            header_ms: std::sync::atomic::AtomicU64::new(0),
             // Same per-pump opt-out for the WS-delivery completeness cross-check:
             // default-ON in production, deterministically OFF in tests so the
             // synthetic log streams (which use relevant-topic logs as pure block
@@ -2511,13 +2637,14 @@ mod tests {
         assert_eq!(BACKFILL_TIMEOUT_SECS, 60);
     }
 
-    /// A `DrainSink` test double (AGENTS.md: `Fake` prefix, no mocking).
+    /// A `StageHandlers` test double (AGENTS.md: `Fake` prefix, no mocking).
     ///
-    /// Records every `finalize_block` / `on_send` / `on_drain` invocation with
-    /// the `(block, metadata)` pair the pump passed, so tests can assert the
+    /// Records every `on_finalize` / `on_publish` (the retired `on_send` —
+    /// the Published-row delivery flush) / `on_solve` invocation with the
+    /// `(block, metadata)` pair the pump passed, so tests can assert the
     /// *block N's* result batch carries *block N's* metadata — the VTWCIG
-    /// contract. Behaves as an empty sink (no dirty paths, no state).
-    struct FakeDrainSink {
+    /// contract. Behaves as an empty engine (no dirty paths, no state).
+    struct FakeStageEngine {
         finalized: Mutex<Vec<(u64, BlockMetadata)>>,
         sent: Mutex<Vec<BlockMetadata>>,
         drained: Mutex<Vec<(u64, BlockMetadata)>>,
@@ -2544,7 +2671,7 @@ mod tests {
         drained_at: Mutex<Vec<tokio::time::Instant>>,
     }
 
-    impl FakeDrainSink {
+    impl FakeStageEngine {
         fn new(last_processed: Option<u64>) -> Self {
             Self {
                 finalized: Mutex::new(Vec::new()),
@@ -2597,17 +2724,39 @@ mod tests {
         }
     }
 
-    impl DrainSink for FakeDrainSink {
+    impl StageHandlers for FakeStageEngine {
+        fn on_streaming_complete(
+            &self,
+            _work: &crate::bot_core::stage_handlers::StreamingComplete<'_>,
+        ) -> Result<crate::bot_core::stage_handlers::QuiesceOutcome, crate::bot_core::StageError>
+        {
+            Ok(crate::bot_core::stage_handlers::QuiesceOutcome {
+                verdict: crate::bot_core::stage_handlers::QuiesceVerdict::Settled,
+            })
+        }
         fn has_dirty_paths(&self) -> bool {
             self.dirty.load(Ordering::Relaxed)
         }
-        fn on_drain(&self, ctx: &BlockContext) {
-            // Faithful to `SolveCoordinator::on_drain`: record + advance the
-            // drain cursor so `last_processed_block()` reflects the drained
-            // block (the anchoring `resume` relies on — see
+        fn on_resolve(
+            &self,
+            _work: &Resolve<'_>,
+        ) -> Result<crate::bot_core::AffectedPaths, crate::bot_core::StageError> {
+            Ok(crate::bot_core::AffectedPaths::default())
+        }
+        fn on_solve(
+            &self,
+            work: &Solve,
+        ) -> Result<crate::bot_core::SolveOutcome, crate::bot_core::StageError> {
+            // Faithful to the old `SolveCoordinator::on_drain` recording
+            // behavior: record + advance the drained cursor so
+            // `last_processed_block()` reflects the drained block (the
+            // anchoring `resume` relies on — see
             // `resume_anchors_to_subscribe_block`).
-            let block = ctx.block();
-            self.drained.lock().unwrap().push((block, *ctx.metadata()));
+            let block = work.ctx.block();
+            self.drained
+                .lock()
+                .unwrap()
+                .push((block, *work.ctx.metadata()));
             // PWPPAZ T2: virtual-time dispatch stamp (start_paused tests
             // assert the slice fired at its deadline, not at burst end).
             self.drained_at
@@ -2615,15 +2764,46 @@ mod tests {
                 .unwrap()
                 .push(tokio::time::Instant::now());
             self.last_processed.store(block, Ordering::Relaxed);
+            Ok(crate::bot_core::SolveOutcome::default())
         }
-        fn on_send(&self, ctx: &BlockContext) {
-            self.sent.lock().unwrap().push(*ctx.metadata());
+        fn on_simulate(
+            &self,
+            _work: &crate::bot_core::Simulate,
+        ) -> Result<crate::bot_core::SimulateOutcome, crate::bot_core::StageError> {
+            Ok(crate::bot_core::SimulateOutcome::default())
         }
-        fn finalize_block(&self, ctx: &BlockContext) {
+        fn on_gate(
+            &self,
+            _work: &crate::bot_core::Gate,
+        ) -> Result<crate::bot_core::GateOutcome, crate::bot_core::StageError> {
+            Ok(crate::bot_core::GateOutcome::default())
+        }
+        fn on_publish(
+            &self,
+            work: &Publish,
+        ) -> Result<crate::bot_core::PublishOutcome, crate::bot_core::StageError> {
+            self.sent.lock().unwrap().push(*work.ctx.metadata());
+            Ok(crate::bot_core::PublishOutcome::default())
+        }
+        fn on_finalize(
+            &self,
+            work: &Finalize,
+        ) -> Result<crate::bot_core::FinalizeOutcome, crate::bot_core::StageError> {
             self.finalized
                 .lock()
                 .unwrap()
-                .push((ctx.block(), *ctx.metadata()));
+                .push((work.ctx.block(), *work.ctx.metadata()));
+            Ok(crate::bot_core::FinalizeOutcome {
+                cutoff: work.ctx.epoch(),
+            })
+        }
+        fn on_rewind(
+            &self,
+            _work: &crate::bot_core::Rewind,
+        ) -> Result<crate::bot_core::RewindOutcome, crate::bot_core::StageError> {
+            Ok(crate::bot_core::RewindOutcome {
+                restored_to: crate::bot_core::Epoch::at(0),
+            })
         }
         fn set_last_solved_block(&self, solved: Epoch) {
             self.solved.lock().unwrap().push(solved.block());
@@ -2650,9 +2830,9 @@ mod tests {
 
     /// Build a `BlockPump` whose provider is an `alloy` mock transport (never
     /// hit on the no-timeout / no-gap test paths) and whose sink is a
-    /// `FakeDrainSink` that records metadata calls. Returns the pump + the
+    /// `FakeStageEngine` that records metadata calls. Returns the pump + the
     /// sink handle (for inspection). Offline + deterministic.
-    fn pump_for_test(last_processed: Option<u64>) -> (BlockPump, Arc<FakeDrainSink>) {
+    fn pump_for_test(last_processed: Option<u64>) -> (BlockPump, Arc<FakeStageEngine>) {
         use alloy::network::Ethereum as NetEth;
         use alloy::providers::{Provider, ProviderBuilder};
         // `alloy_transport::mock::{Asserter, MockTransport}` — unfeatured (no
@@ -2678,7 +2858,7 @@ mod tests {
             Arc::clone(&bot),
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let sink = Arc::new(FakeDrainSink::new(last_processed));
+        let sink = Arc::new(FakeStageEngine::new(last_processed));
         let pump = BlockPump::for_test(bot, sink.clone(), reorg, provider, shutdown);
         (pump, sink)
     }
@@ -2810,7 +2990,7 @@ mod tests {
         last_processed: Option<u64>,
     ) -> (
         BlockPump,
-        Arc<FakeDrainSink>,
+        Arc<FakeStageEngine>,
         alloy::transports::mock::Asserter,
         Arc<AtomicBool>,
     ) {
@@ -2830,7 +3010,7 @@ mod tests {
             Arc::clone(&bot),
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let sink = Arc::new(FakeDrainSink::new(last_processed));
+        let sink = Arc::new(FakeStageEngine::new(last_processed));
         let pump = BlockPump::for_test(bot, sink.clone(), reorg, provider, Arc::clone(&shutdown));
         (pump, sink, asserter, shutdown)
     }
@@ -3768,7 +3948,7 @@ mod tests {
     /// RED→GREEN tracer (epic 6W35AI, 22Y7AB): the pump forwards a
     /// `BlockNotification` for every `newHeads` header it accepts (one per
     /// header, carrying the header's number + metadata), via
-    /// `DrainSink::notify_block` — independent of solve/debounce state. This
+    /// `StageHandlers::notify_block` — independent of solve/debounce state. This
     /// is the seam that lets Python derive its block clock from `newHeads`
     /// instead of the stale `ResultBatch::solve_block`.
     #[tokio::test]
@@ -4371,12 +4551,17 @@ mod tests {
             gas_used: 14,
             gas_limit: 15,
         };
-        // The drain issued before resume anchors the cursor to W:
-        pump.sink.on_drain(&BlockContext::new(w, meta_w));
+        // The solve issued before resume anchors the cursor to W (SZJUKL:
+        // the engine's own cursor; the dissolved coordinator cursor is gone).
+        use crate::bot_core::Solve as TestSolve;
+        let _ = sink.on_solve(&TestSolve {
+            ctx: BlockContext::new(w, meta_w),
+            paths: crate::bot_core::AffectedPaths::default(),
+        });
         assert_eq!(
-            pump.sink.last_processed_block(),
+            sink.last_processed_block(),
             Some(w),
-            "on_drain(W) must anchor the cursor (mirrors SolveCoordinator)"
+            "solve(W) must anchor the cursor (mirrors the old SolveCoordinator drain)"
         );
 
         // Resume stream (post-fix: first_observed = W, not 0). header(W+1)
@@ -4423,6 +4608,64 @@ mod tests {
             finalized[0].1, meta_w1,
             "block w+1's batch carries w+1's metadata (in-order)"
         );
+    }
+
+    /// SZJUKL port of the dissolved `event_dispatch` test
+    /// `drainer_warns_and_drops_reorg_flying_stale_epoch_work`: the stale-epoch
+    /// drop is now the DRIVER-side `reorg_flying_stale` check at each work
+    /// site — the DispatchOwner FIFO is gone. A work item minted in the
+    /// pre-rewind generation is dropped LOUDLY (WARN + metric) instead of
+    /// silently consuming `epoch.block()` into solve/finalize bookkeeping;
+    /// the post-rewind item minted in the bumped generation is applied.
+    #[test]
+    fn driver_drops_reorg_flying_stale_epoch_work() {
+        let (pump, sink) = pump_for_test(None);
+        let mut fsm = StageMachine::new(100, 0);
+
+        // The stage machine rewinds: the generation bumps to 1 (I2) — a
+        // removed log opens the window, a forward closes it.
+        assert!(matches!(fsm.on_log(90, true), LogDecision::EnterReorg(_)));
+        assert!(matches!(
+            fsm.on_log(91, false),
+            LogDecision::CloseReorg { .. }
+        ));
+        assert_eq!(fsm.rewind_seq(), 1);
+
+        // Pre-rewind (reorg-flying) work: an item minted BEFORE the bump in
+        // generation 0 — dropped, never applied to the engine.
+        let stale_ctx = BlockContext::new(
+            crate::bot_core::Epoch::with_generation(100, 0),
+            BlockMetadata::default(),
+        );
+        assert!(pump.reorg_flying_stale(&fsm, &stale_ctx));
+        pump.drive_finalize(
+            &fsm,
+            BlockContext::new(
+                crate::bot_core::Epoch::with_generation(100, 0),
+                BlockMetadata::default(),
+            ),
+            &crate::bot_core::PublishOutcome::default(),
+        );
+        assert!(
+            sink.finalized.lock().unwrap().is_empty(),
+            "the reorg-flying finalize must be dropped, never applied"
+        );
+
+        // Fresh (post-rewind) work at the bumped generation: applied normally.
+        assert!(
+            !pump.reorg_flying_stale(&fsm, &fsm.context_for(100, BlockMetadata::default())),
+            "context_for mints at the CURRENT generation"
+        );
+        pump.drive_finalize(
+            &fsm,
+            crate::bot_core::BlockContext::new(
+                crate::bot_core::Epoch::with_generation(100, 1),
+                BlockMetadata::default(),
+            ),
+            &crate::bot_core::PublishOutcome::default(),
+        );
+        assert_eq!(sink.finalized.lock().unwrap().len(), 1);
+        assert_eq!(sink.finalized.lock().unwrap().first().unwrap().0, 100);
     }
 
     // -----------------------------------------------------------------
@@ -4631,7 +4874,7 @@ mod tests {
     fn pump_for_test_with_bot(
         bot: Arc<Bot>,
         last_processed: Option<u64>,
-    ) -> (BlockPump, Arc<FakeDrainSink>, Arc<AtomicBool>) {
+    ) -> (BlockPump, Arc<FakeStageEngine>, Arc<AtomicBool>) {
         use alloy::network::Ethereum as NetEth;
         use alloy::providers::{Provider, ProviderBuilder};
         use alloy::rpc::client::ClientBuilder;
@@ -4647,7 +4890,7 @@ mod tests {
             Arc::clone(&bot),
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let sink = Arc::new(FakeDrainSink::new(last_processed));
+        let sink = Arc::new(FakeStageEngine::new(last_processed));
         let pump = BlockPump::for_test(bot, sink.clone(), reorg, provider, Arc::clone(&shutdown));
         (pump, sink, shutdown)
     }
@@ -5944,7 +6187,7 @@ mod tests {
         last_processed: Option<u64>,
     ) -> (
         BlockPump,
-        Arc<FakeDrainSink>,
+        Arc<FakeStageEngine>,
         Arc<AtomicBool>,
         alloy::transports::mock::Asserter,
     ) {
@@ -5963,7 +6206,7 @@ mod tests {
             Arc::clone(&bot),
         ));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let sink = Arc::new(FakeDrainSink::new(last_processed));
+        let sink = Arc::new(FakeStageEngine::new(last_processed));
         let pump = BlockPump::for_test(bot, sink.clone(), reorg, provider, Arc::clone(&shutdown));
         (pump, sink, shutdown, asserter)
     }

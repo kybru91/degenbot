@@ -3,8 +3,9 @@
 //! batched, GIL-free channel.
 //!
 //! The Rust pub/sub mechanism (`degenbot_bot::bot_core::log_dispatcher` — the
-//! `PoolStateSubscriber` trait + `LogDispatcher` `Weak`-fan-out +
-//! `EngineSubscriber`) is the single notification path for ALL Rust-owned state
+//! `PoolStateSubscriber` trait + `LogDispatcher` `Weak`-fan-out, with the
+//! retired engine liveness adapter now deleted) is the single notification
+//! path for ALL Python-owned subscriber state
 //! changes once a pool's state is Rust-owned. This adapter is the seam that
 //! lets a `#[pyclass]` / plain-Python subscriber register against that SAME
 //! `LogDispatcher` path the engine uses — so Rust-owned mutation notifies Rust
@@ -301,7 +302,7 @@ impl PoolStateSubscriber for PySubscriberAdapter {
 /// Returned by [`register_subscriber`]; Python owns the lifetime. Drop the
 /// handle (or call [`unsubscribe`](Self::unsubscribe)) → the strong `Arc` drops
 /// → `LogDispatcher`'s `Weak` goes dead → `notify` silently skips the adapter.
-/// This mirrors `PublisherMixin.unsubscribe` + `EngineSubscriber`'s
+/// This mirrors `PublisherMixin.unsubscribe` + the retired engine liveness adapter's
 /// engine-lifetime-anchored `Arc`.
 ///
 /// Not inherently tied to one `pool_id` (a future `subscribe_all` form could

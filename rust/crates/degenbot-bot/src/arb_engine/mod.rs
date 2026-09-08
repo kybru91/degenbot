@@ -57,10 +57,13 @@ use crate::bot_core::BotState;
 mod delivery_lifecycle;
 mod delivery_policy;
 mod diagnostic;
-pub mod engine_handle;
-pub mod engine_subscriber;
-#[cfg(test)]
-mod epoch_delta_parity; // the LXDY4C capture-replay parity gate (primary validation gate)
+// SZJUKL seam retirement: the arb engine's StageHandlers implementation —
+// the ONE surface left between the machine driver and the engine. The
+// dissolved `engine_handle` (wrapper Mutex), `engine_subscriber` (liveness
+// adapter), and `epoch_delta_parity`/`test_oracle` (the LXDY4C parity
+// oracle, GONE now that `EpochDelta` is sole authority) are deleted —
+// hard cutover, Q6.
+pub mod engine_stages;
 mod event_routing;
 pub mod inline_sim;
 mod lifecycle;
@@ -71,9 +74,9 @@ mod snapshot_verify;
 mod solve_executor;
 mod solver_dispatch;
 #[cfg(test)]
-mod test_oracle;
-#[cfg(test)]
 mod tests;
+
+pub use engine_stages::EngineStages;
 
 pub use diagnostic::{
     compute_field_diffs, DiagnosticHop, DiagnosticPathState, DiagnosticPoolState, FieldDiff,
@@ -391,7 +394,7 @@ pub struct ArbitrageEngine {
     /// cleared by `finalize_block`. Owned by the engine since LEZJAS.
     has_logs_this_block: bool,
     /// REMED1 T2: which entry drove the CURRENT solve cycle - `drain`
-    /// (`EngineHandle::solve_dirty`, per-log streaming) vs `finalize` (the
+    /// (`EngineStages::solve_dirty`, per-log streaming) vs `finalize` (the
     /// boundary catch in `finalize_block`). Emitted on the cycle-complete
     /// line so a block's two real cycles (65/1853 overnight) are attributable
     /// instead of looking like duplicate logging.
@@ -491,7 +494,7 @@ pub struct ArbitrageEngine {
     /// detached enqueue until teardown. Each enqueue clones it into the
     /// per-bin `std::thread`s.
     detached_merge_tx: Option<std::sync::mpsc::Sender<solver_dispatch::DetachedMergeItem>>,
-    /// Receiver parked until `EngineHandle::solve_dirty` spawns the merge
+    /// Receiver parked until `EngineStages::solve_dirty` spawns the merge
     /// sidecar (taken once via `take_detached_merge_rx`). `Mutex`-wrapped so
     /// the engine stays `Sync` (the parked Receiver behind the worker-only
     /// guard is touched exactly once, by the spawner thread).
@@ -647,7 +650,7 @@ impl ArbitrageEngine {
     ///
     /// The shared `Arc<RwLock<BotState>>` cannot be reassigned through this
     /// accessor: callers may `read()`/`write()` *through* it, but its identity
-    /// stays pinned to the same `Arc` the `EngineHandle`/`EngineSubscriber`/pump
+    /// stays pinned to the same `Arc` the `EngineStages` stage surface/pump
     /// reference (an invariant no downstream crate can break by swapping the
     /// field).
     #[must_use]

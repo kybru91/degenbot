@@ -25,11 +25,8 @@ pub mod cpu_budget;
 pub mod curve_data_provider_impl;
 pub mod curve_state;
 pub mod divergence_probe;
-pub mod drain_sink;
-pub mod engine;
 pub mod epoch;
 pub mod epoch_delta;
-pub mod event_dispatch;
 pub mod liquidity_verifier;
 pub mod log_dispatcher;
 pub mod pool_builder;
@@ -41,7 +38,6 @@ pub(crate) mod resolve;
 pub mod sim_anchor;
 pub mod snapshot_verify;
 pub(crate) mod solve_anchor;
-pub mod solve_coordinator;
 pub mod stage_handlers;
 pub mod stage_machine;
 /// KAHU5W: the process-wide typed BotConfig holder. The degenbot-config
@@ -89,7 +85,11 @@ pub use registration_lifecycle::{
     run_v4_registration_lifecycle, RegistrationLifecycleError,
 };
 pub use sim_anchor::SimAnchorState;
-pub use stage_handlers::{Stage, StageError, StageHandlers};
+pub use stage_handlers::{
+    AffectedPaths, CandidateId, Finalize, FinalizeOutcome, Gate, GateOutcome, Publish,
+    PublishOutcome, QuiesceOutcome, QuiesceVerdict, Resolve, Rewind, RewindOutcome, Simulate,
+    SimulateOutcome, Solve, SolveOutcome, Stage, StageError, StageHandlers,
+};
 
 pub use ::degenbot_pools::v4_state::{
     v4_simulate_swap, BufferedV4LiquidityUpdate, BufferedV4PoolEvent, BufferedV4SwapEvent,
@@ -1425,7 +1425,7 @@ pub use bot::Bot;
 ///
 /// Passed from the pump's WS block header into the drain tick, then forwarded
 /// to Python via the result batch channel. Lives in `bot_core` (general block
-/// data) so the `BlockPump` + `DrainSink` seams stay in `bot_core` without a
+/// data) so the `BlockPump` + `StageHandlers` seams stay in `bot_core` without a
 /// reverse dependency on `solvers` (ADR-006 D4).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlockMetadata {

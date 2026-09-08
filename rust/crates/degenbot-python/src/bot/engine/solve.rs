@@ -6,8 +6,7 @@
 //! blocks per type, so each concern file contributes one slice.
 
 use super::{
-    hex_string_to_pool_id, make_tick_info, Address, DrainSink, HashMap, PyArbitrageEngine, PyList,
-    V4StateSync,
+    hex_string_to_pool_id, make_tick_info, Address, HashMap, PyArbitrageEngine, PyList, V4StateSync,
 };
 use crate::prelude::*;
 use std::sync::Arc;
@@ -15,16 +14,16 @@ use std::sync::Arc;
 #[pymethods]
 impl PyArbitrageEngine {
     /// Last block number processed by the pump's drain phase. Routes through
-    /// the `SolveCoordinator` (ADR-006 slice 6), not the raw engine: the
-    /// coordinator takes its `drain_lock` and returns a drain-consistent
-    /// "good" block the whole system has fully drained to — **blocking** any
-    /// Python poll until an in-flight drain completes (no Rust/Python race over
-    /// a mid-drain cursor read).
+    /// the engine's stage surface (`EngineStages`, SZJUKL): the engine's own
+    /// cursor. The dissolved coordinator cursor (`last_drained_block` under
+    /// `drain_lock`) is gone — solve/finalize/publish work runs INLINE in the
+    /// single-writer pump driver, so the engine cursor IS the drained cursor
+    /// by construction (no Rust/Python race over a mid-drain read).
     ///
     /// Returns `None` if no block has been processed yet (before the first
-    /// `on_drain` / before `start`).
+    /// solve / before resume).
     fn last_processed_block(&self) -> Option<u64> {
-        self.pump.coordinator.last_processed_block()
+        self.pump.stages.last_processed_block()
     }
 
     /// Set the last processed block manually after Python backfill.

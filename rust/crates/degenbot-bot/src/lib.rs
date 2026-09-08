@@ -65,7 +65,7 @@ pub mod instruments {
         /// no-op
         pub fn observe_settle_wait(&self, _secs: f64) {}
         /// no-op
-        pub fn observe_drain_queue_wait(&self, _secs: f64) {}
+
         /// no-op
         pub fn observe_log_decode(&self, _secs: f64) {}
         /// no-op
@@ -109,7 +109,7 @@ pub mod instruments {
         /// no-op (FRKBGP)
         pub fn set_process_rss_bytes(&self, _bytes: u64) {}
         /// no-op
-        pub fn set_drain_queue_depth(&self, _depth: u64) {}
+
         /// no-op
         pub fn set_state_head_lag(&self, _head_minus_clock: i64) {}
         /// no-op

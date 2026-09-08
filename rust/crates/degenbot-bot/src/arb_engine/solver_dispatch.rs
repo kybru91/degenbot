@@ -199,7 +199,7 @@ pub(crate) static SOLVE_EXECUTOR_TOKIO: std::sync::atomic::AtomicBool =
 /// `DEGENBOT_DETACHED_SOLVES` — the detached solve cycle (enqueue-and-return
 /// with sidecar merge). Default ON since task 2UVG3E (epic MROOY7, stage-table
 /// seam #4): the DRIVEN solve path takes NO engine-level Mutex — the
-/// `EngineHandle` hold collapses to enqueue end (µs) and each result merges on
+/// stage-surface (`EngineStages`) solve hold collapses to enqueue end (µs) and each result merges on
 /// the sidecar under its own short per-item acquisition (the Q1a stale
 /// policy makes that safe). Opt OUT with `DEGENBOT_DETACHED_SOLVES=0` (the
 /// in-cycle arm reappears, engine Mutex held through the fan-out). The
@@ -966,7 +966,7 @@ pub(crate) enum DetachedMergeItem {
 /// unbounded mpsc `Receiver` of the merge pipe and applies each item under
 /// the engine Mutex — Q1a stale gate + the SAME merge/emit path as the
 /// in-cycle drain (`merge_one_result`, which carries the streaming
-/// delivery emission). Spawned by `EngineHandle::solve_dirty` at the FIRST
+/// delivery emission). Spawned by `EngineStages::solve_dirty` at the FIRST
 /// detached enqueue; runs until every `Sender` drops (engine teardown),
 /// so the pipe never strands items across the engine's lifetime.
 pub(crate) fn detached_merge_sidecar(
@@ -1212,9 +1212,9 @@ impl ArbitrageEngine {
     }
 
     /// Hand the parked merge-pipe Receiver to the spawner (epic SRQEK5
-    /// WV62TX): `EngineHandle::solve_dirty` takes it ONCE, at the FIRST
+    /// WV62TX): `EngineStages::solve_dirty` takes it ONCE, at the FIRST
     /// Hand the parked merge-pipe Receiver to the spawner (epic SRQEK5
-    /// WV62TX): `EngineHandle::solve_dirty` takes it ONCE, at the FIRST
+    /// WV62TX): `EngineStages::solve_dirty` takes it ONCE, at the FIRST
     /// detached enqueue, and owns it inside the sidecar thread. `None` = the
     /// sidecar is already running (or no detached cycle ever enqueued).
     pub(crate) fn take_detached_merge_rx(
@@ -2060,7 +2060,7 @@ impl ArbitrageEngine {
                 self.detached_issued_seq = cycle_seq;
                 if self.detached_merge_tx.is_none() {
                     // First detached cycle: open the merge pipe. The sidecar
-                    // thread is spawned by EngineHandle::solve_dirty right
+                    // thread is spawned by EngineStages::solve_dirty right
                     // after this enqueue half returns; the Receiver parks in
                     // the engine until then.
                     let (merge_tx, merge_rx) = std::sync::mpsc::channel();

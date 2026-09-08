@@ -3,7 +3,7 @@
 //! Before this module, "what block is this work about" had several answers
 //! living in parallel field soups: the solve anchor ([`super::solve_anchor`]),
 //! the cold-start `results_block` seed, the ADR-021 verifier anchor carried in
-//! `DrainWork::Publish`, the pump FSM's recovery anchor (`record_backfill`),
+//! the Published-edge verifier anchor, the pump FSM's recovery anchor (`record_backfill`),
 //! the engine's `last_solved_block`, the coordinator's `last_drained_block`,
 //! and the bare `(block, BlockMetadata)` parameter pairs threaded through the
 //! drain seam. Each answer was locally correct; none shared a coordinate
@@ -180,7 +180,7 @@ impl PartialEq<u64> for Epoch {
 ///
 /// Carries the coordinate ONLY — no `BotState` representation is baked in
 /// (the `StateView` decision attaches later, in the data-plane task). Every
-/// anchor that used to travel as a loose field (the `DrainWork::Publish`
+/// anchor that used to travel as a loose field (the Published-edge anchor
 /// verifier anchor, the `(block, metadata)` drain/finalize/solve pairs)
 /// travels as ONE context now: "what block is this work about" has exactly
 /// one answer.

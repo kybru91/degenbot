@@ -303,7 +303,7 @@ impl PyArbitrageEngine {
 
     // block_stream() lived here while the block-clock pipe was engine-side; it
     // moved to PyBot with the pipe itself (ADR-027 completion, ergo 6VGMLY) —
-    // a header tick is coordinator business, not engine business.
+    // a header tick is solve-state business, never queued behind solver work.
 
     /// Await the next result batch from the engine.
     ///
@@ -542,7 +542,7 @@ fn hop_info_to_pydict<'py>(py: Python<'py>, hop: &HopInfo) -> PyResult<Bound<'py
 //
 // The authoritative `newHeads`-derived block clock for Python. The pump
 // forwards one `BlockNotification` per accepted header via
-// `DrainSink::notify_block`; this class is the async iterator Python consumes
+// `StageHandlers::notify_block`; this class is the async iterator Python consumes
 // (`async for block in engine.block_stream(): …`). Mirrors the result-channel
 // `__anext__` shape (take the receiver, await + send, put it back) so a single
 // shared receiver survives across awaits.

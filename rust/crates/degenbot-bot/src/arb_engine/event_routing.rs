@@ -7,9 +7,9 @@ use alloy::primitives::{aliases::U112, Address};
 use crate::bot_core::{V3SwapUpdate, V4SwapUpdate};
 
 #[cfg(test)]
-use super::test_oracle::affected_keys;
-#[cfg(test)]
 use super::HashSet;
+#[cfg(test)]
+use crate::arb_engine::tests::test_keys::affected_keys;
 
 use super::{ArbitrageEngine, BlockMetadata};
 
@@ -88,7 +88,7 @@ impl ArbitrageEngine {
         }
 
         // LXDY4C: the affected keys arrive from the block's EpochDelta
-        // (consumed by the SolveCoordinator fan-out); no engine-local
+        // (consumed by the stage surface's on_resolve hook); no engine-local
         // dirty-set intake remains.
         // Re-solve only paths containing updated pools (no batch send)
         self.rebuild_and_solve_affected(affected, block_number, metadata);

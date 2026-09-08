@@ -15,8 +15,8 @@
 //!   logs-silence watchdogs, the backfill trigger, the tombstone /
 //!   WS-completeness verify, and the `Rewind` handling (epoch `seq` bump +
 //!   staleness of pre-rewind contexts) are all machine decisions below.
-//! - `DrainerHealth`'s no-progress obligation (retire is the NEXT task,
-//!   `SZJUKL`) must remain representable here: the machine exposes
+//! - `DrainerHealth`'s no-progress obligation (retired by SZJUKL) is
+//!   represented here: the machine exposes
 //!   [`watchdog_phase`](Self::watchdog_phase) — `Healthy` / `HeaderStale` /
 //!   `LogsSilent` — the phase space the dissolved accounting's watchdogs
 //!   map onto, and every stage row stays reachable via the stage cycle
@@ -122,16 +122,16 @@ use super::stage_handlers::Stage;
 #[derive(Debug)]
 pub enum StageDecision {
     /// Eager solve of every dirty path (top-of-loop). The driver runs
-    /// `dispatch.dispatch(DrainWork::Drain{..})` and `sink.set_last_solved_block`.
+    /// the engine's Resolved→Solved hooks and the `set_last_solved_block` bookkeeping.
     Drain { block: u64, metadata: BlockMetadata },
     /// Quiesce-gated publish (ADR-008 D2) at a settle point. The driver
-    /// fetches the change-set and runs `dispatch.dispatch(DrainWork::Publish)`.
+    /// fetches the change-set and drives the engine's Published-edge `on_publish`.
     Publish { open: u64, metadata: BlockMetadata },
     /// Tombstone finalize of a fully-delivered block (VTWCIG metadata). The
-    /// driver runs `dispatch.dispatch(DrainWork::Finalize{..})`.
+    /// driver drives the engine's `on_finalize` stage hook.
     Finalize { block: u64, metadata: BlockMetadata },
     /// Block-clock notification for Python's head tracker (B2). The driver
-    /// runs `dispatch.notify_block(block, metadata)`.
+    /// feeds the engine's block-clock pipe (`notify_block`).
     Notify { block: u64, metadata: BlockMetadata },
     /// Mark a block solved on the engine (LEZJAS). The driver runs
     /// `sink.set_last_solved_block(block)`.
@@ -294,7 +294,7 @@ impl StageMachine {
     /// Mint a `BlockContext` for work about `block` carrying `metadata`:
     /// THE single-answer coordinate (the FSM's rewind generation stamped
     /// onto the work's block). The driver calls this at every decision
-    /// point that hands work downstream, so every `DrainWork` item and
+    /// point that hands work downstream, so every stage work item and
     /// every verifier anchor carries the same epoch type.
     #[must_use]
     pub fn context_for(&self, block: u64, metadata: BlockMetadata) -> BlockContext {
@@ -1587,7 +1587,7 @@ impl StageMachine {
 
     /// The current rewind generation (the `Epoch.seq` of everything the
     /// machine mints; I2: bumps exactly once per `Rewind`). Drain-side
-    /// consumers (the `event_dispatch` drainer) mirror this to WARN on
+    /// consumers (the machine driver, at each inline work site) mirror this to WARN on
     /// reorg-flying stale work instead of silently consuming its epoch (I3).
     #[must_use]
     pub fn rewind_seq(&self) -> u64 {
@@ -1595,7 +1595,7 @@ impl StageMachine {
     }
 
     /// The watchdog phase (see [`WatchdogPhase`]): the no-progress phase
-    /// space the `DrainerHealth` dissolve (task `SZJUKL`, NEXT) maps its
+    /// space the dissolved `DrainerHealth` (SZJUKL) maps its
     /// strike detector onto. Pure: same inputs as [`on_tick`](Self::on_tick);
     /// advances no state.
     #[must_use]
