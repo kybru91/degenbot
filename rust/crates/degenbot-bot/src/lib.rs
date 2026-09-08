@@ -111,7 +111,14 @@ pub mod instruments {
         /// no-op (FRKBGP)
         pub fn set_process_rss_bytes(&self, _bytes: u64) {}
         /// no-op (NO4DIW per-block log funnel)
-        pub fn observe_epoch_logs(&self, _seen: u64, _received: u64, _applied: u64, _ignored: u64) {
+        pub fn observe_epoch_logs(
+            &self,
+            _seen: u64,
+            _received: u64,
+            _applied: u64,
+            _ignored: u64,
+            _closing_block: u64,
+        ) {
         }
         /// no-op (MROOY7 BF43PM)
         pub fn observe_publish_cycle(&self, _secs: f64) {}

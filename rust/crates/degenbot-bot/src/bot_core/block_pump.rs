@@ -1010,6 +1010,7 @@ impl BlockPump {
                             ledger.received,
                             ledger.applied,
                             ledger.undecoded + ledger.apply_missed,
+                            number,
                         );
                     }
                     // Sync-only header-processing scope (TQ7PD6): this enter
