@@ -44,8 +44,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 
 | Env var | TOML key | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `DEGENBOT_DELIVERY_LAG_TRIP_BLOCKS` | `pump.delivery_lag_trip_blocks` | `Option<u64>` | `(unset)` | Delivery-lag trip threshold in blocks (`> 0`; unset = report-only, no abort trip). |
-| `DEGENBOT_DESYNC_DUMP_DIR` | `pump.desync_dump_dir` | `path` | `logs/desync` | Root directory for desync repro dumps (overridden for test isolation). |
 | `DEGENBOT_PUMP_DEBOUNCE_MS` | `pump.pump_debounce_ms` | `duration-ms (u64)` | `50` | Publish-debounce settle window in ms (`> 0`; bad values historically fall back to 50 at the site). |
 | `DEGENBOT_EARLY_SLICE_MS` | `pump.early_slice_ms` | `duration-ms (u64)` | `25` | Early-slice window in ms; `0` valid and disables the slice (settle-only parity). |
 | `DEGENBOT_STREAMING_DELIVERY` | `pump.streaming_delivery` | `bool` | `true` | Stream solved arms immediately (T3 default); `0` opts out to the debounce sweep. |
@@ -60,8 +58,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `DEGENBOT_DUMP_TICK_MAPS` | `trace.dump_tick_maps` | `bool` | `false` | Dump assembled tick maps for offline comparison (UO3JM4 re-assembly aid). |
 | `DEGENBOT_TRACE_LIQUIDITY` | `trace.trace_liquidity` | `bool` | `false` | Global liquidity-events trace for EVERY V3/V4 liquidity mutation across all pools. |
 | `DEGENBOT_TRACE_REGISTER_SEED` | `trace.trace_register_seed` | `bool` | `false` | Trace pool registration seeding progress. |
-| `DEGENBOT_TRACE_SOLVE_ANCHOR` | `trace.trace_solve_anchor` | `bool` | `false` | Strict per-hop solve-anchor probe (operator opt-in). |
-| `DEGENBOT_TRACE_STAGED_CLOCK` | `trace.trace_staged_clock` | `bool` | `false` | Staged-clock probe in the strict verifier (operator opt-in). |
 | `DEGENBOT_TRACE_TICK` | `trace.trace_tick` | `Option<i32>` | `(unset)` | Watch one known-divergent tick (signed decimal) across mutations in the pin/drain probes. |
 | `DEGENBOT_WS_TRACE` | `trace.ws_trace` | `bool` | `false` | Catch-all WS-log trace (one line per relevant log; high volume by design). |
 | `DEGENBOT_GATE_TRACE` | `trace.gate_trace` | `bool` | `false` | T5 profit-envelope compose tracing gate (profit_envelope TRACE). |
@@ -78,7 +74,7 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `DEGENBOT_SOLVE_RESOLVE_PAR` | `solve.solve_resolve_par` | `bool` | `true` | Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables. |
 | `DEGENBOT_SOLVE_SIM_INFLIGHT` | `solve.solve_sim_inflight` | `Option<usize>` | `(unset; derived from CPU budget)` | Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation. |
 | `DEGENBOT_INLINE_SIM_WORKERS` | `solve.inline_sim_workers` | `Option<usize>` | `(unset; derived from CPU budget)` | Inline-sim worker count (clamped 1..=32; unparsable falls back to derived default at the site). |
-| `DEGENBOT_DETACHED_SOLVES` | `solve.detached_solves` | `bool` | `false` | Route solve arms through detached (out-of-cycle) workers (`1` enables). |
+| `DEGENBOT_DETACHED_SOLVES` | `solve.detached_solves` | `bool` | `true` | Route solve arms through detached (out-of-cycle) workers; `0`/`false` opts back into the in-cycle engine-Mutex hold. Default ON: the solve path takes no engine-level Mutex (epic MROOY7 task 2UVG3E, seam #4). |
 | `DEGENBOT_MIN_PROFIT_WEI` | `solve.min_profit_wei` | `u128 (decimal text)` | `0` | Minimum path profit floor in wei (decimal text; TOML: quoted string). |
 | `DEGENBOT_WALK_EVENT_SOLVER` | `solve.walk_event_solver_legacy` | `bool (inverted: `0` enables)` | `false` | Legacy event-solver path is enabled by `DEGENBOT_WALK_EVENT_SOLVER=0` (inverted flag). |
 | `DEGENBOT_WALK_EVENT_CENSUS` | `solve.walk_event_census` | `bool` | `false` | Loop-15 nested event census counters in the CL walker (`1` enables). |
@@ -108,9 +104,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | --- | --- | --- | --- | --- |
 | `DEGENBOT_VERIFY_DBG` | `verify.verify_dbg` | `bool` | `true` | Structural visibility probes diagnosing liquidity-map verification misses (default ON; `0` disables). |
 | `DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD` | `verify.verify_spotcheck_permyriad` | `u64` | `0` | Per-myriad (1/10_000) sampling rate for verify spot-checks (0 = off). |
-| `DEGENBOT_ASSERT_SOLVER_STATE` | `verify.assert_solver_state` | `bool` | `false` | Strict per-hop verifier tripwire (operator opt-in; heavy). |
-| `DEGENBOT_SOLVER_DIVERGENCE_SCAN` | `verify.solver_divergence_scan` | `bool` | `false` | Strict-gate divergence scan companion (operator opt-in). |
-| `DEGENBOT_SOLVER_STALENESS_BLOCKS` | `verify.solver_staleness_blocks` | `Option<u64>` | `(unset; default 3)` | CL staleness threshold in blocks (dry-run MTBF knob); unset = 3 (MAX_CL_STALENESS_BLOCKS). |
 ## `simulation`
 
 | Env var | TOML key | Type | Default | Description |
@@ -147,7 +140,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | Env var | TOML key | Type | Default | Description |
 | --- | --- | --- | --- | --- |
 | `DEGENBOT_ALLOC_TRACK` | `test_hooks.alloc_track` | `bool` | `false` | Allocation-tracking gate for the math/pools bench suites (`1` enables). |
-| `DEGENBOT_DESYNC_TEST_STANCE` | `test_hooks.desync_test_stance` | `string` | `(empty)` | Block-pump desync hatch stance hash (test-only scaffolding). |
 | `DEGENBOT_SELF_ABORT_TEST` | `test_hooks.self_abort_test` | `bool` | `false` | Block-pump self-abort hatch (presence gates in tests). |
 | `DEGENBOT_NO_PROGRESS_ABORT_TEST` | `test_hooks.no_progress_abort_test` | `bool` | `false` | No-progress abort hatch gate (test scaffolding; `1` enables). |
 | `DEGENBOT_UNUSED_TEST_FLAG` | `test_hooks.unused_test_flag` | `bool` | `true` | Default-ON flag-parse probe (asserted by the bot-core unit tests). |

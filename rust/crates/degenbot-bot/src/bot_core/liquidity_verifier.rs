@@ -407,7 +407,8 @@ pub async fn verify_v3_pools<S: std::hash::BuildHasher>(
 /// per-pool entry point of [`verify_v3_pools`]. The scan covers the engine's
 /// own bitmap words plus ±2 around the active tick; a divergence (per-tick
 /// gross/net mismatch, or an on-chain tick the engine does not hold) is a
-/// [`LiquidityVerifyError::Mismatch`]. Reused by the judge's tick-map fidelity probe (the `solver_state_tripwire` judge).
+/// [`LiquidityVerifyError::Mismatch`]. The former tripwire consumer retired
+/// with epic MROOY7 task 2UVG3E.
 ///
 /// # Panics
 ///
@@ -751,8 +752,8 @@ pub async fn verify_v4_pools<S: std::hash::BuildHasher>(
 /// Verify a single V4 pool's tick bookkeeping map against on-chain state via
 /// `StateView.getTickBitmap(poolId, word)` + `getTickLiquidity(poolId, tick)`,
 /// the per-pool entry point of [`verify_v4_pools`]. Same scan + divergence
-/// contract as [`verify_v3_pool`]; reused by the solve-time tripwire's tick-map
-/// fidelity probe.
+/// contract as [`verify_v3_pool`]. The former tripwire consumer retired with
+/// epic MROOY7 task 2UVG3E.
 ///
 /// # Panics
 ///

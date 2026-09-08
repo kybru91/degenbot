@@ -158,10 +158,6 @@ crate::config_schema! {
     }
 
     pump PumpConfig {
-        delivery_lag_trip_blocks [opt u64] = None, env = "DEGENBOT_DELIVERY_LAG_TRIP_BLOCKS", def = "(unset)",
-            doc = "Delivery-lag trip threshold in blocks (`> 0`; unset = report-only, no abort trip).";
-        desync_dump_dir [path] = std::path::PathBuf::from("logs/desync"), env = "DEGENBOT_DESYNC_DUMP_DIR", def = "logs/desync",
-            doc = "Root directory for desync repro dumps (overridden for test isolation).";
         pump_debounce_ms [ms] = 50, env = "DEGENBOT_PUMP_DEBOUNCE_MS", def = "50",
             doc = "Publish-debounce settle window in ms (`> 0`; bad values historically fall back to 50 at the site).";
         early_slice_ms [ms] = 25, env = "DEGENBOT_EARLY_SLICE_MS", def = "25",
@@ -185,10 +181,6 @@ crate::config_schema! {
             doc = "Global liquidity-events trace for EVERY V3/V4 liquidity mutation across all pools.";
         trace_register_seed [bool] = false, env = "DEGENBOT_TRACE_REGISTER_SEED", def = "false",
             doc = "Trace pool registration seeding progress.";
-        trace_solve_anchor [bool] = false, env = "DEGENBOT_TRACE_SOLVE_ANCHOR", def = "false",
-            doc = "Strict per-hop solve-anchor probe (operator opt-in).";
-        trace_staged_clock [bool] = false, env = "DEGENBOT_TRACE_STAGED_CLOCK", def = "false",
-            doc = "Staged-clock probe in the strict verifier (operator opt-in).";
         trace_tick [opt i32] = None, env = "DEGENBOT_TRACE_TICK", def = "(unset)",
             doc = "Watch one known-divergent tick (signed decimal) across mutations in the pin/drain probes.";
         ws_trace [bool] = false, env = "DEGENBOT_WS_TRACE", def = "false",
@@ -216,8 +208,8 @@ crate::config_schema! {
             doc = "Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation.";
         inline_sim_workers [opt usize] = None, env = "DEGENBOT_INLINE_SIM_WORKERS", def = "(unset; derived from CPU budget)",
             doc = "Inline-sim worker count (clamped 1..=32; unparsable falls back to derived default at the site).";
-        detached_solves [bool] = false, env = "DEGENBOT_DETACHED_SOLVES", def = "false",
-            doc = "Route solve arms through detached (out-of-cycle) workers (`1` enables).";
+        detached_solves [bool] = true, env = "DEGENBOT_DETACHED_SOLVES", def = "true",
+            doc = "Route solve arms through detached (out-of-cycle) workers; `0`/`false` opts back into the in-cycle engine-Mutex hold. Default ON: the solve path takes no engine-level Mutex (epic MROOY7 task 2UVG3E, seam #4).";
         min_profit_wei [u128] = 0, env = "DEGENBOT_MIN_PROFIT_WEI", def = "0",
             doc = "Minimum path profit floor in wei (decimal text; TOML: quoted string).";
         walk_event_solver_legacy [bool_not] = false, env = "DEGENBOT_WALK_EVENT_SOLVER", def = "false",
@@ -266,12 +258,6 @@ crate::config_schema! {
             doc = "Structural visibility probes diagnosing liquidity-map verification misses (default ON; `0` disables).";
         verify_spotcheck_permyriad [u64] = 0, env = "DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD", def = "0",
             doc = "Per-myriad (1/10_000) sampling rate for verify spot-checks (0 = off).";
-        assert_solver_state [bool] = false, env = "DEGENBOT_ASSERT_SOLVER_STATE", def = "false",
-            doc = "Strict per-hop verifier tripwire (operator opt-in; heavy).";
-        solver_divergence_scan [bool] = false, env = "DEGENBOT_SOLVER_DIVERGENCE_SCAN", def = "false",
-            doc = "Strict-gate divergence scan companion (operator opt-in).";
-        solver_staleness_blocks [opt u64] = None, env = "DEGENBOT_SOLVER_STALENESS_BLOCKS", def = "(unset; default 3)",
-            doc = "CL staleness threshold in blocks (dry-run MTBF knob); unset = 3 (MAX_CL_STALENESS_BLOCKS).";
     }
 
     simulation SimulationConfig {
@@ -324,8 +310,6 @@ crate::config_schema! {
     test_hooks TestHookConfig {
         alloc_track [bool] = false, env = "DEGENBOT_ALLOC_TRACK", def = "false",
             doc = "Allocation-tracking gate for the math/pools bench suites (`1` enables).";
-        desync_test_stance [string] = String::new(), env = "DEGENBOT_DESYNC_TEST_STANCE", def = "(empty)",
-            doc = "Block-pump desync hatch stance hash (test-only scaffolding).";
         self_abort_test [bool] = false, env = "DEGENBOT_SELF_ABORT_TEST", def = "false",
             doc = "Block-pump self-abort hatch (presence gates in tests).";
         no_progress_abort_test [bool] = false, env = "DEGENBOT_NO_PROGRESS_ABORT_TEST", def = "false",

@@ -72,13 +72,6 @@ impl SolveAnchor {
         self.epoch.block()
     }
 
-    /// The anchored epoch (block + rewind generation) — the coordinate
-    /// solve/verify/sim work stamped at this anchor carries downstream.
-    #[must_use]
-    pub const fn epoch(self) -> Epoch {
-        self.epoch
-    }
-
     /// The future-hop rule (module docs): strictly ahead of the anchor is
     /// future and never legitimate; a hop *at* the anchor is a mid-block
     /// capture and is NOT future.

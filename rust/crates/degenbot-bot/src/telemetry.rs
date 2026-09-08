@@ -20,8 +20,6 @@ pub const DIAGNOSTIC_TARGET: &str = "degenbot::diag";
 /// (`&'static str`), never arbitrary strings, so Prometheus series cannot
 /// blow up in cardinality. Pool/path detail belongs in the TRACE, not here.
 pub mod error_kind {
-    /// ADR-021 solver-state tripwire (engine view diverged from chain).
-    pub const SOLVER_STATE_DESYNC: &str = "solver_state_desync";
     /// Pump completeness tripwire (WS log drop / dead stream).
     pub const WS_COMPLETENESS: &str = "ws_completeness";
     /// Simulated-arb failure classified at the dispatch seam.
@@ -42,13 +40,6 @@ pub mod error_kind {
 /// are the ADR-040 bucket-table reason keys ("kind.reason"). Compile-time
 /// closed like [`error_kind`]; the `failure_policy` matrix maps every pair.
 pub mod error_reason {
-    /// Solver-state tripwire classes (ADR-021 D2) — the reason sub-keys of
-    /// `solver_state_desync`.
-    pub const MISSED_LOG: &str = "missed_log";
-    pub const UNHANDLED_REORG: &str = "unhandled_reorg";
-    pub const STORAGE_MUTATED: &str = "storage_mutated";
-    pub const DELIVERY_LAG: &str = "delivery_lag";
-    pub const UNCLASSIFIED: &str = "unclassified";
 
     /// `sim_failure` reason split (ADR-040): the encode/revert distinction.
     pub const SIM_PRE_ENCODE: &str = "pre_encode";

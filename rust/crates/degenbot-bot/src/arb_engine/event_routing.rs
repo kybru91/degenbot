@@ -5,7 +5,6 @@ use alloy::primitives::{aliases::U112, Address};
 
 #[cfg(test)]
 use crate::bot_core::{V3SwapUpdate, V4SwapUpdate};
-use degenbot_solvers::mixed::MixedPoolRef;
 
 #[cfg(test)]
 use super::test_oracle::affected_keys;
@@ -136,32 +135,6 @@ impl ArbitrageEngine {
     /// up-to-date (via `solve_dirty`) before calling this.
     pub fn send_result_batch(&mut self, metadata: &BlockMetadata) {
         self.compute_diff_and_send(metadata);
-    }
-
-    /// Snapshot every registered path's per-hop pool refs for the Option-A
-    /// solver-state accuracy gate (`solver_state_tripwire`). The pump extracts
-    /// the `BotState` scalar state + diffs it against the chain at the solve
-    /// block; engines with non-scalar-diffable paths override the default.
-    #[must_use]
-    pub fn solver_path_pool_refs(&self) -> Vec<Vec<MixedPoolRef>> {
-        self.path_pools
-            .values()
-            .map(|path| path.pools.clone())
-            .collect()
-    }
-
-    /// Consume-and-clear the ADR-021 solver-state change set: return the pool
-    /// refs for ONLY the paths re-solved since the last call and clear it, so
-    /// the verifier diffs just this block's re-solved paths (never the whole
-    /// registered set). `&mut self` is satisfied by the engine's owner holding
-    /// it behind a `Mutex`; the atomic take-then-clear avoids any race between
-    /// a reader and the next solve cycle overwriting the set.
-    pub fn take_solver_path_pool_refs_change_set(&mut self) -> Vec<Vec<MixedPoolRef>> {
-        let ids = std::mem::take(&mut self.last_solved_path_ids);
-        ids.iter()
-            .filter_map(|id| self.path_pools.get(id))
-            .map(|path| path.pools.clone())
-            .collect()
     }
 
     /// Finalize the current block: advance the solved boundary and emit the

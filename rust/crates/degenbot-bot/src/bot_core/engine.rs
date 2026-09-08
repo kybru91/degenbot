@@ -20,7 +20,6 @@
 //! `dispatch` before notify fired — slice 4's `EngineSubscriber` invariant).
 
 use crate::bot_core::BlockMetadata;
-use degenbot_solvers::mixed::MixedPoolRef;
 
 /// The drain-side engine seam: the 6 methods [`DrainSink`](super::drain_sink::DrainSink)
 /// fans out across engines (ADR-006 D4).
@@ -80,22 +79,4 @@ pub trait Engine: Send + Sync {
     /// In steady state, callers should prefer the coordinator's
     /// `last_processed_block` (drain-consistent) over a per-engine read.
     fn last_processed_block(&self) -> Option<u64>;
-
-    /// Snapshot every registered path's per-hop pool refs (the Option-A
-    /// solver-state accuracy gate — see `solver_state_tripwire`). Engines
-    /// whose paths are not scalar-diffable (Solidly/Balancer/Curve) return
-    /// empty; the arbitrage engine overrides with its `path_pools`.
-    fn solver_path_pool_refs(&self) -> Vec<Vec<MixedPoolRef>> {
-        Vec::new()
-    }
-
-    /// Consume-and-clear the ADR-021 solver-state change set (paths re-solved
-    /// since the last publish). Defaults to empty; the arbitrage engine
-    /// overrides with its accumulated `last_solved_path_ids`. The caller (pump
-    /// publish point) hands this to the solver-state verifier so it diffs only
-    /// this block's re-solved paths against the chain — never the whole
-    /// registered set.
-    fn take_solver_path_pool_refs_change_set(&self) -> Vec<Vec<MixedPoolRef>> {
-        Vec::new()
-    }
 }

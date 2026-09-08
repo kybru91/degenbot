@@ -26,7 +26,6 @@ use std::sync::{Arc, Weak};
 use crate::bot_core::engine::Engine;
 use crate::bot_core::log_dispatcher::PoolStateSubscriber;
 use crate::bot_core::BlockMetadata;
-use degenbot_solvers::mixed::MixedPoolRef;
 
 use super::engine_subscriber::EngineSubscriber;
 use super::ArbitrageEngine;
@@ -129,41 +128,25 @@ impl EngineHandle {
 }
 
 impl Engine for EngineHandle {
-    /// Hold-time invariant (ergo 3HYYGQ, assessed 2026-06 — no refactor).
+    /// Hold-time posture (task 2UVG3E, epic MROOY7 seam #4 — supersedes the
+    /// 3HYYGQ single-hold assessment of 2026-06): the driven solve path takes
+    /// NO engine-level Mutex. The default detached stance routes the cycle's
+    /// solve arms to out-of-cycle workers, so this hold COLLAPSES TO ENQUEUE
+    /// END (µs — resolve/gate/bookkeeping only); every result merges on the
+    /// `arb-detached-merge` sidecar under its own short per-item engine
+    /// Mutex acquisition, guarded by the Q1a stale policy (apply-if-unchanged /
+    /// drop-on-touched via the enqueue-time per-hop update stamps). Python's
+    /// result hot path consumes batches via the unbounded `mpsc` channel and
+    /// never acquires the engine lock; `register_path`/`deregister_path` take
+    /// the SAME engine Mutex the per-item merges acquire, so no interleaving
+    /// hazard is created by the split. The `degenbot.solve.mutex_hold`
+    /// histogram therefore sits in the µs range.
     ///
-    /// This call holds the engine `Mutex` for the whole `solve_dirty`,
-    /// including the rayon `par_iter` solve in `rebuild_and_solve_affected`
-    /// (~5-20ms for 100-200 affected paths). This is **acceptable**: Python's
-    /// result hot path consumes batches via the unbounded `mpsc` channel
-    /// (`PyArbitrageEngine::__anext__` → `rx.recv().await`), which never
-    /// acquires the engine lock, so the hold does NOT block result delivery.
-    /// The only cross-thread contenders during a solve are:
-    ///   - `EngineSubscriber::insert_dirty` (queues a dirty marker for the
-    ///     NEXT solve — a delayed mark is absorbed by the following
-    ///     `solve_dirty` iteration, so the delay is benign);
-    ///   - non-hot-path introspection/admin methods (`inspect_path`,
-    ///     `latest_results`, `deregister_path`, `set_profit_thresholds`).
-    ///
-    /// Do NOT speculatively split this lock (e.g. release around the rayon
-    /// `par_iter`) without first re-deriving interleaving safety for
-    /// `register_path`/`deregister_path`: those run GIL-released on the
-    /// Python thread concurrently with the pump and currently rely on this
-    /// single hold for serialization. `latest_results()` is test/admin-only —
-    /// grep-verified absent from the example hot loop, which is
-    /// `async for batch in engine_registry.engine:`.
-    ///
-    /// **Detached-cycles exception (epic SRQEK5, task 4QKZE3):** when the
-    /// engine's `detached_solving` stance is ON, this hold collapses to
-    /// ENQUEUE end (~µs — resolve/gate/bookkeeping only): the solves run on
-    /// per-bin threads and each straggler merges on the sidecar thread under
-    /// its own per-item engine-Mutex acquisition. The `register_path`/
-    /// `deregister_path` serialization argument above still holds in detached
-    /// mode — those methods take the SAME engine Mutex the per-item merges
-    /// acquire, so no interleaving hazard is created by the split. The
-    /// `degenbot.solve.mutex_hold` histogram therefore shifts from the
-    /// 5-20ms range to the µs range ONLY while the stance is ON (default
-    /// OFF until epic SRQEK5 T3's soak flip); the historical in-cycle hold
-    /// text above stays true for the default engine.
+    /// Backpressure exception: when `DETACHED_INFLIGHT_CAP` stragglers are
+    /// outstanding (a lagging sidecar), the cycle degrades to the IN-CYCLE
+    /// arm, which holds the engine Mutex for the fan-out (`~5-20ms` at the
+    /// heavy end) — the safety valve, not the steady state. Operators can
+    /// force the old posture with `DEGENBOT_DETACHED_SOLVES=0`.
     #[hotpath::measure(label = "EngineHandle::solve_dirty")]
     fn solve_dirty(
         &self,
@@ -317,14 +300,6 @@ impl Engine for EngineHandle {
 
     fn last_processed_block(&self) -> Option<u64> {
         self.engine.lock().last_processed_block()
-    }
-
-    fn solver_path_pool_refs(&self) -> Vec<Vec<MixedPoolRef>> {
-        self.engine.lock().solver_path_pool_refs()
-    }
-
-    fn take_solver_path_pool_refs_change_set(&self) -> Vec<Vec<MixedPoolRef>> {
-        self.engine.lock().take_solver_path_pool_refs_change_set()
     }
 }
 

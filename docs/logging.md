@@ -113,7 +113,6 @@ code, not by the tracing filter.
 
 | env var | default | gates |
 |---|---|---|
-| `DEGENBOT_ASSERT_SOLVER_STATE` | ON | ADR-021 publish tripwire — aborts the process on a verified solver-state desync |
 | `DEGENBOT_VERIFY_DBG` | ON | structural verify diagnostics / divergence set |
 | `DEGENBOT_DUMP_CALL_TRACE` | ON | full revm call trace on a sim failure |
 | `DEGENBOT_V2_CALC_TRACE` | ON | V2 reserves slot-8 read before each sim (see `[v2-calc-trace]` above) |

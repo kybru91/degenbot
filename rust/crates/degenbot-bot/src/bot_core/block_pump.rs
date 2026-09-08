@@ -50,11 +50,7 @@ use futures_util::{stream, StreamExt};
 use tokio::time::timeout;
 use tracing::Instrument;
 
-use crate::bot_core::event_dispatch::{DispatchOwner, DrainWork, SolverVerifyRequest};
-use crate::bot_core::solver_state_tripwire::{
-    extract_solver_hop_states, judge, GateVerdict, TripReorgWindow, TripwireConfig,
-    TripwireDivergence,
-};
+use crate::bot_core::event_dispatch::{DispatchOwner, DrainWork};
 use crate::bot_core::LogDecision;
 use crate::bot_core::{drain_sink::DrainSink, BlockMetadata, Bot, Epoch};
 use degenbot_decoders::v2_sync_decoder::V2_SYNC_TOPIC;
@@ -189,10 +185,6 @@ pub struct BlockPump {
     /// routed through the `DrainSink` — reorg is a `Bot` concern, parallel
     /// to `dispatch_log`).
     reorg_coordinator: Arc<crate::bot_core::reorg_coordinator::ReorgCoordinator>,
-    /// ADR-021 D2 Part A — the bounded reorg-window evidence list
-    /// (recorded at the FSM reorg decisions; snapshotted as Copies before
-    /// each `judge()` await, never held across it).
-    trip_reorg_windows: Arc<parking_lot::Mutex<std::collections::VecDeque<TripReorgWindow>>>,
     /// The Alloy provider (created from the RPC URL)
     provider: Arc<AlloyProvider>,
     /// Shutdown flag — set by `stop()` or by a too-deep reorg (graceful exit)
@@ -218,21 +210,13 @@ pub struct BlockPump {
     /// the sub) so the liveness watchdog is test-observable without depending
     /// on log-capture infrastructure.
     log_silence_alarms: u64,
-    /// The packed ADR-021 solver-state tripwire stances (the publish-point
-    /// accuracy gate + its observation stages). `enabled` is conservative
-    /// default ON (`DEGENBOT_ASSERT_SOLVER_STATE`, via
-    /// `bot_env_flag_default_on`); the three diagnostics default off (via
-    /// `bot_env_flag_default_off`). Held as a field (not per-call env reads)
-    /// so tests deterministically opt out per-pump (Z4KQXF); the tripwire
-    /// module itself reads no env.
-    tripwire_config: crate::bot_core::solver_state_tripwire::TripwireConfig,
     /// Whether the per-block WS-delivery completeness cross-check runs
     /// (`assert_ws_block_complete` — aborts on any relevant-topic log that
     /// `eth_getLogs` has but the live websocket dropped). Conservative default
     /// ON (`DEGENBOT_WS_COMPLETENESS`, via `bot_env_flag_default_on`): set
     /// `=0` to disable. Held as a field (not a global env read) so tests
-    /// deterministically opt out per-pump (same pattern as `solver_state_verify`,
-    /// Z4KQXF). When OFF the `ws_delivered` index-tracking map is not populated
+    /// deterministically opt out per-pump (Z4KQXF pattern). When OFF the
+    /// `ws_delivered` index-tracking map is not populated
     /// (no work on the hot loop).
     ws_completeness_enabled: bool,
     /// Publish-debounce window (ms): after a dirty log, wait this long for a
@@ -315,34 +299,12 @@ impl BlockPump {
             bot,
             sink,
             reorg_coordinator,
-            trip_reorg_windows: Arc::new(
-                parking_lot::Mutex::new(std::collections::VecDeque::new()),
-            ),
             provider: Arc::new(provider),
             shutdown,
             header_staleness: Duration::from_secs(HEADER_STALENESS_SECS),
             log_wait_max_age: Duration::from_secs(LOG_WAIT_MAX_AGE_SECS),
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
-            tripwire_config: crate::bot_core::solver_state_tripwire::TripwireConfig {
-                // VERIFY2 T1 (2026-09-05): the strict per-hop verifier was
-                // reading every hop of every published path set per block
-                // (the tens-of-seconds degenbot.solver.verify spans) while
-                // finding no desyncs in 6.5h. It is now OPERATOR OPT-IN
-                // (DEGENBOT_ASSERT_SOLVER_STATE=1) - the standing promise is
-                // on-demand verification instead: sim failures arm a
-                // divergence probe on the failing path's next sim (VERIFY2
-                // T2), and the RPC pre-state the sim reads remains the
-                // authority between checks.
-                enabled: stance::config().verify.assert_solver_state,
-                divergence_scan: stance::config().verify.solver_divergence_scan,
-                anchor_probe: stance::config().trace.trace_solve_anchor,
-                staged_clock_probe: stance::config().trace.trace_staged_clock,
-                delivery_lag_trip_blocks: stance::config()
-                    .pump
-                    .delivery_lag_trip_blocks
-                    .filter(|n| *n > 0),
-            },
             ws_completeness_enabled: stance::config().pump.ws_completeness,
             debounce_ms: stance::config().pump.pump_debounce_ms,
             early_slice_ms: stance::config().pump.early_slice_ms,
@@ -693,234 +655,6 @@ impl BlockPump {
             .await
     }
 
-    /// Judges the published block's change set against the chain (the ADR-021
-    /// option-A tripwire). Loops over solve-block notifications from the pump
-    /// via a LATEST-WINS `watch` channel: only the most recently published
-    /// block is ever judged — a superseded block is dropped, never queued, so
-    /// the judge can neither pile up an unbounded backlog of full-path
-    /// snapshots nor stall the pump's `run_with_stream` on the
-    /// `O(registered_paths × hops × RPC)` cost (the confirmed freeze).
-    async fn solver_state_verify_loop(
-        mut rx: tokio::sync::watch::Receiver<Option<SolverVerifyRequest>>,
-        bot: Arc<Bot>,
-        provider: Arc<AlloyProvider>,
-        config: TripwireConfig,
-        reorg_windows: Arc<parking_lot::Mutex<std::collections::VecDeque<TripReorgWindow>>>,
-    ) {
-        while rx.changed().await.is_ok() {
-            let Some((epoch, path_refs)) = (*rx.borrow_and_update()).clone() else {
-                continue;
-            };
-            // The verifier anchor is an Epoch (block + rewind generation);
-            // the on-chain reads below still need the block coordinate.
-            let block = epoch.block();
-            if path_refs.is_empty() {
-                continue;
-            }
-            tracing::debug!(
-                block,
-                paths = path_refs.len(),
-                "solver-state tripwire: judging published block change set"
-            );
-            // Extract + resolve the anchor under the SHORT read guard — the
-            // guard is dropped before `judge` awaits its on-chain reads.
-            let (path_hop_states, anchor) = {
-                let state = bot.state_arc();
-                let core = state.read();
-                let phs: Vec<_> = path_refs
-                    .iter()
-                    .map(|pools| extract_solver_hop_states(&core, pools))
-                    .collect();
-                (
-                    phs,
-                    crate::bot_core::solve_anchor::SolveAnchor::resolve(block, &core),
-                )
-            };
-            // ADR-021 D2 Part A — snapshot the reorg evidence (Copies out
-            // under the lock) BEFORE the judge awaits; no guard is held
-            // across the await.
-            let reorg_evidence: Vec<TripReorgWindow> =
-                reorg_windows.lock().iter().copied().collect();
-            // Solver-state check timing (Jaeger): one span per judged block —
-            // overlaps the "did the pool's WS log apply BEFORE this check ran"
-            // question against the per-log events the dispatcher emits.
-            // Created outside the await, moved into the judge future via
-            // .instrument (no enter guard across an await — TQ7PD6).
-            let verify_span =
-                tracing::info_span!("degenbot.solver.verify", block, paths = path_refs.len(),);
-            // Trace continuity: the verifier runs on a DETACHED task, so the
-            // span would export as a root. Pin the published block's span as
-            // the remote parent (same bridge as the simulate fan-out) so the
-            // verify renders inside the block's Jaeger trace.
-            crate::telemetry::attach_published_parent(&verify_span, block);
-            if let Some(p) = crate::instruments::pipeline() {
-                p.count_solver_verify_block();
-            }
-            if let GateVerdict::Divergent(d) = judge(
-                &provider,
-                &config,
-                &path_hop_states,
-                anchor,
-                &reorg_evidence,
-            )
-            .instrument(verify_span)
-            .await
-            {
-                // ADR-040: per-bucket reaction. The responsible hop's pool is
-                // resolved from the judged path refs (path_idx/hop_idx align
-                // with the extract that produced them by construction); a
-                // missing index is a programming error and keeps the old
-                // fail-loud contract verbatim.
-                let hop_pool_key = path_refs
-                    .get(d.path_idx)
-                    .and_then(|hops| hops.get(d.hop_idx))
-                    .map(|hop_ref| hop_ref.pool_key);
-                match hop_pool_key {
-                    Some(pool_key) => Self::react_to_desync(&bot, &d, pool_key, block),
-                    None => Self::trip_and_exit(&d),
-                }
-            }
-        }
-    }
-
-    /// The pump's entire executor-side reaction to a verified desync — the trip
-    /// and the exit (ADR-021 D1: "The pump loop keeps only the trip and the
-    /// exit"). Prints the grep-able `[SOLVER-STATE] ABORT` marker (unbuffered
-    /// stderr) after the structured `tracing::error!`, then aborts the PROCESS
-    /// — no task unwind, no wedge, no teardown hang (see the tripwire module
-    /// docs for the panic/shutdown-wedge history; UO3JM4).
-    /// ADR-040: the per-bucket desync reaction. The `failure_policy` matrix
-    /// decides: the default stance QUARANTINES the divergent pool (excluded
-    /// from solve resolution by `BotState::quarantine_pool` + the resolve
-    /// gate) with a keyed loud event, and the session keeps running; the
-    /// operator's `exit` override (or the fatal buckets) keeps the byte-
-    /// identical loud abort. The grep-able breadcrumb prints in BOTH cases.
-    fn react_to_desync(bot: &Bot, d: &TripwireDivergence, pool_key: u64, block: u64) {
-        use crate::failure_policy::Action;
-        let reason = d.class.reason_key();
-        let action = crate::failure_policy::action(
-            crate::telemetry::error_kind::SOLVER_STATE_DESYNC,
-            Some(reason),
-        );
-        // ADR-040 / 52I5SV: the reproduction artifact. Written for every
-        // non-observe stance BEFORE the action executes (the exit stance
-        // aborts mid-match; the dump must predate it). The dump root is the
-        // typed `pump.desync_dump_dir` schema key (KAHU5W — the loader owns
-        // the DEGENBOT_DESYNC_DUMP_DIR env read). I/O failure degrades to a
-        // log - never blocks.
-        if let Ok(dump_path) = d
-            .snapshot
-            .write(&stance::config().pump.desync_dump_dir.clone())
-        {
-            tracing::info!(dump = %dump_path.display(), "desync repro artifact written");
-        } else {
-            tracing::warn!("desync repro dump failed (reaction proceeds)");
-        }
-        // The structured trace span (52I5SV): one `degenbot.desync.trip` span
-        // carrying class/pool/path/hop + anchor, child of the verify span.
-        let trip_span = tracing::info_span!(
-            "degenbot.desync.trip",
-            class = ?d.class,
-            pool_key,
-            path_idx = d.path_idx,
-            hop_idx = d.hop_idx,
-            anchor_block = d.snapshot.anchor_block,
-        );
-        let _trip_guard = trip_span.enter();
-        match action {
-            Action::Exit => Self::trip_and_exit(d),
-            Action::Quarantine => {
-                let surfaced = crate::telemetry::record_exception_keyed(
-                    crate::telemetry::error_kind::SOLVER_STATE_DESYNC,
-                    &format!("pool:{pool_key}"),
-                    block,
-                    format_args!(
-                        "{:?} path_idx={} hop_idx={} pool_key={}",
-                        d.class, d.path_idx, d.hop_idx, pool_key
-                    ),
-                );
-                if surfaced {
-                    tracing::error!(
-                        class = ?d.class,
-                        path_idx = d.path_idx,
-                        hop_idx = d.hop_idx,
-                        pool_key,
-                        "DEGENBOT_ASSERT_SOLVER_STATE: verified desync — QUARANTINE (pool excluded from solve; ADR-040)"
-                    );
-                    #[expect(clippy::print_stderr)] // grep-able diagnostic (ADR-040 keeps loudness)
-                    {
-                        eprintln!("[SOLVER-STATE] QUARANTINE: {}", d.breadcrumb);
-                    }
-                }
-                if let Some(p) = crate::instruments::pipeline() {
-                    p.count_quarantine_event(
-                        crate::telemetry::error_kind::SOLVER_STATE_DESYNC,
-                        "pool",
-                    );
-                }
-                let state = bot.state_arc();
-                let mut core = state.write();
-                let changed = core.quarantine_pool(pool_key);
-                drop(core);
-                if changed {
-                    tracing::warn!(
-                        pool_key,
-                        "desync quarantine applied (pool now solve-invisible)"
-                    );
-                }
-            }
-            Action::Event => {
-                let _ = crate::telemetry::record_exception_keyed(
-                    crate::telemetry::error_kind::SOLVER_STATE_DESYNC,
-                    &format!("pool:{pool_key}"),
-                    block,
-                    format_args!(
-                        "{:?} path_idx={} hop_idx={} pool_key={}",
-                        d.class, d.path_idx, d.hop_idx, pool_key
-                    ),
-                );
-                tracing::error!(
-                    class = ?d.class,
-                    path_idx = d.path_idx,
-                    hop_idx = d.hop_idx,
-                    pool_key,
-                    "DEGENBOT_ASSERT_SOLVER_STATE: verified desync — operator override disabled quarantine (ADR-040 [failure_policy])"
-                );
-            }
-            Action::Observe => {
-                tracing::info!(
-                    class = ?d.class,
-                    pool_key,
-                    "solver-state divergence observed (policy=observe)"
-                );
-            }
-        }
-    }
-
-    fn trip_and_exit(d: &TripwireDivergence) -> ! {
-        crate::telemetry::record_exception(
-            crate::telemetry::error_kind::SOLVER_STATE_DESYNC,
-            format_args!(
-                "{:?} path_idx={} hop_idx={}",
-                d.class, d.path_idx, d.hop_idx
-            ),
-        );
-        crate::telemetry::flush_before_exit();
-        tracing::error!(
-            class = ?d.class,
-            path_idx = d.path_idx,
-            hop_idx = d.hop_idx,
-            "DEGENBOT_ASSERT_SOLVER_STATE: verified desync — ABORT"
-        );
-        #[expect(clippy::print_stderr)] // fatal diagnostic emitted before abort
-        {
-            eprintln!("{}", d.breadcrumb);
-        }
-        std::process::abort()
-    }
-
-    /// Run the main pump loop with an existing WS stream.
-    ///
     /// Processes logs eagerly: each WS log is applied to engine state
     /// immediately and affected paths are solved right away, without
     /// waiting for a block header. Block headers provide metadata
@@ -929,10 +663,8 @@ impl BlockPump {
     /// # Panics
     ///
     /// Hard-aborts the process (never unwinds a half-alive pump) on the fatal
-    /// failure buckets and on operator-exit desync overrides — the ADR-040
-    /// DEFAULT verified-desync reaction QUARANTINES the divergent pool and
-    /// keeps the session (see `react_to_desync`),
-    /// a live-websocket log drop (`DEGENBOT_WS_COMPLETENESS`), or a dead or
+    /// failure buckets, on a live-websocket log drop
+    /// (`DEGENBOT_WS_COMPLETENESS`), or a dead or
     /// stalled background drainer (a send into a closed channel, or
     /// `NO_PROGRESS_STRIKE_LIMIT` consecutive no-progress pushes). Also shuts
     /// down on a
@@ -1127,59 +859,24 @@ impl BlockPump {
         // (the logs-silence clock + re-arm alarm now live in the FSM, fed via
         // `record_log`; the telemetry seam owns the DIAG gap anchor).
 
-        // Option-A solver-state accuracy gate (AV42C7): when enabled, diff each
-        // solved path's per-hop pool state against the chain at the solve block
-        // after every drain, aborting on any mismatch (ADR-021 tripwire).
-        // Conservative default ON (`self.solver_state_verify` from
-        // `DEGENBOT_ASSERT_SOLVER_STATE`); set `=0` to disable. Adds an RPC read
-        // per path per solve on the hot loop (only at the publish point).
-        let tripwire_config = self.tripwire_config;
-
-        // ADR-021 relocation (pump-freeze fix): the solver-state verify is NOT
-        // awaited inline on `run_with_stream`. It runs on a dedicated verifier
-        // task fed by a LATEST-WINS `watch`; the pump hands every published
-        // block to it with a non-blocking send and returns to polling the WS
-        // stream immediately, so the O(registered × hops × RPC) verify can
-        // never stall pump advancement (the confirmed freeze: `last_complete`
-        // froze while the inline gate ground through the whole registered set).
-        // The verifier abort()s the whole process on desync (unchanged ADR-021
-        // fail-stop); only the most recent published block is ever verified.
-        let verify_tx: Option<tokio::sync::watch::Sender<Option<SolverVerifyRequest>>> =
-            if tripwire_config.enabled || tripwire_config.divergence_scan {
-                let (tx, rx) = tokio::sync::watch::channel(None);
-                tokio::spawn(Self::solver_state_verify_loop(
-                    rx,
-                    Arc::clone(&self.bot),
-                    Arc::clone(&self.provider),
-                    tripwire_config,
-                    Arc::clone(&self.trip_reorg_windows),
-                ));
-                Some(tx)
-            } else {
-                None
-            };
-
         // B4GX7C drain-decoupling: the sink's solve/dispatch/finalize calls run
         // on this spawned background drainer task so the WS poller returns to
         // `combined.next()` promptly instead of parking behind `Python::attach`
         // / heavy Möbius solve. FIFO order + the engine/sink locks give the
-        // deferred work the inline semantics it replaced (the sole mode). The
-        // change-set is consumed atomically in the pump (single-writer) and the
-        // verifier anchor is carried in the message.
+        // deferred work the inline semantics it replaced (the sole mode).
         //
         // The poller gets FEEDBACK on the drainer through `drainer_health`: a
         // send into a closed channel (drainer task dead) aborts loudly, and the
         // B3 no-progress detector aborts if the drainer is alive but makes no
         // progress — a dead/stalled drainer must never silently lose every
         // solve/dispatch/publish while the WS loop keeps advancing.
-        // One dispatch owner (epic B) owns the drain pipe + the drainer task +
-        // the verifier latest-wins transmitter. All sink work is deferred to the
-        // background drainer task (sole mode) so the WS poller never parks
-        // behind GIL-bound `Python::attach` / heavy Möbius solve. FIFO order +
-        // the engine/sink locks give the deferred work the inline semantics it
-        // replaced; the verifier anchor + change-set ride the `Publish` message
-        // (single-writer). A dead or stalled drainer never silently loses work.
-        let dispatch = DispatchOwner::new(Arc::clone(&self.sink), &verify_tx);
+        // One dispatch owner (epic B) owns the drain pipe + the drainer task.
+        // All sink work is deferred to the background drainer task (sole mode)
+        // so the WS poller never parks behind GIL-bound `Python::attach` /
+        // heavy Möbius solve. FIFO order + the engine/sink locks give the
+        // deferred work the inline semantics it replaced. A dead or stalled
+        // drainer never silently loses work.
+        let dispatch = DispatchOwner::new(Arc::clone(&self.sink));
         // S53STH cooperative timed exit: arm the StallWatch cancel token when
         // a hotpath timed window is configured so no watchdog sample lands
         // between the post-loop OTel flush and teardown.
@@ -1522,11 +1219,9 @@ impl BlockPump {
                                         "[pump-overlap] per-block phase attribution (throttled)"
                                     );
                                 }
-                                let change_set = self.sink.take_solver_path_pool_refs_change_set();
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
                                 dispatch.dispatch(DrainWork::Publish {
                                     context: fsm.context_for(open, metadata),
-                                    change_set,
                                 });
                             }
                             PumpDecision::Backfill { from, to } => {
@@ -1909,14 +1604,6 @@ impl BlockPump {
                                     return;
                                 }
                             }
-                            // ADR-021 D2 Part A — record the reorg window for the
-                            // tripwire's UnhandledReorg evidence (cheap; the
-                            // judge snapshots it at solve time).
-                            crate::bot_core::solver_state_tripwire::reorg_window_open(
-                                &mut self.trip_reorg_windows.lock(),
-                                reorg_block,
-                                log_block,
-                            );
                             // Cancel any pending publish: results accumulated
                             // from pre-reorg state are invalid (the FSM disarmed
                             // the publish in `on_log`).
@@ -1957,11 +1644,6 @@ impl BlockPump {
                                     return;
                                 }
                             }
-                            // ADR-021 D2 Part A — widen the open window's rollback.
-                            crate::bot_core::solver_state_tripwire::reorg_window_continue(
-                                &mut self.trip_reorg_windows.lock(),
-                                log_block,
-                            );
                             continue;
                         }
                         LogDecision::CloseReorg { new_head } => {
@@ -1989,11 +1671,6 @@ impl BlockPump {
                             }
                             reorg_pools_restored = 0;
                             reorg_idempotent_noops = 0;
-                            // ADR-021 D2 Part A — close the evidence window.
-                            crate::bot_core::solver_state_tripwire::reorg_window_close(
-                                &mut self.trip_reorg_windows.lock(),
-                                new_head,
-                            );
                             // Fall through to dispatch this forward log (the FSM
                             // moved the cursor to `new_head` in `on_log`).
                         }
@@ -2123,11 +1800,9 @@ impl BlockPump {
                     for decision in fsm.on_stream_end() {
                         match decision {
                             PumpDecision::Publish { open, metadata } => {
-                                let change_set = self.sink.take_solver_path_pool_refs_change_set();
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
                                 dispatch.dispatch(DrainWork::Publish {
                                     context: fsm.context_for(open, metadata),
-                                    change_set,
                                 });
                             }
                             PumpDecision::Stop => {}
@@ -2664,19 +2339,12 @@ impl BlockPump {
             bot,
             sink,
             reorg_coordinator,
-            trip_reorg_windows: Arc::new(
-                parking_lot::Mutex::new(std::collections::VecDeque::new()),
-            ),
             provider,
             shutdown,
             header_staleness: Duration::from_secs(HEADER_STALENESS_SECS),
             log_wait_max_age: Duration::from_secs(LOG_WAIT_MAX_AGE_SECS),
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
-            // ADR-021 tripwire OFF in tests (deterministic per-pump opt-out; see
-            // the struct field doc). Tests arm it explicitly when they exercise
-            // the tripwire (e.g. the desync-abort tests).
-            tripwire_config: crate::bot_core::solver_state_tripwire::TripwireConfig::disabled(),
             // Same per-pump opt-out for the WS-delivery completeness cross-check:
             // default-ON in production, deterministically OFF in tests so the
             // synthetic log streams (which use relevant-topic logs as pure block
@@ -2848,9 +2516,6 @@ mod tests {
         /// is the sole path that backfills past the stream's observed block).
         solved: Mutex<Vec<u64>>,
         last_processed: AtomicU64,
-        /// Configurable path-pool refs for the Option-A AV42C7 gate tests
-        /// (default empty — the gate early-returns). Set via `set_path_refs`.
-        path_refs: Mutex<Vec<Vec<degenbot_solvers::mixed::MixedPoolRef>>>,
         /// Test knob for the active-block promotion RED test (BO5FBS):
         /// when `true`, `has_dirty_paths()` reports dirty so the top-of-loop
         /// `on_drain` path fires. Default `false` keeps every existing test's
@@ -2876,7 +2541,6 @@ mod tests {
                 notified: Mutex::new(Vec::new()),
                 solved: Mutex::new(Vec::new()),
                 last_processed: AtomicU64::new(last_processed.unwrap_or(0)),
-                path_refs: Mutex::new(Vec::new()),
                 dirty: AtomicBool::new(false),
                 logs_recorded: std::sync::atomic::AtomicUsize::new(0),
                 pump_ended: std::sync::atomic::AtomicBool::new(false),
@@ -2919,17 +2583,9 @@ mod tests {
                 .map(|(b, _)| *b)
                 .collect()
         }
-
-        /// Configure the path-pool refs the AV42C7 gate verifies (test-only).
-        fn set_path_refs(&self, refs: Vec<Vec<degenbot_solvers::mixed::MixedPoolRef>>) {
-            *self.path_refs.lock().unwrap() = refs;
-        }
     }
 
     impl DrainSink for FakeDrainSink {
-        fn solver_path_pool_refs(&self) -> Vec<Vec<degenbot_solvers::mixed::MixedPoolRef>> {
-            self.path_refs.lock().unwrap().clone()
-        }
         fn has_dirty_paths(&self) -> bool {
             self.dirty.load(Ordering::Relaxed)
         }
@@ -3013,19 +2669,6 @@ mod tests {
         let sink = Arc::new(FakeDrainSink::new(last_processed));
         let pump = BlockPump::for_test(bot, sink.clone(), reorg, provider, shutdown);
         (pump, sink)
-    }
-
-    #[test]
-    fn test_pump_disables_solver_state_verify_by_default() {
-        // Z4KQXF: the ADR-021 tripwire is conservative-ON in production (via
-        // `bot_env_flag_default_on`) but deterministically OFF in the test
-        // constructor (per-pump opt-out) so TDD tests are immune to the global
-        // env. Tests that exercise the verifier arm it explicitly.
-        let (pump, _sink) = pump_for_test(None);
-        assert!(
-            !pump.tripwire_config.enabled,
-            "test pumps must disable the tripwire"
-        );
     }
 
     #[test]
@@ -5431,199 +5074,6 @@ mod tests {
             );
         } else {
             panic!("test setup: V2 pool not found for {pool_addr}");
-        }
-    }
-
-    /// UO3JM4 — the solver-state gate must FAIL HARD & LOUDLY on a verified
-    /// desync: `abort()` the whole process, not `shutdown`+return silently
-    /// (the AV42C7 fallback left the bot idling on discovery/probe threads)
-    /// and not `panic!` (2026-08-02: unwound only the pump tokio task →
-    /// no-progress busy loop). `abort()` can't unwind or linger, so the bot
-    /// dies on the spot. `abort()` can't be tested in-process (it SIGABRTs
-    /// the test binary), so this parent test spawns itself as a subprocess
-    /// driving the gate through the desync and asserts the child died by
-    /// ADR-040 (subset of UO3JM4, kept loud): with the operator `exit`
-    /// override installed, a verified solver-state desync must STILL
-    /// `abort()` the whole process — byte-identical to the pre-ADR-040
-    /// fail-fast (marker, SIGABRT). Subprocess test (`abort()` SIGABRTs the
-    /// test binary); the core suppression wrapper (`ulimit -c 0`) is kept.
-    #[test]
-    fn solver_state_desync_operator_exit_stance_aborts() {
-        let exe = std::env::current_exe().expect("current test exe");
-        // The child is EXPECTED to SIGABRT here — the point of the test, not
-        // a leak. Run via `sh -c 'ulimit -c 0; exec "$@"'` so the core-dump
-        // suppression crosses the exec (kernel.core_pattern → GNOME/ABRT
-        // spurious crash-report history, UO3JM4).
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("ulimit -c 0; exec \"$@\"")
-            .arg("sh") // $0; the test binary + args follow as $1.. and become `$@`
-            .arg(&exe)
-            .arg("solver_state_desync_aborts_self")
-            .arg("--nocapture")
-            .env("DEGENBOT_SELF_ABORT_TEST", "1")
-            .env("DEGENBOT_DESYNC_TEST_STANCE", "exit")
-            .output()
-            .expect("spawn desync subprocess");
-        let status = out.status;
-        assert!(
-            !status.success(),
-            "the operator exit stance must kill the process, got {status:?}"
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("[SOLVER-STATE] ABORT"),
-            "exit stance must print the loud grep-able marker to stderr; got: {stderr}"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            assert_eq!(
-                status.signal(),
-                Some(6), // SIGABRT
-                "expected the child killed by SIGABRT, got {status:?}"
-            );
-        }
-    }
-
-    /// ADR-040: the DEFAULT reaction to a verified desync is quarantine + a
-    /// keyed loud event, and the session SURVIVES. Subprocess self-test: the
-    /// child drives the gate over a mocked desynced V2 pool, asserts the pool
-    /// is quarantined solve-invisible, and exits 0 with the grep-able marker.
-    #[test]
-    fn solver_state_desync_default_quarantines_and_survives() {
-        let exe = std::env::current_exe().expect("current test exe");
-        let out = std::process::Command::new(&exe)
-            .arg("solver_state_desync_aborts_self")
-            .arg("--nocapture")
-            .env("DEGENBOT_SELF_ABORT_TEST", "1")
-            .env("DEGENBOT_DESYNC_TEST_STANCE", "quarantine")
-            .output()
-            .expect("spawn desync subprocess");
-        let status = out.status;
-        assert!(
-            status.success(),
-            "the default reaction must QUARANTINE and keep the process up, got {status:?}\nstderr: {}\nstdout: {}",
-            String::from_utf8_lossy(&out.stderr),
-            String::from_utf8_lossy(&out.stdout)
-        );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("[SOLVER-STATE] QUARANTINE:"),
-            "quarantine reaction must print the grep-able breadcrumb; got: {stderr}"
-        );
-    }
-
-    /// UO3JM4 child half: no-op unless spawned by
-    /// `solver_state_desync_aborts_process` (env `DEGENBOT_SELF_ABORT_TEST`).
-    /// Drives the gate against a registered V2 pool whose on-chain
-    /// `getReserves` (mocked) MISMATCHES the solver's stored reserves →
-    /// `judge` returns `GateVerdict::Divergent` → `trip_and_exit` must
-    /// `abort()` before this function can return.
-    #[tokio::test]
-    async fn solver_state_desync_aborts_self() {
-        use degenbot_solvers::mixed::HopType;
-        use degenbot_solvers::mixed::MixedPoolRef;
-
-        if std::env::var_os("DEGENBOT_SELF_ABORT_TEST").is_none() {
-            return; // no-op unless driven as the abort subprocess
-        }
-
-        let pool_addr = Address::from([0x44u8; 20]);
-        let (pump, sink, asserter, _shutdown) = pump_for_test_sink_and_asserter(Some(100));
-        let bot = pump.bot_arc_for_test();
-        let pool_id = {
-            let state = bot.state_arc();
-            let mut core = state.write();
-            core.register_v2_pool(&RegisterV2PoolParams {
-                address: pool_addr,
-                token0: Address::from([0xa0u8; 20]),
-                token1: Address::from([0xa1u8; 20]),
-                reserve0: U112::from(1_000),
-                reserve1: U112::from(2_000),
-                fee_token0: (997, 1000),
-                fee_token1: (997, 1000),
-                factory: Address::from([0xf0u8; 20]),
-                update_block: 100,
-                variant: degenbot_uniswap::dex_identity::DexVariant::UniswapV2,
-                stable_swap: false,
-                fee_denominator: None,
-                ..Default::default()
-            })
-            .expect("test setup: V2 registration")
-        };
-        sink.set_path_refs(vec![vec![MixedPoolRef {
-            hop_type: HopType::V2,
-            pool_key: pool_id,
-            zero_for_one: false,
-        }]]);
-
-        // Mock getReserves -> (777, 888, 0): MISMATCHES solver (1000, 2000),
-        // so verify_solver_hop_states returns Err and the gate must abort.
-        let word = |v: U256| {
-            let mut w = [0u8; 32];
-            w[..].copy_from_slice(&v.to_be_bytes::<32>());
-            w
-        };
-        let mut resp = Vec::new();
-        resp.extend_from_slice(&word(U256::from(777u64)));
-        resp.extend_from_slice(&word(U256::from(888u64)));
-        resp.extend_from_slice(&word(U256::ZERO));
-        let hex_resp = format!("0x{}", alloy::primitives::hex::encode(&resp));
-        asserter.push_success(&hex_resp);
-
-        let refs = pump.sink.solver_path_pool_refs();
-        let (path_hop_states, anchor) = {
-            let state = pump.bot.state_arc();
-            let core = state.read();
-            (
-                refs.iter()
-                    .map(|pools| extract_solver_hop_states(&core, pools))
-                    .collect::<Vec<_>>(),
-                crate::bot_core::solve_anchor::SolveAnchor::resolve(200, &core),
-            )
-        };
-        let reorg_evidence: Vec<TripReorgWindow> =
-            pump.trip_reorg_windows.lock().iter().copied().collect();
-        let verdict = judge(
-            &pump.provider,
-            &crate::bot_core::solver_state_tripwire::TripwireConfig::enabled_only(),
-            &path_hop_states,
-            anchor,
-            &reorg_evidence,
-        )
-        .await;
-        // ADR-040: the reaction is stance-selected by the parent test.
-        let stance = std::env::var("DEGENBOT_DESYNC_TEST_STANCE").unwrap_or_default();
-        match stance.as_str() {
-            "quarantine" => {
-                if let GateVerdict::Divergent(d) = verdict {
-                    // The default matrix reaction: quarantine + loud event.
-                    BlockPump::react_to_desync(&pump.bot, &d, pool_id, 200);
-                    let quarantined = pump.bot.state_arc().read().is_pool_quarantined(pool_id);
-                    assert!(
-                        quarantined,
-                        "the divergent pool must be quarantined (solve-invisible)"
-                    );
-                    #[expect(clippy::print_stderr)] // parent-asserted marker
-                    {
-                        eprintln!("[SOLVER-STATE] QUARANTINE: ADR-040 reaction verified");
-                    }
-                    // AV42C7: the desync probe self-aborts so the PARENT test observes the marker.
-                    #[expect(clippy::exit)]
-                    std::process::exit(0);
-                }
-                unreachable!("the solver-state gate MUST trip on the mismatched reserves (AV42C7)");
-            }
-            "exit" => {
-                crate::failure_policy::install_overrides([("solver_state_desync", "exit")])
-                    .expect("operator exit override installs");
-                if let GateVerdict::Divergent(d) = verdict {
-                    BlockPump::react_to_desync(&pump.bot, &d, pool_id, 200);
-                }
-                unreachable!("the exit stance MUST abort before returning (byte-identical UO3JM4)");
-            }
-            other => unreachable!("unknown DEGENBOT_DESYNC_TEST_STANCE {other:?}"),
         }
     }
 

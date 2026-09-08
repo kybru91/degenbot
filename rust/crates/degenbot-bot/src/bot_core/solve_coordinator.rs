@@ -41,7 +41,6 @@ use std::sync::{Arc, Mutex};
 use crate::bot_core::drain_sink::DrainSink;
 use crate::bot_core::EpochDelta;
 use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
-use degenbot_solvers::mixed::MixedPoolRef;
 
 use super::block_clock_pipe::BlockClockPipe;
 use super::engine::Engine;
@@ -290,24 +289,6 @@ impl DrainSink for SolveCoordinator {
             .lock()
             .expect("block_clock poisoned")
             .notify(block, metadata);
-    }
-
-    fn solver_path_pool_refs(&self) -> Vec<Vec<MixedPoolRef>> {
-        #[expect(clippy::expect_used)] // invariant-guarded (documented)
-        let _guard = self.drain_lock.lock().expect("drain_lock poisoned");
-        self.engines
-            .iter()
-            .flat_map(|engine| engine.solver_path_pool_refs())
-            .collect()
-    }
-
-    fn take_solver_path_pool_refs_change_set(&self) -> Vec<Vec<MixedPoolRef>> {
-        #[expect(clippy::expect_used)] // invariant-guarded (documented)
-        let _guard = self.drain_lock.lock().expect("drain_lock poisoned");
-        self.engines
-            .iter()
-            .flat_map(|engine| engine.take_solver_path_pool_refs_change_set())
-            .collect()
     }
 }
 

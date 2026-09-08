@@ -367,132 +367,11 @@ mod tests {
         assert!(!solve_result.profit.is_zero());
     }
 
-    /// ADR-021 change-set scoping (pump-freeze fix): the solver-state verifier
-    /// must diff ONLY the paths re-solved this block, never the whole registered
-    /// set. A path untouched by a solve stays out of the change set; a solve on
-    /// one path does not leak the others in; and `take_solver_path_pool_refs_change_set`
-    /// consumes+clears the set so it cannot accumulate into the whole set over
-    /// time. RED before the change-set plumbing existed (the verifier walked
-    /// `solver_path_pool_refs`, i.e. every registered path, each publish).
-    #[test]
-    fn solver_state_change_set_scopes_to_resolved_paths_and_clears() {
-        let mut engine = ArbitrageEngine::new();
-
-        let a = engine.register_v2_pool(
-            Address::from([0x11u8; 20]),
-            usdc(1_000_000),
-            weth(500),
-            GAMMA_03,
-            FEE_DENOM_03,
-        );
-        let a2 = engine.register_v2_pool(
-            Address::from([0x13u8; 20]),
-            usdc(1_100_000),
-            weth(510),
-            GAMMA_03,
-            FEE_DENOM_03,
-        );
-        let b = engine.register_v2_pool(
-            Address::from([0x12u8; 20]),
-            usdc(2_000_000),
-            weth(900),
-            GAMMA_03,
-            FEE_DENOM_03,
-        );
-        let b2 = engine.register_v2_pool(
-            Address::from([0x14u8; 20]),
-            usdc(2_100_000),
-            weth(910),
-            GAMMA_03,
-            FEE_DENOM_03,
-        );
-        let _path_a = engine
-            .register_path(vec![
-                PoolHop {
-                    pool_id: a,
-                    zero_for_one: true,
-                },
-                PoolHop {
-                    pool_id: a2,
-                    zero_for_one: true,
-                },
-            ])
-            .unwrap();
-        let _path_b = engine
-            .register_path(vec![
-                PoolHop {
-                    pool_id: b,
-                    zero_for_one: true,
-                },
-                PoolHop {
-                    pool_id: b2,
-                    zero_for_one: true,
-                },
-            ])
-            .unwrap();
-
-        // Solve only path A's pool this block — B must stay out of the set.
-        engine.rebuild_and_solve_affected(
-            &crate::arb_engine::test_oracle::affected_keys(
-                &HashSet::from([a]),
-                &HashSet::new(),
-                &HashSet::new(),
-            ),
-            5,
-            &BlockMetadata::default(),
-        );
-
-        let change = engine.take_solver_path_pool_refs_change_set();
-        assert_eq!(
-            change.len(),
-            1,
-            "change set must contain only the re-solved path, got {} paths",
-            change.len()
-        );
-        assert_eq!(change[0].len(), 2);
-        assert_eq!(
-            change[0][0].pool_key, a,
-            "change set must reference path A's pool, not the whole set"
-        );
-        assert!(
-            change
-                .iter()
-                .flat_map(|p| p.iter())
-                .all(|r| r.pool_key == a || r.pool_key == a2),
-            "no path referencing pool B may leak into A's change set"
-        );
-
-        // Consumed + cleared: a second take returns nothing (can't accumulate).
-        let again = engine.take_solver_path_pool_refs_change_set();
-        assert!(
-            again.is_empty(),
-            "change set must be consumed+cleared by take"
-        );
-
-        // Re-solving B pushes B into the set — but never the whole set.
-        engine.rebuild_and_solve_affected(
-            &crate::arb_engine::test_oracle::affected_keys(
-                &HashSet::from([b]),
-                &HashSet::new(),
-                &HashSet::new(),
-            ),
-            6,
-            &BlockMetadata::default(),
-        );
-        let change2 = engine.take_solver_path_pool_refs_change_set();
-        assert_eq!(change2.len(), 1);
-        assert!(
-            change2
-                .iter()
-                .flat_map(|p| p.iter())
-                .all(|r| r.pool_key == b || r.pool_key == b2),
-            "a fresh solve must carry only the newly-re-solved path"
-        );
-    }
-    /// R522XA wiring: an Invalid path (empty V3 hop) is NOT re-resolved when an
-    /// unrelated co-hop is dirty, but IS re-checked when its own responsible
-    /// pool goes dirty — the container-clearing transition driven through the
-    /// production reverse-index fan-out.
+    /// The invalid-path container recheck: an invalid path re-checks ONLY when
+    /// a responsible pool goes dirty (and leaves Invalid as long as the pool
+    /// stays empty); unrelated co-hop dirt does not re-derive it. Observable
+    /// via `resolved_update_snapshot` (a re-derive stamps it; a skipped path
+    /// never does).
     #[test]
     fn invalid_path_skips_unrelated_dirty_but_rechecks_own_pool() {
         use crate::arb_engine::path_lifecycle::PathSolveStatus;
@@ -546,7 +425,10 @@ mod tests {
             other => panic!("expected Invalid, got {other:?}"),
         }
 
-        // Unrelated dirty (the V2 co-hop) must NOT re-resolve the invalid path.
+        // Unrelated dirty (the V2 co-hop) must NOT re-resolve the invalid path:
+        // clear the resolve stamp and prove the cycle does not re-derive the
+        // path (no snapshot re-insertion).
+        engine.resolved_update_snapshot.clear();
         engine.rebuild_and_solve_affected(
             &crate::arb_engine::test_oracle::affected_keys(
                 &HashSet::from([v2]),
@@ -556,10 +438,9 @@ mod tests {
             5,
             &BlockMetadata::default(),
         );
-        let change = engine.take_solver_path_pool_refs_change_set();
         assert!(
-            change.is_empty(),
-            "unrelated dirty co-hop must skip the invalid path"
+            !engine.resolved_update_snapshot.contains_key(&path_id),
+            "unrelated dirty co-hop must not re-derive the invalid path"
         );
         match &engine.path_status[&path_id] {
             PathSolveStatus::Invalid { responsible } => {
@@ -580,11 +461,9 @@ mod tests {
             6,
             &BlockMetadata::default(),
         );
-        let change = engine.take_solver_path_pool_refs_change_set();
-        assert_eq!(
-            change.len(),
-            1,
-            "dirtying the path's own responsible pool must re-check it"
+        assert!(
+            engine.resolved_update_snapshot.contains_key(&path_id),
+            "dirtying the path's own responsible pool must re-derive (re-check) it"
         );
     }
 
@@ -1840,9 +1719,9 @@ mod tests {
     /// (stored state byte-identical to on-chain), so it is SOLVED, not deferred.
     /// The old gate deferred it because `update_block` age looks like staleness —
     /// the quiet-pool false positive QNFYR5 proved live. Genuine chain/solver
-    /// divergence is caught by the ADR-021 tripwire
-    /// (`solver_state_tripwire::judge`) before the pump's trip + exit,
-    /// which fatal-aborts loudly, NOT by a solve-time defer.
+    /// divergence is out of the solve path's scope: the tripwire retired with
+    /// epic MROOY7 task 2UVG3E, and stale merge results are DROPPED by the
+    /// Q1a window gate, never applied.
     #[test]
     fn quiet_pool_frozen_far_behind_is_solved_not_deferred() {
         let mut engine = ArbitrageEngine::new();
@@ -6327,7 +6206,7 @@ mod tests {
     /// slow path is still solving. RED before the per-result emission: the
     /// debounce path sends nothing until `send_result_batch`.
     #[test]
-
+    #[expect(clippy::too_many_lines)]
     fn streaming_delivery_emits_fast_result_while_slow_path_solves() {
         if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
             eprintln!("skipping: streaming-delivery test requires >=2 cores");
@@ -6836,94 +6715,6 @@ mod tests {
         );
     }
 
-    /// T2 (epic SRQEK5 4QKZE3) ADR-021 targeted test: a detached straggler can
-    /// never bypass the publish verifier. Two directions pinned: (a) a
-    /// straggler that lands AFTER a publish consumed its cycle's change set is
-    /// re-scoped into the NEXT publish's change set (`merge_detached_item`
-    /// re-extends `last_solved_path_ids`); (b) a stale-DROPPED straggler
-    /// contributes NOTHING to the publish path: no result entry, and nothing
-    /// new enters the publish verifier scope.
-    #[test]
-    fn adr021_detached_stragglers_stay_scoped_to_the_publish_verifier() {
-        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
-        // LXDY4C: the solve consumes the delta's taken keys (all fixture
-        // pools are V2 hops in this fixture).
-        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
-            .iter()
-            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
-            .collect();
-        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
-        let pid = path_ids[0];
-        assert!(
-            engine.results.contains_key(&pid),
-            "precondition: fresh merge"
-        );
-        let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
-        let fresh_result = engine.results.get(&pid).unwrap().clone();
-
-        // Publish #1: the cycle's change set names the re-solved path, then
-        // the consume-and-clear contract empties it.
-        let publish_1 = engine.take_solver_path_pool_refs_change_set();
-        assert!(
-            !publish_1.is_empty(),
-            "publish #1 must scope the re-solved path"
-        );
-        assert!(publish_1.iter().any(|refs| refs.len() == 2));
-        assert!(
-            engine.take_solver_path_pool_refs_change_set().is_empty(),
-            "the change set must be consumed by the publish"
-        );
-
-        // (a) An APPLIED straggler that lands AFTER publish #1 is re-scoped:
-        // the next publish's verifier diff covers it — no bypass.
-        engine.merge_detached_item(
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-                payload: None,
-                worker_clamp_twins: 0,
-                cycle_seq: 1,
-                solve_block: 100,
-                metadata: BlockMetadata::default(),
-                pid,
-                update_stamp: fresh_stamp.clone(),
-                result: fresh_result.clone(),
-                solve_span: tracing::Span::none(),
-            },
-        );
-        let publish_2 = engine.take_solver_path_pool_refs_change_set();
-        assert!(
-            !publish_2.is_empty(),
-            "a late-merged straggler MUST be re-scoped into the next publish's verifier change set (no publish bypass)"
-        );
-        assert!(engine.results.contains_key(&pid));
-
-        // (b) A stale-DROPPED straggler reaches the publish path never: it
-        // acquires no result entry and adds nothing to the change set.
-        let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
-        engine.merge_detached_item(
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-                payload: None,
-                worker_clamp_twins: 0,
-                cycle_seq: 1,
-                solve_block: 100,
-                metadata: BlockMetadata::default(),
-                pid,
-                update_stamp: stale_stamp,
-                result: fresh_result,
-                solve_span: tracing::Span::none(),
-            },
-        );
-        assert_eq!(
-            engine
-                .detached_dropped_stale
-                .load(std::sync::atomic::Ordering::Relaxed),
-            1
-        );
-        assert!(
-            engine.take_solver_path_pool_refs_change_set().is_empty(),
-            "a stale-dropped straggler must not re-enter the publish verifier scope"
-        );
-    }
-
     /// T2 (epic SRQEK5 4QKZE3) watchdog + cadence acceptance: with detached
     /// cycles ON through the PRODUCTION drain seam (`SolveCoordinator` inside
     /// `DispatchOwner` — the shipped `solve_dirty`/`send_result_batch` cadence),
@@ -6950,8 +6741,7 @@ mod tests {
             crate::arb_engine::engine_handle::EngineHandle::new(std::sync::Arc::clone(&engine));
         let coordinator = SolveCoordinator::new(vec![std::sync::Arc::new(handle)]);
         coordinator.set_delta(delta);
-        let (verify_tx, _verify_rx) = tokio::sync::watch::channel(None);
-        let owner = DispatchOwner::new(std::sync::Arc::new(coordinator), &Some(verify_tx));
+        let owner = DispatchOwner::new(std::sync::Arc::new(coordinator));
         let meta = BlockMetadata::default();
 
         let t0 = std::time::Instant::now();
@@ -6964,7 +6754,6 @@ mod tests {
         // + further block cycles interleave with the sidecar's merges.
         owner.dispatch(DrainWork::Publish {
             context: BlockContext::new(100, meta),
-            change_set: Vec::new(),
         });
         owner.dispatch(DrainWork::Drain {
             context: BlockContext::new(101, meta),

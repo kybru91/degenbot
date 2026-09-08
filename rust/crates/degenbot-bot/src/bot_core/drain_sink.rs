@@ -23,7 +23,6 @@
 //! acquire core *write* guards internally — engine-then-core, never reversed.
 
 use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
-use degenbot_solvers::mixed::MixedPoolRef;
 
 /// The per-block drain + reorg seam the `BlockPump` drives (ADR-006 D4).
 ///
@@ -96,21 +95,4 @@ pub trait DrainSink: Send + Sync {
     /// block clock tracks `newHeads` and is never stale by the send debounce.
     /// Fan-out mirrors `on_drain`/`on_send` under the drain lock.
     fn notify_block(&self, block: u64, metadata: &BlockMetadata);
-
-    /// Snapshot every registered path's per-hop pool refs across all engines
-    /// (for the Option-A solver-state accuracy gate). Defaults to empty; the
-    /// arbitrage `SolveCoordinator` fans this out to each engine.
-    fn solver_path_pool_refs(&self) -> Vec<Vec<MixedPoolRef>> {
-        Vec::new()
-    }
-
-    /// Consume-and-clear the ADR-021 solver-state change set (paths re-solved
-    /// since the last publish) across all engines, for the solver-state accuracy
-    /// gate. Defaults to empty; the arbitrage `SolveCoordinator` fans this out
-    /// to each engine's accumulated change set and clears it (atomic take-then-
-    /// clear, so the verifier diffs only this block's re-solved paths — never
-    /// the whole registered set).
-    fn take_solver_path_pool_refs_change_set(&self) -> Vec<Vec<MixedPoolRef>> {
-        Vec::new()
-    }
 }

@@ -57,13 +57,12 @@ fn main() -> Result<(), String> {
     println!(
         "config-only smoke boot OK: file={path}, solve.executor={}, \
          streaming_delivery={}, min_profit_wei={}, solve_cpus_unset={}, \
-         metrics_addr={}, desync_dump_dir={}",
+         metrics_addr={}",
         engine.solve_executor_probe(),
         engine.streaming_delivery_probe(),
         cfg.solve.min_profit_wei,
         cfg.solve.solve_cpus.is_none(),
         cfg.telemetry.metrics_addr,
-        cfg.pump.desync_dump_dir.display(),
     );
     Ok(())
 }

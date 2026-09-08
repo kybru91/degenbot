@@ -1,7 +1,7 @@
 //! `DispatchOwner` — the block pump's single dispatch seam (epic B).
 //!
-//! One module owns the pump's hand-offs to the sink, the solver-state verifier,
-//! and Python's block clock — the **dispatch owner** — but delivers them over
+//! One module owns the pump's hand-offs to the sink and Python's block clock —
+//! the **dispatch owner** — but delivers them over
 //! application-specific pipes, each with the delivery semantics its task needs
 //! (see CONTEXT.md "Block-pump dispatch seam"). "One seam" means one coordinated
 //! home, NEVER one queue forced to fit every task.
@@ -17,11 +17,10 @@
 //!   accepted header is delivered 1:1 (no coalescing). The sink's `notify_block`
 //!   no longer takes the `drain_lock` (the `engines` vec is frozen after start),
 //!   so the clock does not contend with the drain fan-out.
-//! - **Verifier pipe (B1):** a latest-wins `watch` to the solver-state verifier
-//!   task (ADR-021). Only the most recent published block is ever verified;
-//!   non-blocking so a slow verify can never stall the pump. The `watch`
-//!   transmitter lives here; the verifier task construction stays in the pump
-//!   (it needs `solver_state_verify_loop`, which is `impl BlockPump`).
+//! - **Upstream-verify edge:** the ADR-021 upstream verification
+//!   (`CompletenessDecision::Verify` → `assert_ws_block_complete` — the kept
+//!   RPC-disagreement check per task 2UVG3E) runs directly in the pump at the
+//!   tombstone edge; it needs no dispatch pipe.
 //!
 //! ## Delivery (sole mode since B4)
 //!
@@ -29,22 +28,12 @@
 //! is retired — the WS poller never parks behind GIL-bound Python or a heavy
 //! Möbius solve). FIFO order + the engine/sink locks give the deferred work the
 //! same semantics the pre-B4GX7C inline path had.
-//!
-//! The `Publish` change-set is consumed atomically by the caller (single-writer)
-//! and the verifier anchor is carried in the message.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::bot_core::drain_sink::DrainSink;
-use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
-
-/// The payload handed from the pump to the solver-state verifier task at each
-/// publish point: the solve block and the pool refs for ONLY the paths re-solved
-/// that block (the ADR-021 change set). Captured atomically at the publish so
-/// the verifier diffs exactly what this block re-solved against the chain — never
-/// the whole registered set (the root of the confirmed pump freeze).
-pub type SolverVerifyRequest = (Epoch, Vec<Vec<degenbot_solvers::mixed::MixedPoolRef>>);
+use crate::bot_core::{BlockContext, BlockMetadata};
 
 /// A deferred drain-sink operation to the background drainer task: the sink's
 /// solve/dispatch/finalize run via these messages so the WS poller is never
@@ -55,20 +44,15 @@ pub type SolverVerifyRequest = (Epoch, Vec<Vec<degenbot_solvers::mixed::MixedPoo
 ///
 /// T6IYKY: every item carries its work block as a [`BlockContext`] — the ONE
 /// coordinate (block + rewind generation, minted by `PumpFSM::context_for`).
-/// The old loose `block`/`open` + `metadata` field pairs are gone; the
-/// verifier anchor IS `Publish`'s context epoch.
+/// The old loose `block`/`open` + `metadata` field pairs are gone.
 pub enum DrainWork {
     /// Eager solve of every dirty path at the context's block.
     Drain { context: BlockContext },
     /// Solve + emit the block-boundary batch (tombstone path).
     Finalize { context: BlockContext },
-    /// The quiesce-gated publish: flush the sink's `on_send` to Python, then
-    /// hand the log-driven quiesced context + change-set to the latest-wins
-    /// verifier (the context's epoch is the ADR-021 verifier anchor).
-    Publish {
-        context: BlockContext,
-        change_set: Vec<Vec<degenbot_solvers::mixed::MixedPoolRef>>,
-    },
+    /// The quiesce-gated publish: flush the sink's `on_send` to Python with
+    /// the log-driven quiesced context.
+    Publish { context: BlockContext },
 }
 
 /// Shared progress counters giving the WS poller feedback on the background
@@ -277,8 +261,6 @@ fn now_millis() -> u64 {
         .try_into()
         .unwrap_or(u64::MAX)
 }
-/// pipe, and the verifier pipe.
-///
 /// Small interface: `dispatch(work)` (the drain pipe; enqueue or run inline) +
 /// `notify_block` (the block-clock pipe; a direct, non-FIFO dispatch) + `pending()`
 /// (the drain lag metric). The implementation absorbs the channel, the background
@@ -308,20 +290,15 @@ pub struct DispatchOwner {
 
 impl DispatchOwner {
     /// Build the drain pipe, always spawning the background drainer task (the
-    /// sole mode since B4 — the inline path is retired). The drainer holds
-    /// clones of `sink` and `verify_tx`. `verify_tx` is the latest-wins verifier
-    /// transmitter the `Publish` path forwards to. The WS poller never parks
-    /// behind GIL-bound `Python::attach` / heavy Möbius solve.
-    pub fn new(
-        sink: Arc<dyn DrainSink>,
-        verify_tx: &Option<tokio::sync::watch::Sender<Option<SolverVerifyRequest>>>,
-    ) -> Self {
+    /// sole mode since B4 — the inline path is retired). The drainer holds a
+    /// clone of `sink`. The WS poller never parks behind GIL-bound
+    /// `Python::attach` / heavy Möbius solve.
+    pub fn new(sink: Arc<dyn DrainSink>) -> Self {
         let (tx, mut rx) =
             tokio::sync::mpsc::unbounded_channel::<(DrainWork, tracing::Span, u64)>();
         let health = Arc::new(DrainerHealth::new());
         let header_ms = Arc::new(AtomicU64::new(0));
         let sink_clone = Arc::clone(&sink);
-        let vt = verify_tx.clone();
         let health_clone = Arc::clone(&health);
         let header_ms_clone = Arc::clone(&header_ms);
         let _drainer = tokio::spawn(async move {
@@ -354,16 +331,8 @@ impl DispatchOwner {
                     DrainWork::Finalize { context } => {
                         sink_clone.finalize_block(&context);
                     }
-                    DrainWork::Publish {
-                        context,
-                        change_set,
-                    } => {
-                        // on_send first, then the latest-wins verifier — the
-                        // publish context's epoch is the verifier anchor.
+                    DrainWork::Publish { context } => {
                         sink_clone.on_send(&context);
-                        if let Some(ref tx) = vt {
-                            let _ = tx.send(Some((context.epoch(), change_set)));
-                        }
                     }
                 }
                 // T2: header→solved latency for solve-carrying work items.
@@ -482,9 +451,7 @@ impl DispatchOwner {
 
     /// Route one drain-sink operation to the background drainer task (the sole
     /// mode since B4). FIFO ordering + the engine/sink locks give the deferred
-    /// work the same semantics the pre-B4GX7C inline path had. For `Publish` the
-    /// change-set is already consumed atomically by the caller (single-writer)
-    /// and the verifier anchor is carried in the message.
+    /// work the same semantics the pre-B4GX7C inline path had.
     ///
     /// The B3 stall backstop (soak-hardened): the pump aborts when the drain
     /// pipe holds a backlog AND the drainer has completed nothing for
@@ -556,6 +523,7 @@ impl DispatchOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bot_core::Epoch;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -612,7 +580,7 @@ mod tests {
     }
 
     fn owner_for(sink: &Arc<RecordingSink>) -> DispatchOwner {
-        DispatchOwner::new(Arc::clone(sink) as Arc<dyn DrainSink>, &None)
+        DispatchOwner::new(Arc::clone(sink) as Arc<dyn DrainSink>)
     }
 
     /// The block-clock pipe is delivered even without any drain work — the
@@ -661,23 +629,18 @@ mod tests {
         assert_eq!(*sink.notified.lock(), vec![43]);
     }
 
-    /// Inline `Publish` hands the quiesced block + change-set to the latest-wins
-    /// The `Publish` drain-work hands the quiesced block + change-set to the
-    /// latest-wins verifier watch (the ADR-021 hand-off), after `on_send`. Via
-    /// the background drainer (sole mode).
+    /// The `Publish` drain-work flushes the sink's `on_send` with the quiesced
+    /// context, via the background drainer (sole mode).
     #[tokio::test]
-    #[expect(clippy::panic)] // the test asserts a required side effect; abort on absence
-    async fn publish_forwards_to_verifier() {
+    async fn publish_flushes_on_send_via_the_drainer() {
         let sink = Arc::new(RecordingSink::new());
-        let (verify_tx, verify_rx) = tokio::sync::watch::channel(None);
-        let owner = DispatchOwner::new(Arc::clone(&sink) as Arc<dyn DrainSink>, &Some(verify_tx));
+        let owner = DispatchOwner::new(Arc::clone(&sink) as Arc<dyn DrainSink>);
 
         owner.dispatch(DrainWork::Publish {
             context: BlockContext::new(7, BlockMetadata::default()),
-            change_set: Vec::new(),
         });
 
-        // Wait for the drainer to process the publish (on_send + verify).
+        // Wait for the drainer to process the publish (on_send).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while owner.health().processed() < 1 {
             assert!(
@@ -687,14 +650,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        // on_send ran, then the verifier got the most-recent request.
         assert_eq!(sink.send_count.load(Ordering::Relaxed), 1);
-        let got = verify_rx.borrow().clone();
-        let Some((epoch, change_set)) = got else {
-            panic!("verifier did not receive a publish");
-        };
-        assert_eq!(epoch.block(), 7);
-        assert!(change_set.is_empty());
     }
 
     #[test]
@@ -775,7 +731,7 @@ mod tests {
             return;
         }
         let sink = Arc::new(BlockingSink);
-        let mut owner = DispatchOwner::new(sink as Arc<dyn DrainSink>, &None);
+        let mut owner = DispatchOwner::new(sink as Arc<dyn DrainSink>);
         // Small stall window so the freeze aborts in milliseconds, not 30s.
         owner.set_stall_window_for_test(50);
         // The blocking sink means the drainer picks up one item and never
@@ -801,7 +757,7 @@ mod tests {
             return;
         }
         let sink = Arc::new(BlockingSink);
-        let mut owner = DispatchOwner::new(sink as Arc<dyn DrainSink>, &None);
+        let mut owner = DispatchOwner::new(sink as Arc<dyn DrainSink>);
         owner.set_stall_window_for_test(50);
         let meta = BlockMetadata::default();
         // The drainer picks up item 0 and freezes mid-on_drain; items 1..

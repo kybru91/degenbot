@@ -34,10 +34,10 @@
 //! Each hook receives its [`BlockContext`] (the one epoch coordinate,
 //! task T6IYKY, plus the block's execution metadata) plus the previous
 //! stage's output. The per-epoch dirty tracking travels as the opaque
-//! [`EpochDelta`] handle — its internals (touched-pool bookkeeping,
-//! affected-path derivation input) are owned by the `EpochDelta` task (LXDY4C)
-//! and are deliberately NOT part of this seam, so the dirty-tracking rewrite
-//! cannot fork the trait.
+//! [`EpochDelta`] handle — the real touched-pool ledger
+//! (`crate::bot_core::epoch_delta`, LXDY4C), re-exported by this module;
+//! its internals are NOT
+//! part of this seam, so the dirty-tracking rewrite cannot fork the trait.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -142,19 +142,14 @@ pub const fn legal_successors(previous: Option<Stage>) -> &'static [Stage] {
 // Opaque delta handle
 // ----------------------------------------------------------------------
 
-/// Opaque per-epoch dirty-tracking handle, minted during the Streaming row
-/// (the only writer stage, invariant I4) and carried opaque through the
-/// resolve hooks.
-///
-/// PLACEHOLDER: the real internals (touched-pool bookkeeping, affected-path
-/// derivation input) land with the `EpochDelta` task (LXDY4C), which replaces
-/// this body — the `StageHandlers` signatures stay exactly as they are, which
-/// is the point: dirty-tracking details cannot fork the engine seam.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EpochDelta {
-    /// Private by construction: even the engine sees only the handle.
-    _opaque: (),
-}
+// LXDY4C cutover (task 2UVG3E data-plane pass): the module-local placeholder
+// is unified onto the REAL per-epoch dirty ledger (crate::bot_core::epoch_delta,
+// the type Bot mints at dispatch time) — the StageHandlers signatures are
+// unchanged, which is the point: dirty-tracking details cannot fork the
+// engine seam.
+
+#[doc(inline)]
+pub use crate::bot_core::epoch_delta::EpochDelta;
 
 /// A gap-backfill episode the Streaming stage executed before this epoch
 /// quiesced (stage table: Streaming applies live WS logs + gap `eth_getLogs`
@@ -768,7 +763,7 @@ mod conformance {
                 trace: Vec::new(),
                 cutoff: None,
                 rewinds: RewindTracker::default(),
-                delta: EpochDelta::default(),
+                delta: EpochDelta::new(0u64),
             }
         }
 

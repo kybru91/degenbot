@@ -1,7 +1,21 @@
 // THROWAWAY spike harness for ergo KWKEVV (StateView mechanism feasibility).
-// Lives only for this spike; deleted once the numbers land in
-// docs/architecture/stateview-feasibility.md.
-#![expect(clippy::unwrap_used)]
+// Lives only for this spike; deleted after supervisor sign-off per
+// docs/architecture/stateview-feasibility.md §7. Lint-exempt wholesale: it is
+// diagnostic-only and never ships.
+#![allow(
+    clippy::print_stdout,
+    clippy::unnecessary_wraps,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::similar_names,
+    clippy::unreadable_literal,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::explicit_into_iter_loop,
+    clippy::uninlined_format_args
+)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
