@@ -3,11 +3,12 @@
 //! `LogDispatcher` owns a decoder registry + a `Weak<dyn PoolStateSubscriber>`
 //! registry keyed by `pool_id`. `Bot` drives `dispatch(log)`: decode the log,
 //! apply the decoded event to `BotState` under a **write** guard, **release the
-//! guard**, then notify each subscriber of the affected `pool_id`
-//! (`on_pool_state_updated`). The subscriber (an engine adapter) dirties the
-//! `pool_id` in its own per-engine set taking only the engine `Mutex` — the
-//! core write is already released, so D2's engine-then-core order is preserved
-//! by not nesting.
+//! guard**, record the touched key into the epoch's `EpochDelta` ledger (the
+//! dirty-tracking mechanism since LXDY4C — the retired engine-subscriber
+//! classification is gone), then notify each subscriber of the affected
+//! `pool_id` (`on_pool_state_updated`). Subscribers take only their own lock —
+//! the core write is already released, so D2's engine-then-core order is
+//! preserved by not nesting.
 //!
 //! This module ships the bus + subscriber seam in isolation (ADR-006 slice 4).
 //! The pump driving the dispatcher lands in slice 5; the live `apply_log` hot
@@ -44,9 +45,10 @@ fn is_known_pool_topic(topic0: Option<&alloy::primitives::B256>) -> bool {
 /// A subscriber to pool-state updates (ADR-006 D4).
 ///
 /// `on_pool_state_updated` fires after `BotState` has been mutated and the
-/// write guard released. The implementer dirties `pool_id` in its own state
-/// taking only its own lock — never the `BotState` lock synchronously (that
-/// would re-nest against D2's engine-then-core order).
+/// write guard released (touched-pool tracking itself is the `EpochDelta`
+/// ledger's byproduct of the apply — LXDY4C). The implementer reacts taking
+/// only its own lock — never the `BotState` lock synchronously (that would
+/// re-nest against D2's engine-then-core order).
 ///
 /// Ships as `PoolStateSubscriber` until a second state-subject type proves
 /// generality (then rename to `StateSubscriber`).

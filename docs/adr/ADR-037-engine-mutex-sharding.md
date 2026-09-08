@@ -2,6 +2,12 @@
 
 **Status: accepted.** Implemented August 2026 (epic C42WKO).
 
+> **Historical since epic `MROOY7` ([ADR-041](ADR-041-block-epoch-pipeline.md), `SZJUKL`):**
+> the `drain_lock → engine Mutex → BotState RwLock` ordering chain below no longer exists —
+> there is no `drain_lock`, and with `DEGENBOT_DETACHED_SOLVES` default ON the engine-`Mutex`
+> hold on the solve path collapses to enqueue-length. The DashMap sharding mechanics remain
+> accurate history.
+
 ## Context
 
 The `ArbitrageEngine` lived behind a single `parking_lot::Mutex`. Every

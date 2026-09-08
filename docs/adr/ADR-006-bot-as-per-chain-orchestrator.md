@@ -8,6 +8,12 @@ Implementation is a separate body of work; this ADR records the settled shape on
 The `EventSink` / `on_block` interface signature is intentionally *not* specified here —
 see "Deferred" — only the topology is decided.
 
+> **Partial supersession (epic `MROOY7`, [ADR-041](ADR-041-block-epoch-pipeline.md)):**
+> the `SolveCoordinator` helper row below was retired in `SZJUKL` — dirty tracking is the
+> `EpochDelta` ledger and solve triggering is the `StageHandlers` hooks driven inline by
+> the pump. The `Bot` / `BotState` / `LogDispatcher` / `BlockPump` / `ReorgCoordinator`
+> rows remain accurate.
+
 ## Update (ADR-006 D3+D4 follow-up completion)
 
 The original landing claim ("all 11 slices landed; ADR-006 acceptance verified")
