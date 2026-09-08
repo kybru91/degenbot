@@ -7,10 +7,55 @@ on:
     branches: [main, dev]
   workflow_call:
 
+concurrency:
+  # Superseded pushes to the same branch/PR replace the older run instead of
+  # stacking full CI invocations behind it.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  # Incremental state is never reused within a run on ephemeral CI runners and
+  # only bloats the rust-cache save. Debuginfo likewise: rust/target (and the
+  # cache) shrink substantially without it.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
+  # Path gate: cheap first job that decides which tracks the event actually
+  # touched. PRs diff against the merge-base, pushes against the previous
+  # commit (dorny/paths-filter handles both). The workflow_call trigger has no
+  # in-repo consumer; its event carries no diff, so every output defaults to
+  # true and the callee runs the full matrix.
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ github.event_name == 'workflow_call' || steps.filter.outputs.rust }}
+      python: ${{ github.event_name == 'workflow_call' || steps.filter.outputs.python }}
+      tier3: ${{ github.event_name == 'workflow_call' || steps.filter.outputs.tier3 }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'rust/**'
+              - 'tier3-oracle/artifacts/**'
+            python:
+              - 'rust/**'
+              - 'src/**'
+              - 'tests/**'
+              - 'examples/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'tier3-oracle/artifacts/**'
+            tier3:
+              - 'tier3-oracle/**'
+              - 'executor/**'
+
   commitlint:
     name: Commit Lint
     runs-on: ubuntu-latest
@@ -69,8 +114,15 @@ jobs:
       - name: Lint Markdown
         run: npx markdownlint-cli2 --fix "**/*.md" "!node_modules/**" "!.opencode/node_modules/**" "!.venv/**"
 
-  rust-check:
-    name: Rust Lint
+  rust:
+    # Consolidation of the former rust-check / rust-test /
+    # solver-replay-golden / rust-build / publish-dry-run jobs, which each paid
+    # toolchain install + cache restore + a workspace compile. One job = one
+    # target dir: clippy's dep artifacts are reused by test / golden replay /
+    # build / dry-run on the same runner.
+    name: Rust (lint, tests, F2 golden replay, build, publish dry-run)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -81,40 +133,13 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache Cargo
-        uses: actions/cache@v6
+        # Shared prefix so the jobs that survive the path gate chain off each
+        # other's saves. Unlike a Cargo.lock-only key, rust-cache accounts for
+        # workspace source changes and prunes stale artifacts before saving.
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install just
-        uses: extractions/setup-just@v4
-
-      - name: Check formatting
-        run: just fmt-check
-
-      - name: Run Clippy
-        run: just lint-rust
-
-  rust-test:
-    name: Rust Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: rust
+          shared-key: ci-rust
 
       - name: Install just
         uses: extractions/setup-just@v4
@@ -122,27 +147,18 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
+      # Cheapest first: a fmt/clippy failure never pays for the test build.
+      - name: Check formatting
+        run: just fmt-check
+
+      - name: Run Clippy
+        run: just lint-rust
+
       - name: Run Tests
         run: just test-rust
 
-  solver-replay-golden:
-    name: Solver Golden Replay (F2 gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
+      # Former standalone "Solver Golden Replay (F2 gate)" job; the golden
+      # regression now fails the `rust` job.
       - name: Run two-sided golden replay gate (offline, blocks merge)
         run: |
           cd rust
@@ -158,11 +174,28 @@ jobs:
           cargo run -q -p degenbot-solvers --example cl_solve_replay -- \
             crates/degenbot-solvers/tests/fixtures/heavy_cl_solve_captures.jsonl
 
-        # NOTE: add this job to the required checks in branch protection so a
-        # golden regression blocks merges.
+        # NOTE: make THIS `rust` job the required check in branch protection
+        # (it replaces the former "Solver Golden Replay (F2 gate)" check — see
+        # docs/handoffs/ci-consolidation-required-checks.md) so a golden
+        # regression blocks merges.
+
+      # Former rust-build job: near-free after the clippy/test build.
+      - name: Build extension
+        run: just build-rust-extension
+
+      # Former publish-dry-run job; its rust/ diff gate moved to the `changes`
+      # job. Catches manifest/file-inclusion regressions on every rust change,
+      # long before a tag. --no-verify keeps the PR gate fast (no isolated
+      # build); the verified publish itself is publish-to-crates-io.yml's
+      # pre-publish step plus the real `cargo publish` (always verified —
+      # release policy forbids --no-verify on publishes).
+      - name: Dry-run publish of all publishable members
+        run: cargo publish --workspace --dry-run --no-verify --allow-dirty --manifest-path rust/Cargo.toml
 
   tier3-oracle:
     name: Tier-3 On-Chain Accuracy Oracle
+    needs: changes
+    if: needs.changes.outputs.tier3 == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -173,13 +206,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
-        uses: actions/cache@v6
+        # Shared prefix so the jobs that survive the path gate chain off each
+        # other's saves. Unlike a Cargo.lock-only key, rust-cache accounts for
+        # workspace source changes and prunes stale artifacts before saving.
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: rust
+          shared-key: ci-rust
 
       - name: Install just
         uses: extractions/setup-just@v4
@@ -190,7 +223,7 @@ jobs:
       - name: Fetch canonical reference contracts (v2/v3/v4-core) + solc binaries
         run: tier3-oracle/bootstrap-libs.sh
 
-      # The oracle TESTS themselves run in the default `rust-test` job (they load
+      # The oracle TESTS themselves run in the consolidated `rust` job (they load
       # the committed bytecode from tier3-oracle/artifacts/ — no toolchain at
       # runtime). This job's unique role is the AUTHORITATIVE compile-vs-use
       # check: recompile every harness with the real solc/forge toolchain and
@@ -216,114 +249,20 @@ jobs:
       - name: Verify committed executor artifact matches a fresh compile
         run: just verify-tier3-executor-artifact
 
-  rust-build:
-    name: Rust Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install just
-        uses: extractions/setup-just@v4
-
-      - name: Build
-        run: just build-rust-extension
-
-  publish-dry-run:
-    name: Publish dry-run (crates.io gate)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Gate on rust/ changes
-        # Path-filtering without workflow path inputs: skip the dry run when
-        # the event's diff does not touch rust/. PRs diff against the base
-        # branch; pushes against before..HEAD; a brand-new branch (all-zero
-        # `before`) skips — its PR (if any) gates the rust/ content.
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="origin/${{ github.base_ref }}"
-          else
-            before="${{ github.event.before }}"
-            if [ "$before" = "0000000000000000000000000000000000000000" ]; then
-              echo "New branch push (no before SHA) — skipping dry run."
-              exit 0
-            fi
-            base="$before"
-          fi
-          if [ -z "$(git diff --name-only "$base" HEAD -- rust/ 2>/dev/null)" ]; then
-            echo "No rust/ changes in this event — skipping publish dry-run."
-            exit 0
-          fi
-          echo "rust/ changed — running publish dry-run."
-
-      - name: Dry-run publish of all publishable members
-        # Catches manifest/file-inclusion regressions on every rust/ change,
-        # long before a tag. --no-verify keeps the PR gate fast (no isolated
-        # build); the verified publish itself is publish-to-crates-io.yml's
-        # pre-publish step plus the real `cargo publish` (always verified —
-        # release policy forbids --no-verify on publishes).
-        run: cargo publish --workspace --dry-run --no-verify --allow-dirty --manifest-path rust/Cargo.toml
-
-  python-lint:
-    name: Python Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install just
-        uses: extractions/setup-just@v4
-
-      - name: Build and install Rust extension
-        run: just dev
-
-      - name: Check formatting
-        run: just fmt-check-python
-
-      - name: Run Python linters
-        run: just lint-python
-
-  python-test:
-    name: Python Tests
+  python:
+    # Consolidation of the former python-lint / python-test matrix /
+    # python-test-anvil jobs, which were byte-identical environments (uv +
+    # Rust toolchain + maturin develop) differing only in their final
+    # commands. The 3.12 floor leg absorbs the lint steps and the anvil tier;
+    # 3.14 is the ceiling leg. 3.13 was dropped as a mid-endpoint.
+    name: Python ${{ matrix.python-version }}
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: 
+        python-version:
           - "3.12"
-          - "3.13"
           - "3.14"
 
     steps:
@@ -338,13 +277,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo
-        uses: actions/cache@v6
+        # Shared prefix so the jobs that survive the path gate chain off each
+        # other's saves. Unlike a Cargo.lock-only key, rust-cache accounts for
+        # workspace source changes and prunes stale artifacts before saving.
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          workspaces: rust
+          shared-key: ci-rust
 
       - name: Sync dependencies
         run: uv sync --locked --dev --all-extras
@@ -352,50 +291,25 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v4
 
-      - name: Build and install Rust extension
-        run: just dev
-
-      - name: Run Tests
-        run: just test-python
-
-  python-test-anvil:
-    name: Python Tests (standalone anvil)
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Cargo
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            rust/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Sync dependencies
-        run: uv sync --locked --dev --all-extras
-
-      - name: Install just
-        uses: extractions/setup-just@v4
-
-      # Foundry provides `anvil` so the standalone-anvil (T1) tier executes here
-      # (the no-anvil python-test job skips it). No RPC secret is ever plumbed:
-      # standalone-anvil tests run against a seeded local chain with no upstream.
+      # Foundry provides `anvil` so the standalone-anvil (T1) tier executes on
+      # the floor leg (no RPC secret is ever plumbed: standalone-anvil tests
+      # run against a seeded local chain with no upstream). The 3.14 leg skips
+      # that tier, matching the historical matrix behavior.
       - name: Install Foundry (anvil)
+        if: matrix.python-version == '3.12'
         uses: foundry-rs/foundry-toolchain@v1
 
       - name: Build and install Rust extension
         run: just dev
+
+      # Former python-lint job (same pinned 3.12 uv environment as this leg).
+      - name: Check Python formatting
+        if: matrix.python-version == '3.12'
+        run: just fmt-check-python
+
+      - name: Run Python linters
+        if: matrix.python-version == '3.12'
+        run: just lint-python
 
       - name: Run Tests
         run: just test-python
