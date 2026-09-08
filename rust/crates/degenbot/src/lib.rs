@@ -1,4 +1,5 @@
 /// The whole `degenbot-core` crate (errors, hex, EIP-55, runtime, EIP-1559).
+pub use degenbot_config as config;
 pub use degenbot_core as core;
 /// Foundational utilities — errors, hex, EIP-55 addresses, shared runtime.
 pub use degenbot_core::{address_utils, errors, hex_utils, runtime};
