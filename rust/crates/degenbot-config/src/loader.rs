@@ -85,12 +85,28 @@ impl LoadedConfig {
     }
 }
 
-/// Builder for the layered load.
-#[derive(Default)]
+/// Builder for the layered load. The default env source is the process
+/// environment (12-factor: env > file > defaults; tests replace it via
+/// [`Self::with_env`] with a [`MapEnv`] or disable it via
+/// [`Self::without_env`]).
 pub struct BotConfigLoader {
     file: Option<PathBuf>,
     cli: Vec<(String, String)>,
     env: Option<Box<dyn EnvVars>>,
+}
+
+impl Default for BotConfigLoader {
+    /// Defaults + process environment (no file, no CLI) — the documented
+    /// production surface. A `#[derive(Default)]` here silently produced a
+    /// no-env loader (K7-config gap: production boots ignored every
+    /// DEGENBOT_* override).
+    fn default() -> Self {
+        Self {
+            file: None,
+            cli: Vec::new(),
+            env: Some(Box::new(ProcessEnv)),
+        }
+    }
 }
 
 impl std::fmt::Debug for BotConfigLoader {
