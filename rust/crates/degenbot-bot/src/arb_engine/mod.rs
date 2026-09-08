@@ -328,7 +328,7 @@ pub struct ArbitrageEngine {
     pub(crate) cfg: std::sync::Arc<::degenbot_config::BotConfig>,
     /// KAHU5W: the instance solver runtime stance, built at construction from
     /// [`Self::cfg`] and threaded down into every solve cycle. Replaces the
-    /// solver crate's removed process-global RUNTIME OnceLock.
+    /// solver crate's removed process-global RUNTIME `OnceLock`.
     runtime_cfg: ::degenbot_solvers::runtime::SolveRuntimeConfig,
     /// V2 + V3 + V4 pool state owner (ADR-003). The shared
     /// `Arc<RwLock<BotState>>` (ADR-006 D1+D2): read methods take a read guard,
@@ -569,23 +569,23 @@ impl ArbitrageEngine {
     pub fn with_core(core: Arc<StateLock<BotState>>) -> Self {
         Self::with_core_cfg(
             core,
-            std::sync::Arc::new(::degenbot_config::BotConfig::default()),
+            &std::sync::Arc::new(::degenbot_config::BotConfig::default()),
         )
     }
 
-    /// KAHU5W: config-threaded construction. `cfg` is the typed BotConfig
+    /// KAHU5W: config-threaded construction. `cfg` is the typed `BotConfig`
     /// (loaded ONCE by the owner from the `--config` file / env via the
     /// degenbot-config loader) — the engine packs its construction stances
     /// from it and threads the solver runtime stance down per instance.
     #[must_use]
     pub fn with_core_cfg(
         core: Arc<StateLock<BotState>>,
-        cfg: std::sync::Arc<::degenbot_config::BotConfig>,
+        cfg: &std::sync::Arc<::degenbot_config::BotConfig>,
     ) -> Self {
-        solver_dispatch::install_engine_stances(&cfg);
+        solver_dispatch::install_engine_stances(cfg);
         Self {
-            cfg: std::sync::Arc::clone(&cfg),
-            runtime_cfg: solver_dispatch::solve_runtime_config_from_cfg(&cfg),
+            cfg: std::sync::Arc::clone(cfg),
+            runtime_cfg: solver_dispatch::solve_runtime_config_from_cfg(cfg),
             core,
             path_pools: HashMap::new(),
             path_resolved: HashMap::new(),

@@ -1164,7 +1164,15 @@ mod conformance {
         }
     }
 
-    /// The ALL_STAGES index (the stub's atomic script encoding).
+    /// The `ALL_STAGES` index (the stub's atomic script encoding).
+    #[expect(
+        clippy::expect_used,
+        reason = "scripted stub: a stage missing from ALL_STAGES is a conformance bug that must fail loudly"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ALL_STAGES has well under 256 rows"
+    )]
     fn stage_index(stage: Stage) -> u8 {
         ALL_STAGES
             .iter()

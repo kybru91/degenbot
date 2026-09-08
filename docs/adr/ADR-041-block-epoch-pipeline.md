@@ -1,12 +1,17 @@
 # ADR-041: The block-epoch pipeline — one stage machine over a cheap-read data plane
 
-**Status: accepted.** Settled in the originating architecture conversation
-(ergo epic `MROOY7`, block-epoch pipeline); recorded here so every later task
-can execute without it. The user checkpoint on this ADR is sign-off of the
-stage table and seam retirement list (canonical form in
-[the design doc](../architecture/block-epoch-pipeline.md)); the status flips
-to implemented in the epic's "Final integration" task after the soak
-regression passes (pattern: ADR-037 records its epic).
+**Status: implemented** (2026-09-07, ergo epic `MROOY7` / task `PLRGIN`).
+Settled in the originating architecture conversation, recorded here so every
+later task can execute without it; the user checkpoint on this ADR was
+sign-off of the stage table and seam retirement list (canonical form in
+[the design doc](../architecture/block-epoch-pipeline.md)). Implemented across
+the epic's tasks and validated by the final-integration gate: capture-replay
+regression sweep (zero divergences; see PLRGIN result) and the live Jaeger
+soak A/B against the pre-epic operator baselines
+(../architecture/stateview-feasibility.md §3). The unified `StageMachine`
+lives at `rust/crates/degenbot-bot/src/bot_core/stage_machine.rs` (ergo
+`7NFYQW`); the retired `DrainSink`/`Engine`/`SolveCoordinator`/
+`DispatchOwner`/`DirtySets`/`EngineSubscriber` seams are gone (SZJUKL).
 
 ## Context
 

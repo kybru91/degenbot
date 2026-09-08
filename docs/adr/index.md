@@ -57,7 +57,7 @@ The load-bearing decisions behind the two-consumer architecture:
 | [038](ADR-038-cl-event-routing-fsm.md) | The CL event-routing FSM | accepted |
 | [039](ADR-039-state-lock-sim-anchor-projection.md) | State-lock — enumerated sim-anchor projection | pending status |
 | [040](ADR-040-per-bucket-failure-reactions.md) | Failure reactions are per-bucket | accepted |
-| [041](ADR-041-block-epoch-pipeline.md) | The block-epoch pipeline — one stage machine over a cheap-read data plane | accepted |
+| [041](ADR-041-block-epoch-pipeline.md) | The block-epoch pipeline — one stage machine over a cheap-read data plane | implemented |
 
 Numbering note: ADR-037 was assigned twice (engine mutex sharding; swap-simulation gate) — both kept as filed.
 

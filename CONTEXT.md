@@ -617,6 +617,50 @@ this decision *realizes* that for the single-call layer. No new crate deps
 (all four straggler crates already depend on `degenbot-rpc`), no pyo3-in-cores
 violation, no behaviour change.
 
+## Block epoch, StageMachine, cheap-read StateView, degenbot-ingestion (ADR-041, 2026-09 — epic `MROOY7`)
+
+The block-coordinate vocabulary above is **retired as of ergo `SZJUKL`
+(seam retirement) and epic `MROOY7`**: `DrainSink`, `Engine` (the per-block
+fan-out seam), `SolveCoordinator` (+ `drain_lock`), `DispatchOwner` +
+`DrainWork`, `DirtySets` + `EngineSubscriber`, and the six correlated
+per-block machines are folded in as sub-state of the one `StageMachine` (below) and
+no longer exist as independent per-block machines — `BlockClock` and
+`PumpFSM` are deleted outright, the path/delivery/registration lifecycles
+survive only as engine-side subservient drivers, and `EnginePhase` remains
+solely as the process-level runtime-lifecycle axis (`Created` → `Resumed`;
+ADR-041 §6), carrying no per-epoch stage state. Occurrences of the six
+machines' former per-block vocabulary in the tree are historical narration
+only. The current terms:
+
+- **Block epoch** — one confirmed block from first delivery to publish +
+  quiesced settlement; the unit of work the per-block loop was always
+  implicitly managing. Rewind (reorg) reopens an epoch at the reorg block
+  with a fresh `seq`, invalidating pre-rewind solve contexts.
+- **StageMachine** — the ONE pure, I/O-free state machine
+  (`bot_core/stage_machine.rs`, ergo `7NFYQW`) that owns every per-block edge
+  condition: header admission, log routing (forward/tombstone/reorg), the
+  reorg window, cursor + tombstone advance, WS-completeness, watchdogs,
+  quiesce/debounce, and the single publish arm. Its pinned tests are the
+  behavioral contract. Stage handlers are thin I/O drivers per stage.
+- **StateView (cheap-read)** — the read data plane: every pool family
+  (V2/V3/V4 scalars + tickmaps) reads through cheap snapshots/views instead
+  of cloning registry state; solves over the `Resolved`..`Solved` window are
+  structurally uncontended because writes are confined to the Streaming
+  stage. Budget verifier: the soak's `state_lock_wait`/`state_lock_hold`
+  histograms (measurements in
+  [stateview-feasibility](docs/architecture/stateview-feasibility.md)).
+- **degenbot-ingestion** — the standalone crate (`rust/crates/degenbot-ingestion`)
+  owning event ingestion and its watchdog (log-silence / header-staleness
+  force-close), consumed by the bot core; the Python layer never sees raw
+  WS streams.
+
+**Retired-name discipline:** do not reintroduce `DrainSink`, `Engine` (as a
+per-block fan-out type), `SolveCoordinator`, `DispatchOwner`, `DrainWork`,
+`DirtySets`, or `EngineSubscriber` in new code or docs; describe the same
+roles with the stage-machine vocabulary above. The engine **Mutex sharding**
+ADR-037 sections below predate this cutover and remain accurate for the
+sharding mechanics only.
+
 ## The `_ffi` seam (Pydantic barrier — DECIDED)
 
 **Decision:** `degenbot._ffi` is **private** — a raw Rust extension imported by ONE barrier per domain, never by leaf code. Model: pydantic-core (`_pydantic_core` is imported only by `pydantic_core/__init__.py`; the companion `pydantic` never touches it). Replaces degenbot's prior mixed state (ban test + allowlist back-door + direct `_ffi.<sub>` leaf imports).

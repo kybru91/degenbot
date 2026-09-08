@@ -112,7 +112,7 @@ macro_rules! point_span {
             logs.n = $logs,
         );
         if let Some(a) = $age {
-            span.record("queue.age_us", a.as_micros() as u64);
+            span.record("queue.age_us", u64::try_from(a.as_micros()).unwrap_or(u64::MAX));
         }
         span
     }};
@@ -168,7 +168,7 @@ impl StageTelemetry {
         }
     }
 
-    /// Quiesced (the StreamingComplete row): all dispatched logs of the epoch
+    /// Quiesced (the `StreamingComplete` row): all dispatched logs of the epoch
     /// applied. Closes the Streaming interval (recording its age) and emits
     /// the point span.
     pub fn on_quiesced(&mut self, parent: &Span, epoch: Epoch, logs: u64) {
@@ -219,7 +219,7 @@ impl StageTelemetry {
         ));
     }
 
-    /// EnterReorg (the `Rewind` stage from ANY row — invariant I6). Closes
+    /// `EnterReorg` (the `Rewind` stage from ANY row — invariant I6). Closes
     /// any open interval in the PRE-rewind generation and opens the Rewind
     /// interval in the fresh epoch, counting Rewind frequency.
     pub fn on_enter_reorg(&mut self, parent: &Span, epoch: Epoch, from: Option<Stage>) {
@@ -231,7 +231,7 @@ impl StageTelemetry {
         }
     }
 
-    /// CloseReorg: the unwind window closed at `new_head`. Closes the Rewind
+    /// `CloseReorg`: the unwind window closed at `new_head`. Closes the Rewind
     /// interval (recording its duration) and reopens Streaming for the fresh
     /// epoch (the cycle restarts — the machine resets the row).
     pub fn on_close_reorg(&mut self, parent: &Span, epoch: Epoch) {
@@ -253,7 +253,10 @@ impl StageTelemetry {
         }
         let (kind, epoch) = (open.kind, open.epoch);
         if let Some(open) = self.open.take() {
-            open.span.record("queue.age_us", age.as_micros() as u64);
+            open.span.record(
+                "queue.age_us",
+                u64::try_from(age.as_micros()).unwrap_or(u64::MAX),
+            );
             open.span.record("queue.force_closed", true);
         }
         tracing::warn!(
@@ -307,7 +310,10 @@ impl StageTelemetry {
     fn close_open(&mut self) -> Option<Duration> {
         let open = self.open.take()?;
         let age = open.opened_at.elapsed();
-        open.span.record("queue.age_us", age.as_micros() as u64);
+        open.span.record(
+            "queue.age_us",
+            u64::try_from(age.as_micros()).unwrap_or(u64::MAX),
+        );
         Some(age)
     }
 
@@ -397,6 +403,16 @@ mod tests {
         );
     }
 
+    /// Test-time fake aging: 6s before now, padded to the Windows-clock
+    /// guarantee, never underflows here.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test-time fake aging: now-6s cannot underflow"
+    )]
+    fn aged_instant() -> Instant {
+        Instant::now().checked_sub(Duration::from_secs(6)).unwrap()
+    }
+
     /// G3 force-close contract (SONJQA, generalized): a stale interval closes
     /// AT the expiry tick, with its age recorded — never at the next epoch.
     /// Export behavior (the span actually lands in the exporter, closed and
@@ -408,7 +424,7 @@ mod tests {
         tel.on_first_log(&parent, Epoch::at(100));
         // Directly age the interval by rewinding its anchor.
         if let Some(open) = tel.open.as_mut() {
-            open.opened_at = Instant::now() - Duration::from_secs(6);
+            open.opened_at = aged_instant();
         }
         tel.force_close_aged(Duration::from_secs(5));
         assert_eq!(tel.open_kind(), None, "stale interval must be force-closed");
@@ -436,7 +452,28 @@ mod otel_tests {
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use tracing_subscriber::layer::SubscriberExt;
 
+    /// Test-time fake aging: 6s before now, never underflows in tests.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test-time fake aging: now-6s cannot underflow"
+    )]
+    fn aged_instant() -> Instant {
+        Instant::now().checked_sub(Duration::from_secs(6)).unwrap()
+    }
+
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "otel test: flush and span collection must succeed, else the test fails loudly"
+    )]
+    #[expect(
+        clippy::panic,
+        reason = "assertion helper: diagnostic payload if the streaming span did not export"
+    )]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "queue.age_us attribute is integral microseconds; an f64 encoding of it is integral too"
+    )]
     fn stale_stage_span_exports_force_closed() {
         let exporter = InMemorySpanExporter::default();
         let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
@@ -448,7 +485,7 @@ mod otel_tests {
         tel.on_first_log(&root, Epoch::at(100));
         // Age the interval past the max age, then run the force-close.
         if let Some(open) = tel.open.as_mut() {
-            open.opened_at = Instant::now() - Duration::from_secs(6);
+            open.opened_at = aged_instant();
         }
         tel.force_close_aged(Duration::from_secs(5));
         drop(tel);

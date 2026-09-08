@@ -3,12 +3,17 @@
 //! DEGENBOT_* variable — see the exported clean-env guarantee below).
 //!
 //! Procedure:
-//!   cargo run -p degenbot-bot --example config_smoke_boot -- <config.toml>
+//!   cargo run -p degenbot-bot --example `config_smoke_boot` -- <config.toml>
 //!
 //! A full live boot needs RPC; this main()-level construction proves the
 //! same wiring the pump uses: loader (file layer) -> holder install ->
-//! stance-packing -> ArbitrageEngine construction with its instance
-//! SolveRuntimeConfig. Exits non-zero on any wiring breakage.
+//! stance-packing -> `ArbitrageEngine` construction with its instance
+//! `SolveRuntimeConfig`. Exits non-zero on any wiring breakage.
+
+#![expect(
+    clippy::print_stdout,
+    reason = "diagnostic example: reports the packed stances on stdout"
+)]
 
 use std::sync::Arc;
 
@@ -49,7 +54,7 @@ fn main() -> Result<(), String> {
     let core = Arc::new(degenbot_bot::bot_core::state_lock::StateLock::new(
         degenbot_bot::bot_core::BotState::new(),
     ));
-    let engine = degenbot_bot::arb_engine::ArbitrageEngine::with_core_cfg(core, Arc::clone(&cfg));
+    let engine = degenbot_bot::arb_engine::ArbitrageEngine::with_core_cfg(core, &cfg);
 
     // Observe the packed stances end-to-end (config file -> engine field):
     // the file sets pump.streaming_delivery=false, solve.executor=rayon and

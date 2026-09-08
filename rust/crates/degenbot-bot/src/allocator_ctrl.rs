@@ -461,7 +461,6 @@ mod tests {
             mimalloc_auto_purge: false,
             mimalloc_purge_delay_mult: 3.0,
             mimalloc_purge_decommits: true,
-            ..Default::default()
         });
         assert_eq!(cfg.fixed_ms, Some(45_000));
         assert!(!cfg.auto);

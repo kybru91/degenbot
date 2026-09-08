@@ -6715,7 +6715,7 @@ mod tests {
 
     /// T2 (epic SRQEK5 4QKZE3) cadence acceptance, SZJUKL-port: with detached
     /// cycles ON through the PRODUCTION stage surface (`EngineStages` — the
-    /// shipped solve_dirty cadence the driver executes INLINE at the machine's
+    /// shipped `solve_dirty` cadence the driver executes INLINE at the machine's
     /// decision points), each solve call RETURNS at enqueue-end (µs) while the
     /// 400ms straggler still merges on the sidecar — consecutive stage cycles
     /// interleave with the merges, and the dissolved B3 frozen-drainer
