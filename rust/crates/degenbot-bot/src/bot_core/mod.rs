@@ -44,6 +44,7 @@ pub(crate) mod solve_anchor;
 pub mod solve_coordinator;
 pub mod stage_handlers;
 pub mod stage_machine;
+pub mod stage_telemetry;
 /// KAHU5W: the process-wide typed BotConfig holder. The degenbot-config
 /// loader (the ONLY environment-reading site in the workspace) produces the
 /// value once at startup; every formerly env-reading call site below reads

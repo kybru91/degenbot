@@ -272,7 +272,7 @@ mod otel_tests {
 // time (`publish_block_context`, keyed by the batch's solve block), and
 // re-attach it as a REMOTE parent when the Python seam builds its dispatch
 // span (`simulate_dispatch_span`). Same trace id + block span id as parent —
-// Jaeger renders the full chain (pump.block → arb.solve → simulate.dispatch
+// Jaeger renders the full chain (epoch → arb.solve → simulate.dispatch
 // → bundle.*) as ONE trace. Remote (not in-process) semantics is correct:
 // the block span is usually already closed when the future starts.
 // ---------------------------------------------------------------------------

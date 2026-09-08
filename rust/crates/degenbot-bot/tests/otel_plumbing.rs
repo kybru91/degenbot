@@ -92,7 +92,7 @@ fn layer_builds_on_bare_registry() {
 
 /// f701ccd3 session: the block→simulate handoff broke the `OTel` context at
 /// the Rust→Python bridge — `degenbot.simulate.dispatch` exported as a ROOT
-/// span, uncorrelated with `degenbot.pump.block` (two trace families joined
+/// span, uncorrelated with `degenbot.epoch` (two trace families joined
 /// only by the `current_block` tag). The block-context bridge
 /// (`telemetry::publish_block_context` when a batch is sent +
 /// `telemetry::simulate_dispatch_span` re-attaching the remote parent at the
@@ -108,7 +108,7 @@ fn simulate_dispatch_span_carries_published_block_parent() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     {
-        let block_span = tracing::info_span!("degenbot.pump.block", block.number = 77);
+        let block_span = tracing::info_span!("degenbot.epoch", block.number = 77);
         let _entered = block_span.enter();
         // Production call site: `compute_diff_and_send` under the settle-
         // entered block span.
@@ -129,8 +129,8 @@ fn simulate_dispatch_span_carries_published_block_parent() {
     // exported data, not from a live handle.)
     let block = spans
         .iter()
-        .find(|s| s.name.as_ref() == "degenbot.pump.block")
-        .expect("pump.block span must be exported");
+        .find(|s| s.name.as_ref() == "degenbot.epoch")
+        .expect("epoch root span must be exported");
     let child = spans
         .iter()
         .find(|s| s.name.as_ref() == "degenbot.simulate.dispatch")
@@ -143,7 +143,7 @@ fn simulate_dispatch_span_carries_published_block_parent() {
     assert_eq!(
         child.span_context.trace_id(),
         block.span_context.trace_id(),
-        "simulate.dispatch must share the pump.block trace"
+        "simulate.dispatch must share the epoch trace"
     );
     assert_eq!(
         child.parent_span_id,
@@ -169,7 +169,7 @@ fn attach_published_parent_parents_a_detached_task_span() {
     let _guard = tracing::subscriber::set_default(subscriber);
 
     {
-        let block_span = tracing::info_span!("degenbot.pump.block", block.number = 91);
+        let block_span = tracing::info_span!("degenbot.epoch", block.number = 91);
         let _entered = block_span.enter();
         telemetry::publish_block_context(91);
     }
@@ -186,8 +186,8 @@ fn attach_published_parent_parents_a_detached_task_span() {
     let spans = exporter.get_finished_spans().expect("spans");
     let block = spans
         .iter()
-        .find(|s| s.name.as_ref() == "degenbot.pump.block")
-        .expect("pump.block span must be exported");
+        .find(|s| s.name.as_ref() == "degenbot.epoch")
+        .expect("epoch root span must be exported");
     let verify = spans
         .iter()
         .find(|s| s.name.as_ref() == "degenbot.solver.verify")
