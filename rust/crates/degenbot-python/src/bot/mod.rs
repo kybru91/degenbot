@@ -1490,8 +1490,9 @@ impl PyBot {
     /// This is the Python-facing mirror of the `BlockPump`'s per-log call to
     /// `Bot::dispatch_log`: decode via the registered `LogDecoder`s, apply the
     /// decoded event to the shared `BotState` under a write guard, release it,
-    /// then notify every attached `PoolStateSubscriber` (the engine adapter) so
-    /// the affected `pool_id` is dirtied for the next `solve_all_paths`.
+    /// then notify every attached `PoolStateSubscriber` (touched-pool tracking
+    /// is the `EpochDelta` ledger's byproduct of the same apply — LXDY4C) so
+    /// the next solve reads fresh keys.
     ///
     /// Reconstructs an `alloy::rpc::types::Log` from the WS-log shape Python
     /// passes — `(address, topics, data, block_number)` — so an offline test

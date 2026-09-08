@@ -109,6 +109,11 @@ logs/t3_lane_hotpath.json. The decision table shape is unchanged on live
 data from both lanes; the deferred cross-cycle straggler rejection analysis
 has no trigger.
 
+> **Terminology note (epic `MROOY7`):** the seam names this decision record uses —
+> `SolveCoordinator`, `DispatchOwner`, `DrainSink`, `EngineHandle`, `DrainWork` — were
+> retired in `SZJUKL` ([ADR-041](architecture/block-epoch-pipeline.md)). The
+> detached-solve stance itself remains: `DEGENBOT_DETACHED_SOLVES` default ON.
+
 ## Watchdog + publish-verifier audit
 
 - B3 frozen-drainer backstop: detached drain items COMPLETE at enqueue-end

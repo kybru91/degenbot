@@ -34,9 +34,12 @@ The pump advances two independent clocks:
    `update_block` across all pools. No single owner "decides" it; it is a
    derived maximum.
 
-A drain (`SolveCoordinator::on_drain`) passes `current_block` to every engine
-→ `solve_dirty(current_block)`. The solver then **re-anchors to the state
-clock** because a hop's `update_block` can exceed the lagging header clock:
+The settle drain (the resolve→solve stage hooks on the one `StageHandlers` seam
+since the MROOY7 cutover; formerly `SolveCoordinator::on_drain`) resolves its
+anchor from the driver's `current_block` — the solver then **re-anchors to the
+state clock** (`SolveAnchor::resolve`: max(block, `pool_state_head()`),
+`bot_core/solve_anchor.rs`) because a hop's `update_block` can exceed the
+lagging header clock:
 
 - `solver_dispatch.rs:109` — `solve_block = max(block_number, pool_state_head())`
 - `block_pump.rs:609` — verifier `anchor = max(block, pool_state_head())`

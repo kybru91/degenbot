@@ -525,8 +525,8 @@ pub struct ArbitrageEngine {
 
 impl ArbitrageEngine {
     /// The pump ended: close the delivery channels so Python's block/result
-    /// streams end loudly (incident 2026-08-20 #2). The `Engine` trait's
-    /// `on_pump_ended` answer — see [`DeliveryLifecycle::close`] for the
+    /// streams end loudly (incident 2026-08-20 #2). The `StageHandlers`
+    /// liveness hook's answer — see [`DeliveryLifecycle::close`] for the
     /// end-of-stream contract.
     pub fn on_pump_ended(&mut self) {
         self.delivery.lifecycle.close();

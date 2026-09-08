@@ -3784,14 +3784,14 @@ mod tests {
     }
 
     // The block-channel engine tests (set_block_channel plumbing, notify_block
-    // push) relocated with the pipe itself: the block clock is coordinator-owned
-    // now (ADR-027 completion) — see bot_core/block_clock_pipe.rs + the
-    // SolveCoordinator tests.
+    // push) relocated with the pipe itself: the block clock is now relayed by
+    // the engine's stage surface (`EngineStages` over `BlockClockPipe`) — see
+    // bot_core/block_clock_pipe.rs + the EngineStages tests.
 
     #[test]
     fn on_pump_ended_closes_the_result_stream() {
-        // Incident 2026-08-20 (WS-silent class): pump death routes
-        // DrainSink::on_pump_ended -> Engine::on_pump_ended; the engine-side
+        // Incident 2026-08-20 (WS-silent class): pump death routes the sink's
+        // `on_pump_ended` liveness answer to the engine-side close;
         // result stream must report Disconnected so the consumer ends and the
         // bot fails loudly (the engine outlives the pump, so without the
         // close the sender stays alive and the Python side awaits forever).
@@ -5332,7 +5332,7 @@ mod tests {
         let block = 5000u64;
         tracing::subscriber::with_default(subscriber, || {
             for i in 0..200 {
-                // Drain the ledger the way the SolveCoordinator does: take
+                // Drain the ledger the way the settle drain does: take
                 // keys, solve exactly what the take returned.
                 let keys = marker_delta.take_keys();
                 if !keys.is_empty() {
@@ -5517,7 +5517,8 @@ mod tests {
 
     /// ZZS6CG (trace hygiene): a solve span must parent to its OWN block's
     /// published epoch root span (`degenbot.epoch`) - exact-match only. The stale
-    /// `DrainWork::Finalize` crossing a block boundary parked block N-1's
+    /// `DrainWork::Finalize` (retired in MROOY7) crossing a block boundary parked
+    /// block N-1's
     /// `arb.solve` inside block N's trace in 19/20 of the recent traces
     /// analyzed (the drain/finalize arms inherited the dispatch-time loop
     /// context unconditionally). RED before `attach_published_parent_exact`
@@ -6104,7 +6105,8 @@ mod tests {
     /// occupied the ONLY worker and the heartbeat task starved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn solve_dirty_hold_does_not_starve_runtime_tasks() {
-        // The Engine trait provides solve_dirty on the handle.
+        // The stage surface provides the solve hooks on the engine
+        // (`EngineStages`; the retired `Engine` trait is gone — SZJUKL).
         use std::time::Duration;
 
         let mut oracle = crate::arb_engine::tests::test_keys::DirtyKeys::new();

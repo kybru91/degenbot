@@ -8,6 +8,12 @@ current fail-fast behaviour of the AV42C7 gate and names the forward deepening
 is the work; the *posture* (detect, classify, stop loudly, never heal) is
 decided here.
 
+> **Update (epic `MROOY7`, [ADR-041](ADR-041-block-epoch-pipeline.md) / `2UVG3E`):** the
+> in-process chain-vs-solver tripwire module was deleted — write confinement to the
+> Streaming stage makes in-process desync unrepresentable. The remaining kernel of this
+> ADR is the upstream RPC-disagreement verification at the Published edge
+> (`CompletenessDecision::Verify` → `assert_ws_block_complete`), which stays and stays loud.
+
 ## Context
 
 The live backrun session (2026-08-02, `docs/exploration-live-debug-session.md`)

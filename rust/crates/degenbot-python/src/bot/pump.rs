@@ -10,8 +10,8 @@
 //! state through their own `Arc<PumpState>` handle.
 //!
 //! `PumpState` is the lifecycle layer: engine phase, the pump handle, the
-//! subscribe state held between `subscribe` and `resume`, the solve coordinator
-//! + reorg coordinator + shutdown flag. The pure solve core (`Arc<Mutex<ArbitrageEngine>>`,
+//! subscribe state held between `subscribe` and `resume`, the engine stage
+//! surface + reorg coordinator + shutdown flag. The pure solve core (`Arc<Mutex<ArbitrageEngine>>`,
 //!   `BotState`, v3/v4 snapshot stores, verify config) stays on
 //!   `PyArbitrageEngine`.
 

@@ -6,6 +6,12 @@ block clock are owned by a single **dispatch owner** but delivered over **three
 application-specific pipes**, each with the delivery semantics its task needs. A future
 architecture review must not re-suggest a third bespoke channel or a single-bus unification.
 
+> **Superseded in part (epic `MROOY7`, [ADR-041](ADR-041-block-epoch-pipeline.md), `SZJUKL`):**
+> the one-owner dispatch layer (the `DispatchOwner`), the `DrainWork` FIFO, and the
+> coordinator-owned pipes were retired; stage work runs inline in the pump driver and the
+> surviving channels are sinks at the Published edge (the block-clock pipe and the result
+> batch). Historical record below.
+
 ## Context
 
 `BlockPump::run_with_stream` (rust/crates/degenbot-bot/src/bot_core/block_pump.rs) drives the

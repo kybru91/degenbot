@@ -1,5 +1,10 @@
 # UYSAXS — Hotpath verification
 
+> **Historical measurements (pre-MROOY7).** Function names below
+> (`SolveCoordinator::on_drain`) are from the seam generation retired in MROOY7
+> (ADR-041); the numbers are the pre-stage-machine baselines they were measured
+> against and are kept for comparison only.
+
 Verified with two profiled runs. Final comparator run reached **50,311 registered paths** in
 902s (the prior >12s solve regime was ~48k paths), so the after-build is measured at or above
 the baseline path inventory.

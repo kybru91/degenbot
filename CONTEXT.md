@@ -117,8 +117,10 @@ per-pool `Quarantined → drain+verify → Live` sequence owned by the Rust core
   registration drain uses: a pin's `update_block` cannot outrun it (the inline
   `last_complete_block` above is this fact). Owned by `BotState` as a monotone
   value; the pump driver advances it when executing the tombstone verdict —
-  no shared handle crosses the `PumpFSM` capsule, and a resume never resets
-  it (ADR-028 correction, 2026-08; supersedes the 3M5PO5 shared-atom bridge).
+  no shared handle crosses the pump's decision-machine capsule (the retired
+  `PumpFSM`; its successor is the `StageMachine`, ADR-041), and a resume never
+  resets it (ADR-028 correction, 2026-08; supersedes the 3M5PO5 shared-atom
+  bridge).
 - **Verify-lifecycle** (the choreography) — the per-pool
   `set_quarantined → verify seed (RPC) → drain+pin → verify post-drain (RPC) →
   set_live` sequence plus its block-resolution + config-gating policy. Owned by
@@ -328,6 +330,11 @@ Three options surfaced: (A) merge the seam — make IO a constructor arg of `Bot
 
 ## Block-pump dispatch seam (B — unified event seams, 2026-08)
 
+> **Historical (superseded by ADR-041, epic `MROOY7`).** The dispatch-owner
+> module (`DispatchOwner`) and the `DrainWork` FIFO below were retired in
+> `SZJUKL`; stage work now executes inline at the `StageMachine`'s decision
+> points. Kept as design provenance.
+
 The pump's hand-offs to the sink, the solver-state verifier, and Python's block
 clock are owned by ONE module — one **dispatch owner** — but delivered over three
 **application-specific pipes**, each with the delivery semantics its task needs.
@@ -391,6 +398,13 @@ clock are owned by ONE module — one **dispatch owner** — but delivered over 
 
 ## Delivery lifecycle + block-clock relocation (2026-08-20 architecture review)
 
+> **Historical (superseded by ADR-041, epic `MROOY7`).** The
+> coordinator-side relocation below targets the retired `SolveCoordinator`;
+> the block-clock pipe now lives in `degenbot-core::block_clock_pipe` and the
+> delivery lifecycle's close contract survives on the engine's `StageHandlers`
+> implementation (`EngineStages`). `Engine` and `EngineHandle` are retired
+> (`SZJUKL`). Kept as design provenance.
+
 - **Delivery lifecycle** (`DeliveryLifecycle`, `arb_engine`) — the channels'
   open/deliver/close plus the end-of-stream contract ("receivers observe a
   natural stream end exactly once, on pump death or engine drop" — incident
@@ -421,6 +435,13 @@ clock are owned by ONE module — one **dispatch owner** — but delivered over 
 
 
 ## Block-pump PumpDecision seam (A — pure producer/FSM, 2026-08)
+
+> **Historical (superseded by ADR-041, epic `MROOY7`).** The `PumpFSM` and
+> its `PumpDecision` vocabulary were folded into the one `StageMachine`
+> (`7NFYQW`) and the executor surfaces named below (`DispatchOwner`,
+> `DrainWork`, the `Engine` fan-out) were retired (`SZJUKL`) — the
+> pure-decision/thin-driver discipline itself continues. Kept as design
+> provenance.
 
 Epic A (ergo `FUE5SP`, tasks A1–A5) — the ADR-008 deepening: the block pump's
 per-event *policy* lives in a **pure decision producer**, executed by a **thin

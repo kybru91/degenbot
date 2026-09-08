@@ -6,6 +6,11 @@ un-applied when 25397049's `newHeads` advanced the cursor while N's liquidity lo
 in-flight). Full design note and rationale live in `docs/architecture/block-state-machine.md`;
 this ADR records the settled shape only.
 
+> **Superseded in part (epic `MROOY7`, [ADR-041](ADR-041-block-epoch-pipeline.md)):** the
+> standalone `BlockClock` machine was folded into the one `StageMachine` and the type
+> deleted (hard cutover). The D1 tombstone / D2 quiesce-gate / D3 reorg decisions below
+> survive as machine decisions; read this ADR as provenance, not as a live design.
+
 ## Implementation status
 
 Implemented in `rust/crates/degenbot-bot/src/bot_core/` (commits `5673f8ce`, `440b848`,

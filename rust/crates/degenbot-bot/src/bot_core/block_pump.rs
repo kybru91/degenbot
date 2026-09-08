@@ -4110,7 +4110,8 @@ mod tests {
         // Mimic resume's first step: start with no prior cursor, then
         // `on_drain(W)` (the drain Python issues after `subscribe` returns,
         // before `resume`) anchors `last_processed_block` to W — exactly as
-        // the real `SolveCoordinator` does. Then resume with first_observed=W
+        // the production settle drain does (the `StageHandlers` solve stage).
+        // Then resume with first_observed=W
         // (the real subscribe block, post-fix).
         let (mut pump, sink) = pump_for_test(None);
         let w = 21_500_000u64;
@@ -4502,8 +4503,8 @@ mod tests {
     /// observable; what is asserted here is that the *pump* routes a
     /// `removed: true` log there, and that an in-depth reorg is non-fatal.
     /// Incident 2026-08-20 (WS-silent class): a WS subscription stream that
-    /// ENDS mid-run must notify the sink (`on_pump_ended` - the production
-    /// `SolveCoordinator` impl drops the engine delivery channels there), so
+    /// ENDS mid-run must notify the sink (`on_pump_ended` — the production
+    /// `StageHandlers` impl closes the engine delivery channels there), so
     /// the Python block/result streams END and the settlement bot fails
     /// loudly instead of idling forever (the silent stall operators saw).
     #[tokio::test]

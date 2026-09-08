@@ -7,6 +7,12 @@ deepening — the same "deep module: pure decision producer + thin I/O driver" f
 ADR-027's dispatch owner. The FSM *decides*; the driver *executes*. No provider, no
 timer, no `Instant`, no lock lives in the FSM.
 
+> **Superseded by [ADR-041](ADR-041-block-epoch-pipeline.md) (epic `MROOY7`):** the
+> `PumpFSM` was folded — with this ADR's producer/driver discipline intact — into the
+> unified `StageMachine` (`rust/crates/degenbot-bot/src/bot_core/stage_machine.rs`).
+> The `PumpFSM` type and the `DispatchOwner`/`DrainSink` executors named below are
+> retired (`SZJUKL`). The pure-producer/thin-driver family continues.
+
 ## Context
 
 `BlockPump::run_with_stream` (rust/crates/degenbot-bot/src/bot_core/block_pump.rs) was a
