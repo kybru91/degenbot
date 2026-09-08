@@ -436,6 +436,55 @@ pub struct LogDispatcher {
     /// per-pump opt-out (tests set the field OFF deterministically, keeping
     /// the synthetic-fixture streams decode-miss-neutral).
     strict_decode_fault: std::sync::atomic::AtomicBool,
+    /// NO4DIW: per-epoch log tally — the dispatcher outcomes sampled and
+    /// reset by the pump at each header epilogue and projected to the
+    /// `degenbot.epoch.logs_*` funnel gauges. Single-writer: the pump task.
+    tally: EpochLogTally,
+}
+
+/// NO4DIW: the per-epoch leg of the log funnel. Order of magnitude of each
+/// leg (seen \u2265 received \u2265 [applied + ignored]); the pump samples and
+/// resets this at each accepted header, so a snapshot covers exactly the
+/// epoch that just closed.
+#[derive(Debug, Default)]
+pub struct EpochLogTally {
+    seen: std::sync::atomic::AtomicU64,
+    received: std::sync::atomic::AtomicU64,
+    decoded: std::sync::atomic::AtomicU64,
+    undecoded: std::sync::atomic::AtomicU64,
+    apply_missed: std::sync::atomic::AtomicU64,
+    applied: std::sync::atomic::AtomicU64,
+}
+
+/// One epoch's ledger snapshot (see [`EpochLogTally`]).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EpochLogCounts {
+    pub seen: u64,
+    pub received: u64,
+    pub decoded: u64,
+    pub undecoded: u64,
+    pub apply_missed: u64,
+    pub applied: u64,
+}
+
+impl EpochLogTally {
+    fn inc(field: &std::sync::atomic::AtomicU64) {
+        field.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Swap the ledger out (one-shot reset) — the pump's header epilogue.
+    #[must_use]
+    fn snapshot_and_reset(&self) -> EpochLogCounts {
+        use std::sync::atomic::Ordering::Relaxed;
+        EpochLogCounts {
+            seen: self.seen.swap(0, Relaxed),
+            received: self.received.swap(0, Relaxed),
+            decoded: self.decoded.swap(0, Relaxed),
+            undecoded: self.undecoded.swap(0, Relaxed),
+            apply_missed: self.apply_missed.swap(0, Relaxed),
+            applied: self.applied.swap(0, Relaxed),
+        }
+    }
 }
 
 impl LogDispatcher {
@@ -448,7 +497,15 @@ impl LogDispatcher {
             strict_decode_fault: std::sync::atomic::AtomicBool::new(
                 crate::bot_core::stance::config().pump.ws_completeness,
             ),
+            tally: EpochLogTally::default(),
         }
+    }
+
+    /// NO4DIW: the pump's header epilogue — sample and reset the per-epoch
+    /// log ledger for projection onto the `degenbot.epoch.logs_*` gauges.
+    #[must_use]
+    pub fn snapshot_epoch_logs_and_reset(&self) -> EpochLogCounts {
+        self.tally.snapshot_and_reset()
     }
 
     /// Per-pump opt-out for the strict decode-miss fault (the test pumps
@@ -519,6 +576,7 @@ impl LogDispatcher {
         // with a per-phase call count — zero-cost no-ops when the `hotpath`
         // feature is off. See `src/profiling.rs`.
         // T2: relevant-topic log entering the dispatcher.
+        EpochLogTally::inc(&self.tally.received);
         if let Some(p) = crate::instruments::pipeline() {
             p.count_log_received();
         }
@@ -542,10 +600,12 @@ impl LogDispatcher {
             p.observe_log_decode(decode_start.elapsed().as_secs_f64());
         }
         if decoded.is_some() {
+            EpochLogTally::inc(&self.tally.decoded);
             if let Some(p) = crate::instruments::pipeline() {
                 p.count_log_decoded();
             }
         } else if let Some(p) = crate::instruments::pipeline() {
+            EpochLogTally::inc(&self.tally.undecoded);
             p.count_log_undecoded();
         }
         let Some(decoded) = decoded else {
@@ -619,6 +679,7 @@ impl LogDispatcher {
                 pool = %identity,
                 "APPLY MISS - unregistered scalar refresh (row re-seed trust); skipped write lock"
             );
+            EpochLogTally::inc(&self.tally.apply_missed);
             if let Some(p) = crate::instruments::pipeline() {
                 p.count_log_apply_missed();
             }
@@ -649,6 +710,7 @@ impl LogDispatcher {
                     "[state] pool event applied"
                 );
                 // T2: successful apply to a registered pool.
+                EpochLogTally::inc(&self.tally.applied);
                 if let Some(p) = crate::instruments::pipeline() {
                     p.count_log_applied();
                 }
@@ -935,6 +997,55 @@ mod tests {
     /// RED: dispatching a log that decodes but targets an unregistered pool is
     /// a silent apply-miss through the funnel early-return - no subscriber
     /// notify, no state mutation.
+    /// NO4DIW: the per-epoch log tally sums the dispatcher's outcomes and
+    /// snapshot_and_reset is one-shot (a second snapshot returns zeros).
+    #[test]
+    fn epoch_tally_sums_and_resets() {
+        let applied_addr = alloy::primitives::Address::from([0x55u8; 20]);
+        let state = Arc::new(StateLock::new(BotState::new()));
+
+        let mut dispatcher = LogDispatcher::new();
+        dispatcher.register_decoder(Box::new(FakeDecoder {
+            pool_address: applied_addr,
+        }));
+        dispatcher.dispatch(&sentinel_log(), &state, None); // apply miss (pool unregistered)
+
+        state
+            .write()
+            .register_v2_pool(&crate::bot_core::RegisterV2PoolParams {
+                address: applied_addr,
+                token0: alloy::primitives::Address::ZERO,
+                token1: alloy::primitives::Address::ZERO,
+                reserve0: alloy::primitives::aliases::U112::from(1000),
+                reserve1: alloy::primitives::aliases::U112::from(2000),
+                fee_token0: (997, 1000),
+                fee_token1: (997, 1000),
+                factory: alloy::primitives::Address::ZERO,
+                update_block: 0,
+                variant: degenbot_uniswap::dex_identity::DexVariant::UniswapV2,
+                stable_swap: false,
+                fee_denominator: None,
+                ..Default::default()
+            })
+            .expect("test setup: V2 registration");
+        dispatcher.dispatch(&sentinel_log(), &state, None); // applied
+
+        let c = dispatcher.snapshot_epoch_logs_and_reset();
+        assert_eq!(
+            (
+                c.received,
+                c.decoded,
+                c.applied,
+                c.apply_missed,
+                c.undecoded
+            ),
+            (2, 2, 1, 1, 0),
+            "two dispatched logs: 1 applied + 1 apply-missed, all relevant decoded"
+        );
+        let c2 = dispatcher.snapshot_epoch_logs_and_reset();
+        assert_eq!(c2.received, 0, "one-shot reset");
+    }
+
     #[test]
     fn dispatch_unregistered_pool_is_apply_miss_no_notify() {
         let pool_address = alloy::primitives::Address::from([0x55u8; 20]);

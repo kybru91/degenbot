@@ -417,7 +417,7 @@
   },
   {
    "id": 8,
-   "title": "Log funnel: received / applied / apply-miss",
+   "title": "Log funnel (per block)",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -435,8 +435,8 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "rate(degenbot_logs_received_total[1m])",
-     "legendFormat": "received/s",
+     "expr": "degenbot_epoch_logs_applied",
+     "legendFormat": "applied",
      "refId": "A"
     },
     {
@@ -444,8 +444,8 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "rate(degenbot_logs_applied_total[1m])",
-     "legendFormat": "applied/s",
+     "expr": "degenbot_epoch_logs_ignored",
+     "legendFormat": "ignored",
      "refId": "B"
     },
     {
@@ -453,8 +453,8 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "rate(degenbot_logs_received_total[1m]) - rate(degenbot_logs_applied_total[1m])",
-     "legendFormat": "apply-miss/s",
+     "expr": "clamp_min(degenbot_epoch_logs_seen - degenbot_epoch_logs_received, 0)",
+     "legendFormat": "not relevant",
      "refId": "C"
     },
     {
@@ -462,39 +462,57 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "rate(degenbot_logs_undecoded_total[1m])",
-     "legendFormat": "undecoded/s",
+     "expr": "degenbot_epoch_logs_seen",
+     "legendFormat": "seen (total)",
      "refId": "D"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_ws_logs_seen_total[1m])",
-     "legendFormat": "ws logs seen/s",
-     "refId": "E"
     }
    ],
    "fieldConfig": {
     "defaults": {
-     "unit": "ops",
+     "unit": "short",
      "color": {
       "mode": "palette-classic"
      },
      "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8,
-      "lineInterpolation": "linear",
-      "showPoints": "never",
+      "drawStyle": "bars",
+      "lineWidth": 0,
+      "fillOpacity": 100,
       "stacking": {
        "group": "A",
-       "mode": "none"
-      }
+       "mode": "normal"
+      },
+      "showPoints": "never"
      }
     },
-    "overrides": []
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "seen (total)"
+      },
+      "properties": [
+       {
+        "id": "custom.drawStyle",
+        "value": "line"
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 0
+       },
+       {
+        "id": "custom.lineWidth",
+        "value": 1
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "yellow"
+        }
+       }
+      ]
+     }
+    ]
    },
    "options": {
     "legend": {
@@ -506,7 +524,8 @@
      "mode": "multi",
      "sort": "desc"
     }
-   }
+   },
+   "description": "Per-block log accounting, sampled by the pump at each header epilogue (NO4DIW EpochLogTally). Stacked composition of one block: applied (reached a registered pool) + ignored (undecoded + decoded-but-no-pool) + not relevant (suppressed by the topic filter; seen minus received). The yellow line is the seen total; received = the bar top without the not-relevant segment. X is time at one-block cadence — block numbers cannot label a Prometheus series (unbounded cardinality); a spike in ignored is a decoder/registry drift signal (drill into the epoch's trace in Jaeger)."
   },
   {
    "id": 10,

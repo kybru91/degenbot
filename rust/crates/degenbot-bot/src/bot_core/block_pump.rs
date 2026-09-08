@@ -1001,6 +1001,17 @@ impl BlockPump {
                     // from the prior epoch (an all-quiet prior block never
                     // reached a settle) so nothing dangles into the new one.
                     stage_tel.new_epoch();
+                    // NO4DIW: the epoch that just closed is fully accounted —
+                    // sample its log ledger into the per-block funnel gauges.
+                    let ledger = self.bot.dispatcher().snapshot_epoch_logs_and_reset();
+                    if let Some(p) = crate::instruments::pipeline() {
+                        p.observe_epoch_logs(
+                            ledger.seen,
+                            ledger.received,
+                            ledger.applied,
+                            ledger.undecoded + ledger.apply_missed,
+                        );
+                    }
                     // Sync-only header-processing scope (TQ7PD6): this enter
                     // guard dies before the first await below, so it can never
                     // leak across a task migration. The backfill future below

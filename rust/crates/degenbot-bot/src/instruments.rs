@@ -177,6 +177,14 @@ pub struct PipelineInstruments {
     /// ADR-040: per-error-reason tally for error-outcome simulations. The
     /// `reason` label is the closed `telemetry::error_reason` set.
     sim_error_reasons: Counter<u64>,
+    /// NO4DIW: per-block log funnel (the pump samples at each header).
+    /// PROMETHEUS NAME COUPLING: renders as `degenbot_epoch_logs_{seen,
+    /// received,applied,ignored}` — the dashboard stacked-funnel panel
+    /// queries those verbatim; rename here and the panel together.
+    epoch_logs_seen: Gauge<f64>,
+    epoch_logs_received: Gauge<f64>,
+    epoch_logs_applied: Gauge<f64>,
+    epoch_logs_ignored: Gauge<f64>,
     /// Epic MROOY7 (BF43PM): first relevant log → publish per quiesce cycle
     /// (the publish-cycle duration for the Final-integration A/B).
     publish_cycle: Histogram<f64>,
@@ -457,6 +465,10 @@ impl PipelineInstruments {
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .with_description("Time a guard was held after acquisition (per site, mode)")
                 .build(),
+            epoch_logs_seen: meter.f64_gauge("degenbot.epoch.logs_seen").build(),
+            epoch_logs_received: meter.f64_gauge("degenbot.epoch.logs_received").build(),
+            epoch_logs_applied: meter.f64_gauge("degenbot.epoch.logs_applied").build(),
+            epoch_logs_ignored: meter.f64_gauge("degenbot.epoch.logs_ignored").build(),
             publish_cycle: meter
                 .f64_histogram("degenbot.stage.publish_cycle")
                 .with_unit("s")
@@ -773,6 +785,16 @@ impl PipelineInstruments {
         );
     }
 
+    /// NO4DIW: per-block log funnel — the pump's header-epilogue snapshot
+    /// (degenbot.epoch.logs_*; see the field note for the coupling).
+    #[expect(clippy::cast_precision_loss)]
+    pub fn observe_epoch_logs(&self, seen: u64, received: u64, applied: u64, ignored: u64) {
+        self.epoch_logs_seen.record(seen as f64, &[]);
+        self.epoch_logs_received.record(received as f64, &[]);
+        self.epoch_logs_applied.record(applied as f64, &[]);
+        self.epoch_logs_ignored.record(ignored as f64, &[]);
+    }
+
     /// Epic MROOY7 (BF43PM): one publish-cycle duration (first relevant log
     /// → publish).
     pub fn observe_publish_cycle(&self, secs: f64) {
@@ -926,6 +948,29 @@ mod kind_tests {
             !text.contains("header_to_solved"),
             "retired drain-era race family still present in exposition"
         );
+        drop(provider);
+    }
+
+    /// NO4DIW: per-block log funnel gauges (degenbot.epoch.logs_*) render
+    /// the EXACT per-epoch values the pump snapshots at each header; the
+    /// dashboard stacks them as the per-block funnel bars.
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn epoch_log_funnel_gauges_are_scrapeable() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_funnel"));
+        instruments.observe_epoch_logs(120, 40, 30, 2);
+        let text = crate::metrics::render(&registry);
+        for (family, value) in [
+            ("degenbot_epoch_logs_seen", 120),
+            ("degenbot_epoch_logs_received", 40),
+            ("degenbot_epoch_logs_applied", 30),
+            ("degenbot_epoch_logs_ignored", 2),
+        ] {
+            let line = text.lines().find(|l| l.starts_with(family)).expect(family);
+            assert!(line.ends_with(&value.to_string()), "{line} != {value}");
+        }
         drop(provider);
     }
 
