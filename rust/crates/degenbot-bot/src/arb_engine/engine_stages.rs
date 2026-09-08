@@ -1,0 +1,366 @@
+//! `EngineStages` — the arb engine's `StageHandlers` implementation and the
+//! Published-edge adapter for the delivery-to-Python channels (epic MROOY7,
+//! task SZJUKL — the seam-retirement cutover).
+//!
+//! This is the ONE consumers-and-drivers surface that survived the seam
+//! retirement: the dissolved `SolveCoordinator` / `DrainSink` / `Engine`
+//! fan-out and the `EngineHandle` wrapper lock layer collapsed into this
+//! type — the shared engine behind the `Arc<Mutex<ArbitrageEngine>>` the
+//! Python wrapper co-owns, driven by the machine driver (the block pump)
+//! through the stage hooks. There is no drain FIFO, no fan-out vec, no
+//! `drain_lock`: solve/finalize/publish work runs INLINE in the pump task at
+//! the machine's decision points, so the "drain-consistent cursor" problem
+//! dissolves (single-writer by construction) and the stale-epoch drop the
+//! old `DispatchOwner` FIFO needed is a cheap I3 check the driver runs at
+//! each work site (see `block_pump::run_with_stream`).
+//!
+//! Channels survive ONLY at genuine asynchrony boundaries (SZJUKL):
+//! - the **block clock** (delivery-to-Python header ticks) — an unbounded
+//!   mpsc send per accepted header, never queued behind solver work;
+//! - the **result batch** channel — the Published edge `on_publish` writes
+//!   the debounced batch into; Python's consumer subscribes there as a
+//!   sink (ADR-027 completion, B4GX7C lineage).
+//!
+//! The no-progress/strike obligations of the dissolved `DrainerHealth`
+//! map onto the machine's `WatchdogPhase` (7NFYQW): header staleness =
+//! a dead `newHeads` arm, log silence = a dead logs arm. A wedge that
+//! stops the driver from executing stage work IS the pump stall the
+//! machine's watchdogs already abort on — there is no separate drainer
+//! task left to go silently dead.
+//!
+//! **Lock order:** engine `Mutex` alone (the driver runs between BotState
+//! touches; the engine takes its own core read/write internally). The
+//! block-clock send takes only its own mutex (never the engine).
+//!
+//! `latest_results` / `register_path` / the FFI surface keep their
+//! StateLock-mediated core locking — this type adds NO lock layer.
+
+use std::sync::Arc;
+
+use parking_lot::{Mutex, RwLock};
+
+use crate::bot_core::block_clock_pipe::BlockClockPipe;
+use crate::bot_core::stage_handlers::StageHandlers;
+use crate::bot_core::{
+    stage_handlers::{
+        AffectedPaths, Finalize, FinalizeOutcome, Gate, GateOutcome, Publish, PublishOutcome,
+        QuiesceOutcome, Resolve, Simulate, SimulateOutcome, Solve, SolveOutcome, StageError,
+    },
+    BlockMetadata, Epoch, EpochDelta, Rewind, RewindOutcome,
+};
+
+use degenbot_solvers::affected_keys::AffectedKey;
+
+use super::ArbitrageEngine;
+
+/// The arb engine's stage surface: the shared engine + the touched-pool
+/// ledger it solves from + the delivered-to-Python block clock.
+pub struct EngineStages {
+    /// The shared engine state (the same `Arc` `PyArbitrageEngine.engine`
+    /// holds). The stage hooks lock per call — the SRQEK5 detached-solve
+    /// posture keeps the steady-state hold at enqueue length (µs).
+    engine: Arc<Mutex<ArbitrageEngine>>,
+    /// The epoch ledger the hooks take keys from (wired to
+    /// `Bot::active_delta` so log application records into the SAME ledger
+    /// `on_resolve` consumes — LXDY4C shared dirty tracking).
+    delta: RwLock<Arc<EpochDelta>>,
+    /// The block-clock pipe (delivery-to-Python at the async boundary).
+    /// Header ticks never touch the engine (a chain fact, not engine
+    /// business — B2/ADR-027 lineage; the pipe moved here from the
+    /// dissolved coordinator).
+    block_clock: Mutex<BlockClockPipe>,
+}
+
+impl EngineStages {
+    /// Construct over a strong clone of the shared engine handle.
+    #[must_use]
+    pub fn new(engine: Arc<Mutex<ArbitrageEngine>>) -> Self {
+        Self {
+            engine,
+            delta: RwLock::new(Arc::new(EpochDelta::new(0u64))),
+            block_clock: Mutex::new(BlockClockPipe::default()),
+        }
+    }
+
+    /// Hand the stage surface the shared epoch ledger (the wiring layer
+    /// passes `Bot::active_delta`).
+    pub fn set_delta(&self, delta: Arc<EpochDelta>) {
+        *self.delta.write() = delta;
+    }
+
+    /// Attach the block-clock channel sender (the wiring layer creates the
+    /// channel pair; the Python-facing receiver lives on `PumpState`).
+    /// The pipe mutex is a non-poisoning `parking_lot` — a nanosecond send,
+    /// never queued behind solver work (B2).
+    pub fn set_block_channel(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::bot_core::BlockNotification>,
+    ) {
+        self.block_clock.lock().set_channel(tx);
+    }
+
+    /// Test probe: clone of the actively-shared delta ledger.
+    #[cfg(test)]
+    #[must_use]
+    pub fn delta_for_test(&self) -> Arc<EpochDelta> {
+        Arc::clone(&self.delta.read())
+    }
+
+    /// The engine's solve cycle — the behavior port of the dissolved
+    /// `EngineHandle::solve_dirty` hold/spans/sidecar logic, verbatim.
+    /// Public: the solve-shaped tests and the registration eager-solve
+    /// path drive it directly; the driver arrives via `StageHandlers::on_solve`.
+    pub fn solve_dirty(&self, affected: &[AffectedKey], block: u64, metadata: &BlockMetadata) {
+        self.run_solve_cycle(affected, block, metadata);
+    }
+
+    /// The drained-cursor read (the engine's own `last_processed_block`).
+    #[must_use]
+    pub fn last_processed_block(&self) -> Option<u64> {
+        self.engine.lock().last_processed_block()
+    }
+
+    /// Flush a debounced result batch (the Published-edge delivery).
+    pub fn send_result_batch(&self, metadata: &BlockMetadata) {
+        self.engine.lock().send_result_batch(metadata);
+    }
+
+    /// The tombstone boundary catch (advance + terminal publish).
+    pub fn finalize_block(&self, block: u64, metadata: &BlockMetadata) {
+        self.engine.lock().finalize_block(block, metadata);
+    }
+
+    /// Mark `block` solved (engine-owned bookkeeping since LEZJAS).
+    pub fn set_last_solved_block(&self, block: u64) {
+        self.engine.lock().set_last_solved_block(block);
+    }
+
+    /// Seed the cold-start `results_block` anchor (resume boundary).
+    pub fn set_solve_anchor(&self, block: u64) {
+        self.engine.lock().set_solve_anchor(block);
+    }
+
+    /// Record a forward-log apply this block (LEZJAS bookkeeping).
+    pub fn record_logs_this_block(&self) {
+        self.engine.lock().record_logs_this_block();
+    }
+
+    /// Pump death: close the block clock + the delivery channels.
+    pub fn on_pump_ended(&self) {
+        self.block_clock.lock().close();
+        self.engine.lock().on_pump_ended();
+    }
+
+    fn run_solve_cycle(
+        &self,
+        affected: &[degenbot_solvers::affected_keys::AffectedKey],
+        block: u64,
+        metadata: &BlockMetadata,
+    ) {
+        // P5FEOI / T0 / K4ETHF span-gate lineage preserved verbatim from the
+        // dissolved wrapper: one Jaeger node for dirty solves, none for the
+        // ~2µs empty pass, gate + work under ONE mutex acquisition.
+        let mut engine =
+            hotpath::measure_block!("EngineStages::solve.probe_lock", self.engine.lock());
+        if affected.is_empty() {
+            // Kept for inner bookkeeping parity (last_processed_block et al);
+            // provably cannot consume dirt under this continuous hold.
+            engine.solve_dirty(block, metadata, affected);
+            drop(engine);
+            self.spawn_detached_sidecar_if_pending();
+            return;
+        }
+        // REMED1 T2: the streaming (drain) entry tags its cycles.
+        engine.set_solve_entry("drain");
+        let span = tracing::info_span!(
+            "degenbot.arb.solve",
+            block.number = block,
+            cycle.solve_block = tracing::field::Empty,
+        );
+        // ZZS6CG: exact-match reparent onto this block's published pump
+        // span. The work now runs INLINE in the driver (no drainer task), so
+        // the ambient span is already the pump's block span; the published-
+        // parent attach keeps the block-boundary exactness.
+        crate::telemetry::attach_published_parent_exact(&span, block);
+        let _guard = span.enter();
+        // T3: solve duration + registered-path gauge (dirty solves only).
+        let solve_start = std::time::Instant::now();
+        {
+            if let Some(p) = crate::instruments::pipeline() {
+                p.set_registered_paths(u64::try_from(engine.path_count()).unwrap_or(u64::MAX));
+            }
+            // T3 (epic BXZBWY): the solve cycle must not pin a shared
+            // pump-runtime worker while it runs. 2UVG3E seam #4: under the
+            // detached stance the engine Mutex hold collapses to enqueue end
+            // (µs); the in-cycle arm is the backpressure safety valve only.
+            let hold_start = std::time::Instant::now();
+            if is_multi_thread_runtime() {
+                tokio::task::block_in_place(|| engine.solve_dirty(block, metadata, affected));
+            } else {
+                engine.solve_dirty(block, metadata, affected);
+            }
+            // KNEUQX: surface the cycle's anchored block on the span.
+            span.record("cycle.solve_block", engine.results_block());
+            if let Some(p) = crate::instruments::pipeline() {
+                p.observe_mutex_hold_duration(hold_start.elapsed().as_secs_f64());
+            }
+            // SRQEK5 (WV62TX): spawn the detached merge sidecar at the FIRST
+            // detached enqueue (rx take + spawn atomic under the held guard).
+            if let Some(merge_rx) = engine.take_detached_merge_rx() {
+                let engine_arc = Arc::clone(&self.engine);
+                if let Err(err) = std::thread::Builder::new()
+                    .name("arb-detached-merge".to_string())
+                    .spawn(move || {
+                        super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
+                    })
+                {
+                    // LOUD abort: a stranded merge pipe would silently orphan
+                    // every detached result.
+                    tracing::error!(
+                        error = %err,
+                        "detached merge sidecar spawn failed — aborting (stranded merge pipe)"
+                    );
+                    std::process::abort();
+                }
+            }
+        }
+        if let Some(p) = crate::instruments::pipeline() {
+            p.observe_solve_duration(solve_start.elapsed().as_secs_f64());
+            p.count_solves_executed();
+        }
+    }
+
+    /// SRQEK5 (WV62TX): if the empty-affected solve path took the parked
+    /// Receiver tradeoff, the sidecar spawn happens here instead.
+    fn spawn_detached_sidecar_if_pending(&self) {
+        let Some(merge_rx) = self.engine.lock().take_detached_merge_rx() else {
+            return;
+        };
+        let engine_arc = Arc::clone(&self.engine);
+        if let Err(err) = std::thread::Builder::new()
+            .name("arb-detached-merge".to_string())
+            .spawn(move || {
+                super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
+            })
+        {
+            tracing::error!(
+                error = %err,
+                "detached merge sidecar spawn failed — aborting (stranded merge pipe)"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+/// Is the caller inside an ambient multi-thread tokio runtime? `block_in_place`
+/// is only valid there; a current-thread runtime or no runtime runs inline.
+fn is_multi_thread_runtime() -> bool {
+    tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+}
+
+impl StageHandlers for EngineStages {
+    /// Quiesced row: the machine classifies completeness (tombstone vs
+    /// settle) — the engine takes no action; the solve cycle the quiesce
+    /// arms is the driver's drained-settle gate below.
+    fn on_streaming_complete(
+        &self,
+        _work: &crate::bot_core::stage_handlers::StreamingComplete<'_>,
+    ) -> Result<QuiesceOutcome, StageError> {
+        Ok(QuiesceOutcome {
+            verdict: crate::bot_core::stage_handlers::QuiesceVerdict::Settled,
+        })
+    }
+
+    /// Resolved row: consume the epoch ledger's touched keys ONCE (the
+    /// LXDY4C take preserves the retired `DirtySets::take_all` semantics;
+    /// keys recorded while this drain runs land in the NEXT cycle).
+    fn on_resolve(&self, work: &Resolve<'_>) -> Result<AffectedPaths, StageError> {
+        let affected = work.delta.take_keys();
+        Ok(AffectedPaths(affected))
+    }
+
+    /// Solved row: the engine's solve cycle over the affected keys. The
+    /// in-process simulation (ADR-019) and the gate (ADR-040) run INSIDE
+    /// this engine cycle (solve_dirty → solver dispatch + inline sim);
+    /// results stream on the delivery channel, not on the hook return.
+    fn on_solve(&self, work: &Solve) -> Result<SolveOutcome, StageError> {
+        self.run_solve_cycle(&work.paths.0, work.ctx.block(), work.ctx.metadata());
+        Ok(SolveOutcome::default())
+    }
+
+    /// Simulated row: in-process revm simulation ran inside the Solved
+    /// cycle (the engine's sole-executor posture is a property of the
+    /// cycle, not a separate pass). No engine action.
+    fn on_simulate(&self, _work: &Simulate) -> Result<SimulateOutcome, StageError> {
+        Ok(SimulateOutcome::default())
+    }
+
+    /// Gated row: the deliver/reject verdicts are produced inside the
+    /// Solved cycle's gate (ADR-040). No engine action.
+    fn on_gate(&self, _work: &Gate) -> Result<GateOutcome, StageError> {
+        Ok(GateOutcome::default())
+    }
+
+    /// Published row: the delivery-to-Python edge — flush the debounced
+    /// result batch (delivery/submission/Python are sinks at THIS edge,
+    /// not seams in front of the engine).
+    fn on_publish(&self, work: &Publish) -> Result<PublishOutcome, StageError> {
+        self.engine.lock().send_result_batch(work.ctx.metadata());
+        Ok(PublishOutcome::default())
+    }
+
+    /// Finalized row: the boundary catch — advance + terminal publish, no
+    /// solve cycle (PWPPAZ T1).
+    fn on_finalize(&self, work: &Finalize) -> Result<FinalizeOutcome, StageError> {
+        self.engine
+            .lock()
+            .finalize_block(work.ctx.block(), work.ctx.metadata());
+        Ok(FinalizeOutcome {
+            cutoff: work.ctx.epoch(),
+        })
+    }
+
+    /// `Rewind` row: the machine owns the unwind (epoch seq bump, stale
+    /// contexts fail fast); pool restoration is the event-driven
+    /// `ReorgCoordinator` per-log path, not a stage hook. Echoes the target.
+    fn on_rewind(&self, work: &Rewind) -> Result<RewindOutcome, StageError> {
+        Ok(RewindOutcome {
+            restored_to: work.to_epoch,
+        })
+    }
+
+    fn has_dirty_paths(&self) -> bool {
+        !self.delta.read().is_empty()
+    }
+
+    fn set_last_solved_block(&self, solved: Epoch) {
+        self.engine.lock().set_last_solved_block(solved.block());
+    }
+
+    fn set_solve_anchor(&self, anchor: Epoch) {
+        self.engine.lock().set_solve_anchor(anchor.block());
+    }
+
+    fn record_logs_this_block(&self) {
+        self.engine.lock().record_logs_this_block();
+    }
+
+    fn last_processed_block(&self) -> Option<u64> {
+        self.engine.lock().last_processed_block()
+    }
+
+    fn notify_block(&self, block: u64, metadata: &BlockMetadata) {
+        // Direct, non-FIFO dispatch: one send per accepted header, never
+        // queued behind solver work (B2). NOT taking the engine lock.
+        self.block_clock.lock().notify(block, metadata);
+    }
+
+    fn on_pump_ended(&self) {
+        tracing::error!(
+            "EngineStages: pump ended - closing the block-clock pipe + engine delivery channels; the Python block/result streams now end so the bot fails loudly"
+        );
+        self.block_clock.lock().close();
+        self.engine.lock().on_pump_ended();
+    }
+}

@@ -5,9 +5,11 @@
 //! block-clock pipe used to live on the *engine* (`DeliveryPolicy.block_tx`),
 //! contradicting that design: `newHeads` ticks are chain facts, not engine
 //! business — the engine merely relayed them, taking its `Mutex` per header.
-//! Now the [`SolveCoordinator`](super::solve_coordinator::SolveCoordinator)
-//! owns the pipe directly: one non-blocking send per accepted header, engines
-//! out of the block path entirely, and pump death closes it with the engines'
+//! Now the engine's stage surface
+//! ([`EngineStages`](crate::arb_engine::engine_stages::EngineStages), via
+//! `StageHandlers::notify_block`) owns the pipe: one non-blocking send per
+//! accepted header, solves out of the block path entirely, and pump death
+//! closes it with the engines'
 //! result lifecycles.
 
 use tokio::sync::mpsc;

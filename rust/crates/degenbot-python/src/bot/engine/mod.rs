@@ -44,10 +44,9 @@ pub(crate) use tokio::sync::mpsc;
 
 pub(crate) use crate::bot::PyBot;
 pub(crate) use degenbot_bot::bot_core::reorg_coordinator::ReorgCoordinator;
-pub(crate) use degenbot_bot::bot_core::solve_coordinator::SolveCoordinator;
-pub(crate) use degenbot_bot::bot_core::{drain_sink::DrainSink, Bot, V4StateSync};
+pub(crate) use degenbot_bot::bot_core::{Bot, V4StateSync};
 
-pub(crate) use degenbot_bot::arb_engine::engine_handle::EngineHandle;
+pub(crate) use degenbot_bot::arb_engine::EngineStages;
 
 pub(crate) use degenbot_bot::arb_engine::{ArbitrageEngine, BlockNotification, ResultBatch};
 pub(crate) use degenbot_solvers::mixed::{HopType, PoolHop, SolvePathResult};
@@ -64,13 +63,7 @@ pub(crate) use degenbot_solvers::mixed::{HopType, PoolHop, SolvePathResult};
 pub struct PyArbitrageEngine {
     /// Shared engine state
     engine: Arc<parking_lot::Mutex<ArbitrageEngine>>,
-    /// Retained `EngineHandle` — the ADR-006 cycle-free owner of the strong
-    /// `EngineSubscriber`. `register_path`/`register_and_solve_path` draw a
-    /// live `Weak` from this (see `subscriber_weak`) so `LogDispatcher::notify`
-    /// routes `on_pool_state_updated` → `insert_dirty` on the live engine.
-    /// A clone of this same `Arc<EngineHandle>` is the `Arc<dyn Engine>` held
-    /// by `SolveCoordinator`.
-    engine_handle: Arc<EngineHandle>,
+
     /// ADR-006 D4 (T3): the pump lifecycle state (coordinator, reorg
     /// coordinator, bot, shutdown, pump handle, subscribe state, phase) now
     /// lives in a shared `Arc<PumpState>` co-owned with `PyBot`. The legacy

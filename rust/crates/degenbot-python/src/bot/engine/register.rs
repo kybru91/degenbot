@@ -6,9 +6,8 @@
 //! blocks per type, so each concern file contributes one slice.
 
 use super::{
-    mpsc, ArbitrageEngine, Arc, Bot, DynamicFeePoolRejectedError, EngineHandle,
+    mpsc, ArbitrageEngine, Arc, Bot, DynamicFeePoolRejectedError, EngineStages,
     HookedPoolRejectedError, PoolHop, PyArbitrageEngine, PyBot, PyList, ReorgCoordinator,
-    SolveCoordinator,
 };
 use crate::prelude::*;
 
@@ -41,36 +40,26 @@ impl PyArbitrageEngine {
         engine.set_result_channel(result_tx);
         let (block_tx, block_rx) = mpsc::unbounded_channel();
         let engine = Arc::new(parking_lot::Mutex::new(engine));
-        // ADR-006 slice 6: wrap the shared engine in `EngineHandle` (an
-        // `Arc<dyn Engine>` view) and build the coordinator. The coordinator
-        // replaces slice 5a's `EngineDrainSink` pass-through; it fans drain-tick
-        // calls to the engine under a `drain_lock` and exposes a
-        // drain-consistent `last_processed_block` (Python polls block until
-        // any in-flight drain completes — no Rust/Python race).
-        //
-        // The `EngineHandle` is retained on `Self` (not discarded into the
-        // coordinator) so `register_path`/`register_and_solve_path` can draw a
-        // live `Weak<dyn PoolStateSubscriber>` from it via `subscriber_weak()`.
-        // This is the ADR-006 cycle-free home for the strong subscriber: it is
-        // co-owned with the engine `Arc`, so the dispatcher's `Weak::upgrade`
-        // succeeds until the engine actually drops (the fix for the dangling-
-        // Weak bug the 2026-07-14 hotpath capture surfaced).
-        let engine_handle = Arc::new(EngineHandle::new(Arc::clone(&engine)));
-        let coordinator = Arc::new(SolveCoordinator::new(vec![
-            Arc::clone(&engine_handle) as Arc<dyn degenbot_bot::bot_core::engine::Engine>
-        ]));
-        // ADR-027 completion: the block-clock pipe is coordinator-owned —
-        // header ticks never touch the engine (a chain fact, not engine
-        // business). The receiver lives on the shared `PumpState` beside the
-        // pipe's owner; `PyBot::block_stream` hands it to Python once.
-        coordinator.set_block_channel(block_tx);
-        // LXDY4C: the drain seam consumes the SAME epoch ledger
-        // `Bot::dispatch_log` records into — one dirty-tracking mechanism.
-        coordinator.set_delta(bot.active_delta());
+        // SZJUKL seam retirement: the pump drives the engine — a StageHandlers
+        // implementation — directly through the stage hooks; the dissolved
+        // `SolveCoordinator`/`EngineHandle` fan-out/wrapper layer is gone
+        // (hard cutover, Q6). Python polls the engine's own cursor
+        // (`last_processed_block`): stage work runs INLINE in the
+        // single-writer driver, so the cursor is drain-consistent by
+        // construction (no `drain_lock` to wait on).
+        let stages = Arc::new(EngineStages::new(Arc::clone(&engine)));
+        // The stage surface consumes the SAME epoch ledger `Bot::dispatch_log`
+        // records into — one dirty-tracking mechanism (LXDY4C).
+        stages.set_delta(bot.active_delta());
+        // The block-clock pipe lives on the stage surface — header ticks
+        // never touch the engine's solve state (a chain fact, not engine
+        // business; B2/ADR-027 lineage). The receiver lives on the shared
+        // `PumpState`; `PyBot::block_stream` hands it to Python once.
+        stages.set_block_channel(block_tx);
         let reorg_coordinator = Arc::new(ReorgCoordinator::new(Arc::clone(&bot)));
         let pump = Arc::new(crate::bot::pump::PumpState::new(
             Arc::clone(&engine),
-            Arc::clone(&coordinator),
+            stages,
             Arc::clone(&reorg_coordinator),
             Arc::clone(&bot),
             parking_lot::Mutex::new(Some(block_rx)),
@@ -85,7 +74,6 @@ impl PyArbitrageEngine {
         let warm_code_cache = degenbot_simulation::WarmCodeCacheInner::shared_default();
         Self {
             engine,
-            engine_handle,
             pump,
             result_rx: Arc::new(parking_lot::Mutex::new(Some(result_rx))),
             warm_code_cache,
@@ -121,7 +109,6 @@ impl PyArbitrageEngine {
             return Err(pyo3::exceptions::PyValueError::new_err(msg));
         }
 
-        let pool_ids: Vec<u64> = hops.iter().map(|h| h.pool_id).collect();
         let engine = Arc::clone(&self.engine);
         // YLYJM2: release the GIL across the engine `Mutex` acquisition +
         // `register_path` (which internally takes `core.read()`) so the live
@@ -130,24 +117,12 @@ impl PyArbitrageEngine {
         // `PyErr` OUTSIDE the closure (GIL-held).
         let result = py.detach(move || engine.lock().register_path(hops));
         let path_id = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
-        // ADR-006 D4: subscribe the engine to each pool_id's state updates so
-        // `Bot::dispatch_log` (driven by BlockPump) dirties the engine via the
-        // `EngineSubscriber` adapter. Without this, dispatched logs apply to
-        // `BotState` but never mark paths dirty → no solves (the live chain was
-        // severed when `apply_log` was replaced by `dispatch_log` in slice 5).
-        // Duplicate pool_ids across paths are harmless (`insert_dirty` is
-        // idempotent via `HashSet`).
-        //
-        // The `Weak` is drawn from the retained `EngineHandle` (the
-        // cycle-free strong owner) so `LogDispatcher::notify`'s `upgrade()`
-        // succeeds until the engine drops — the fix for the dangling-Weak bug
-        // (2026-07-14 hotpath capture: 71 notifies → 0 dirties).
-        let subscriber = self.engine_handle.subscriber_weak();
-        for pool_id in pool_ids {
-            // 42FL35 attach provenance now lives on the `degenbot.path.register`
-            // span (hops list); a NOTIFY MISS still names the stale generation.
-            self.pump.bot.attach_engine(pool_id, subscriber.clone());
-        }
+        // SZJUKL: no engine-side PoolStateSubscriber registration. The
+        // retired `EngineSubscriber` adapter was only ever a liveness probe
+        // (LXDY4C): touched-pool dirty tracking is BYPRODUCT of log
+        // application (`Bot::dispatch_log` records the block's
+        // `EpochDelta`, which `on_resolve` consumes). The dispatcher's
+        // `Weak` fan-out now carries only Python's own subscribers.
         Ok(path_id)
     }
 
@@ -186,7 +161,6 @@ impl PyArbitrageEngine {
             return Err(pyo3::exceptions::PyValueError::new_err(msg));
         }
 
-        let pool_ids: Vec<u64> = hops.iter().map(|h| h.pool_id).collect();
         let engine = Arc::clone(&self.engine);
         // YLYJM2: release the GIL across the engine `Mutex` acquisition +
         // `register_and_solve_path` (engine.lock() + core.read() + the single
@@ -194,11 +168,7 @@ impl PyArbitrageEngine {
         // error maps to a `PyErr` OUTSIDE the closure.
         let result = py.detach(move || engine.lock().register_and_solve_path(hops));
         let path_id = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
-        // ADR-006 D4: subscribe the engine to each pool_id (see `register_path`).
-        let subscriber = self.engine_handle.subscriber_weak();
-        for pool_id in pool_ids {
-            self.pump.bot.attach_engine(pool_id, subscriber.clone());
-        }
+        // No engine-side subscription — see `register_path` (SZJUKL).
         Ok(path_id)
     }
 

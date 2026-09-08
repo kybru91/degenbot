@@ -2,7 +2,7 @@
 //!
 //! [hotpath-rs](https://hotpath.rs) instruments functions, channels, locks, and
 //! threads. The `#[hotpath::measure]` attributes sprinkled across the
-//! block-pump → `SolveCoordinator` → `EngineHandle` drain path are the lasting
+//! block-pump → `EngineStages` solve path (the stage-machine driver's inline
 //! instrumentation: they are **no-ops unless the `hotpath` Cargo feature is
 //! enabled** (hotpath's `lib_off.rs` expands them to nothing), so default
 //! builds pay zero compile-time or runtime cost.
@@ -41,8 +41,9 @@
 //!
 //! The pump → coordinator → engine-handle path is the canonical
 //! "Rust-is-the-engine" layer (ADR-005 / ADR-006): a tokio task driving WS
-//! `newHeads` + `logs` through a `DrainSink` → `Arc<dyn Engine>` fan-out under
-//! the `drain_lock → engine-Mutex → BotState RwLock` ordering. It is where
+//! `newHeads` + `logs` through the ONE stage seam (`StageHandlers`, SZJUKL) —
+//! solution hooks hold the engine `Mutex` (enqueue-length under the detached
+//! posture) and take the `BotState` RwLock internally. It is where
 //! latency = lost MEV, and it combines every hotpath capability relevant
 //! here: tokio runtime, the result-batch mpsc channel, three nested locks,
 //! and CPU-bound solve work. See `docs/architecture/rust-owned-bot.md` for the

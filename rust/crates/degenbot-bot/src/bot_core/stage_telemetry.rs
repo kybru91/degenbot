@@ -57,7 +57,7 @@ use super::stage_handlers::Stage;
 /// while its parent exported at arm-exit (319us), corrupting the waterfall.
 /// Degenerate relative to the 30s staleness watchdog, a fresh 5s bound keeps
 /// children within a healthy block cadence.
-pub(crate) const STAGE_MAX_AGE_SECS: u64 = 5;
+pub const STAGE_MAX_AGE_SECS: u64 = 5;
 
 /// The open-ended stage rows (the only ones holding a span open). `Streaming`
 /// holds from the epoch's first relevant log until quiesce/tombstone/rewind;

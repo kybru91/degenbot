@@ -17,11 +17,10 @@
 
 use std::sync::Arc;
 
-use degenbot_bot::arb_engine::{ArbitrageEngine, EnginePhase};
+use degenbot_bot::arb_engine::{ArbitrageEngine, EnginePhase, EngineStages};
 use degenbot_bot::bot_core::block_pump::{BlockPump, WsEvent};
 use degenbot_bot::bot_core::reorg_coordinator::ReorgCoordinator;
-use degenbot_bot::bot_core::solve_coordinator::SolveCoordinator;
-use degenbot_bot::bot_core::{drain_sink::DrainSink, Bot};
+use degenbot_bot::bot_core::{Bot, StageHandlers};
 use parking_lot::Mutex;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -30,7 +29,7 @@ use tokio::sync::mpsc;
 
 /// Python-facing subscribe state, held between `subscribe()` and `resume()`.
 pub(crate) struct PySubscribeState {
-    /// The pump instance (holds `Arc<Bot>` + `Arc<dyn DrainSink>`, provider, shutdown)
+    /// The pump instance (holds `Arc<Bot>` + `Arc<dyn StageHandlers>`, provider, shutdown)
     pub(crate) pump: BlockPump,
     /// First block number observed during subscribe
     pub(crate) first_block: u64,
@@ -53,10 +52,9 @@ pub(crate) struct PySubscribeState {
 pub(crate) struct PumpState {
     /// Shared engine state (for `process_backfill_logs` / `last_processed_block`).
     pub(crate) engine: Arc<parking_lot::Mutex<ArbitrageEngine>>,
-    /// The drain-point solve coordinator (ADR-006 D4, slice 6). Holds the
-    /// engine as `Arc<dyn Engine>` (via `EngineHandle`) and fans drain-tick /
-    /// send / finalize / reorg calls to it under a `drain_lock`.
-    pub(crate) coordinator: Arc<SolveCoordinator>,
+    /// The engine's stage surface (SZJUKL seam retirement): the ONE
+    /// `StageHandlers` seam the pump drives — no coordinator, no fan-out.
+    pub(crate) stages: Arc<EngineStages>,
     /// The per-event reorg coordinator (ADR-006 slice 7).
     pub(crate) reorg_coordinator: Arc<ReorgCoordinator>,
     /// The per-chain `Bot` orchestrator (ADR-006 D4). `BlockPump` clones this
@@ -89,7 +87,7 @@ impl PumpState {
     #[must_use]
     pub(crate) fn new(
         engine: Arc<parking_lot::Mutex<ArbitrageEngine>>,
-        coordinator: Arc<SolveCoordinator>,
+        stages: Arc<EngineStages>,
         reorg_coordinator: Arc<ReorgCoordinator>,
         bot: Arc<Bot>,
         block_rx: parking_lot::Mutex<
@@ -98,7 +96,7 @@ impl PumpState {
     ) -> Self {
         Self {
             engine,
-            coordinator,
+            stages,
             reorg_coordinator,
             bot,
             shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -167,7 +165,7 @@ impl PumpState {
             ));
         }
         let bot = Arc::clone(&self.bot);
-        let sink: Arc<dyn DrainSink> = self.coordinator.clone();
+        let engine_stage: Arc<dyn StageHandlers> = self.stages.clone();
         let reorg_coordinator = Arc::clone(&self.reorg_coordinator);
         let shutdown = Arc::clone(&self.shutdown);
         let runtime = degenbot_core::runtime::get_runtime();
@@ -181,7 +179,8 @@ impl PumpState {
         let subscribe_result = py
             .detach(|| {
                 runtime.block_on(async {
-                    BlockPump::subscribe(rpc_url, bot, sink, reorg_coordinator, shutdown).await
+                    BlockPump::subscribe(rpc_url, bot, engine_stage, reorg_coordinator, shutdown)
+                        .await
                 })
             })
             .map_err(PyRuntimeError::new_err)?;
@@ -241,7 +240,6 @@ impl PumpState {
         let mut pump = state.pump;
         let first_block = state.first_block;
         let combined_stream = state.combined_stream;
-        self.coordinator.start();
         // J3FMDO race fix: run the snapshot→WS backfill SYNCHRONOUSLY before
         // spawning the live loop, so Python's `build_paths` (which drains the
         // per-pool backfill buffer via `apply_backfill_buffer_v3`) cannot race
@@ -327,7 +325,7 @@ impl PumpState {
         if let Some(handle) = handle {
             handle.abort();
             // Drive the cancelled task to completion so its held resources
-            // (WS subscription futures, `Arc<dyn DrainSink>` clones) drop
+            // (WS subscription futures, `Arc<dyn StageHandlers>` clones) drop
             // before Python tears the runtime down. `block_on` on the shared
             // runtime matches the existing `subscribe`/`backfill_from_snapshot`
             // sync discipline; the aborted task completes promptly.
@@ -645,15 +643,13 @@ mod tests {
     // `Ok(())` because the handle is `take()`n on the first). Building a
     // real `PumpState` mirrors the standalone (no-`py_bot`) path of
     // `PyArbitrageEngine::new` — a fresh `Bot`/`BotState`/`ArbitrageEngine`/
-    // `SolveCoordinator`/`ReorgCoordinator`. No WS connection is opened;
+    // `EngineStages`/`ReorgCoordinator`. No WS connection is opened;
     // the running-handle test installs a never-completing dummy task so
     // `stop()`'s abort path is exercised without the real pump.
 
     use super::PumpState;
-    use degenbot_bot::arb_engine::engine_handle::EngineHandle;
-    use degenbot_bot::arb_engine::ArbitrageEngine;
+    use degenbot_bot::arb_engine::{ArbitrageEngine, EngineStages};
     use degenbot_bot::bot_core::reorg_coordinator::ReorgCoordinator;
-    use degenbot_bot::bot_core::solve_coordinator::SolveCoordinator;
     use degenbot_bot::bot_core::state_lock::StateLock;
     use degenbot_bot::bot_core::{Bot, BotState};
     use tokio::sync::mpsc;
@@ -665,16 +661,14 @@ mod tests {
         let (result_tx, _result_rx) = mpsc::unbounded_channel();
         engine.set_result_channel(result_tx);
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
-        let coordinator = std::sync::Arc::new(SolveCoordinator::new(vec![EngineHandle::arc_dyn(
-            std::sync::Arc::clone(&engine),
-        )]));
+        let stages = std::sync::Arc::new(EngineStages::new(std::sync::Arc::clone(&engine)));
         let (block_tx, _block_rx) = mpsc::unbounded_channel();
-        coordinator.set_block_channel(block_tx);
+        stages.set_block_channel(block_tx);
         let reorg_coordinator =
             std::sync::Arc::new(ReorgCoordinator::new(std::sync::Arc::clone(&bot)));
         std::sync::Arc::new(PumpState::new(
             engine,
-            coordinator,
+            stages,
             reorg_coordinator,
             bot,
             parking_lot::Mutex::new(None),

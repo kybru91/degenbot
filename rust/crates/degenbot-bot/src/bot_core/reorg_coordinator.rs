@@ -7,9 +7,9 @@
 //! per-pool, mirroring slice 5a's `dispatch_log` shape:
 //!
 //! - Pump, on a WS log with `removed: true`, calls
-//!   `bot.dispatch_reorg_log(&log)` (NOT `sink.on_reorg(block)` — reorg no
-//!   longer flows through the `DrainSink`; the engine solves at the next
-//!   drain tick via the normal subscriber→`on_drain` path).
+//!   `bot.dispatch_reorg_log(&log)` — reorg is a Bot concern, parallel to
+//!   `dispatch_log`, never a stage-hook seam (SZJUKL). The engine re-solves
+//!   at the next drained-settle gate from the freshly recorded `EpochDelta`.
 //! - `ReorgCoordinator::dispatch_reorg_log` decodes the log to resolve the
 //!   target `pool_id` (V2/V3 via `pool_id_by_address`, V4 via
 //!   `v4_pool_id_by_key`), RESTORES that pool's state via

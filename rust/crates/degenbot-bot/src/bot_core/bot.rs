@@ -12,8 +12,10 @@
 //! byte-identical).
 //!
 //! The other ADR-006 D4 helper rows (`LogDispatcher`/`BlockPump`/
-//! `SolveCoordinator`/`ReorgCoordinator`) already live as sibling
+//! `ReorgCoordinator`) already live as sibling
 //! `bot_core/*.rs` files; `bot.rs` is the last one to file-extract.
+//! (SZJUKL: the former `SolveCoordinator` row is dissolved — the arb engine's
+//! `EngineStages`/`StageHandlers` surface replaced it.)
 
 use std::sync::Arc;
 
@@ -25,8 +27,9 @@ use crate::bot_core::{log_dispatcher, BotState};
 /// The per-chain orchestrator: a thin facade over a shared
 /// [`BotState`] (the pure-data registries/swap math/reorg journal) plus the
 /// `chain_id` (ADR-006 D1) and, in later slices, the cohesive helpers
-/// (`LogDispatcher` / `BlockPump` / `SolveCoordinator` / `ReorgCoordinator`) and a
-/// `Vec<Box<dyn EventSink>>` of attached engines.
+/// (`LogDispatcher` / `BlockPump` / `ReorgCoordinator`) — the engine seam is
+/// the arb engine's `StageHandlers` surface (SZJUKL; the former
+/// `SolveCoordinator` is dissolved).
 ///
 /// `PyBot` owns a `Bot` outright (not behind a lock) and hands out clones of
 /// [`Bot::state_arc`] so `PyLiquidityPool` / `PyErc20Token` / `ArbitrageEngine`

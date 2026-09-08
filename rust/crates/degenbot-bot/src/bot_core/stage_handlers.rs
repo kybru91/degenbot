@@ -39,11 +39,11 @@
 //! its internals are NOT
 //! part of this seam, so the dirty-tracking rewrite cannot fork the trait.
 
-#[cfg(test)]
-use std::cell::Cell;
 use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 
-use crate::bot_core::{BlockContext, Epoch};
+use crate::bot_core::{BlockContext, BlockMetadata, Epoch};
 
 // ----------------------------------------------------------------------
 // Stage
@@ -189,8 +189,10 @@ pub struct QuiesceOutcome {
 pub struct CandidateId(pub u64);
 
 /// The affected-path set derived at the Resolved row from the epoch's delta.
+/// (SZJUKL: carries the real ledger keys — the `EpochDelta` take — not loose
+/// ids, so the Solved hook receives exactly what the solver consumes.)
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AffectedPaths(pub Vec<u64>);
+pub struct AffectedPaths(pub Vec<degenbot_solvers::affected_keys::AffectedKey>);
 
 /// The Solved row's output: candidates risen from the affected paths.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -467,7 +469,7 @@ impl std::error::Error for DoubleRewind {}
 /// compile-fails-if-incomplete property). Hooks never compute — they carry
 /// the stage's decision to the runtime, which owns ordering, state posture,
 /// and stage transitions.
-pub trait StageHandlers {
+pub trait StageHandlers: Send + Sync {
     /// Quiesced row: all dispatched logs for the epoch's block are applied;
     /// classify completeness (tombstone-by-successor vs settle; the
     /// early-slice/debounce gates).
@@ -536,6 +538,58 @@ pub trait StageHandlers {
     /// # Errors
     /// [`StageError::Failed`] on a hard hook failure.
     fn on_rewind(&self, work: &Rewind) -> Result<RewindOutcome, StageError>;
+
+    // ---------------------------------------------------------------------
+    // Driver-facing lifecycle surface (SZJUKL seam retirement)
+    //
+    // The dissolved `DrainSink`/`Engine`/`SolveCoordinator` fan-out had two
+    // halves: the drain seam (deleted — its work is the stage hooks above)
+    // and the pump↔engine coordination the driver still needs. That
+    // coordination lands HERE as required methods of the ONE seam — no
+    // second trait, no fan-out, no wrapper lock layer:
+    //
+    // - `has_dirty_paths` — the driver's drained-settle gate (Streaming →
+    //   Resolved readiness: ledger emptiness, LXDY4C).
+    // - `set_last_solved_block` / `set_solve_anchor` / `record_logs_this_block`
+    //   — engine-owned bookkeeping since LEZJAS, coordinated from the
+    //   driver's decisions (SetLastSolved, resume seeding, forward logs).
+    // - `last_processed_block` — the engine's own cursor (drain-consistent
+    //   by construction: work runs inline in the driver, single-writer).
+    // - `notify_block` — the block-clock pipe (delivery-to-Python at the
+    //   async boundary; never queued behind solver work, B2/B4GX7C lineage).
+    // - `on_pump_ended` — the liveness answer (incident 2026-08-20 #2):
+    //   delivery channels END so Python fails loudly instead of idling.
+    // ---------------------------------------------------------------------
+
+    /// Are there unsolved dirty pool keys accumulated since the last solve?
+    #[must_use]
+    fn has_dirty_paths(&self) -> bool;
+
+    /// Mark `solved` as solved (engine-owned bookkeeping since LEZJAS).
+    fn set_last_solved_block(&self, solved: Epoch);
+
+    /// Seed the cold-start `results_block` anchor to a settled block (the
+    /// pump's resume/backfill boundary). Only fills while it is 0.
+    fn set_solve_anchor(&self, anchor: Epoch);
+
+    /// Record that at least one forward log applied this block (cleared by
+    /// the next finalize — LEZJAS).
+    fn record_logs_this_block(&self);
+
+    /// The last block this engine solved. The resume path reads it to seed
+    /// the machine's starting cursor.
+    #[must_use]
+    fn last_processed_block(&self) -> Option<u64>;
+
+    /// Forward a `newHeads` tick to the delivery-to-Python block clock
+    /// (the one non-FIFO dispatch: a chain fact never queues behind solver
+    /// work; every accepted header delivered 1:1).
+    fn notify_block(&self, block: u64, metadata: &BlockMetadata);
+
+    /// The pump ended (WS stream dead or pump task exited): make the
+    /// Python-facing streams END so the bot fails loudly (no default —
+    /// every engine answers the liveness question explicitly).
+    fn on_pump_ended(&self);
 }
 
 // ======================================================================
@@ -1110,6 +1164,14 @@ mod conformance {
         }
     }
 
+    /// The ALL_STAGES index (the stub's atomic script encoding).
+    fn stage_index(stage: Stage) -> u8 {
+        ALL_STAGES
+            .iter()
+            .position(|s| *s == stage)
+            .expect("scripted stage must be in ALL_STAGES") as u8
+    }
+
     /// The executable spec of hook completeness (ADR-041 non-goals): a
     /// TEST-DECLARED conformance stub implementing every `StageHandlers`
     /// hook. It computes nothing — each hook returns a well-formed inert
@@ -1119,8 +1181,10 @@ mod conformance {
     #[derive(Debug, Default)]
     pub struct NoopStubEngine {
         /// The stage that will request a mid-cycle rewind, one-shot (cleared
-        /// on firing). `None` = the all-inert script.
-        rewind_from: Cell<Option<Stage>>,
+        /// on firing). `0` = the all-inert script; otherwise the `ALL_STAGES`
+        /// index + 1 (an atomic so the stub is `Send + Sync` like the trait
+        /// requires).
+        rewind_from: AtomicU8,
     }
 
     impl NoopStubEngine {
@@ -1128,26 +1192,31 @@ mod conformance {
         #[must_use]
         pub fn new() -> Self {
             Self {
-                rewind_from: Cell::new(None),
+                rewind_from: AtomicU8::new(0),
             }
         }
 
         /// Script a one-shot mid-cycle rewind request from `stage`.
         #[must_use]
         pub fn rewind_from(self, stage: Stage) -> Self {
-            self.rewind_from.set(Some(stage));
+            self.rewind_from
+                .store(stage_index(stage) + 1, Ordering::SeqCst);
             self
         }
 
         /// The one-shot control-flow probe: the scripted stage fires
         /// exactly one rewind request, then the stub reverts to inert.
+        /// (An atomic consume: only the matching nonzero script index
+        /// clears — the all-inert `0` never matches.)
         fn take_rewind(&self, stage: Stage) -> bool {
-            if self.rewind_from.get() == Some(stage) {
-                self.rewind_from.set(None);
-                true
-            } else {
-                false
+            let wanted = stage_index(stage) + 1;
+            let stored = self.rewind_from.load(Ordering::SeqCst);
+            if wanted != 0 && stored == wanted {
+                // consume the one-shot script (non-matching probes leave it)
+                self.rewind_from.store(0, Ordering::SeqCst);
+                return true;
             }
+            false
         }
     }
 
@@ -1233,6 +1302,25 @@ mod conformance {
                 restored_to: work.to_epoch,
             })
         }
+
+        // Lifecycle surface — the stub computes nothing and owns no channels.
+        fn has_dirty_paths(&self) -> bool {
+            false
+        }
+
+        fn set_last_solved_block(&self, _solved: Epoch) {}
+
+        fn set_solve_anchor(&self, _anchor: Epoch) {}
+
+        fn record_logs_this_block(&self) {}
+
+        fn last_processed_block(&self) -> Option<u64> {
+            None
+        }
+
+        fn notify_block(&self, _block: u64, _metadata: &BlockMetadata) {}
+
+        fn on_pump_ended(&self) {}
     }
 
     #[cfg(test)]
