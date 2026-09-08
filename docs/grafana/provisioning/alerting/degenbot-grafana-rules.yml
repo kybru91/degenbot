@@ -257,6 +257,67 @@ groups:
               expression: A
               conditions:
                 - evaluator: { type: gt, params: [1.0005] }
+      - uid: degenbot-epoch-race-slow
+        title: DegenbotEpochRaceSlow
+        condition: C
+        for: 5m
+        annotations:
+          summary: degenbot epoch race slow - header to publish p95 over 2s
+          description: >-
+            The epoch race (ADR-041): header accept to Published-stage
+            dispatch (degenbot_epoch_header_to_publish_seconds) - the edge
+            where submission/delivery subscribe - has its 5m p95 above 2s.
+            Warning level: money is landing but late. Investigated with the
+            dashboard stage-cycle waterfall (delivery / burst / settle /
+            streaming-age legs) and a degenbot.epoch trace from Jaeger.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 10m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: >-
+                histogram_quantile(0.95, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le)) > 2
+                or vector(0)
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+      - uid: degenbot-epoch-stale-drops
+        title: DegenbotEpochStaleDrops
+        condition: C
+        for: 10m
+        annotations:
+          summary: degenbot stale-epoch drops sustained - stage cycle spilling past the next header
+          description: >-
+            Stale-epoch work items are being dropped loudly by the I3
+            rewind-generation fail-fast (degenbot_epoch_stale_drops) for 10m.
+            The stage cycle (Streaming..Publish) is chronically spilling into
+            the next epoch - early warning before the race p95 tail moves and
+            before detached-in-flight backs up (DegenbotDrainerStall).
+        data:
+          - refId: A
+            relativeTimeRange: { from: 15m, to: 0s }
+            datasourceUid: eea7hc2lizlz4d
+            model:
+              expression: >-
+                sum(rate(degenbot_epoch_stale_drops_total[5m])) > 0
+                or vector(0)
+              datasource: { type: prometheus, uid: eea7hc2lizlz4d }
+              editorMode: code
+              instant: true
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0] }
       - uid: degenbot-simulate-error-rate
         title: DegenbotSimulateErrorRate
         condition: C

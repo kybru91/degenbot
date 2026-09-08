@@ -269,7 +269,7 @@
   },
   {
    "id": 5,
-   "title": "Block-to-solve (p95 5m)",
+   "title": "Header → published (p95 5m)",
    "type": "stat",
    "gridPos": {
     "h": 4,
@@ -287,7 +287,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
      "legendFormat": "__auto",
      "refId": "A",
      "instant": true,
@@ -331,11 +331,12 @@
     "colorMode": "background",
     "graphMode": "area",
     "justifyMode": "auto"
-   }
+   },
+   "description": "The epoch race (ADR-041 §3.1): header accept → Published-stage dispatch, the edge where submission/delivery subscribe. Succeeds the retired drain-era \"Block-to-solve\" stat — solve is no longer the race endpoint (degenbot_block_header_to_solved family retired with the stage machine; hard cutover)."
   },
   {
    "id": 6,
-   "title": "Solve (p95 5m)",
+   "title": "Epoch stale-drop share (5m)",
    "type": "stat",
    "gridPos": {
     "h": 4,
@@ -353,7 +354,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_solve_duration_seconds_bucket[5m])) by (le))",
+     "expr": "sum(rate(degenbot_epoch_stale_drops_total[5m])) / clamp_min(sum(rate(degenbot_solves_executed_total[5m])), 0.001)",
      "legendFormat": "__auto",
      "refId": "A",
      "instant": true,
@@ -362,7 +363,7 @@
    ],
    "fieldConfig": {
     "defaults": {
-     "unit": "s",
+     "unit": "percentunit",
      "color": {
       "mode": "palette-classic"
      },
@@ -375,11 +376,11 @@
        },
        {
         "color": "yellow",
-        "value": 2
+        "value": 0.01
        },
        {
         "color": "red",
-        "value": 5
+        "value": 0.1
        }
       ]
      }
@@ -397,7 +398,8 @@
     "colorMode": "background",
     "graphMode": "area",
     "justifyMode": "auto"
-   }
+   },
+   "description": "Share of solve cycles whose work was dropped as a stale epoch (I3 reorg-flying fail-fast, degenbot_epoch_stale_drops) — chronic stage-cycle spillover into the next header that the p95 tail alone hides. Sits at 0 healthy; sustained non-zero means publishes are chronically racing the next header."
   },
   {
    "id": 7,
@@ -723,7 +725,7 @@
   },
   {
    "id": 14,
-   "title": "Header -> solved latency (p50/p90/p95/p99)",
+   "title": "Header → published latency (p50/p90/p95/p99)",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -741,7 +743,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "expr": "histogram_quantile(0.50, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
      "legendFormat": "p50",
      "refId": "A"
     },
@@ -750,7 +752,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.90, sum(rate(degenbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "expr": "histogram_quantile(0.90, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
      "legendFormat": "p90",
      "refId": "B"
     },
@@ -759,7 +761,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
      "legendFormat": "p95",
      "refId": "C"
     },
@@ -768,7 +770,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.99, sum(rate(degenbot_block_header_to_solved_seconds_bucket[5m])) by (le))",
+     "expr": "histogram_quantile(0.99, sum(rate(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le))",
      "legendFormat": "p99",
      "refId": "D"
     }
@@ -879,7 +881,7 @@
   },
   {
    "id": 16,
-   "title": "Header -> solved latency distribution",
+   "title": "Header → published latency distribution",
    "type": "heatmap",
    "gridPos": {
     "h": 8,
@@ -898,7 +900,7 @@
       "uid": "${DS_PROMETHEUS}"
      },
      "refId": "A",
-     "expr": "sum(increase(degenbot_block_header_to_solved_seconds_bucket[5m])) by (le)",
+     "expr": "sum(increase(degenbot_epoch_header_to_publish_seconds_bucket[5m])) by (le)",
      "legendFormat": "{{le}}",
      "format": "heatmap"
     }
@@ -1943,82 +1945,13 @@
    "panels": []
   },
   {
-   "id": 39,
-   "title": "Engine-Mutex hold per dirty solve (p50/p90/p99)",
-   "type": "timeseries",
-   "gridPos": {
-    "h": 8,
-    "w": 12,
-    "x": 0,
-    "y": 112
-   },
-   "datasource": {
-    "type": "prometheus",
-    "uid": "${DS_PROMETHEUS}"
-   },
-   "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.50, sum(rate(degenbot_solve_mutex_hold_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p50",
-     "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.90, sum(rate(degenbot_solve_mutex_hold_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p90",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "histogram_quantile(0.99, sum(rate(degenbot_solve_mutex_hold_seconds_bucket[5m])) by (le))",
-     "legendFormat": "p99",
-     "refId": "C"
-    }
-   ],
-   "fieldConfig": {
-    "defaults": {
-     "unit": "s",
-     "color": {
-      "mode": "palette-classic"
-     },
-     "custom": {
-      "drawStyle": "line",
-      "lineWidth": 1,
-      "fillOpacity": 8
-     }
-    },
-    "overrides": []
-   },
-   "options": {
-    "legend": {
-     "showLegend": true,
-     "displayMode": "list",
-     "placement": "bottom"
-    },
-    "tooltip": {
-     "mode": "multi",
-     "sort": "desc"
-    }
-   }
-  },
-  {
    "id": 40,
    "title": "Detached cycle: stragglers in flight + applied vs stale-dropped",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
     "w": 12,
-    "x": 12,
+    "x": 0,
     "y": 112
    },
    "datasource": {
@@ -2222,7 +2155,7 @@
    },
    "options": {
     "mode": "markdown",
-    "content": "## Jaeger drill-down - span tree (stage-table shape, BF43PM/AJIOCU)\n\n    degenbot.epoch                  (trace ROOT per block epoch: epoch.block, epoch.seq,\n    |                                pregap.logs / header_to_first_log_us / log_burst_us / settle_wait_us)\n    +-- degenbot.stage.streaming     (open: first relevant log -> quiesce; queue.age_us at close)\n    +-- degenbot.stage.quiesced      (point: quiesce transition)\n    +-- degenbot.arb.solve           (solver cycle - fanout / lpt / resolve / path / merge children unchanged)\n    +-- degenbot.stage.publish       (point: publish decision; metric degenbot_stage_publish_cycle_seconds)\n    +-- degenbot.stage.finalize      (point: epoch finalized)\n    Rewind epochs hold degenbot.stage.rewind OPEN across the reorg window (metrics\n    degenbot_stage_rewind_total / degenbot_stage_rewind_duration_seconds); the next epoch\n    root carries epoch.seq + 1.\n\n**Jaeger queries** (service `degenbot-bot`, host `host.docker.internal:16686`):\n\n- Epoch waterfall: `operation=degenbot.epoch&limit=20&lookback=1h`\n- Stage transitions: `operation=degenbot.stage.streaming` / `degenbot.stage.publish` / `degenbot.stage.finalize` (attrs `stage.from`, `stage.to`, `queue.age_us`)\n- Phase attribution: the `fanout` / `lpt` / `resolve` / `merge` children of a solve trace (unchanged)\n- Rewind story: read `epoch.seq` across epoch roots - a bumped seq is the reorg generation\n- RETIRED spans (BF43PM/AJIOCU, epic MROOY7): `degenbot.pump.block` / `pump.log_wait` / `pump.apply_stream` are discontinued\n\nThe **Engine-Mutex hold** panel is the metric-level view of the solve arm: under\n`DEGENBOT_DETACHED_SOLVES=1` the hold collapses from the in-cycle 5-20ms band to\nenqueue cost (us) while solves continue on the dedicated `degenbot-solve-tokio`\nworkers - a step change in that panel means the stance flipped, not a regression.\nThe **Detached cycle** panel is the sidecar-merge health (Q1a): in-flight is the\nun-merged-straggler backpressure gauge (cap 8), and stale-dropped stragglers are\nEXPECTED under pool churn - a sustained drop rate with zero applied means the\nsidecar pipe is wedged.",
+    "content": "## Jaeger drill-down - span tree (stage-table shape, BF43PM/AJIOCU)\n\n    degenbot.epoch                  (trace ROOT per block epoch: epoch.block, epoch.seq,\n    |                                pregap.logs / header_to_first_log_us / log_burst_us / settle_wait_us)\n    +-- degenbot.stage.streaming     (open: first relevant log -> quiesce; queue.age_us at close)\n    +-- degenbot.stage.quiesced      (point: quiesce transition)\n    +-- degenbot.arb.solve           (solver cycle - fanout / lpt / resolve / path / merge children unchanged)\n    +-- degenbot.stage.publish       (point: publish decision; metric degenbot_stage_publish_cycle_seconds)\n    +-- degenbot.stage.finalize      (point: epoch finalized)\n    Rewind epochs hold degenbot.stage.rewind OPEN across the reorg window (metrics\n    degenbot_stage_rewind_total / degenbot_stage_rewind_duration_seconds); the next epoch\n    root carries epoch.seq + 1.\n\n**Jaeger queries** (service `degenbot-bot`, host `host.docker.internal:16686`):\n\n- Epoch waterfall: `operation=degenbot.epoch&limit=20&lookback=1h`\n- Stage transitions: `operation=degenbot.stage.streaming` / `degenbot.stage.publish` / `degenbot.stage.finalize` (attrs `stage.from`, `stage.to`, `queue.age_us`)\n- Phase attribution: the `fanout` / `lpt` / `resolve` / `merge` children of a solve trace (unchanged)\n- Rewind story: read `epoch.seq` across epoch roots - a bumped seq is the reorg generation\n- RETIRED spans (BF43PM/AJIOCU, epic MROOY7): `degenbot.pump.block` / `pump.log_wait` / `pump.apply_stream` are discontinued\n\nThe **Header → published** panels are the epoch race (ADR-041 §3.1): header\naccept → Published-stage dispatch, where submission/delivery subscribe. The\nretired drain-era header→solved stamp measured the solve endpoint; a solve that\ncompletes but publishes after the next header's accept shows up in the\n**Epoch stale-drop share** stat, not the p95. The Engine-Mutex hold panel is\nRETIRED (§3.4): the engine Mutex left the solve path with the stage machine.\nThe **Detached cycle** panel is the sidecar-merge health (Q1a): in-flight is the\nun-merged-straggler backpressure gauge (cap 8), and stale-dropped stragglers are\nEXPECTED under pool churn - a sustained drop rate with zero applied means the\nsidecar pipe is wedged.",
     "code": {
      "language": "plaintext",
      "showLineNumbers": false
@@ -2231,7 +2164,7 @@
   },
   {
    "id": 44,
-   "title": "Pre-solve gap decomposition: delivery / burst / settle (p50/p95)",
+   "title": "Stage-cycle gap: delivery / burst / settle / streaming-age (p50/p95)",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -2297,6 +2230,24 @@
      "expr": "histogram_quantile(0.95, sum(rate(degenbot_block_settle_wait_seconds_bucket[5m])) by (le))",
      "legendFormat": "settle p95",
      "refId": "F"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.50, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
+     "legendFormat": "streaming-age p50",
+     "refId": "G"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_streaming_age_seconds_bucket[5m])) by (le))",
+     "legendFormat": "streaming-age p95",
+     "refId": "H"
     }
    ],
    "fieldConfig": {
@@ -2323,12 +2274,12 @@
      "mode": "multi",
      "sort": "desc"
     },
-    "description": "Decomposition of the block-to-solve gap BEFORE the solver engages (phases recorded at each settle point): header-to-first-log = WS delivery latency; log_burst = diffusion of the block logs across the feed (first-to-last); settle_wait = debounce/quiesce hold after the last log. Jaeger: the same values ride as span fields (header_to_first_log_us, log_burst_us, settle_wait_us) on the degenbot.epoch trace root (retired degenbot.pump.block, BF43PM)."
+    "description": "Pre-solve gap decomposition (phases recorded at each settle point): header-to-first-log = WS delivery latency; log_burst = diffusion of the block logs across the feed (first-to-last); settle_wait = debounce/quiesce hold after the last log; streaming_age = first relevant log → quiesce (the epoch-stage wait, degenbot.stage.streaming_age). Jaeger: the same values ride as span fields (header_to_first_log_us, log_burst_us, settle_wait_us, queue.age_us) on the degenbot.epoch trace root."
    }
   },
   {
    "id": 45,
-   "title": "Pre-solve gap means vs header-to-solved (mean dissolve)",
+   "title": "Pre-solve gap means vs header-to-published (mean dissolve)",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -2373,8 +2324,8 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "sum(rate(degenbot_block_header_to_solved_seconds_sum[5m])) / sum(rate(degenbot_block_header_to_solved_seconds_count[5m]))",
-     "legendFormat": "header-to-solved (mean)",
+     "expr": "sum(rate(degenbot_epoch_header_to_publish_seconds_sum[5m])) / sum(rate(degenbot_epoch_header_to_publish_seconds_count[5m]))",
+     "legendFormat": "header-to-published (mean)",
      "refId": "D"
     }
    ],
@@ -2402,7 +2353,7 @@
      "mode": "multi",
      "sort": "desc"
     },
-    "description": "Mean phase durations vs the total race number. delivery + burst + settle + solve should approximately equal header-to-solved; a residual means unbudgeted time (queue wait, registration, submit queue)."
+    "description": "Mean phase durations vs the total epoch race. delivery + burst + settle + solve should approximately equal header-to-published (ADR-041: the race ends at the Published edge); a residual means unbudgeted time (resolve/simulate/gate queueing, submit queue)."
    }
   },
   {
@@ -2833,6 +2784,158 @@
     "tooltip": {
      "mode": "multi"
     }
+   }
+  },
+  {
+   "id": 58,
+   "title": "Epoch accounting (stage-cycle health)",
+   "type": "row",
+   "gridPos": {
+    "h": 1,
+    "w": 24,
+    "x": 0,
+    "y": 185
+   },
+   "collapsed": false,
+   "panels": []
+  },
+  {
+   "id": 59,
+   "title": "Epoch work: headers vs solve cycles vs candidates (rate/s)",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 0,
+    "y": 186
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(degenbot_blocks_observed_total[5m])",
+     "legendFormat": "headers/s",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(degenbot_solves_executed_total[5m])",
+     "legendFormat": "solve cycles/s",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "rate(degenbot_candidates_found_total[5m])",
+     "legendFormat": "candidates/s",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "id": 60,
+   "title": "Rewind pressure: episodes/s + duration p95",
+   "type": "timeseries",
+   "gridPos": {
+    "h": 8,
+    "w": 12,
+    "x": 12,
+    "y": 186
+   },
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${DS_PROMETHEUS}"
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(rate(degenbot_stage_rewind_total[5m]))",
+     "legendFormat": "rewind episodes/s",
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_rewind_duration_seconds_bucket[5m])) by (le))",
+     "legendFormat": "rewind duration p95",
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${DS_PROMETHEUS}"
+     },
+     "expr": "sum(increase(degenbot_reorg_recovery_dropped_total[5m]))",
+     "legendFormat": "recovery drops /5m",
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "s",
+     "color": {
+      "mode": "palette-classic"
+     },
+     "custom": {
+      "drawStyle": "line",
+      "lineWidth": 1,
+      "fillOpacity": 8
+     }
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "showLegend": true,
+     "displayMode": "list",
+     "placement": "bottom"
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    },
+    "description": "Rewind frequency (one per EnterReorg) and unwind-window duration p95 (degenbot.stage.rewind_duration). The drain-era liveness role of these panels is the degenbot.epoch trace root with bumped epoch.seq."
    }
   }
  ],

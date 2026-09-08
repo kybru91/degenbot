@@ -307,6 +307,10 @@ impl StageTelemetry {
 
     /// Close the held interval with its age recorded (the outgoing stage's
     /// queue age). Returns the age so point spans can carry it too.
+    /// Streaming closes also project the age to
+    /// `degenbot.stage.streaming_age` (first relevant log → quiesce/tombstone
+    /// wait) so the stage leg is scrapeable without Jaeger; Rewind already
+    /// owns `degenbot.stage.rewind_duration` at `close_rewind_and_record`.
     fn close_open(&mut self) -> Option<Duration> {
         let open = self.open.take()?;
         let age = open.opened_at.elapsed();
@@ -314,6 +318,11 @@ impl StageTelemetry {
             "queue.age_us",
             u64::try_from(age.as_micros()).unwrap_or(u64::MAX),
         );
+        if open.kind == OpenKind::Streaming {
+            if let Some(p) = crate::instruments::pipeline() {
+                p.observe_streaming_age(age.as_secs_f64());
+            }
+        }
         Some(age)
     }
 

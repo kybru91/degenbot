@@ -324,7 +324,7 @@ fn pipeline_instruments_render_expected_families() {
     let meter = provider.meter("degenbot.test");
     let p = PipelineInstruments::new(&meter);
 
-    p.observe_header_to_solved(0.25);
+    p.observe_header_to_publish(0.25);
     p.count_block();
     p.count_log_received();
     p.count_log_applied();
@@ -333,7 +333,7 @@ fn pipeline_instruments_render_expected_families() {
 
     let text = metrics::render(&registry);
     for family in [
-        "degenbot_block_header_to_solved",
+        "degenbot_epoch_header_to_publish_seconds_bucket",
         "degenbot_blocks_observed_total",
         "degenbot_logs_received_total",
         "degenbot_logs_applied_total",

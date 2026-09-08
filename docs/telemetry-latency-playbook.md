@@ -194,7 +194,7 @@ Cross-
 check the matching metric histogram percentiles in Prometheus before adding
 new spans.
 
-### S7. header_to_solved dominated by a flat settle wait
+### S7. header_to_publish dominated by a flat settle wait
 
 Decompose the pre-solve gap first — `degenbot.epoch` root fields (recorded at the settle point):
 `header_to_first_log_us` (header → first relevant log), `log_burst_us`
@@ -206,7 +206,9 @@ same-block log bursts at the price of that fixed tail.
 2026-09-04 baseline (block-25906841 session): `settle_wait_us` pinned at
 ~51 ms on 24 of 28 blocks while `log_burst_us` spanned 1.3–27.5 ms — the 50 ms
 debounce fired long after each burst was fully applied, making it a fixed
-~50 ms per-block tax on header_to_solved. The window is operator-tunable via
+~50 ms per-block tax on header_to_publish (the ADR-041 epoch race; the
+retired drain-era `degenbot_header_to_solved` endpoint measured the solve
+edge). The window is operator-tunable via
 `DEGENBOT_PUMP_DEBOUNCE_MS` (parse contract `BlockPump::debounce_ms_cfg`:
 unset/zero/invalid falls back to 50 ms, so a bad value can never collapse the
 window to zero). Live A/B at 15 ms settled the same bursts at ~16 ms with no
@@ -253,7 +255,10 @@ full sweep). Span events carry `code.line.number` — use it to confirm binary
 freshness against current source.
 
 Key Prometheus families (`instruments.rs`): `degenbot_solve_duration_seconds`,
-`degenbot_header_to_solved_seconds`, `degenbot_stage_publish_cycle_seconds` /
+`degenbot_epoch_header_to_publish_seconds` (the epoch race — header accept →
+Published dispatch; the drain-era `degenbot_header_to_solved` family is
+RETIRED with the stage machine), `degenbot_stage_streaming_age_seconds`,
+`degenbot_epoch_stale_drops_total`, `degenbot_stage_publish_cycle_seconds` /
 `degenbot_stage_rewind_total` / `_duration_seconds` (the DispatchOwner
 `degenbot_drain_queue_wait_seconds` / `_depth` families are RETIRED, SZJUKL),
 `degenbot_log_decode_seconds`, `degenbot_state_apply_seconds`,

@@ -147,6 +147,18 @@ Rule inventory (10 rules, 2 groups, 60s evaluation):
   15m), **DegenbotProfitEfficiencyDrop** (>80% left on table),
   **DegenbotSimulateErrorRate** (>10% error outcomes 10m) - severity
   semantics unchanged from the Prometheus file.
+- **DegenbotEpochRaceSlow** - epoch race (ADR-041) degraded:
+  `degenbot_epoch_header_to_publish_seconds` 5m p95 > 2s for 5m. The money
+  race ends at the Published edge (submission/delivery subscribe there), not
+  at solve; the retired drain-era header→solved endpoint no longer owns this
+  signal. Triage with the dashboard stage-cycle waterfall (delivery / burst /
+  settle / streaming-age legs) plus a `degenbot.epoch` Jaeger trace.
+- **DegenbotEpochStaleDrops** - `degenbot_epoch_stale_drops_total` > 0 for
+  10m: the I3 rewind-generation fail-fast is dropping stage work as stale
+  epochs (the loud warn in `BlockPump::reorg_flying_stale`). Early warning
+  that the stage cycle chronically spills past the next header (also visible
+  as the dashboard stale-drop-share stat); precedes detached-straggler
+  backpressure.
 
 ### Removed
 

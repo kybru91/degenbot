@@ -88,9 +88,19 @@ fn us_to_secs(us: u64) -> f64 {
     f64::from(u32::try_from(us).unwrap_or(u32::MAX)) / 1_000_000.0
 }
 
+/// Wall-clock milliseconds since the Unix epoch. The epoch-race anchor
+/// clock: header accept (`header_ms`) and Published dispatch
+/// (`drive_publish`) are both stamped here so the race can be diffed in a
+/// method that does not own the run loop's `tick_epoch` local.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// Milliseconds -> seconds with a 32-bit guard (the `event_dispatch`
-/// `ms_to_secs` helper, kept for the header→solved latency histogram the
-/// dissolved `DispatchOwner` drainer stamped).
+/// `ms_to_secs` helper, kept for the header→publish epoch-race histogram
+/// the dissolved `DispatchOwner` header→solved stamp became).
 fn ms_to_secs(ms: u64) -> f64 {
     f64::from(u32::try_from(ms).unwrap_or(u32::MAX)) / 1_000.0
 }
@@ -143,8 +153,9 @@ pub struct BlockPump {
     /// driver's select (the FSM decides, the driver executes — ADR-008).
     watchdog: Watchdog,
     /// Wall-clock ms of the last accepted header — the anchor the driver
-    /// measures `header_to_solved` latency against (the T2 metric the
-    /// dissolved `DispatchOwner` owned; single-writer: the pump task).
+    /// measures `header_to_publish` (the ADR-041 epoch race) against
+    /// (succeeds the dissolved `DispatchOwner`'s T2 header→solved anchor;
+    /// single-writer: the pump task).
     header_ms: std::sync::atomic::AtomicU64,
     /// Whether the per-block WS-delivery completeness cross-check runs
     /// (`assert_ws_block_complete` — aborts on any relevant-topic log that
@@ -1018,10 +1029,12 @@ impl BlockPump {
                                 );
                             }
                         }
-                        // T2: the header→solved latency anchor (the dissolved
-                        // DispatchOwner's note; single-writer pump task).
+                        // ADR-041: the header→publish epoch-race anchor
+                        // (the dissolved DispatchOwner drainer's header→solved
+                        // anchor, re-stamped at the Published edge; single-writer
+                        // pump task). Wall clock — see `wall_ms`.
                         self.header_ms
-                            .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+                            .store(wall_ms(), std::sync::atomic::Ordering::Relaxed);
                     }
                     // ADR-028: THE header decision lives in the FSM. Feeding
                     // the header (metadata + a wall-clock `now_ms` for the
@@ -1698,7 +1711,7 @@ impl BlockPump {
         &self,
         fsm: &StageMachine,
         block_span: Option<&tracing::Span>,
-        now_ms: u64,
+        _now_ms: u64, // the retired header→solved stamp consumed it; the epoch race is stamped in drive_publish
     ) {
         let _solve_ctx = block_span.map(tracing::Span::enter);
         let state_head = self.bot.state_arc().read().pool_state_head();
@@ -1706,14 +1719,6 @@ impl BlockPump {
             unreachable!("drain_decision always drains when called");
         };
         self.drive_solve(fsm, fsm.context_for(block, metadata));
-        // T2: header→solved latency for solve-carrying work items (the
-        // dissolved `DispatchOwner` drainer stamp; single-writer inline now).
-        let header_ms = self.header_ms.load(std::sync::atomic::Ordering::Relaxed);
-        if header_ms != 0 {
-            if let Some(p) = crate::instruments::pipeline() {
-                p.observe_header_to_solved(ms_to_secs(now_ms.saturating_sub(header_ms)));
-            }
-        }
     }
 
     /// The I3 stale-epoch drop (7NFYQW, T6IYKY review Q2 edge) — the
@@ -1738,7 +1743,7 @@ impl BlockPump {
                 "reorg-flying stage work: stale epoch dropped instead of consuming epoch.block() (I3)"
             );
             if let Some(p) = crate::instruments::pipeline() {
-                p.count_reorg_recovery_dropped();
+                p.count_stale_drop();
             }
             return true;
         }
@@ -1800,6 +1805,16 @@ impl BlockPump {
     ) {
         if self.reorg_flying_stale(fsm, &ctx) {
             return;
+        }
+        // ADR-041 epoch race: header accept → Published dispatch (succeeds
+        // the dissolved `DispatchOwner` drainer's header→solved stamp; the
+        // money race ends at this edge — submission/delivery subscribe here).
+        // Single-writer: the pump task alone stores `header_ms`.
+        let header_ms = self.header_ms.load(std::sync::atomic::Ordering::Relaxed);
+        if header_ms != 0 {
+            if let Some(p) = crate::instruments::pipeline() {
+                p.observe_header_to_publish(ms_to_secs(wall_ms().saturating_sub(header_ms)));
+            }
         }
         if let Err(error) = self.engine.on_publish(&Publish {
             ctx,

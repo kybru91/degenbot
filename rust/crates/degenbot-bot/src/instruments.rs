@@ -35,8 +35,24 @@ const LATENCY_BUCKETS_SECONDS: &[f64] = &[
 
 /// Every drain-path instrument, built from one meter.
 pub struct PipelineInstruments {
-    /// Header accepted → solve completed (the race number).
-    header_to_solved: Histogram<f64>,
+    /// Header accepted → Published-stage dispatch (the epoch race; ADR-041
+    /// §3.1 — submission/delivery subscribe at the Published edge, so the
+    /// race ends there, not at solve). Succeeds the drain-era
+    /// `block.header_to_solved` stamp retired with the stage machine.
+    ///
+    /// PROMETHEUS NAME COUPLING: renders as
+    /// `degenbot_epoch_header_to_publish_seconds`; the Grafana headline stat
+    /// and the `DegenbotEpochRaceSlow` alert query that string verbatim —
+    /// rename here and the consumers together.
+    header_to_publish: Histogram<f64>,
+    /// ADR-041 I3: stale-epoch work items dropped loudly by the
+    /// rewind-generation fail-fast (`reorg_flying_stale`). Sustained
+    /// non-zero = the stage cycle chronically spills into the next epoch.
+    epoch_stale_drops: Counter<u64>,
+    /// ADR-041 Streaming-stage wait: first relevant log → quiesce/tombstone.
+    /// The span-only `queue.age_us` attr projected to a series so the
+    /// stage-cycle waterfall owns the leg without Jaeger.
+    stage_streaming_age: Histogram<f64>,
     /// Header accepted → first RELEVANT log delivered (WS-feed latency —
     /// the delivery side of the pre-solve gap).
     header_to_first_log: Histogram<f64>,
@@ -186,11 +202,25 @@ impl PipelineInstruments {
     #[expect(clippy::too_many_lines)] // one instrument per block; splitting hides the inventory
     pub fn new(meter: &Meter) -> Self {
         Self {
-            header_to_solved: meter
-                .f64_histogram("degenbot.block.header_to_solved")
+            header_to_publish: meter
+                .f64_histogram("degenbot.epoch.header_to_publish")
                 .with_unit("s")
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
-                .with_description("Header accepted to solve completed")
+                .with_description(
+                    "Header accepted to Published-stage dispatch (the epoch race; ADR-041)",
+                )
+                .build(),
+            epoch_stale_drops: meter
+                .u64_counter("degenbot.epoch.stale_drops")
+                .with_description(
+                    "Stale-epoch work items dropped by the I3 rewind-generation fail-fast",
+                )
+                .build(),
+            stage_streaming_age: meter
+                .f64_histogram("degenbot.stage.streaming_age")
+                .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
+                .with_description("First relevant log to epoch quiesce (Streaming stage wait)")
                 .build(),
             header_to_first_log: meter
                 .f64_histogram("degenbot.block.header_to_first_log")
@@ -467,9 +497,21 @@ impl PipelineInstruments {
         }
     }
 
-    /// Header accepted → solve completed.
-    pub fn observe_header_to_solved(&self, secs: f64) {
-        self.header_to_solved.record(secs, &[]);
+    /// Header accepted → Published-stage dispatch (the epoch race).
+    /// PROMETHEUS NAME COUPLING: renders as
+    /// `degenbot_epoch_header_to_publish_seconds` — see the field note.
+    pub fn observe_header_to_publish(&self, secs: f64) {
+        self.header_to_publish.record(secs, &[]);
+    }
+
+    /// Streaming-stage wait: first relevant log → quiesce/tombstone.
+    pub fn observe_streaming_age(&self, secs: f64) {
+        self.stage_streaming_age.record(secs, &[]);
+    }
+
+    /// One stale-epoch work item dropped (I3 reorg-flying fail-fast).
+    pub fn count_stale_drop(&self) {
+        self.epoch_stale_drops.add(1, &[]);
     }
 
     /// Header accepted → first relevant log delivered (pre-solve gap phase 1).
@@ -852,6 +894,39 @@ mod kind_tests {
         ];
         let unique: HashSet<&str> = kinds.iter().copied().collect();
         assert_eq!(unique.len(), kinds.len(), "duplicate failure kind");
+    }
+
+    /// The epoch race (ADR-041): `degenbot.epoch.header_to_publish` renders
+    /// via the Prometheus exposition, the I3 stale-drop counter and the
+    /// Streaming-age projection are scrapeable, and the retired drain-era
+    /// `degenbot.block.header_to_solved` family is GONE (hard cutover — a
+    /// lingering family would keep dashboards pointed at the solve endpoint
+    /// instead of the Published edge).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn epoch_race_renders_and_retired_family_gone() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_race"));
+        instruments.observe_header_to_publish(0.62);
+        instruments.count_stale_drop();
+        instruments.observe_streaming_age(0.35);
+        let text = crate::metrics::render(&registry);
+        for family in [
+            "degenbot_epoch_header_to_publish_seconds_bucket",
+            "degenbot_epoch_stale_drops_total",
+            "degenbot_stage_streaming_age_seconds_bucket",
+        ] {
+            assert!(
+                text.contains(family),
+                "epoch-race family missing from exposition: {family}"
+            );
+        }
+        assert!(
+            !text.contains("header_to_solved"),
+            "retired drain-era race family still present in exposition"
+        );
+        drop(provider);
     }
 
     /// Fix 3 (VPD5ZH follow-up): the 10.0s top bucket collapsed every

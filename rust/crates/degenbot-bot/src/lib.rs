@@ -56,16 +56,18 @@ pub mod instruments {
     pub struct PipelineInstruments;
 
     impl PipelineInstruments {
-        /// no-op
-        pub fn observe_header_to_solved(&self, _secs: f64) {}
+        /// no-op (ADR-041 epoch race)
+        pub fn observe_header_to_publish(&self, _secs: f64) {}
+        /// no-op (ADR-041 streaming stage wait)
+        pub fn observe_streaming_age(&self, _secs: f64) {}
+        /// no-op (ADR-041 I3 stale drops)
+        pub fn count_stale_drop(&self) {}
         /// no-op
         pub fn observe_header_to_first_log(&self, _secs: f64) {}
         /// no-op
         pub fn observe_log_burst(&self, _secs: f64) {}
         /// no-op
         pub fn observe_settle_wait(&self, _secs: f64) {}
-        /// no-op
-
         /// no-op
         pub fn observe_log_decode(&self, _secs: f64) {}
         /// no-op
@@ -114,8 +116,6 @@ pub mod instruments {
         pub fn count_rewind(&self) {}
         /// no-op (MROOY7 BF43PM)
         pub fn observe_rewind_duration(&self, _secs: f64) {}
-        /// no-op
-
         /// no-op
         pub fn set_state_head_lag(&self, _head_minus_clock: i64) {}
         /// no-op

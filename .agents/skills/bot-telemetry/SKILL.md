@@ -40,11 +40,12 @@ curl -s 'http://host.docker.internal:16686/api/traces?service=degenbot-bot&opera
 
 Core span names:
 
-- `degenbot.pump.block` — per-block drain (field `block.number`); parent of the block's work.
+- `degenbot.epoch` — trace ROOT per block epoch (attrs `epoch.block`, `epoch.seq` + pre-solve gap fields); parent of the epoch's stage waterfall.
+- `degenbot.stage.{streaming,quiesced,publish,finalize,rewind}` — ADR-041 stage transitions (the retired `degenbot.pump.block` waterfalls are gone, epic MROOY7).
 - `degenbot.arb.solve` — solve dispatch per block (field `block.number`).
 - `degenbot.path.register` — path registration (field `hops.count`).
 
-Metric families (meter `degenbot-bot`, all prefixed `degenbot.`): latency histograms `block.header_to_solved`, `solve.duration`, `simulate.duration`, `drain.queue_wait`, `log.decode`, `state.apply`; gauges `drain.queue_depth`, `state.head_lag_blocks`, `pump.seconds_since_header`, `pump.seconds_since_apply`, `engine.registered_paths`; counters `logs.received/applied/apply_missed`, `candidates.found`, `solver.clamps`, `submit.outcomes`, `errors`. Scrape `curl http://127.0.0.1:9464/metrics` for the live list — the instruments source is authoritative when this list drifts.
+Metric families (meter `degenbot-bot`, all prefixed `degenbot.`): latency histograms `epoch.header_to_publish` (the ADR-041 epoch race: header accept → Published dispatch; the drain-era `block.header_to_solved` is RETIRED), `stage.streaming_age`, `solve.duration`, `simulate.duration`, `stage.publish_cycle`, `log.decode`, `state.apply`; gauges `detached.in_flight`, `state.head_lag_blocks`, `pump.seconds_since_header`, `pump.seconds_since_apply`, `engine.registered_paths`, `engine.quarantined_pools`; counters `epoch.stale_drops`, `stage.rewind`(+`_duration`), `logs.received/applied/apply_missed`, `candidates.found`, `solver.clamps`, `submit.outcomes`, `errors`. Scrape `curl http://127.0.0.1:9464/metrics` for the live list — the instruments source is authoritative when this list drifts.
 
 Grafana dashboards + alert rules live in `docs/grafana/` (`degenbot-overview.json`, `degenbot-alerts.yml`, `ALERTS.md`).
 
