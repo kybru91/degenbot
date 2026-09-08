@@ -23,6 +23,13 @@ const SWEEP_ARTIFACTS: &[&str] = &[
     "DEGENBOT_V",
 ];
 
+/// Real static env keys the config crate reads BEFORE/OUTSIDE the schema:
+/// `DEGENBOT_CONFIG` selects the config FILE layer (see
+/// `with_standard_file_paths` in `loader.rs`) — chicken-and-egg, it cannot
+/// be an option inside the file it locates, so it is deliberately NOT a
+/// schema key.
+const BOOTSTRAP_KEYS: &[&str] = &["DEGENBOT_CONFIG"];
+
 /// Real static keys the artifact regex cannot capture (digit-terminated
 /// matches expand to these full names).
 const SWEEP_EXPANSIONS: &[&str] = &[
@@ -79,7 +86,7 @@ fn schema_covers_the_full_key_inventory() {
 
     let mut expected: BTreeSet<String> = sweep
         .iter()
-        .filter(|k| !SWEEP_ARTIFACTS.contains(&k.as_str()))
+        .filter(|k| !SWEEP_ARTIFACTS.contains(&k.as_str()) && !BOOTSTRAP_KEYS.contains(&k.as_str()))
         .cloned()
         .collect();
     for expansion in SWEEP_EXPANSIONS {
@@ -111,7 +118,7 @@ fn snapshot_fallback_agrees_with_schema() {
     );
     let mut expected: BTreeSet<String> = sweep
         .iter()
-        .filter(|k| !SWEEP_ARTIFACTS.contains(&k.as_str()))
+        .filter(|k| !SWEEP_ARTIFACTS.contains(&k.as_str()) && !BOOTSTRAP_KEYS.contains(&k.as_str()))
         .cloned()
         .collect();
     for expansion in SWEEP_EXPANSIONS {
