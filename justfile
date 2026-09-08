@@ -91,7 +91,7 @@ pre-push:
 # job and the pre-push hook call this subunit directly; humans use `just test`.
 test-rust: test-standalone
     #!/usr/bin/env bash
-    python_libdir="$(.venv/bin/python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+    python_libdir="$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
     export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     # vendored deployments.json (degenbot-uniswap) must match the canonical
     # Python-tree registry file byte-for-byte (TGO5ZY: a crate can only
@@ -331,7 +331,7 @@ test-tier3 family='all':
             *) echo "unknown tier-3 family '$1' (families: step swap v2 v4 path5000 curve balancer pancake pancake2 | all)" >&2; exit 2 ;;
         esac
         tier3-oracle/"$harness"
-        python_libdir="$(.venv/bin/python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+        python_libdir="$(uv run --no-sync python -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
         export LD_LIBRARY_PATH="${python_libdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
         cargo test --manifest-path rust/Cargo.toml -p "$pkg" --test "$test"
     }
