@@ -32,7 +32,7 @@
 //! The work-item description: the epoch plus the block's execution metadata
 //! (`BlockMetadata`). It carries the coordinate only — no `BotState`
 //! representation attaches here; the `StateView` mechanism is a separate
-//! data-plane decision (epic spike). `PumpFSM::context_for` mints contexts
+//! data-plane decision (epic spike). `StageMachine::context_for` mints contexts
 //! at the pump's decision points; the stage-machine task (7NFYQW) makes the
 //! stages consume them.
 
@@ -59,7 +59,7 @@ impl Epoch {
         Self { block, seq: 0 }
     }
 
-    /// `block` in an explicit generation (what `PumpFSM::context_for` mints:
+    /// `block` in an explicit generation (what `StageMachine::context_for` mints:
     /// the decision block stamped with the FSM's current generation).
     #[must_use]
     pub const fn with_generation(block: u64, seq: u64) -> Self {
@@ -166,7 +166,7 @@ impl std::error::Error for StaleEpoch {}
 
 /// Bare-u64 comparison for the pinned FSM field reads: an `Epoch` equals a
 /// raw block number exactly when its BLOCK coordinate matches, regardless of
-/// generation. Generation-blind by design — this exists so the `PumpFSM`'s
+/// generation. Generation-blind by design — this exists so the `StageMachine`'s
 /// pinned recovery-anchor tests read `fsm.recovery_anchor == 104` on an
 /// `Epoch` field; generation-sensitive code must use [`Epoch::ensure_current`].
 impl PartialEq<u64> for Epoch {

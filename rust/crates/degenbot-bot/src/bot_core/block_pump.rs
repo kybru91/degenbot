@@ -41,8 +41,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bot_core::pump_fsm::{CompletenessDecision, PumpDecision, PumpFSM};
 use crate::bot_core::stance;
+use crate::bot_core::{CompletenessDecision, StageDecision, StageMachine};
 
 use alloy::primitives::B256;
 use alloy::rpc::types::{Filter, Log, Topic};
@@ -780,9 +780,9 @@ impl BlockPump {
         // race past the backfill window.
         self.sink.set_solve_anchor(Epoch::at(current_block));
         // Whether we're past the first header after resume. The first
-        // Epic A1: the pump's decision state now lives in the PumpFSM; the
+        // Epic A1: the pump's decision state now lives in the StageMachine; the
         // driver routes the decision arms through it. `current_block` seeds the FSM.
-        let mut fsm = PumpFSM::new(current_block, 0);
+        let mut fsm = StageMachine::new(current_block, 0);
         // DFQYM5 single-writer, now FSM-owned (epic O3HW7E/T3): on a resume
         // where the snapshot→WS gap was backfilled (S < W), the backfill owns
         // [S+1, W] inclusive and the live WS owns [W+1, ∞). Seed the FSM's
@@ -1004,6 +1004,13 @@ impl BlockPump {
                 return;
             }
 
+            // 7NFYQW (I3): mirror the machine's rewind generation to the
+            // drainer once per iteration, so any reorg-flying item still in
+            // the FIFO is dropped loudly instead of consuming its stale
+            // epoch. Redundant with the log-arm refresh below; both are
+            // monotone max-updates (cheap, idempotent).
+            dispatch.observe_rewind_seq(fsm.rewind_seq());
+
             // Wait for the next event. Use a shorter settle window when a publish is
             // pending so the quiesce-gated flush fires promptly if no new log
             // arrives (coalescing a same-block burst); otherwise the long
@@ -1071,12 +1078,12 @@ impl BlockPump {
                         self.log_silence.as_millis() as u64,
                     ) {
                         match decision {
-                            PumpDecision::Recover => {
+                            StageDecision::Recover => {
                                 self.handle_timeout_eager(&mut fsm)
                                     .instrument(block_span.clone().unwrap_or_else(tracing::Span::none))
                                     .await;
                             }
-                            PumpDecision::LogSilence => {
+                            StageDecision::LogSilence => {
                                 // Logs-subscription liveness watchdog (inverse
                                 // of header staleness): headers are FRESH (the
                                 // Recover branch did not fire) but no
@@ -1113,7 +1120,7 @@ impl BlockPump {
                     // executes the emitted decisions.
                     for decision in fsm.on_settle() {
                         match decision {
-                            PumpDecision::Publish { open, metadata } => {
+                            StageDecision::Publish { open, metadata } => {
                                 // Option-A solver-state accuracy gate (AV42C7):
                                 // publish on_send to Python, then hand the
                                 // quiesced `open` block + its change set to the
@@ -1224,7 +1231,7 @@ impl BlockPump {
                                     context: fsm.context_for(open, metadata),
                                 });
                             }
-                            PumpDecision::Backfill { from, to } => {
+                            StageDecision::Backfill { from, to } => {
                                 // No activity for 60s — backfill `[from, to)`.
                                 debug_assert!(from == fsm.current_block() + 1 && to.is_none());
                                 self.handle_timeout_eager(&mut fsm)
@@ -1347,7 +1354,7 @@ impl BlockPump {
                     };
                     for decision in fsm.on_header(number, metadata, now_ms()) {
                         match decision {
-                            PumpDecision::Backfill { from, to } => {
+                            StageDecision::Backfill { from, to } => {
                                 // Header-gap catch-up over `[from, to]`
                                 // (ephemeral, header-driven). The decision's
                                 // explicit range is authoritative — the FSM has
@@ -1367,15 +1374,15 @@ impl BlockPump {
                                     .instrument(new_block_span.clone())
                                     .await;
                             }
-                            PumpDecision::SetLastSolved { block } => {
+                            StageDecision::SetLastSolved { block } => {
                                 // LEZJAS: the backfill/first header solved up
                                 // to `block` already — mark it solved so the
                                 // first `finalize_block` guard no-ops.
                                 let _ctx = new_block_span.enter();
                                 self.sink.set_last_solved_block(block.into());
                             }
-                            PumpDecision::Notify { block, metadata } => {
-                                // Python's block fsm.clock tracks `newHeads`.
+                            StageDecision::Notify { block, metadata } => {
+                                // Python's block fsm tracks `newHeads`.
                                 let _ctx = new_block_span.enter();
                                 dispatch.notify_block(block, &metadata);
                             }
@@ -1509,9 +1516,14 @@ impl BlockPump {
                     // forward (→ shutdown), and returns the verdict for the
                     // driver to execute the I/O.
                     let log_decision = fsm.on_log(log_block, log.removed);
+                    // The reorg classification may have just bumped the
+                    // rewind generation (I2): mirror it to the drainer BEFORE
+                    // the same arm enqueues any DrainWork, so pre-rewind
+                    // items in flight fail loud (I3), never silently apply.
+                    dispatch.observe_rewind_seq(fsm.rewind_seq());
                     // Per-pool trace: log EVERY relevant-topic WS log for the
                     // `DEGENBOT_DRAIN_DBG` pool — block, log-index, tx-index,
-                    // topic0, removed, and the fsm.clock decision — so the
+                    // topic0, removed, and the fsm decision — so the
                     // delivery order of same-block Mint/Burn logs is visible
                     // against the registration drain+pin that follows. No-op
                     // for other pools / when the env var is unset.
@@ -1699,7 +1711,7 @@ impl BlockPump {
                             // half-delivered `prev` (the rolling-start race
                             // where a later same-block log lands after the pin).
                             // 3M5PO5: no explicit `mark_pump_blocks_complete`
-                            // here — the fsm.clock's own `tombstone(prev)` (inside
+                            // here — the fsm's own `tombstone(prev)` (inside
                             // `on_log`) already advanced the shared cutoff
                             // the registration drain reads.
                             // LOUD WS-completeness check: block `prev` is now
@@ -1799,13 +1811,13 @@ impl BlockPump {
                     // executes the emitted Publish (I/O) and stops.
                     for decision in fsm.on_stream_end() {
                         match decision {
-                            PumpDecision::Publish { open, metadata } => {
+                            StageDecision::Publish { open, metadata } => {
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
                                 dispatch.dispatch(DrainWork::Publish {
                                     context: fsm.context_for(open, metadata),
                                 });
                             }
-                            PumpDecision::Stop => {}
+                            StageDecision::Stop => {}
                             other => {
                                 unreachable!("on_stream_end only emits Publish|Stop, got {other:?}")
                             }
@@ -1948,19 +1960,19 @@ impl BlockPump {
     /// `dispatch()` to capture it as the drainer parent).
     ///
     /// Pump-owned ACTIVE BLOCK promotion (QMSTSV/BO5FBS): the solve anchor is
-    /// the LOG-DRIVEN settled block (`fsm.clock.latest_observed()`, never a
+    /// the LOG-DRIVEN settled block (`fsm.latest_observed()`, never a
     /// racing header), floored by the pool-state head so it is never below
     /// the state it solves against (MQIZ5M +1-wei / IIA class; the
     /// backfill-ahead semantics). `drain_decision` owns the exact rule.
     fn boundary_drain_dispatch(
         &self,
-        fsm: &PumpFSM,
+        fsm: &StageMachine,
         dispatch: &crate::bot_core::event_dispatch::DispatchOwner,
         block_span: Option<&tracing::Span>,
     ) {
         let _solve_ctx = block_span.map(tracing::Span::enter);
         let state_head = self.bot.state_arc().read().pool_state_head();
-        let PumpDecision::Drain { block, metadata } = fsm.drain_decision(state_head) else {
+        let StageDecision::Drain { block, metadata } = fsm.drain_decision(state_head) else {
             unreachable!("drain_decision always drains when called");
         };
         dispatch.dispatch(DrainWork::Drain {
@@ -1972,7 +1984,7 @@ impl BlockPump {
     }
 
     /// Handle a 60s timeout by backfilling any missed blocks (eager variant).
-    async fn handle_timeout_eager(&self, fsm: &mut PumpFSM) {
+    async fn handle_timeout_eager(&self, fsm: &mut StageMachine) {
         tracing::warn!(
             backfill_timeout_secs = BACKFILL_TIMEOUT_SECS,
             "BlockPump: no activity — attempting backfill"
@@ -2002,9 +2014,9 @@ impl BlockPump {
     /// log through the SAME per-block state machine as a live WS log (ADR-008
     /// D4, single branch). The provider I/O (`get_logs`) and engine/sink I/O
     /// (`dispatch_log`, `finalize_block`, `on_drain`) stay here on the driver;
-    /// every FSM-state transition is routed through `PumpFSM` methods
+    /// every FSM-state transition is routed through `StageMachine` methods
     /// (`on_log`, `on_log_applied`) — no fields are threaded out of the capsule.
-    async fn backfill_range(&self, from_block: u64, to_block: u64, fsm: &mut PumpFSM) {
+    async fn backfill_range(&self, from_block: u64, to_block: u64, fsm: &mut StageMachine) {
         if from_block > to_block {
             return;
         }
@@ -2414,7 +2426,7 @@ impl BlockPump {
 
 /// The pump's solve anchor (`anchor = max(open, pool_state_head)`, BO5FBS +
 /// ADR-008 D2) is owned by `crate::bot_core::solve_anchor`: the LOG-DRIVEN
-/// settled block (`BlockClock::latest_observed`, falling back to the header
+/// settled block (`StageMachine::latest_observed`, falling back to the header
 /// `current_block`) floored by the pool-state head, with the future-hop rule.
 /// Its failure history (0x99ac8c false-abort, MQIZ5M +1-wei / IIA class) lives
 /// in that module's docs.
@@ -3876,7 +3888,7 @@ mod tests {
 
     /// BGEDB6 (3M5PO5 correction): the delivery cutoff (last complete block)
     /// is owned by `BotState` and outlives a pump run. A second
-    /// `run_with_stream` (a resume with a fresh `PumpFSM`/`BlockClock`)
+    /// `run_with_stream` (a resume with a fresh `StageMachine`)
     /// must NOT reset it — the old design re-embedded a fresh
     /// `Arc<AtomicU64>` (starting at 0) into `BotState` at startup, and the
     /// registration drain stalled until every block re-tombstoned.

@@ -1397,4 +1397,171 @@ mod conformance {
             trace.iter().filter(|e| e.stage == stage).count()
         }
     }
+
+    // ==================================================================
+    // 7NFYQW landmine proof (guidance e): the NoopStubEngine conformance
+    // harness driven by the REAL unified block stage machine
+    // (`bot_core::stage_machine::StageMachine`) — the machine's
+    // decisions select the cycles, the harness executes them on the
+    // stub, and the conformance assertions (stage order, hook
+    // completeness, epoch monotonicity, cutoff monotonicity) run over
+    // the machine-driven trace end to end.
+    // ==================================================================
+    #[expect(clippy::expect_used)] // the conformance drives .expect() on cycles like the tests mod above
+    mod machine_driven {
+        use super::*;
+        use crate::bot_core::stage_machine::{StageDecision, StageMachine, WatchdogPhase};
+
+        fn meta(ts: u64) -> crate::bot_core::BlockMetadata {
+            crate::bot_core::BlockMetadata {
+                timestamp: ts,
+                base_fee_per_gas: Some(ts),
+                gas_used: 1,
+                gas_limit: 2,
+            }
+        }
+
+        fn count(trace: &[TraceEntry], stage: Stage) -> usize {
+            trace.iter().filter(|e| e.stage == stage).count()
+        }
+
+        /// Feed the machine like the production driver: header + forward
+        /// log + apply + settle; return the machine's settle decisions.
+        fn settle_block(machine: &mut StageMachine, block: u64, now_ms: u64) -> Vec<StageDecision> {
+            machine.on_header(block, meta(block * 1_000), now_ms);
+            assert!(matches!(
+                machine.on_log(block, false),
+                crate::bot_core::LogDecision::DispatchForward
+            ));
+            machine.on_log_applied(block);
+            machine.on_settle()
+        }
+
+        #[test]
+        fn noop_stub_engine_conforms_under_the_unified_stage_machine() {
+            let engine = NoopStubEngine::new();
+            let mut harness = Harness::new(&engine);
+            // The machine is the production decision surface; the pump
+            // cursor starts at 99 (pre-cold-start).
+            let mut machine = StageMachine::new(99, 0);
+
+            // --- Block 100: quiesce + settle publish -> one full cycle.
+            let d = settle_block(&mut machine, 100, 10);
+            let StageDecision::Publish { open, .. } = d[0] else {
+                unreachable!("the settled block must publish once: {d:?}")
+            };
+            assert_eq!(open, 100);
+            assert_eq!(machine.stage(), Some(Stage::Publish));
+            harness.run_epoch(open, None).expect("cycle 100 conforms");
+            assert_eq!(harness.current, Some(machine.current_epoch()));
+
+            // --- Block 101: the forward log tombstones 100 (Finalized
+            // row) — the tombstone finalize window, then the 101 cycle.
+            assert!(matches!(
+                machine.on_log(101, false),
+                crate::bot_core::LogDecision::TombstonePrevious(100)
+            ));
+            assert_eq!(machine.stage(), Some(Stage::Finalize));
+            machine.on_log_applied(101);
+            let d = machine.on_settle();
+            let StageDecision::Publish { open, .. } = d[0] else {
+                unreachable!("101 settles after its tombstone: {d:?}")
+            };
+            harness.run_epoch(open, None).expect("cycle 101 conforms");
+
+            // --- Reorg: removed log rewinds the machine (I2 bump), pre-
+            // rewind contexts fail fast (I3), stage row resets.
+            let stale = machine.context_for(101, meta(101_000));
+            assert!(matches!(
+                machine.on_log(100, true),
+                crate::bot_core::LogDecision::EnterReorg(100)
+            ));
+            assert_eq!(machine.rewind_seq(), 1);
+            assert!(stale
+                .epoch()
+                .ensure_current(machine.current_epoch())
+                .is_err());
+            assert_eq!(machine.stage(), None, "rewind resets to Streaming");
+
+            // The harness executes the Rewind row the machine just took:
+            // the generation bumps exactly once (I2) and the rewind
+            // tracker keeps single-in-flight semantics (I6).
+            let current = harness.current.expect("epoch open at the rewind");
+            let target = Epoch::with_generation(102, 1);
+            harness
+                .open_rewind(current, target)
+                .expect("one rewind in flight, seq bumps once");
+            harness
+                .execute_rewind(target)
+                .expect("rewind hook conforms");
+
+            // The reorg window closes on the first forward; the fresh
+            // cycle publishes at the bumped generation and conforms.
+            assert!(matches!(
+                machine.on_log(102, true),
+                crate::bot_core::LogDecision::ContinueReorg
+            ));
+            assert!(matches!(
+                machine.on_log(102, false),
+                crate::bot_core::LogDecision::CloseReorg { new_head: 102 }
+            ));
+            machine.on_log_applied(102);
+            let d = machine.on_settle();
+            let StageDecision::Publish { open, .. } = d[0] else {
+                unreachable!("post-rewind block settles: {d:?}")
+            };
+            // Sync the harness to the machine's bumped epoch (102 @ gen 1)
+            // — the harness treats a cycle resuming exactly at the rewind
+            // target as legal (I2/I6).
+            let fresh = machine.current_epoch();
+            assert_eq!(fresh, Epoch::with_generation(102, 1));
+            harness.current = Some(fresh);
+            harness.resumed_at = Some(fresh);
+            harness
+                .run_epoch(open, None)
+                .expect("post-rewind cycle conforms");
+
+            // Executable-spec walk over the machine-driven trace.
+            harness
+                .assert_conformance()
+                .expect("all conformance invariants hold");
+            let trace = harness.trace();
+            assert_eq!(count(trace, Stage::StreamingComplete), 3);
+            assert_eq!(count(trace, Stage::Publish), 3);
+            assert_eq!(count(trace, Stage::Finalize), 3);
+            // I7: cutoff stamps advance in epoch order (generation-dominant).
+            let cut = harness.cutoff;
+            assert_eq!(cut, Some(Epoch::with_generation(102, 1)));
+            assert!(!harness.rewinds.is_in_flight());
+        }
+
+        /// The watchdog phase space (the dissolved `DrainerHealth`'s
+        /// no-progress obligation) is representable off the REAL machine.
+        #[test]
+        fn watchdog_phase_space_is_representable_off_the_real_machine() {
+            let mut machine = StageMachine::new(200, 1_000);
+            machine.record_header(1_000);
+            machine.record_log(1_000);
+            assert_eq!(
+                machine.watchdog_phase(1_050, 500, 300),
+                WatchdogPhase::Healthy
+            );
+            // Headers stale (no header in 500ms): HeaderStale — the
+            // machine's Recover decision covers it (see on_tick).
+            assert_eq!(
+                machine.watchdog_phase(1_700, 500, 300),
+                WatchdogPhase::HeaderStale
+            );
+            machine.record_header(2_300);
+            // Fresh headers, silent logs: LogsSilent — LogSilence's phase.
+            assert_eq!(
+                machine.watchdog_phase(2_400, 500, 300),
+                WatchdogPhase::LogsSilent
+            );
+            assert!(machine.watchdog_phase(2_400, 500, 300).is_no_progress());
+            // The on_tick decisions agree with the phase space.
+            let d = machine.on_tick(2_400, 500, 300);
+            assert!(d.iter().any(|x| matches!(x, StageDecision::LogSilence)));
+        }
+    }
 }
