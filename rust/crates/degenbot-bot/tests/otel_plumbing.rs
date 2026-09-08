@@ -329,7 +329,6 @@ fn pipeline_instruments_render_expected_families() {
     p.count_log_received();
     p.count_log_applied();
     p.count_backfill();
-    p.set_drain_queue_depth(3);
     p.set_state_head_lag(-2);
 
     let text = metrics::render(&registry);
@@ -339,7 +338,6 @@ fn pipeline_instruments_render_expected_families() {
         "degenbot_logs_received_total",
         "degenbot_logs_applied_total",
         "degenbot_backfills_executed_total",
-        "degenbot_drain_queue_depth",
         "degenbot_state_head_lag_blocks",
     ] {
         assert!(

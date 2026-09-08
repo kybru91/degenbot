@@ -465,13 +465,27 @@ mod otel_tests {
                     spans.iter().map(|sp| sp.name.as_ref()).collect::<Vec<_>>()
                 )
             });
-        let dur = streaming
-            .end_time
-            .duration_since(streaming.start_time)
-            .unwrap_or_default();
+        // The held interval was aged 6s by rewinding its anchor; the seam
+        // records that age on the span's `queue.age_us` attribute — an
+        // un-entered span's wall duration (start→end) is only this test's
+        // create→drop window and can never reflect the aged interval (the
+        // SAME shape as the force-closed production child: closed by handle,
+        // not by an entered scope).
+        let age_us: i64 = streaming
+            .attributes
+            .iter()
+            .filter(|kv| kv.key == opentelemetry::Key::from_static_str("queue.age_us"))
+            .map(|kv| match &kv.value {
+                opentelemetry::Value::I64(v) => *v,
+                opentelemetry::Value::F64(v) => *v as i64,
+                opentelemetry::Value::String(v) => v.as_str().parse::<i64>().unwrap_or(0),
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0);
         assert!(
-            dur >= Duration::from_secs(5),
-            "aged streaming span must carry its real age; dur = {dur:?}"
+            age_us >= 5_000_000,
+            "aged streaming span must carry its real age in queue.age_us; got {age_us}us"
         );
         let forced = streaming
             .attributes
