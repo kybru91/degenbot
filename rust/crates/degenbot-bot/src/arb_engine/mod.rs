@@ -319,6 +319,14 @@ pub(crate) enum SolveExecutorKind {
 
 #[expect(clippy::struct_excessive_bools)] // 4th bool (detached_solving) added by epic SRQEK5 — each bool is a distinct construction-time stance, not flag soup
 pub struct ArbitrageEngine {
+    /// KAHU5W: the owner-loaded typed bot config (one loader process-wide;
+    /// never re-read from the environment). Construction stances + capture
+    /// config read from here.
+    pub(crate) cfg: std::sync::Arc<::degenbot_config::BotConfig>,
+    /// KAHU5W: the instance solver runtime stance, built at construction from
+    /// [`Self::cfg`] and threaded down into every solve cycle. Replaces the
+    /// solver crate's removed process-global RUNTIME OnceLock.
+    runtime_cfg: ::degenbot_solvers::runtime::SolveRuntimeConfig,
     /// V2 + V3 + V4 pool state owner (ADR-003). The shared
     /// `Arc<RwLock<BotState>>` (ADR-006 D1+D2): read methods take a read guard,
     /// mutations a write guard. Lock ordering when nested is
@@ -544,15 +552,45 @@ impl ArbitrageEngine {
     /// remains engine-then-core; the engine's `Mutex<ArbitrageEngine>` engine
     /// state is still engine-local (ADR-006 D2 — engine keeps its own lock
     /// for path/solver state; only the core lock type/flavor changes).
+    /// Probe the packed delivery stance (smoke-boot observability; reads no
+    /// environment — the field was packed from the typed config at
+    /// construction).
+    #[must_use]
+    pub fn streaming_delivery_probe(&self) -> bool {
+        self.streaming_delivery
+    }
+
+    /// Probe the packed solve-dispatch executor kind (smoke-boot
+    /// observability; no environment read).
+    #[must_use]
+    pub fn solve_executor_probe(&self) -> &'static str {
+        match self.solve_executor {
+            SolveExecutorKind::Tokio => "tokio",
+            SolveExecutorKind::Rayon => "rayon",
+        }
+    }
+
     #[must_use]
     pub fn with_core(core: Arc<StateLock<BotState>>) -> Self {
-        // T4: the ONE env-parsing point for the engine's runtime stances
-        // (LPT partition, min_profit floor, walk memo toggles, envelope
-        // caps, census/anchor/event-solver gates). First engine wins.
-        if ::degenbot_solvers::runtime::runtime_is_default() {
-            solver_dispatch::install_engine_env_stances();
-        }
+        Self::with_core_cfg(
+            core,
+            std::sync::Arc::new(::degenbot_config::BotConfig::default()),
+        )
+    }
+
+    /// KAHU5W: config-threaded construction. `cfg` is the typed BotConfig
+    /// (loaded ONCE by the owner from the `--config` file / env via the
+    /// degenbot-config loader) — the engine packs its construction stances
+    /// from it and threads the solver runtime stance down per instance.
+    #[must_use]
+    pub fn with_core_cfg(
+        core: Arc<StateLock<BotState>>,
+        cfg: std::sync::Arc<::degenbot_config::BotConfig>,
+    ) -> Self {
+        solver_dispatch::install_engine_stances(&cfg);
         Self {
+            cfg: std::sync::Arc::clone(&cfg),
+            runtime_cfg: solver_dispatch::solve_runtime_config_from_cfg(&cfg),
             core,
             path_pools: HashMap::new(),
             path_resolved: HashMap::new(),
@@ -589,8 +627,8 @@ impl ArbitrageEngine {
             #[cfg(test)]
             merge_probe: None,
             walk_memo: std::sync::Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
-                ::degenbot_solvers::runtime::runtime().memo_on,
-                ::degenbot_solvers::runtime::runtime().memo_stats,
+                cfg.solve.solver_walk_memo,
+                cfg.solve.solver_walk_memo_stats,
             )),
             paths_same_state_this_cycle: 0,
             delivery: DeliveryPolicy::default(),

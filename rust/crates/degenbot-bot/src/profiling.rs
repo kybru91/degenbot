@@ -85,7 +85,7 @@ pub fn hotpath_guard(caller_name: &'static str) -> Option<Guard> {
     // builder still exists (no-op) but we skip constructing it anyway so
     // there's not even a stub object held across the loop. The env gate
     // applies in both cases.
-    if std::env::var("DEGENBOT_HOTPATH").as_deref() != Ok("1") {
+    if !crate::bot_core::stance::config().trace.hotpath {
         return None;
     }
     #[cfg(feature = "hotpath")]

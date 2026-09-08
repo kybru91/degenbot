@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 alloy = { version = "^2.4" }
 degenbot-core.workspace = true
+degenbot-config.workspace = true
 degenbot-db.workspace = true
 degenbot-decoders.workspace = true
 degenbot-rpc.workspace = true

@@ -46,6 +46,11 @@ pub(crate) mod solve_anchor;
 pub mod solve_coordinator;
 pub mod solver_state_tripwire;
 pub mod stage_handlers;
+/// KAHU5W: the process-wide typed BotConfig holder. The degenbot-config
+/// loader (the ONLY environment-reading site in the workspace) produces the
+/// value once at startup; every formerly env-reading call site below reads
+/// its typed section from here. Purely a VALUE holder — no env access.
+pub mod stance;
 pub mod state_lock;
 pub mod swap_simulation;
 pub mod tick_assembly;
@@ -227,7 +232,7 @@ pub struct BotState {
 /// accepts EITHER shape: the env value matches the address, or it matches any
 /// indexed topic (`PoolId` hex). Zero cost when the env is unset.
 fn drain_dbg_match_v4(address: Address, topics: &[alloy::primitives::B256]) -> bool {
-    let Ok(env) = std::env::var("DEGENBOT_DRAIN_DBG") else {
+    let Some(env) = stance::config().trace.drain_dbg.as_deref() else {
         return false;
     };
     let want = env.trim_start_matches("0x");
@@ -241,8 +246,11 @@ fn drain_dbg_match_v4(address: Address, topics: &[alloy::primitives::B256]) -> b
 }
 
 pub(crate) fn drain_dbg_pool_match(address: Address) -> bool {
-    std::env::var("DEGENBOT_DRAIN_DBG")
-        .is_ok_and(|v| format!("{address:x}").eq_ignore_ascii_case(v.trim_start_matches("0x")))
+    stance::config()
+        .trace
+        .drain_dbg
+        .as_deref()
+        .is_some_and(|v| format!("{address:x}").eq_ignore_ascii_case(v.trim_start_matches("0x")))
 }
 
 /// Whether the global liquidity-events trace is on (env
@@ -255,8 +263,7 @@ pub(crate) fn drain_dbg_pool_match(address: Address) -> bool {
 /// pool it lands on. Pairs with `DEGENBOT_DRAIN_DBG` (per-pool) — either gate
 /// fires the probe.
 pub(crate) fn trace_liquidity_global() -> bool {
-    std::env::var("DEGENBOT_TRACE_LIQUIDITY")
-        .is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+    stance::config().trace.trace_liquidity
 }
 
 /// Whether the global WS-log pipeline trace is on (env
@@ -267,8 +274,7 @@ pub(crate) fn trace_liquidity_global() -> bool {
 /// relevant WS log); opt-in for desync investigations that cannot be
 /// pinned to a single pool in advance.
 pub(crate) fn trace_ws_global() -> bool {
-    std::env::var("DEGENBOT_WS_TRACE")
-        .is_ok_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+    stance::config().trace.ws_trace
 }
 
 /// Optional watch tick for the per-pool trace (env `DEGENBOT_TRACE_TICK`, a
@@ -277,9 +283,7 @@ pub(crate) fn trace_ws_global() -> bool {
 /// (e.g. the ghost-value upper tick of a same-block Mint+Burn) can be tracked
 /// across the rolling-start lifecycle. Unset = no per-tick watch.
 pub(crate) fn trace_watch_tick() -> Option<i32> {
-    std::env::var("DEGENBOT_TRACE_TICK")
-        .ok()
-        .and_then(|v| v.trim().parse::<i32>().ok())
+    stance::config().trace.trace_tick
 }
 
 /// The base-pool delegation port for metapool `get_dy_underlying` (task
@@ -464,9 +468,7 @@ pub(crate) fn trace_apply_swap_v4(
     tick: i32,
     block_number: u64,
 ) {
-    if !std::env::var("DEGENBOT_DRAIN_DBG")
-        .is_ok_and(|v| v.trim_start_matches("0x").eq_ignore_ascii_case(pool_id_hex))
-    {
+    if !trace_pool_id_match(pool_id_hex) {
         return;
     }
     tracing::info!(
@@ -523,10 +525,7 @@ pub(crate) fn trace_apply_route_v4(
     lifecycle: &str,
     routed_to: &str,
 ) {
-    if !trace_liquidity_global()
-        && !std::env::var("DEGENBOT_DRAIN_DBG")
-            .is_ok_and(|v| v.trim_start_matches("0x").eq_ignore_ascii_case(pool_id_hex))
-    {
+    if !trace_liquidity_global() && !trace_pool_id_match(pool_id_hex) {
         return;
     }
     tracing::info!(
@@ -543,37 +542,15 @@ pub(crate) fn trace_apply_route_v4(
     );
 }
 
-/// Parse a flag's env value against the conservative default: `false` only for
-/// an explicit falsey value (`""`, `0`, `false`, `off`, `no`); `true`
-/// otherwise. Pure so it is unit-testable without process-global env mutation.
-pub(crate) fn parse_bot_flag_value(v: &str) -> bool {
-    !matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "" | "0" | "false" | "off" | "no" | "n"
-    )
-}
-
-/// Conservative-default environment flag (Z4KQXF): `true` unless `name` is set
-/// to an explicit falsey value (`""`, `0`, `false`, `off`, `no`). Default-on so
-/// a hand-run or harness never silently drops failure visibility — the HARD/
-/// LOUD posture is the default; disable explicitly with, e.g. `X=0`.
-pub(crate) fn bot_env_flag_default_on(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => parse_bot_flag_value(&v),
-        Err(_) => true,
-    }
-}
-
-/// default-off environment flag (the inverse of the default-on variant above):
-/// true only when the named var is set to an explicit truthy value
-/// (per `parse_bot_flag_value`). For opt-in diagnostics that a hand-run or
-/// harness must never silently activate — unset/false env means the
-/// diagnostic is absent, at zero cost.
-pub(crate) fn bot_env_flag_default_off(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => parse_bot_flag_value(&v),
-        Err(_) => false,
-    }
+/// KAHU5W: trace probes gate on the typed config, not the environment. A
+/// per-pool trace fires when the configured `trace.drain_dbg` names the
+/// pool id hex (with or without a \`0x\` prefix).
+fn trace_pool_id_match(pool_id_hex: &str) -> bool {
+    stance::config()
+        .trace
+        .drain_dbg
+        .as_deref()
+        .is_some_and(|v| v.trim_start_matches("0x").eq_ignore_ascii_case(pool_id_hex))
 }
 
 /// Whether the verify-diagnostics probes are enabled.
@@ -603,7 +580,7 @@ pub(crate) fn bot_env_flag_default_off(name: &str) -> bool {
 /// - `set_v3/v4_pool_live` logs the count + block numbers of the retained
 ///   in-progress-block tail flushed via the unguarded `drain_pump`.
 fn verify_dbg_enabled() -> bool {
-    bot_env_flag_default_on("DEGENBOT_VERIFY_DBG")
+    stance::config().verify.verify_dbg
 }
 
 impl BotState {
@@ -1490,21 +1467,12 @@ mod tests {
 
     #[test]
     fn conservative_bot_flag_default_on() {
-        // Conservative default (Z4KQXF): unset ⇒ enabled (HARD/LOUD). This var
-        // is not set by any test, so the default-on path is deterministic.
-        assert!(bot_env_flag_default_on("DEGENBOT_UNUSED_TEST_FLAG"));
-        // Explicit falsey values opt OUT.
-        assert!(!parse_bot_flag_value("0"));
-        assert!(!parse_bot_flag_value("false"));
-        assert!(!parse_bot_flag_value("off"));
-        assert!(!parse_bot_flag_value("no"));
-        assert!(!parse_bot_flag_value("n"));
-        assert!(!parse_bot_flag_value(""));
-        // Everything else stays enabled.
-        assert!(parse_bot_flag_value("1"));
-        assert!(parse_bot_flag_value("true"));
-        assert!(parse_bot_flag_value("on"));
-        assert!(parse_bot_flag_value("yes"));
+        // KAHU5W: the env-flag parse contract moved to degenbot-config's
+        // fail-closed loader (parse_bool_flag). The Z4KQXF conservative-ON
+        // posture now lives in the typed schema defaults (e.g. verify_dbg
+        // defaults true); this asserts the holder's test-default stance.
+        assert!(!crate::bot_core::stance::installed());
+        assert!(crate::bot_core::stance::config().verify.verify_dbg);
     }
 
     fn make_pool_addr() -> Address {

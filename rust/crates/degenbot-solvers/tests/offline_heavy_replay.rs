@@ -135,7 +135,10 @@ fn replay_captured_heavy_paths() {
         sub.merge_enum += gs.pairs_enumerated;
         sub.merge_fallbacks += gs.merge_legacy_fallbacks;
         let t0 = Instant::now();
-        let outcome = degenbot_solvers::mobius_v3_int::solve_cl_derived(&seq_refs);
+        let outcome = degenbot_solvers::mobius_v3_int::solve_cl_derived(
+            &seq_refs,
+            &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+        );
         let result = outcome.result;
         // Green net: profile-widened solve must reproduce the recorded golden
         // byte-for-byte (optimal_input + hop_outputs) for every captured path.

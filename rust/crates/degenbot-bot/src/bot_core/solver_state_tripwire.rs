@@ -1387,21 +1387,15 @@ const MAX_CL_STALENESS_BLOCKS: u64 = 3;
 /// Parse the `DEGENBOT_SOLVER_STALENESS_BLOCKS` override, falling back to
 /// [`MAX_CL_STALENESS_BLOCKS`] on an unparseable value. Pure (no env access) so
 /// it is unit-testable without touching process-global env.
-#[must_use]
-fn parse_cl_staleness_blocks(raw: &str) -> u64 {
-    raw.trim().parse::<u64>().unwrap_or(MAX_CL_STALENESS_BLOCKS)
-}
-
-/// The effective staleness threshold in blocks: `DEGENBOT_SOLVER_STALENESS_BLOCKS`
-/// if set (dry-run dev knob to lower MTBF), else [`MAX_CL_STALENESS_BLOCKS`].
-/// Read fresh per call (cheap getenv; once per hop per block) so a test can
-/// override without cross-test `OnceLock` contamination.
+/// The effective staleness threshold in blocks: the typed schema key
+/// `verify.solver_staleness_blocks` (`DEGENBOT_SOLVER_STALENESS_BLOCKS`),
+/// else [`MAX_CL_STALENESS_BLOCKS`]. KAHU5W: no environment read.
 #[must_use]
 fn cl_staleness_threshold_blocks() -> u64 {
-    match std::env::var("DEGENBOT_SOLVER_STALENESS_BLOCKS") {
-        Ok(v) => parse_cl_staleness_blocks(&v),
-        Err(_) => MAX_CL_STALENESS_BLOCKS,
-    }
+    crate::bot_core::stance::config()
+        .verify
+        .solver_staleness_blocks
+        .unwrap_or(MAX_CL_STALENESS_BLOCKS)
 }
 
 /// Whether a CL hop's stored `update_block` is old enough to warrant a
@@ -2942,23 +2936,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_cl_staleness_blocks_defaults_on_garbage_or_empty() {
-        // Unparseable / empty input falls back to the committed default of 3.
-        assert_eq!(parse_cl_staleness_blocks(""), MAX_CL_STALENESS_BLOCKS);
-        assert_eq!(parse_cl_staleness_blocks("  "), MAX_CL_STALENESS_BLOCKS);
-        assert_eq!(parse_cl_staleness_blocks("abc"), MAX_CL_STALENESS_BLOCKS);
-        assert_eq!(parse_cl_staleness_blocks("-1"), MAX_CL_STALENESS_BLOCKS);
-    }
-
-    #[test]
-    fn parse_cl_staleness_blocks_honors_numeric_override() {
-        // Dev dry-run knob: tighten (0/1) or loosen (5) the threshold.
-        assert_eq!(parse_cl_staleness_blocks("0"), 0);
-        assert_eq!(parse_cl_staleness_blocks("1"), 1);
-        assert_eq!(parse_cl_staleness_blocks("2"), 2);
-        assert_eq!(parse_cl_staleness_blocks("5"), 5);
-        // Whitespace-tolerant.
-        assert_eq!(parse_cl_staleness_blocks(" 2 "), 2);
+    fn cl_staleness_threshold_defaults_to_schema_or_unset_default() {
+        // KAHU5W: the raw-string parse contract moved to the degenbot-config
+        // loader (fail-closed). Here only the effective threshold default is
+        // asserted: config unset => committed default of 3.
+        assert_eq!(MAX_CL_STALENESS_BLOCKS, 3);
+        assert_eq!(
+            cl_staleness_threshold_blocks(),
+            crate::bot_core::stance::config()
+                .verify
+                .solver_staleness_blocks
+                .unwrap_or(MAX_CL_STALENESS_BLOCKS)
+        );
     }
 
     #[test]

@@ -329,7 +329,10 @@ fn main() -> ExitCode {
             let _zfo_a = other_a == a_t0;
             let _zfo_b = s == b_t0;
             let t0 = std::time::Instant::now();
-            let out = degenbot_solvers::mobius_v3_int::solve_cl_derived(&[sa, sb]);
+            let out = degenbot_solvers::mobius_v3_int::solve_cl_derived(
+                &[sa, sb],
+                &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+            );
             let res = out.result;
             let micros = t0.elapsed().as_micros();
             let (pieces, sims) = (out.stats.pieces, out.stats.sims);

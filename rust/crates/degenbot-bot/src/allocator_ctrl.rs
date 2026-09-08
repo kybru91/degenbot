@@ -79,17 +79,11 @@ pub const MIN_DELAY_MS: i64 = 2_000;
 pub const MAX_DELAY_MS: i64 = 600_000;
 const WINDOW: usize = 30;
 const MIN_BLOCKS: usize = 20;
-const DEFAULT_MULT: f64 = 2.0;
 // Hysteresis band: 10 percent of the applied value before re-applying,
 // written as integer math in `observe` (`delta * 10 > applied`) to avoid a
 // float cast under the cast-precision lint.
 const MIN_INTERVAL_SECS: f64 = 2.0;
 const MAX_INTERVAL_SECS: f64 = 60.0;
-
-const ENV_FIXED: &str = "DEGENBOT_MIMALLOC_PURGE_DELAY_MS";
-const ENV_AUTO: &str = "DEGENBOT_MIMALLOC_AUTO_PURGE";
-const ENV_MULT: &str = "DEGENBOT_MIMALLOC_PURGE_DELAY_MULT";
-const ENV_PURGE_DECOMMITS: &str = "DEGENBOT_MIMALLOC_PURGE_DECOMMITS";
 
 static AUTO_ENABLED: AtomicBool = AtomicBool::new(true);
 static INIT_DONE: OnceLock<()> = OnceLock::new();
@@ -134,31 +128,20 @@ pub struct PurgeConfig {
     pub decommits: bool,
 }
 
-/// Env parsing: fixed override > auto flag > mult. Malformed values fall
-/// back to defaults (fail-open, mirroring the hotpath/otel env gates).
+/// KAHU5W: the purge config is a typed schema section
+/// (`allocator.mimalloc_*` / `DEGENBOT_MIMALLOC_*`); the loader owns the
+/// environment read and the fail-closed parse. Fixed override > auto flag >
+/// mult; clamping mirrors the schema-declared ranges.
 #[must_use]
-pub fn config_from_env() -> PurgeConfig {
-    let fixed_ms = std::env::var(ENV_FIXED)
-        .ok()
-        .and_then(|raw| raw.replace('_', "").parse::<i64>().ok())
-        .map(clamp_delay_ms);
-    let auto = std::env::var(ENV_AUTO) != Ok(String::from("0"));
-    let mult = std::env::var(ENV_MULT)
-        .ok()
-        .and_then(|raw| raw.parse::<f64>().ok())
-        .map_or(DEFAULT_MULT, |m| m.clamp(1.0, 20.0));
-    // Default OFF (MADV_FREE): the T3 matrix arm measured -89 percent
-    // refault churn at equal/better solve p95; `=1/true` restores mimalloc's
-    // aggressive decommit behavior.
-    let decommits = matches!(
-        std::env::var(ENV_PURGE_DECOMMITS).as_deref(),
-        Ok("1" | "true")
-    );
+pub fn config_from_cfg(cfg: &::degenbot_config::schema::AllocatorConfig) -> PurgeConfig {
     PurgeConfig {
-        fixed_ms,
-        auto,
-        mult,
-        decommits,
+        fixed_ms: cfg.mimalloc_purge_delay_ms.map(clamp_delay_ms),
+        auto: cfg.mimalloc_auto_purge,
+        mult: cfg.mimalloc_purge_delay_mult.clamp(1.0, 20.0),
+        // Default OFF (MADV_FREE): the T3 matrix arm measured -89 percent
+        // refault churn at equal/better solve p95; `true` restores mimalloc's
+        // aggressive decommit behavior.
+        decommits: cfg.mimalloc_purge_decommits,
     }
 }
 
@@ -301,7 +284,8 @@ fn now_ms() -> u64 {
 /// Startup: apply any fixed override immediately; arm auto-discovery.
 /// Called once from the pump start (next to the hotpath guard).
 pub fn init_from_env_at_pump_start() {
-    let cfg = config_from_env();
+    // KAHU5W: typed schema section; the env read belongs to the loader.
+    let cfg = config_from_cfg(&crate::bot_core::stance::config().allocator);
     if INIT_DONE.set(()).is_err() {
         return; // another pump in this process already configured the seam
     }
@@ -337,7 +321,7 @@ fn observe_at(now_ms: u64) {
         return; // poisoned/contended: skip this beat, try the next header
     };
     let state = guard.get_or_insert_with(|| {
-        let cfg = config_from_env();
+        let cfg = config_from_cfg(&crate::bot_core::stance::config().allocator);
         CadenceState::new(cfg.mult, MIN_BLOCKS)
     });
     if let Some(delay_ms) = state.observe(now_ms) {
@@ -348,6 +332,8 @@ fn observe_at(now_ms: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DEFAULT_MULT: f64 = 2.0;
 
     fn state() -> CadenceState {
         CadenceState::new(DEFAULT_MULT, MIN_BLOCKS)
@@ -467,25 +453,22 @@ mod tests {
     }
 
     #[test]
-    fn config_env_parse_and_defaults_are_process_ordered() {
-        // std env is process-global: parallel tests racing set_var/remove_var
-        // would read each other's leftovers, so both scenarios live in ONE
-        // serialized test (also locking out any future env-touching sibling).
-        std::env::set_var(ENV_FIXED, "45_000");
-        std::env::set_var(ENV_AUTO, "0");
-        std::env::set_var(ENV_MULT, "3");
-        std::env::set_var(ENV_PURGE_DECOMMITS, "1");
-        let cfg = config_from_env();
+    fn config_typed_section_maps_onto_purge_config() {
+        // KAHU5W: env parsing moved to the degenbot-config loader (its own
+        // tests own the string contract). This asserts the typed mapping.
+        let cfg = config_from_cfg(&::degenbot_config::schema::AllocatorConfig {
+            mimalloc_purge_delay_ms: Some(45_000),
+            mimalloc_auto_purge: false,
+            mimalloc_purge_delay_mult: 3.0,
+            mimalloc_purge_decommits: true,
+            ..Default::default()
+        });
         assert_eq!(cfg.fixed_ms, Some(45_000));
         assert!(!cfg.auto);
         assert!((cfg.mult - 3.0).abs() < f64::EPSILON);
-        assert!(cfg.decommits, "=1 must restore decommit purges");
+        assert!(cfg.decommits, "=1/true must restore decommit purges");
 
-        std::env::remove_var(ENV_FIXED);
-        std::env::remove_var(ENV_AUTO);
-        std::env::remove_var(ENV_MULT);
-        std::env::remove_var(ENV_PURGE_DECOMMITS);
-        let cfg = config_from_env();
+        let cfg = config_from_cfg(&::degenbot_config::schema::AllocatorConfig::default());
         assert_eq!(cfg.fixed_ms, None);
         assert!(cfg.auto);
         assert!((cfg.mult - DEFAULT_MULT).abs() < f64::EPSILON);

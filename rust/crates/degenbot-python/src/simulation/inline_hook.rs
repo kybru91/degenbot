@@ -281,21 +281,21 @@ where
 
 /// The inline-sim runtime's worker count (M2 soak sizing): core-count by
 /// default (the payload sims are the per-path marginal cost of every solve
-/// cycle - see the M1/M2 soak records), overridable with
-/// `DEGENBOT_INLINE_SIM_WORKERS`. Clamped to 1..=32; unparsable/garbage
-/// values fall back to the default rather than failing the engine build.
+/// cycle - see the M1/M2 soak records), overridable via the typed
+/// `solve.inline_sim_workers` key (env `DEGENBOT_INLINE_SIM_WORKERS`).
+/// Value parsing/validation is the loader's job (fail-closed at boot,
+/// KAHU5W); this layer just clamps to 1..=32.
 fn inline_sim_worker_count() -> usize {
     // Two-runtime sizing (7LV6VN T5): the sim runtime follows the LEFTOVER
     // of the CPU budget after the solve bins (not raw available
     // parallelism), so sim runtime workers + solve bins never exceed
     // the quota.
     let default = degenbot_bot::bot_core::cpu_budget::leftover_worker_budget();
-    match std::env::var("DEGENBOT_INLINE_SIM_WORKERS") {
-        Ok(raw) => raw
-            .trim()
-            .parse::<usize>()
-            .map_or(default, |n| n.clamp(1, 32)),
-        Err(_) => default,
+    // KAHU5W: typed schema key `solve.inline_sim_workers`
+    // (`DEGENBOT_INLINE_SIM_WORKERS`); the loader owns the env read.
+    match ::degenbot_config::holder::config().solve.inline_sim_workers {
+        Some(n) => n.clamp(1, 32),
+        None => default,
     }
 }
 
@@ -376,11 +376,11 @@ impl InlineSimulator for InlineSimHook {
             .remove(&req.path_id);
         let spotcheck = {
             static PERMYRIAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            // KAHU5W: typed schema key `verify.verify_spotcheck_permyriad`.
             let permyriad = *PERMYRIAD.get_or_init(|| {
-                std::env::var("DEGENBOT_VERIFY_SPOTCHECK_PERMYRIAD")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .unwrap_or(0)
+                ::degenbot_config::holder::config()
+                    .verify
+                    .verify_spotcheck_permyriad
             });
             permyriad > 0
                 && self
@@ -580,30 +580,13 @@ impl InlineSimulator for InlineSimHook {
 
 #[cfg(test)]
 mod tests {
-    // The env var is process-global, so the cases share ONE serial test to
-    // avoid the parallel-test env race (each case asserts a distinct tail).
+    // The override parsing matrix moved to degenbot-config's precedence
+    // tests (KAHU5W: the loader owns the env read). This pins the production
+    // default only: with no override, the count follows the leftover CPU
+    // budget (7LV6VN T5), NOT raw available_parallelism.
     #[test]
-    fn worker_count_env_matrix() {
-        // The fallback default is the PRODUCTION default (7LV6VN T5): the
-        // leftover CPU budget after the solve bins, NOT raw
-        // available_parallelism. Asserting the prod source here keeps the
-        // env matrix honest — this test pins override parsing + clamping,
-        // and cpu_budget has its own detection unit tests.
+    fn inline_sim_worker_count_defaults_to_leftover_budget() {
         let default = degenbot_bot::bot_core::cpu_budget::leftover_worker_budget();
-
-        std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "not-a-number");
-        assert_eq!(super::inline_sim_worker_count(), default);
-
-        std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "9999");
-        assert_eq!(super::inline_sim_worker_count(), 32);
-
-        std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "0");
-        assert_eq!(super::inline_sim_worker_count(), 1);
-
-        std::env::set_var("DEGENBOT_INLINE_SIM_WORKERS", "6");
-        assert_eq!(super::inline_sim_worker_count(), 6);
-
-        std::env::remove_var("DEGENBOT_INLINE_SIM_WORKERS");
         assert_eq!(super::inline_sim_worker_count(), default);
     }
 }

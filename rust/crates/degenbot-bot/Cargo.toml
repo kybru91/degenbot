@@ -21,6 +21,7 @@ async-trait = { version = "^0.1" }
 dashmap = { version = "^6.2" }
 # Hot map type shared with degenbot-pools tick maps (foldhash; workspace note).
 hashbrown.workspace = true
+degenbot-config.workspace = true
 degenbot-abi.workspace = true
 degenbot-math.workspace = true
 degenbot-core.workspace = true

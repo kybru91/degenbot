@@ -489,7 +489,21 @@ update-deps:
 
 # ========== Repository Setup ==========
 
-# Install prek git hooks and configure commit template.
+# Refresh the committed DEGENBOT_* key-inventory snapshot the
+# degenbot-config schema-completeness test compares against (reviewer note,
+# 7LKJFY sign-off). The exclusion glob keeps the snapshot self-contamination
+# (regeneration rewriting its own source) out of the sweep.
+env-inventory:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="rust/crates/degenbot-config/tests/degenbot_env_inventory.txt"
+    rg -o 'DEGENBOT_[A-Z_]+' rust/crates --no-filename \
+        -g '!**/degenbot_env_inventory.txt' \
+        -g '!**/degenbot-config/tests/**' | sort -u > "$target"
+    echo "✓ inventory snapshot refreshed: $target ($(wc -l < "$target") keys)"
+    echo '  then: cd rust && REGEN_CONFIG_DOCS=1 cargo test -p degenbot-config'
+
+# Install prek git hooks and configure template.
 # Run this once after cloning. Commit MESSAGE lint runs at commit time (low
 # friction, since .commitlintrc.yml is relaxed: free-form scope, 100-col) so a
 # bad message is caught the moment it is written — not at push, when amending

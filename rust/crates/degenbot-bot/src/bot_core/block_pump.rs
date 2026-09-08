@@ -42,6 +42,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bot_core::pump_fsm::{CompletenessDecision, PumpDecision, PumpFSM};
+use crate::bot_core::stance;
 
 use alloy::primitives::B256;
 use alloy::rpc::types::{Filter, Log, Topic};
@@ -72,19 +73,9 @@ const BACKFILL_TIMEOUT_SECS: u64 = 60;
 /// the timer. This debouncing ensures one dispatch per burst of logs
 /// rather than one per individual log.
 ///
-/// Default window, overridable per-process via `DEGENBOT_PUMP_DEBOUNCE_MS`
-/// (f701ccd3 lead-2: live runs settle at the full 50 ms on ~every block while
-/// log bursts complete in 1.3-27.5 ms — an operator lowering the window with a
-/// quiet straggler distribution trades a shorter settle tax for occasional
-/// extra same-block publishes; parse contract in `debounce_ms_cfg`).
-const DEBOUNCE_MS: u64 = 50;
-
-/// Default early-slice window for the drained-settle gate (PWPPAZ T2): when
-/// unsolved dirt has been sitting this long, ONE bounded early Drain fires
-/// mid-burst — the designed replacement for the retired finalize steal
-/// (J2X3LZ). `0` disables the slice (exact pre-T2 settle-only behavior).
-/// Operator-tunable via `DEGENBOT_EARLY_SLICE_MS`.
-const EARLY_SLICE_MS: u64 = 25;
+// KAHU5W: the debounce / early-slice defaults moved into the typed schema
+// (pump.pump_debounce_ms = 50, pump.early_slice_ms = 25; the loader validates
+// debounce > 0). The fail-open parse helpers disappeared with them.
 
 /// If no block header arrives within this window, poll `eth_blockNumber`
 /// and backfill the gap — independent of log activity.
@@ -289,38 +280,6 @@ impl BlockPump {
     /// observes until
     /// both a newHeads notification and a log for the same block arrive,
     /// confirming the logs subscription is live and caught up.
-    /// ADR-021 D2 Part B — parse the delivery-lag trip threshold (pure):
-    /// unset/empty/unparseable/zero = `None` = off (today's report-only
-    /// parity).
-    #[must_use]
-    fn delivery_lag_trip_threshold(raw: Option<&str>) -> Option<u64> {
-        raw?.trim().parse::<u64>().ok().filter(|n| *n > 0)
-    }
-
-    /// Publish-debounce window parse (f701ccd3 lead-2, pure): unset/empty/
-    /// unparseable/zero/negative/overflow fall back to the historical
-    /// [`DEBOUNCE_MS`] so a bad env var can never collapse the settle window
-    /// to zero (one publish per log) or stall the pump.
-    #[must_use]
-    fn debounce_ms_cfg(raw: Option<&str>) -> u64 {
-        raw.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(DEBOUNCE_MS)
-    }
-
-    /// Early-slice window parse (PWPPAZ T2, pure): unset/empty/unparseable/
-    /// negative/overflow fall back to [`EARLY_SLICE_MS`]; `0` is VALID —
-    /// it disables the slice (pre-T2 settle-only parity).
-    #[must_use]
-    fn early_slice_ms_cfg(raw: Option<&str>) -> u64 {
-        raw.map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(EARLY_SLICE_MS)
-    }
-
     #[expect(clippy::missing_errors_doc)]
     pub async fn subscribe(
         rpc_url: &str,
@@ -375,32 +334,24 @@ impl BlockPump {
                 // divergence probe on the failing path's next sim (VERIFY2
                 // T2), and the RPC pre-state the sim reads remains the
                 // authority between checks.
-                enabled: crate::bot_core::bot_env_flag_default_off("DEGENBOT_ASSERT_SOLVER_STATE"),
-                divergence_scan: crate::bot_core::bot_env_flag_default_off(
-                    "DEGENBOT_SOLVER_DIVERGENCE_SCAN",
-                ),
-                anchor_probe: crate::bot_core::bot_env_flag_default_off(
-                    "DEGENBOT_TRACE_SOLVE_ANCHOR",
-                ),
-                staged_clock_probe: crate::bot_core::bot_env_flag_default_off(
-                    "DEGENBOT_TRACE_STAGED_CLOCK",
-                ),
-                delivery_lag_trip_blocks: Self::delivery_lag_trip_threshold(
-                    std::env::var("DEGENBOT_DELIVERY_LAG_TRIP_BLOCKS")
-                        .ok()
-                        .as_deref(),
-                ),
+                enabled: stance::config().verify.assert_solver_state,
+                divergence_scan: stance::config().verify.solver_divergence_scan,
+                anchor_probe: stance::config().trace.trace_solve_anchor,
+                staged_clock_probe: stance::config().trace.trace_staged_clock,
+                delivery_lag_trip_blocks: stance::config()
+                    .pump
+                    .delivery_lag_trip_blocks
+                    .filter(|n| *n > 0),
             },
-            ws_completeness_enabled: crate::bot_core::bot_env_flag_default_on(
-                "DEGENBOT_WS_COMPLETENESS",
-            ),
-            debounce_ms: Self::debounce_ms_cfg(
-                std::env::var("DEGENBOT_PUMP_DEBOUNCE_MS").ok().as_deref(),
-            ),
-            early_slice_ms: Self::early_slice_ms_cfg(
-                std::env::var("DEGENBOT_EARLY_SLICE_MS").ok().as_deref(),
-            ),
+            ws_completeness_enabled: stance::config().pump.ws_completeness,
+            debounce_ms: stance::config().pump.pump_debounce_ms,
+            early_slice_ms: stance::config().pump.early_slice_ms,
         };
+        // KAHU5W: the dispatcher-side strict decode-miss fault follows the
+        // pump's completeness stance (respecting any per-pump opt-out).
+        pump.bot
+            .dispatcher()
+            .set_strict_decode_fault(pump.ws_completeness_enabled);
 
         // MJXP5Z (Alternative B): single-stream handshake - NO resubscribe.
         // `subscribe_with_stream` hands the SAME `combined` onward, re-injecting
@@ -854,14 +805,12 @@ impl BlockPump {
         // ADR-040 / 52I5SV: the reproduction artifact. Written for every
         // non-observe stance BEFORE the action executes (the exit stance
         // aborts mid-match; the dump must predate it). The dump root is the
-        // bot CWD's logs/desync (overridable by DEGENBOT_DESYNC_DUMP_DIR for
-        // test isolation). I/O failure degrades to a log - never blocks.
-        if let Ok(dump_path) =
-            d.snapshot
-                .write(&std::env::var_os("DEGENBOT_DESYNC_DUMP_DIR").map_or_else(
-                    || std::path::PathBuf::from("logs/desync"),
-                    std::path::PathBuf::from,
-                ))
+        // typed `pump.desync_dump_dir` schema key (KAHU5W — the loader owns
+        // the DEGENBOT_DESYNC_DUMP_DIR env read). I/O failure degrades to a
+        // log - never blocks.
+        if let Ok(dump_path) = d
+            .snapshot
+            .write(&stance::config().pump.desync_dump_dir.clone())
         {
             tracing::info!(dump = %dump_path.display(), "desync repro artifact written");
         } else {
@@ -2707,6 +2656,10 @@ impl BlockPump {
         provider: Arc<AlloyProvider>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
+        // Per-pump completeness opt-out (see the field doc): the dispatcher's
+        // strict decode-miss fault follows this OFF stance so the synthetic
+        // tombstone logs never trip it.
+        bot.dispatcher().set_strict_decode_fault(false);
         Self {
             bot,
             sink,
@@ -2732,11 +2685,11 @@ impl BlockPump {
             // Historical default: tests exercise the shared window (a per-
             // pump override seam exists via the field, not env, so tests stay
             // immune to the global environment).
-            debounce_ms: DEBOUNCE_MS,
+            debounce_ms: 50,
             // Production default (PWPPAZ T2) — finite test streams end before
             // the slice deadline, so existing quiesce tests are unaffected;
             // the gap-stream tests below set the field explicitly.
-            early_slice_ms: EARLY_SLICE_MS,
+            early_slice_ms: 25,
         }
     }
 
@@ -3062,33 +3015,6 @@ mod tests {
         (pump, sink)
     }
 
-    /// Session lead-2 (trace f701ccd3, block 25906841 + the 2026-09-04
-    /// settle-wait survey): `settle_wait_us` pinned at ~51 ms on 24 of 28 live
-    /// blocks while `log_burst_us` spans 1.3-27.5 ms — the 50 ms publish
-    /// debounce always fires long after the block's log burst is fully
-    /// applied, so it is a fixed per-block latency tax, not a real quiesce
-    /// wait. Make it operator-tunable (pure parse contract; invalid input
-    /// keeps the historical default so a bad env var can never zero the
-    /// window or stall the pump).
-    #[test]
-    fn pump_debounce_ms_cfg_defaults_to_50_and_parses_override() {
-        // Unset / empty / junk / zero / overflow => historical default 50 ms.
-        assert_eq!(BlockPump::debounce_ms_cfg(None), DEBOUNCE_MS);
-        assert_eq!(BlockPump::debounce_ms_cfg(Some("")), DEBOUNCE_MS);
-        assert_eq!(BlockPump::debounce_ms_cfg(Some("junk")), DEBOUNCE_MS);
-        assert_eq!(BlockPump::debounce_ms_cfg(Some("0")), DEBOUNCE_MS);
-        assert_eq!(BlockPump::debounce_ms_cfg(Some("-1")), DEBOUNCE_MS);
-        assert_eq!(
-            BlockPump::debounce_ms_cfg(Some("99999999999999999999")),
-            DEBOUNCE_MS
-        );
-        // Operator override: lower debounce = lower per-block settle tax.
-        assert_eq!(BlockPump::debounce_ms_cfg(Some("15")), 15);
-        assert_eq!(BlockPump::debounce_ms_cfg(Some(" 15 ")), 15);
-        // Allow raising the window for stragglers too.
-        assert_eq!(BlockPump::debounce_ms_cfg(Some("120")), 120);
-    }
-
     #[test]
     fn test_pump_disables_solver_state_verify_by_default() {
         // Z4KQXF: the ADR-021 tripwire is conservative-ON in production (via
@@ -3115,11 +3041,11 @@ mod tests {
             !pump.ws_completeness_enabled,
             "test pumps must disable the WS-delivery completeness cross-check"
         );
-        // And the production default (env unset) must be ON so drops surface
-        // loudly out of the box.
+        // And the production default must be ON so drops surface loudly out
+        // of the box (KAHU5W: typed schema default, loader owns env).
         assert!(
-            crate::bot_core::bot_env_flag_default_on("DEGENBOT_WS_COMPLETENESS"),
-            "production default for DEGENBOT_WS_COMPLETENESS must be ON"
+            crate::bot_core::stance::config().pump.ws_completeness,
+            "production default for pump.ws_completeness must be ON"
         );
     }
 

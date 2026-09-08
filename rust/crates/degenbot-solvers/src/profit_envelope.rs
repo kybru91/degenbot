@@ -27,6 +27,7 @@
 //! carries the distinction, so it cannot be ignored by accident.
 
 use crate::mobius_v3_int::{build_cl_crossing_table, ClCrossingTable};
+use crate::runtime::SolveRuntimeConfig;
 use alloy::primitives::{aliases::I512, U256, U512};
 use degenbot_math::v2::IntHopState;
 use degenbot_pools::int_v3_hop::{IntTickRangeCrossing, IntV3TickRangeSequence};
@@ -164,11 +165,11 @@ fn trace_boundary(hop_idx: usize, hop_lines: usize, survivors: usize, next: &[Li
     );
 }
 
-/// T5 diagnostics: opt-in compose tracing (`DEGENBOT_GATE_TRACE=1`), parsed
-/// once — the gate itself reads no environment in its hot path.
-fn gate_trace_enabled() -> bool {
-    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var("DEGENBOT_GATE_TRACE").is_ok())
+/// T5 diagnostics: opt-in compose tracing (`trace.gate_trace` /
+/// `DEGENBOT_GATE_TRACE`), packed by the owner into the runtime config —
+/// the gate itself reads no environment anywhere.
+fn gate_trace_enabled(cfg: &SolveRuntimeConfig) -> bool {
+    cfg.gate_trace
 }
 
 /// Target coefficient width after sound-reduction: two operands of this
@@ -176,24 +177,11 @@ fn gate_trace_enabled() -> bool {
 /// within `I512` (511 bits). Leaves ~30 bits of headroom for the cross-term
 /// sum in `compose_exact`.
 const COMPOSE_TARGET_BITS: u32 = 240;
-/// Cap on the composed-line count carried into the next hop's product loop
-/// (survivor uniform sampling over the lower envelope). Bounds the product
-/// matrix at K² regardless of pool-liquidity range counts.
-fn sampled_compose_lines() -> usize {
-    env_compose_lines()
-}
-
-/// Loop-18 T2 sweep knobs read from the injected runtime config (T4) —
-/// defaults 32/48 (the loop-9/16 production values); the owner overrides
-/// at construction. Higher caps = tighter (lower) envelope = fewer missed
-/// opportunities, more compose time.
-fn env_tangent_lines() -> usize {
-    crate::runtime::runtime().max_tangent_lines.max(1)
-}
-
-fn env_compose_lines() -> usize {
-    crate::runtime::runtime().sampled_compose_lines.max(1)
-}
+/// Loop-18 T2 sweep knobs come from the caller-passed runtime config (T4,
+/// KAHU5W: threaded, never re-read from the environment) — defaults 32/48
+/// (the loop-9/16 production values); the owner overrides at construction.
+/// Higher caps = tighter (lower) envelope = fewer missed opportunities,
+/// more compose time.
 
 /// Magnitude bit length of an `I512` by direct limb scan (loop-16: the
 /// `Signed::bits()` route cost ~90ns per call; this is ~5ns).
@@ -430,7 +418,7 @@ impl<'a> HopMath<'a> {
 /// Affine lines dominating one hop's output curve, plus the hop's maximum
 /// extractable output (used to cap the search domain).
 #[expect(clippy::too_many_lines)]
-fn hop_lines_and_cap(hop: HopMath<'_>) -> Option<(Vec<Line>, U256)> {
+fn hop_lines_and_cap(hop: HopMath<'_>, cfg: &SolveRuntimeConfig) -> Option<(Vec<Line>, U256)> {
     match hop {
         HopMath::V2(h) => {
             let (r_in, r_out) = (h.reserve_in, h.reserve_out);
@@ -465,7 +453,7 @@ fn hop_lines_and_cap(hop: HopMath<'_>) -> Option<(Vec<Line>, U256)> {
             // concave output curve. Keeping fewer tangents makes min(lines)
             // LOOSER (higher) — the gate becomes more conservative (passes
             // more paths to the solver) but NEVER skips a profitable path.
-            let max_tangent_lines = env_tangent_lines();
+            let max_tangent_lines = cfg.max_tangent_lines.max(1);
             if seq.ranges.is_empty() {
                 return None;
             }
@@ -1480,6 +1468,9 @@ pub struct GateDeps<'a> {
     /// The engine-owned cross-block walk-memo handle (SU7MAE T3); `None`
     /// disables the memo for this solve.
     pub walk_memo: Option<&'a crate::mobius_v3_int::WalkMemo>,
+    /// KAHU5W: the owner's runtime stance (envelope caps + trace gate),
+    /// instance-scoped and passed down — the gate reads no environment.
+    pub runtime: SolveRuntimeConfig,
 }
 
 impl GateDeps<'_> {
@@ -1497,6 +1488,23 @@ impl GateDeps<'_> {
             prefix_cache: true,
             capture,
             walk_memo: None,
+            runtime: SolveRuntimeConfig::default(),
+        }
+    }
+
+    /// Production solve cycle with the owner's instance runtime config.
+    #[must_use]
+    pub fn per_block_with(
+        epoch: u64,
+        capture: Option<&GateCaptureCfg>,
+        runtime: SolveRuntimeConfig,
+    ) -> GateDeps<'_> {
+        GateDeps {
+            epoch,
+            prefix_cache: true,
+            capture,
+            walk_memo: None,
+            runtime,
         }
     }
 
@@ -1509,8 +1517,8 @@ impl GateDeps<'_> {
 
 /// Degenerate-path capture config (M6776W): where to write + how many paths
 /// to capture. The production engine and the harnesses build it from the
-/// `DEGENBOT_GATE_CAPTURE*` env vars via [`GateCaptureCfg::from_env`]; the
-/// gate itself reads no environment.
+/// typed `capture` config section (`DEGENBOT_GATE_CAPTURE*` env keys load
+/// there); the gate itself reads no environment.
 #[derive(Clone, Debug)]
 pub struct GateCaptureCfg {
     pub out_path: std::path::PathBuf,
@@ -1557,7 +1565,7 @@ fn path_profit_bound_inner(
         let Some(hop) = slot.as_ref() else {
             return Err(GateSkipCause::UnmappedHop);
         };
-        let Some((hop_ls, cap)) = hop_lines_and_cap(hop.clone()) else {
+        let Some((hop_ls, cap)) = hop_lines_and_cap(hop.clone(), &deps.runtime) else {
             // M6776W degenerate diagnostic: log the hop family + the reject
             // reason so the steady-state degenerate rate can be classified as
             // the expected shape (sparse CL with empty active range / zero
@@ -1727,8 +1735,8 @@ fn path_profit_bound_inner(
         // a SELECTED pair matches legacy exactly (same compose, same
         // reduce-retry); skipped-pair overflows may relax Err -> Ok
         // (documented skip-relaxation, still sound).
-        let mut next: Vec<Line> =
-            compose_boundary_merged(hop_ls, &lines2, domain, sampled_compose_lines())?;
+        let compose_cap = deps.runtime.sampled_compose_lines.max(1);
+        let mut next: Vec<Line> = compose_boundary_merged(hop_ls, &lines2, domain, compose_cap)?;
         // One reduction pass per hop boundary (O(survivors)) — replaces the
         // per-pair reduction removed from Line::compose. Byte-identical
         // coefficients to the old per-pair pass (same ceil/floor rules).
@@ -1745,14 +1753,14 @@ fn path_profit_bound_inner(
         // tangent cap: min(fewer lines) ≥ min(all lines), so the bound can
         // only rise (skip less, never more). With the live min-profit floor
         // of zero the tightness loss does not affect skips.
-        let samp_t0 = if next.len() > sampled_compose_lines() {
+        let samp_t0 = if next.len() > compose_cap {
             Some(std::time::Instant::now())
         } else {
             None
         };
         if let Some(_t0) = samp_t0 {
-            let step = next.len() / sampled_compose_lines();
-            let mut sampled = Vec::with_capacity(sampled_compose_lines() + 1);
+            let step = next.len() / compose_cap;
+            let mut sampled = Vec::with_capacity(compose_cap + 1);
             let mut i = 0usize;
             while i < next.len() {
                 sampled.push(next[i]);
@@ -1777,7 +1785,7 @@ fn path_profit_bound_inner(
                 cache.map.insert(chain.clone(), next.clone());
             }
         }
-        if gate_trace_enabled() {
+        if gate_trace_enabled(&deps.runtime) {
             trace_boundary(hop_idx, hop_ls_len_dbg, next.len(), &next);
         }
         lines2 = next;
@@ -1983,14 +1991,18 @@ fn narrow(v: I512) -> Option<U256> {
     None
 }
 #[must_use]
-pub fn path_output_bound_at(hops: &[Option<HopMath<'_>>], x: &U256) -> Option<U256> {
+pub fn path_output_bound_at(
+    hops: &[Option<HopMath<'_>>],
+    x: &U256,
+    cfg: &SolveRuntimeConfig,
+) -> Option<U256> {
     let mut lines = vec![Line::IDENTITY];
     for slot in hops {
         let Some(hop) = slot.as_ref() else {
             gate_tls(|t| t.none_hop_unmapped += 1);
             return None;
         };
-        let (hop_ls, _cap) = hop_lines_and_cap(hop.clone())?;
+        let (hop_ls, _cap) = hop_lines_and_cap(hop.clone(), cfg)?;
         let mut next: Vec<Line> = Vec::with_capacity(lines.len() * hop_ls.len());
         for outer in &hop_ls {
             for inner in &lines {
@@ -3026,7 +3038,8 @@ mod tests {
                 seq: s,
                 crossings: std::borrow::Cow::Owned(build_cl_crossing_table(s)),
             });
-            let (lines, cap) = hop_lines_and_cap(view).expect("hop derivable");
+            let (lines, cap) =
+                hop_lines_and_cap(view, &SolveRuntimeConfig::default()).expect("hop derivable");
             xmax = xmax.checked_add(cap).expect("domain sum");
             // Grid over [0, 2*cap]; the hop's search domain within a chain is
             // its input volume, capped by cap.

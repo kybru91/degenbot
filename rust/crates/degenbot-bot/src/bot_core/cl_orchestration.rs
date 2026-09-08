@@ -122,7 +122,7 @@ impl BotState {
         // `update_block` well behind the head + an old sqrt is the stale-seed
         // hypothesis; a head-fresh seed points the finger at a post-registration
         // rewind instead.
-        if std::env::var("DEGENBOT_TRACE_REGISTER_SEED").is_ok() {
+        if crate::bot_core::stance::config().trace.trace_register_seed {
             tracing::info!(
                 pool_addr = %format!("{:x}", params.address),
                 family = "V3",
@@ -623,8 +623,7 @@ impl BotState {
         // Debug-drain gate: log per-event apply when `DEGENBOT_DRAIN_DBG` is set
         // to this pool's address. Diagnoses same-block Mint+Bun net-zero races
         // where one half is lost between fetch and drain.
-        let dbg = std::env::var("DEGENBOT_DRAIN_DBG")
-            .is_ok_and(|v| format!("{address:x}").eq_ignore_ascii_case(v.trim_start_matches("0x")));
+        let dbg = crate::bot_core::drain_dbg_pool_match(*address);
         let Some(&key) = self.pool_addresses.get(address) else {
             if dbg {
                 tracing::info!(pool_addr = %format!("{address:x}"), "[dbg-drain] backfill NOT REGISTERED");
@@ -694,8 +693,7 @@ impl BotState {
     /// Same journal + `update_block` contract as
     /// [`apply_backfill_buffer_v3`] — see its docs.
     pub fn apply_pump_buffer_v3(&mut self, address: &Address) {
-        let dbg = std::env::var("DEGENBOT_DRAIN_DBG")
-            .is_ok_and(|v| format!("{address:x}").eq_ignore_ascii_case(v.trim_start_matches("0x")));
+        let dbg = crate::bot_core::drain_dbg_pool_match(*address);
         let Some(&key) = self.pool_addresses.get(address) else {
             if dbg {
                 tracing::info!(pool_addr = %format!("{address:x}"), "[dbg-drain] pump NOT REGISTERED");

@@ -116,38 +116,12 @@ pub const EXECUTE_GAS_ENV: &str = "DEGENBOT_SIM_EXECUTE_GAS";
 /// and falls back to [`INITIAL_EXECUTE_GAS`]), else [`INITIAL_EXECUTE_GAS`].
 #[must_use]
 pub fn execute_gas_limit() -> u64 {
-    match std::env::var(EXECUTE_GAS_ENV) {
-        Ok(v) => parse_execute_gas_override(&v).unwrap_or(INITIAL_EXECUTE_GAS),
-        Err(_) => INITIAL_EXECUTE_GAS,
-    }
-}
-
-/// Parse a `DEGENBOT_SIM_EXECUTE_GAS` override string into the gas limit.
-/// Returns `None` when the override should not change the default (unset/empty,
-/// `0`, or garbage — the latter two log a warning). **Pure**: it does NOT touch
-/// the process-global env, so it is unit-testable without the project-wide
-/// `std::env::set_var`/`remove_var` race (the env is shared across all parallel
-/// test threads — mutating it in one test perturbs every other test that reads
-/// it, e.g. the sim encode path at line 1404). This mirrors the crate's
-/// `parse_flag_value`/`flag_default_on` split; TEST the pure function, never
-/// the live env.
-#[must_use]
-fn parse_execute_gas_override(v: &str) -> Option<u64> {
-    let t = v.trim();
-    if t.is_empty() {
-        return None;
-    }
-    match t.parse::<u64>() {
-        Ok(g) if g > 0 => Some(g),
-        Ok(_) => {
-            tracing::warn!(%EXECUTE_GAS_ENV, v, "executor gas override must be >0; using default");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(%EXECUTE_GAS_ENV, v, "executor gas override unparseable; using default");
-            None
-        }
-    }
+    // KAHU5W: typed schema key `simulation.sim_execute_gas`
+    // (`DEGENBOT_SIM_EXECUTE_GAS`); the loader owns the env read.
+    ::degenbot_config::holder::config()
+        .simulation
+        .sim_execute_gas
+        .unwrap_or(INITIAL_EXECUTE_GAS)
 }
 
 // NOTE (HAVRUW/SEG2PS): the former `EXECUTE_CONFIG = U256::ZERO` constant
@@ -1120,7 +1094,7 @@ where
     // mainnet blocks (TGXBCE resolved); this probe stays gated by
     // `DEGENBOT_BRIDGE_PROBE` so a future materialization surfaces here
     // rather than silently dropping as `encode-failed`.
-    if std::env::var_os("DEGENBOT_BRIDGE_PROBE").is_some() {
+    if ::degenbot_config::holder::config().aave.bridge_probe {
         if let Some(desc) = scan_for_v4_v2_boundary_bridge(&path.path_info.hops, ctx.weth_address) {
             tracing::info!(
                 path_id = path.path_id,
@@ -1299,7 +1273,7 @@ where
             // `execute → v3c.swap → callback → v3a.swap → callback →
             // V4_UNLOCK → unlockCallback → swap → …` chain that ends in a
             // depth-8 empty-calldata PoolManager Halt.
-            if flag_default_on("DEGENBOT_DUMP_CALL_TRACE") {
+            if ::degenbot_config::holder::config().trace.dump_call_trace {
                 #[expect(clippy::print_stderr)] // env-gated diagnostic call-trace dump
                 {
                     eprintln!(
@@ -1611,30 +1585,9 @@ fn decode_balance(data: &alloy::primitives::Bytes) -> U256 {
 // state-divergence-vs-composer-bug test for `CurrencyNotSettled`. Conservative
 // default ON (a single atomic load per failed path); set `=0` to disable.
 
-/// Parse a flag's env value against the conservative default: `false` only for
-/// an explicit falsey value (`""`, `0`, `false`, `off`, `no`, `n`); `true`
-/// otherwise. Pure so it is unit-testable without process-global env mutation.
-fn parse_flag_value(v: &str) -> bool {
-    !matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "" | "0" | "false" | "off" | "no" | "n"
-    )
-}
-
-/// Conservative-default environment flag (Z4KQXF): `true` unless `name` is set
-/// to an explicit falsey value (`""`, `0`, `false`, `off`, `no`). Default-on so
-/// a hand-run or harness never silently drops failure visibility — the HARD/
-/// LOUD diagnostic is the default; disable explicitly with, e.g. `X=0`.
-pub(crate) fn flag_default_on(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => parse_flag_value(&v),
-        Err(_) => true,
-    }
-}
-
-/// The env-var name gating the reverted-swap diagnostic log. Conservative
-/// default ON (`flag_default_on`): set `=0` to disable.
-const SIM_LOG_REVERTED_SWAPS_ENV: &str = "DEGENBOT_SIM_LOG_REVERTED_SWAPS";
+// KAHU5W: the reverted-swap diagnostic gate moved onto the typed schema
+// key 'simulation.sim_log_reverted_swaps' (DEGENBOT_SIM_LOG_REVERTED_SWAPS);
+// the env-name constant and the generic flag helpers are retired with it.
 
 /// The `[sim-revert-swap]` log prefix — verbatim so log greps return here.
 const SIM_REVERT_SWAP_LOG_PREFIX: &str = "[sim-revert-swap]";
@@ -1645,7 +1598,12 @@ static LOG_REVERTED_SWAPS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLo
 /// ON via [`flag_default_on`]); cached so the per-failed-path cost is a single
 /// atomic load.
 fn log_reverted_swaps_enabled() -> bool {
-    *LOG_REVERTED_SWAPS_ENABLED.get_or_init(|| flag_default_on(SIM_LOG_REVERTED_SWAPS_ENV))
+    // KAHU5W: typed schema key `simulation.sim_log_reverted_swaps`.
+    *LOG_REVERTED_SWAPS_ENABLED.get_or_init(|| {
+        ::degenbot_config::holder::config()
+            .simulation
+            .sim_log_reverted_swaps
+    })
 }
 
 /// The positive (output) side of a captured swap's signed amounts — the
@@ -1992,22 +1950,14 @@ mod tests {
     use alloy::primitives::U256;
     use degenbot_executor::composers::V3HopInfo;
 
-    // ── C0: execute_gas_limit env override (artificial-ceiling investigation) ──
+    // ── C0: execute_gas_limit config override (artificial-ceiling
+    // investigation; KAHU5W: the string contract lives in degenbot-config's
+    // loader tests — here the value is a typed Option<u64>) ──
 
     #[test]
-    fn parse_execute_gas_override_reads_valid_override() {
-        assert_eq!(parse_execute_gas_override("30000000"), Some(30_000_000));
-        assert_eq!(parse_execute_gas_override(" 5000000 "), Some(5_000_000));
-    }
-
-    #[test]
-    fn parse_execute_gas_override_rejects_garbage_and_zero() {
-        // Empty / zero / garbage stay on the default. Testing the PURE parse fn
-        // (not `execute_gas_limit()` + `set_var`) avoids the process-global env
-        // race that made this suite flaky under parallel execution.
-        for bad in ["", " ", "0", "abc", "-1", "1.5"] {
-            assert_eq!(parse_execute_gas_override(bad), None, "{bad:?}");
-        }
+    fn execute_gas_limit_falls_back_to_eip7825_default() {
+        assert_eq!(super::execute_gas_limit(), INITIAL_EXECUTE_GAS);
+        assert_eq!(INITIAL_EXECUTE_GAS, 16_777_216);
     }
 
     // ── C3: fits_int128 ──────────────────────────────────────────────────
@@ -2805,21 +2755,18 @@ mod tests {
 
     #[test]
     fn conservative_flag_default_on_and_parse() {
-        // Conservative default (Z4KQXF): unset ⇒ enabled (HARD/LOUD). This
-        // var is not set by any test, so the default-on path is deterministic.
-        assert!(flag_default_on("DEGENBOT_SIM_LOG_REVERTED_SWAPS"));
-        // Explicit falsey values opt OUT.
-        assert!(!parse_flag_value("0"));
-        assert!(!parse_flag_value("false"));
-        assert!(!parse_flag_value("off"));
-        assert!(!parse_flag_value("no"));
-        assert!(!parse_flag_value("n"));
-        assert!(!parse_flag_value(""));
-        // Everything else stays enabled.
-        assert!(parse_flag_value("1"));
-        assert!(parse_flag_value("true"));
-        assert!(parse_flag_value("on"));
-        assert!(parse_flag_value("yes"));
+        // Conservative default (Z4KQXF): unset ⇒ enabled (HARD/LOUD). The
+        // typed schema default is ON (KAHU5W: loader owns the env read).
+        assert!(
+            ::degenbot_config::holder::config()
+                .simulation
+                .sim_log_reverted_swaps
+        );
+        // The falsey/prase contract now lives in degenbot_config::parse_bool_flag.
+        assert!(!::degenbot_config::parse_bool_flag("0").unwrap());
+        assert!(::degenbot_config::parse_bool_flag("1").unwrap());
+        assert!(::degenbot_config::parse_bool_flag("yes").unwrap());
+        assert!(::degenbot_config::parse_bool_flag("").is_err());
     }
 
     /// The end-to-end clamp attestation (epic 6EQWXK / task 6Z6H4U, plan §7):

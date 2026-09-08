@@ -16,6 +16,9 @@ use degenbot_config::SCHEMA;
 ///   `DEGENBOT_RPC_WS_CHAINID_<chain_id>` (documented next to `SCHEMA`).
 const SWEEP_ARTIFACTS: &[&str] = &[
     "DEGENBOT_JAEGER_E",
+    // KAHU5W: the family wildcard in the allocator doc comment (the loader
+    // owns the four concrete DEGENBOT_MIMALLOC_* keys).
+    "DEGENBOT_MIMALLOC_",
     "DEGENBOT_RPC_WS_CHAINID_",
     "DEGENBOT_V",
 ];
@@ -24,6 +27,8 @@ const SWEEP_ARTIFACTS: &[&str] = &[
 /// matches expand to these full names).
 const SWEEP_EXPANSIONS: &[&str] = &[
     "DEGENBOT_JAEGER_E2E",
+    // KAHU5W: the V2 in DEGENBOT_V2_CALC_TRACE ends the artifact match.
+    "DEGENBOT_V2_CALC_TRACE",
     "DEGENBOT_V3_FIXTURE_RPC",
     "DEGENBOT_V3_FIXTURE_BLOCK",
 ];

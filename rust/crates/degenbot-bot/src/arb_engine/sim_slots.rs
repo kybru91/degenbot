@@ -30,10 +30,9 @@ fn sim_slot_capacity() -> usize {
     const SIM_IO_OVERSUBSCRIBE: usize = 2;
     static CAP: OnceLock<usize> = OnceLock::new();
     *CAP.get_or_init(|| {
-        if let Ok(raw) = std::env::var("DEGENBOT_SOLVE_SIM_INFLIGHT") {
-            if let Ok(n) = raw.trim().parse::<usize>() {
-                return n.clamp(1, 64);
-            }
+        // KAHU5W: typed schema override (`solve.solve_sim_inflight`).
+        if let Some(n) = crate::bot_core::stance::config().solve.solve_sim_inflight {
+            return n.clamp(1, 64);
         }
         crate::bot_core::cpu_budget::leftover_worker_budget().saturating_mul(SIM_IO_OVERSUBSCRIBE)
     })

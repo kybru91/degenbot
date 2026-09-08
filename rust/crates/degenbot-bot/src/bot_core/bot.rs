@@ -75,6 +75,13 @@ impl Bot {
     /// bare-fixture test path. The construction-I/O handle is `None` until
     /// [`Bot::set_construction_io`] attaches one (the Python path does this at
     /// `Bot.__init__` time).
+    /// Immutable accessor for the per-Bot event bus (the pump wires its
+    /// per-pump completeness stance into the dispatcher's strict fault here).
+    #[must_use]
+    pub fn dispatcher(&self) -> &log_dispatcher::LogDispatcher {
+        &self.dispatcher
+    }
+
     #[must_use]
     pub fn new(chain_id: u64) -> Self {
         Self {

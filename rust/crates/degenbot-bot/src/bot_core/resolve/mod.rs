@@ -915,7 +915,13 @@ mod tests {
                 profiles: std::sync::Arc::clone(p),
             })
             .collect();
-        degenbot_solvers::mobius_v3_int::int_solve_cl_path(&seqs, &prepared, None).result
+        degenbot_solvers::mobius_v3_int::int_solve_cl_path(
+            &seqs,
+            &prepared,
+            None,
+            &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+        )
+        .result
     }
 
     /// The mixed intake: resolve -> cached tables -> `exact_solve_mixed_path_n_cached`.
@@ -970,6 +976,7 @@ mod tests {
             &seqs,
             &cl_prepared,
             &hop_order,
+            &degenbot_solvers::runtime::SolveRuntimeConfig::default(),
         )
         .result
     }

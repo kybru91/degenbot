@@ -76,7 +76,7 @@ use crate::{
 /// primary noise gate — the env var only controls whether the (cheap) reads
 /// run.
 fn v2_calc_trace(handle: &mut BlockSimHandle<'_>, sim_path: &SimulatePath) {
-    if !crate::simulator::flag_default_on("DEGENBOT_V2_CALC_TRACE") {
+    if !::degenbot_config::holder::config().trace.v2_calc_trace {
         return;
     }
     for hop in &sim_path.path_info.hops {
