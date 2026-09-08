@@ -63,7 +63,8 @@
   },
   {
    "id": 2,
-   "title": "Drain queue depth",
+   "title": "Solve stragglers in flight",
+   "description": "Successor of the retired degenbot_drain_queue_depth gauge (DispatchOwner era, removed SZJUKL): detached-solve straggers awaiting the sidecar merge. Sits at 0 healthy; sustained non-zero is backpressure, cap 8 = wedged (see the DegenbotDrainerStall alert).",
    "type": "stat",
    "gridPos": {
     "h": 4,
@@ -81,7 +82,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "degenbot_drain_queue_depth",
+     "expr": "degenbot_detached_in_flight",
      "legendFormat": "__auto",
      "refId": "A",
      "instant": true,
@@ -651,7 +652,8 @@
   },
   {
    "id": 11,
-   "title": "Drain queue depth (backlog)",
+   "title": "Solve straggler backlog (detached in-flight)",
+   "description": "Successor of the retired degenbot_drain_queue_depth (SZJUKL): per-epoch queue age now rides the degenbot.stage.* SPANS (queue.age_us attr); degenbot_detached_in_flight is the surviving metric backpressure gauge for the sidecar merge.",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -669,8 +671,8 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "degenbot_drain_queue_depth",
-     "legendFormat": "drain queue depth",
+     "expr": "degenbot_detached_in_flight",
+     "legendFormat": "detached in-flight stragglers",
      "refId": "A"
     }
    ],
@@ -990,7 +992,8 @@
   },
   {
    "id": 19,
-   "title": "Pipeline phase durations (p95): decode / apply / queue wait",
+   "title": "Pipeline phase durations (p95): decode / apply / publish cycle",
+   "description": "queue-wait column replaced: degenbot_drain_queue_wait_seconds is retired (SZJUKL); per-epoch queue age rides the degenbot.stage.* span attrs (queue.age_us), and degenbot_stage_publish_cycle_seconds owns the cycle view.",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -1026,8 +1029,8 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "histogram_quantile(0.95, sum(rate(degenbot_drain_queue_wait_seconds_bucket[5m])) by (le))",
-     "legendFormat": "drain queue wait",
+     "expr": "histogram_quantile(0.95, sum(rate(degenbot_stage_publish_cycle_seconds_bucket[5m])) by (le))",
+     "legendFormat": "publish cycle p95",
      "refId": "C"
     }
    ],
@@ -1494,7 +1497,8 @@
   },
   {
    "id": 29,
-   "title": "Liveness: drain queue depth + state head lag (freeze signature)",
+   "title": "Liveness: state head lag (freeze signature)",
+   "description": "Drain-queue target removed: degenbot_drain_queue_depth is retired (SZJUKL). Pump-side liveness is owned by the stage telemetry (degenbot.stage.* spans) and the header-age / apply-age gauges in the next panel.",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -1507,15 +1511,6 @@
     "uid": "${DS_PROMETHEUS}"
    },
    "targets": [
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "degenbot_drain_queue_depth",
-     "legendFormat": "drain queue depth",
-     "refId": "A"
-    },
     {
      "datasource": {
       "type": "prometheus",
@@ -2087,7 +2082,8 @@
   },
   {
    "id": 41,
-   "title": "Solver audit: clamps / verify blocks / publish state checks",
+   "title": "Solver audit: solver clamps",
+   "description": "The verify-blocks / state-checks series (degenbot_solver_verify_blocks_total / degenbot_solver_state_checks_total) are RETIRED (MROOY7 2UVG3E): the ADR-021 per-solve tripwire is gone and solver-state verification is on-demand (sim-failure-armed divergence probe). Desync containment surfaces via degenbot_errors_total and the degenbot_engine_quarantined_pools gauge; per-block verify context rides the degenbot.epoch / degenbot.stage.* spans.",
    "type": "timeseries",
    "gridPos": {
     "h": 8,
@@ -2108,24 +2104,6 @@
      "expr": "rate(degenbot_solver_clamps_total[1m])",
      "legendFormat": "clamps/s",
      "refId": "A"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_solver_verify_blocks_total[1m])",
-     "legendFormat": "verify blocks/s",
-     "refId": "B"
-    },
-    {
-     "datasource": {
-      "type": "prometheus",
-      "uid": "${DS_PROMETHEUS}"
-     },
-     "expr": "rate(degenbot_solver_state_checks_total[1m])",
-     "legendFormat": "state checks/s",
-     "refId": "C"
     }
    ],
    "fieldConfig": {
@@ -2244,7 +2222,7 @@
    },
    "options": {
     "mode": "markdown",
-    "content": "## Jaeger drill-down - span tree (MQUKB6-T2 shape)\n\n    degenbot.pump.block\n    \u2514\u2500 degenbot.arb.solve              (T0 gate + wall clock + block.number)\n       \u251c\u2500 degenbot.arb.fanout            (paths.affected)\n       \u251c\u2500 degenbot.arb.resolve            (core-lock re-derive)\n       \u251c\u2500 degenbot.arb.lpt                (bin-pack)\n       \u251c\u2500 degenbot.arb.path xN  [DEBUG]   (path.id, path.us, path.sims, gate.us, path.profit)\n       \u2514\u2500 degenbot.arb.merge              (streaming drain; merge.paths)\n\n**Jaeger queries** (service `degenbot-bot`, host `host.docker.internal:16686`):\n\n- Solve cycles: `operation=degenbot.arb.solve&limit=20&lookback=1h`\n- Phase attribution: the `fanout` / `resolve` / `lpt` / `merge` children of a solve trace\n- Per-path attribution: `operation=degenbot.arb.path` (needs `RUST_LOG=degenbot::solver=debug`)\n\nThe **Engine-Mutex hold** panel is the metric-level view of this tree: under\n`DEGENBOT_DETACHED_SOLVES=1` the hold collapses from the in-cycle 5-20ms band to\nenqueue cost (\u00b5s) while solves continue on the dedicated `degenbot-solve-tokio`\nworkers - a step change in that panel means the stance flipped, not a regression.\nThe **Detached cycle** panel is the sidecar-merge health (Q1a): in-flight is the\nun-merged-straggler backpressure gauge (cap 8), and stale-dropped stragglers are\nEXPECTED under pool churn - a sustained drop rate with zero applied means the\nsidecar pipe is wedged.",
+    "content": "## Jaeger drill-down - span tree (stage-table shape, BF43PM/AJIOCU)\n\n    degenbot.epoch                  (trace ROOT per block epoch: epoch.block, epoch.seq,\n    |                                pregap.logs / header_to_first_log_us / log_burst_us / settle_wait_us)\n    +-- degenbot.stage.streaming     (open: first relevant log -> quiesce; queue.age_us at close)\n    +-- degenbot.stage.quiesced      (point: quiesce transition)\n    +-- degenbot.arb.solve           (solver cycle - fanout / lpt / resolve / path / merge children unchanged)\n    +-- degenbot.stage.publish       (point: publish decision; metric degenbot_stage_publish_cycle_seconds)\n    +-- degenbot.stage.finalize      (point: epoch finalized)\n    Rewind epochs hold degenbot.stage.rewind OPEN across the reorg window (metrics\n    degenbot_stage_rewind_total / degenbot_stage_rewind_duration_seconds); the next epoch\n    root carries epoch.seq + 1.\n\n**Jaeger queries** (service `degenbot-bot`, host `host.docker.internal:16686`):\n\n- Epoch waterfall: `operation=degenbot.epoch&limit=20&lookback=1h`\n- Stage transitions: `operation=degenbot.stage.streaming` / `degenbot.stage.publish` / `degenbot.stage.finalize` (attrs `stage.from`, `stage.to`, `queue.age_us`)\n- Phase attribution: the `fanout` / `lpt` / `resolve` / `merge` children of a solve trace (unchanged)\n- Rewind story: read `epoch.seq` across epoch roots - a bumped seq is the reorg generation\n- RETIRED spans (BF43PM/AJIOCU, epic MROOY7): `degenbot.pump.block` / `pump.log_wait` / `pump.apply_stream` are discontinued\n\nThe **Engine-Mutex hold** panel is the metric-level view of the solve arm: under\n`DEGENBOT_DETACHED_SOLVES=1` the hold collapses from the in-cycle 5-20ms band to\nenqueue cost (us) while solves continue on the dedicated `degenbot-solve-tokio`\nworkers - a step change in that panel means the stance flipped, not a regression.\nThe **Detached cycle** panel is the sidecar-merge health (Q1a): in-flight is the\nun-merged-straggler backpressure gauge (cap 8), and stale-dropped stragglers are\nEXPECTED under pool churn - a sustained drop rate with zero applied means the\nsidecar pipe is wedged.",
     "code": {
      "language": "plaintext",
      "showLineNumbers": false
@@ -2345,7 +2323,7 @@
      "mode": "multi",
      "sort": "desc"
     },
-    "description": "Decomposition of the block-to-solve gap BEFORE the solver engages (phases recorded at each settle point): header-to-first-log = WS delivery latency; log_burst = diffusion of the block logs across the feed (first-to-last); settle_wait = debounce/quiesce hold after the last log. Jaeger: the same values ride as span fields (header_to_first_log_us, log_burst_us, settle_wait_us) on degenbot.pump.block."
+    "description": "Decomposition of the block-to-solve gap BEFORE the solver engages (phases recorded at each settle point): header-to-first-log = WS delivery latency; log_burst = diffusion of the block logs across the feed (first-to-last); settle_wait = debounce/quiesce hold after the last log. Jaeger: the same values ride as span fields (header_to_first_log_us, log_burst_us, settle_wait_us) on the degenbot.epoch trace root (retired degenbot.pump.block, BF43PM)."
    }
   },
   {
@@ -2530,7 +2508,7 @@
   },
   {
    "id": 49,
-   "title": "Solver-state desyncs (30m, post-quarantine)",
+   "title": "Quarantine transitions (30m)",
    "type": "stat",
    "gridPos": {
     "h": 4,
@@ -2548,7 +2526,7 @@
       "type": "prometheus",
       "uid": "${DS_PROMETHEUS}"
      },
-     "expr": "sum(increase(degenbot_errors_total{kind=\"solver_state_desync\"}[30m]))",
+     "expr": "changes(degenbot_engine_quarantined_pools[30m])",
      "legendFormat": "__auto",
      "refId": "A",
      "instant": true,
@@ -2587,7 +2565,7 @@
     "colorMode": "background",
     "graphMode": "area"
    },
-   "description": "ADR-040: verified desyncs quarantined in the last 30m. The bot keeps trading its other paths; the repro dump is logs/desync/*.json."
+   "description": "ADR-040 quarantine/release transitions in the last 30m. SUCCESSOR of the retired solver_state_desync errors kind: the ADR-021 per-solve publish tripwire was retired with MROOY7 task 2UVG3E, and containment now lives in the resolve-seam quarantine gate (degenbot_engine_quarantined_pools, maintained by BotState::quarantine_pool / release_pool). The bot keeps trading its other paths; the DegenbotDesyncQuarantine alert pages while any containment is active."
   },
   {
    "id": 50,
