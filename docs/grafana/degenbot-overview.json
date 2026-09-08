@@ -735,9 +735,9 @@
         },
         {
             "id": 67,
-            "type": "timeseries",
-            "title": "Log funnel per interval (applied / ignored / seen) \u2014 bars",
-            "description": "Stacked bars of per-scrape log counts; the XY panel beside it binds the same counts to block numbers.",
+            "type": "barchart",
+            "title": "Log funnel by block (applied / ignored / seen)",
+            "description": "Stacked per-scrape log counts, x = block number (one bar per scrape, ~10 blocks).",
             "datasource": {
                 "type": "prometheus",
                 "uid": "eea7hc2lizlz4d"
@@ -782,43 +782,105 @@
                         "type": "prometheus",
                         "uid": "eea7hc2lizlz4d"
                     }
+                },
+                {
+                    "refId": "D",
+                    "expr": "degenbot_epoch_logs_block{instance=~\"$instance\"}",
+                    "legendFormat": "block",
+                    "instant": false,
+                    "format": "time_series",
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "eea7hc2lizlz4d"
+                    }
                 }
             ],
-            "transformations": [],
+            "transformations": [
+                {
+                    "id": "joinByField",
+                    "options": {
+                        "byField": "Time",
+                        "mode": "outer"
+                    }
+                },
+                {
+                    "id": "groupby",
+                    "options": {
+                        "fields": {
+                            "block": {
+                                "aggregations": [
+                                    "lastNotNull"
+                                ],
+                                "operation": "groupby"
+                            },
+                            "applied": {
+                                "aggregations": [
+                                    "lastNotNull"
+                                ],
+                                "operation": "aggregate"
+                            },
+                            "ignored": {
+                                "aggregations": [
+                                    "lastNotNull"
+                                ],
+                                "operation": "aggregate"
+                            },
+                            "seen": {
+                                "aggregations": [
+                                    "lastNotNull"
+                                ],
+                                "operation": "aggregate"
+                            }
+                        }
+                    }
+                },
+                {
+                    "id": "organize",
+                    "options": {
+                        "excludeByName": {
+                            "Time": true
+                        },
+                        "indexByName": {
+                            "block": 0,
+                            "applied": 1,
+                            "ignored": 2,
+                            "seen": 3
+                        },
+                        "renameByName": {}
+                    }
+                },
+                {
+                    "id": "convertFieldType",
+                    "options": {
+                        "conversions": [
+                            {
+                                "matcher": {
+                                    "id": "byName",
+                                    "options": "block"
+                                },
+                                "destinationType": "string"
+                            },
+                            {
+                                "targetField": "block",
+                                "destinationType": "string"
+                            }
+                        ]
+                    }
+                }
+            ],
             "fieldConfig": {
                 "defaults": {
                     "color": {
                         "mode": "palette-classic"
                     },
                     "custom": {
-                        "drawStyle": "bars",
-                        "barAlignment": 0,
-                        "lineWidth": 1,
                         "fillOpacity": 90,
-                        "showPoints": "never",
-                        "pointSize": 5,
-                        "gradientMode": "none",
-                        "stacking": {
-                            "mode": "normal",
-                            "group": "A"
-                        },
+                        "lineWidth": 0,
                         "hideFrom": {
                             "legend": false,
                             "tooltip": false,
                             "viz": false
-                        },
-                        "axisPlacement": "auto",
-                        "axisColorMode": "text",
-                        "axisLabel": "",
-                        "axisCenteredZero": false,
-                        "axisBorderShow": false,
-                        "scaleDistribution": {
-                            "type": "linear"
-                        },
-                        "thresholdsStyle": {
-                            "mode": "off"
-                        },
-                        "barsCenterWidth": 1.0
+                        }
                     },
                     "unit": "short",
                     "min": 0
@@ -868,10 +930,34 @@
                                 }
                             }
                         ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "block"
+                        },
+                        "properties": [
+                            {
+                                "id": "unit",
+                                "value": "none"
+                            }
+                        ]
                     }
                 ]
             },
             "options": {
+                "orientation": "auto",
+                "barWidth": 1.0,
+                "groupWidth": 0.7,
+                "barRadius": 0,
+                "showValue": "never",
+                "stacking": {
+                    "mode": "normal",
+                    "group": "A"
+                },
+                "xField": "block",
+                "xTickLabelRotation": 90,
+                "xTickLabelSpacing": 120,
                 "legend": {
                     "displayMode": "list",
                     "placement": "bottom",
@@ -879,8 +965,7 @@
                 },
                 "tooltip": {
                     "mode": "multi",
-                    "sort": "none",
-                    "hideZeros": false
+                    "sort": "none"
                 }
             }
         },
