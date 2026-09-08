@@ -508,6 +508,14 @@ impl LogDispatcher {
         self.tally.snapshot_and_reset()
     }
 
+    /// NO4DIW: one WS-delivered log event (pre topic-filter). The pump calls
+    /// this in the `WsEvent::Pool` arm next to `count_ws_log_seen` — the
+    /// dispatcher never sees the logs the pre-filter drops, so `seen` must
+    /// be tallied here for the funnel composition to close.
+    pub fn inc_seen(&self) {
+        EpochLogTally::inc(&self.tally.seen);
+    }
+
     /// Per-pump opt-out for the strict decode-miss fault (the test pumps
     /// disable the completeness machinery deterministically; production
     /// keeps the schema default ON).
@@ -1044,6 +1052,23 @@ mod tests {
         );
         let c2 = dispatcher.snapshot_epoch_logs_and_reset();
         assert_eq!(c2.received, 0, "one-shot reset");
+    }
+
+    /// NO4DIW: the `seen` leg is tallied at the WS event source by the pump
+    /// (`inc_seen`), NOT by `dispatch` — the pre-filter drops most events
+    /// before the dispatcher, so `seen` is independent of `received`.
+    #[test]
+    fn seen_leg_tallies_at_the_source() {
+        let dispatcher = LogDispatcher::new();
+        dispatcher.inc_seen();
+        dispatcher.inc_seen();
+        dispatcher.inc_seen();
+        let c = dispatcher.snapshot_epoch_logs_and_reset();
+        assert_eq!(
+            (c.seen, c.received, c.applied),
+            (3, 0, 0),
+            "seen counts WS events; dispatch outcomes are orthogonal"
+        );
     }
 
     #[test]

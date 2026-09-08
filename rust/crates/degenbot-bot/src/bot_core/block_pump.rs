@@ -1121,6 +1121,9 @@ impl BlockPump {
                     if let Some(p) = crate::instruments::pipeline() {
                         p.count_ws_log_seen();
                     }
+                    // NO4DIW: the funnel's `seen` leg — tallied at the event
+                    // source (pre topic-filter) exactly like the instrument.
+                    self.bot.dispatcher().inc_seen();
                     // Logs-subscription liveness: ANY log (even one the topic
                     // pre-filter drops below) proves the `eth_subscribe
                     // "logs"` arm is delivering. Refresh before the pre-filter
