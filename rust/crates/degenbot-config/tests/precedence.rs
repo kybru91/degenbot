@@ -253,7 +253,6 @@ fn missing_config_file_is_reported() {
 #[test]
 fn unset_option_keys_stay_unset_and_default_provenance_holds() {
     let loaded = must_ok(&BotConfigLoader::new().without_env());
-    assert_eq!(loaded.config.verify.solver_staleness_blocks, None);
     assert_eq!(loaded.config.allocator.mimalloc_purge_delay_ms, None);
     assert_eq!(
         loaded.provenance.len(),

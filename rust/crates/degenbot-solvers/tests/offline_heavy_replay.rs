@@ -181,7 +181,7 @@ fn replay_captured_heavy_paths() {
         i = i.min(rows.len() - 1);
         rows[i]
     };
-    for (frac, label) in [(0.5, "p50"), (0.9, "p90"), (1.0, "max")] {
+    for (frac, label) in [(0.5, "p50"), (0.9, "p90"), (0.99, "p99"), (1.0, "max")] {
         let (us, pid, tr, pieces, sims, ws, some, gate_us, d_us, c_us, s_us, pairs) = pick(frac);
         println!(
             "{label}: {us:>7}us pid={pid} ranges={tr} pieces={pieces} sims={sims} word_steps={ws} profitable={some} | gate={gate_us}us derive={d_us}us compose={c_us}us search={s_us}us pairs={pairs}"

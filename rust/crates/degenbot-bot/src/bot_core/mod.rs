@@ -44,7 +44,6 @@ pub mod sim_anchor;
 pub mod snapshot_verify;
 pub(crate) mod solve_anchor;
 pub mod solve_coordinator;
-pub mod solver_state_tripwire;
 pub mod stage_handlers;
 pub mod state_lock;
 pub mod swap_simulation;
@@ -639,10 +638,13 @@ impl BotState {
     /// that last mutated N blocks ago is quiet (its stored state is byte-
     /// identical to on-chain), not stale. The former TQ43TU solve-time staleness
     /// gate (ergo YXHHKR, resolved QNFYR5) mis-used it to defer quiet paths and
-    /// was REMOVED. The tripwire (`solver_state_tripwire::judge`) diffs each
-    /// hop against the chain at its OWN `update_block` anchor and fatal-aborts on
-    /// a real desync; a never-updated pool (`update_block == 0`) is diffed at the
-    /// solve block instead.
+    /// was REMOVED. The ADR-021 chain-vs-solver tripwire retiree (task 2UVG3E,
+    /// epic MROOY7): in-process chain-vs-solver-state verification is retired
+    /// with the stage-separated data plane — desync the plane excludes is
+    /// unrepresentable — so `update_block` stays a pure bookkeeping clock
+    /// (used by the Q1a merge staleness oracle and the epoch delta). Upstream
+    /// verification remains at the Published edge (`CompletenessDecision::Verify`
+    /// → `assert_ws_block_complete`).
     #[must_use]
     pub fn pool_update_block(&self, pool_id: u64) -> u64 {
         self.pools.get(&pool_id).map_or(0, PoolEntry::update_block)

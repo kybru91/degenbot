@@ -2,11 +2,10 @@
 //!
 //! One pure per-tick comparison shared by every consumer that asks
 //! "does the stored CL tick-map state match the chain at block B?"
-//! (registration lifecycle verify, the Python engine verify, the
-//! solve-time tripwire's tick-map fidelity probe). Consumers supply
-//! their own tick COVERAGE (which ticks to read) and keep their own
-//! REACTION (typed registration error / bridge error / trip + exit);
-//! the seam converges the verdict, not the reaction.
+//! (registration lifecycle verify, the Python engine verify). Consumers
+//! supply their own tick COVERAGE (which ticks to read) and keep their own
+//! REACTION (typed registration error / bridge error); the seam converges
+//! the verdict, not the reaction.
 //!
 //! The provider-bound batch reads stay in `degenbot-bot`'s
 //! `bot_core::liquidity_verifier` (ADR-004 state crate stays pyo3-free
@@ -31,10 +30,10 @@ pub struct TickDivergence {
     pub on_chain: Option<(u128, i128)>,
 }
 
-/// The CL slot0 head scalars — the same fact family the tripwire's
-/// `SolverHopScalarState` pins and the `[sim-revert-swap]` diagnostic
-/// records as fix-enablers. Shared so the two log surfaces speak one
-/// type language.
+/// The CL slot0 head scalars — the same fact family the
+/// `[sim-revert-swap]` diagnostic records as fix-enablers. Shared so the
+/// log surfaces speak one type language.
+///
 /// Compare a stored tick map against an observed on-chain (or post-sim)
 /// tick set. Pure: no reads, no env, no logging — the caller supplies the
 /// coverage (which tick set to read) and owns the reaction to the verdict.

@@ -79,8 +79,6 @@ pub struct PipelineInstruments {
     /// WAJEQP T-R1: log events discarded by the recovery-anchor rule
     /// (`DroppedRecovery`); spikes during reorg episodes.
     reorg_recovery_dropped: Counter<u64>,
-    /// Published blocks judged by the solver-state verifier.
-    solver_verify_blocks: Counter<u64>,
     /// Header-gap / settle backfills executed.
     backfills_executed: Counter<u64>,
     /// Drain FIFO depth at dispatch time (approximate backlog signal).
@@ -140,11 +138,6 @@ pub struct PipelineInstruments {
     profit_missed: Counter<f64>,
     /// Monitor outcomes, labeled (`confirmed`, `expired`).
     monitor_outcomes: Counter<u64>,
-    /// Solver-state divergence-scan checks performed (one per unique pool
-    /// scanned per publish; see `solver_state_tripwire::divergence_scan_stage`).
-    solver_state_checks_total: Counter<u64>,
-    /// Epic SRQEK5 T2: outstanding un-merged detached solve results
-    /// (stragglers in the merge pipe; the in-flight backpressure gauge).
     detached_in_flight: Gauge<f64>,
     /// Epic SRQEK5 T2: detached stragglers DROPPED by the Q1a stale policy.
     detached_stale_dropped: Counter<u64>,
@@ -169,8 +162,6 @@ pub struct PipelineInstruments {
     /// the unit attribute, update the panel expression in the same commit.
     process_rss_bytes: Gauge<f64>,
 
-    /// ADR-040: quarantine containment events by cause + scope.
-    quarantine_events: Counter<u64>,
     /// ADR-040: per-error-reason tally for error-outcome simulations. The
     /// `reason` label is the closed `telemetry::error_reason` set.
     sim_error_reasons: Counter<u64>,
@@ -286,10 +277,6 @@ impl PipelineInstruments {
             logs_undecoded: meter
                 .u64_counter("degenbot.logs.undecoded")
                 .with_description("Relevant-topic logs that matched no decoder")
-                .build(),
-            solver_verify_blocks: meter
-                .u64_counter("degenbot.solver.verify.blocks")
-                .with_description("Published blocks judged by the solver-state verifier")
                 .build(),
             backfills_executed: meter
                 .u64_counter("degenbot.backfills.executed")
@@ -418,12 +405,6 @@ impl PipelineInstruments {
                 .u64_counter("degenbot.monitor.outcomes")
                 .with_description("Monitor outcomes (confirmed/expired)")
                 .build(),
-            solver_state_checks_total: meter
-                .u64_counter("degenbot.solver_state.checks")
-                .with_description(
-                    "Solver-state divergence-scan checks performed (unique pools per publish)",
-                )
-                .build(),
             detached_in_flight: meter
                 .f64_gauge("degenbot.detached.in_flight")
                 .with_description(
@@ -451,10 +432,6 @@ impl PipelineInstruments {
                 .with_unit("s")
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .with_description("Time a guard was held after acquisition (per site, mode)")
-                .build(),
-            quarantine_events: meter
-                .u64_counter("degenbot.quarantine.events")
-                .with_description("Quarantine containment events (scope x cause, ADR-040)")
                 .build(),
             sim_error_reasons: meter
                 .u64_counter("degenbot.sim.error_reason")
@@ -565,11 +542,6 @@ impl PipelineInstruments {
     /// One relevant-topic log that matched no decoder (undecoded topic0).
     pub fn count_log_undecoded(&self) {
         self.logs_undecoded.add(1, &[]);
-    }
-
-    /// One published block handed to the solver-state verifier.
-    pub fn count_solver_verify_block(&self) {
-        self.solver_verify_blocks.add(1, &[]);
     }
 
     /// CFS throttle deltas observed since the previous call. Zero-record
@@ -715,11 +687,6 @@ impl PipelineInstruments {
             .add(1, &[KeyValue::new("outcome", outcome.to_owned())]);
     }
 
-    /// One solver-state divergence-scan check (unique pool per publish).
-    pub fn count_solver_state_check(&self) {
-        self.solver_state_checks_total.add(1, &[]);
-    }
-
     /// Epic SRQEK5 T2: detached merge-pipe in-flight depth (stragglers sent
     /// but not yet applied/dropped). Sampled at enqueue + per disposition.
     pub fn set_detached_in_flight(&self, count: u64) {
@@ -757,18 +724,6 @@ impl PipelineInstruments {
             &[
                 KeyValue::new("site", site.to_owned()),
                 KeyValue::new("mode", mode.to_owned()),
-            ],
-        );
-    }
-
-    /// ADR-040: one quarantine containment event (scope = Pool|Path|Process,
-    /// cause = the closed failure kind that triggered it).
-    pub fn count_quarantine_event(&self, cause: &str, scope: &str) {
-        self.quarantine_events.add(
-            1,
-            &[
-                KeyValue::new("cause", cause.to_owned()),
-                KeyValue::new("scope", scope.to_owned()),
             ],
         );
     }
@@ -975,13 +930,11 @@ mod kind_tests {
         instruments.count_ws_log_seen();
         instruments.count_log_decoded();
         instruments.count_log_undecoded();
-        instruments.count_solver_verify_block();
         let text = crate::metrics::render(&registry);
         for family in [
             "degenbot_ws_logs_seen_total",
             "degenbot_logs_decoded_total",
             "degenbot_logs_undecoded_total",
-            "degenbot_solver_verify_blocks_total",
         ] {
             assert!(
                 text.contains(family),

@@ -137,6 +137,41 @@ Since cheap-read only loses if **both** legs pass, **cheap-read wins for all fam
 - StateLock diagnostics (hold/wait histograms) are retained — they are the budget verifier for the "Spike-derived p99 latency budget met on the capture corpus replay" gate.
 - The ReorgJournal `restore_before_block` costs (§2.2/§2.3, all ≤ 23 µs p99) bound the Rewind path; no materialization machinery is needed to hit the budgets.
 
+## 5.1 Landed (task `2UVG3E`): the data plane + which locks remain on the solve path
+
+Implementation of the cheap-read branch, as landed in this worktree
+(pre-stage-machine; the machine itself is task `7NFYQW`):
+
+- **Data plane unchanged, writers confined by role.** `StateLock<RwLock<BotState>>`
+  (parking_lot + the Z4Z6VO diagnostics wrapper) remains the only pool-state
+  store. Pool-state writes happen in exactly the Streaming-role paths
+  (`Bot::dispatch_log` apply, reorg `ReorgJournal` restore, gap backfill,
+  registration); the solve cycle (Solve/Simulate) consumes read guards — the
+  resolve window holds one consistent read snapshot, the per-path solves take
+  short reads. The one conditional write that used to sit inside the Solved row
+  (buffered-event lazy expiry) is default-off and documented below as the
+  residual pre-machine exception to retire with the stage machine.
+- **Engine `Mutex<ArbitrageEngine>` off the solve path (seam #4).**
+  `DEGENBOT_DETACHED_SOLVES` is now default ON: the drain-driven solve cycle
+  returns at enqueue end, so the `EngineHandle::solve_dirty` engine-Mutex hold
+  collapses to µs (probe + enqueue + bookkeeping), and results merge on the
+  `arb-detached-merge` sidecar under short per-item acquisitions guarded by the
+  Q1a staleness oracle. `DEGENBOT_DETACHED_SOLVES=0` restores the in-cycle hold
+  (the backpressure fallback also degrades to it beyond `DETACHED_INFLIGHT_CAP`).
+- **StateLock diagnostics retained for registration/FFI** (the slow operator
+  paths the 2026-08-21 incident implicated); the solve path's reads are the
+  cheap, `#[track_caller]`-diagnosed bare reads.
+
+**Lock inventory on the solve path after this task** (the contention story):
+
+| Lock | Stage phase | Why it remains |
+|---|---|---|
+| `StateLock<RwLock<BotState>>` (read) | Resolved..Simulated | THE data plane — cheap-read guards; uncontended by Streaming confinement (I4); diagnostics stay for registration/FFI |
+| `StateLock<RwLock<BotState>>` (write) | Streaming only | dispatch_log apply, `ReorgJournal` restore, backfill, registration — the writer side |
+| `Mutex<ArbitrageEngine>` | enqueue end (µs); per-item sidecar merges | Cycle hand-off + registration/FFI serialization. Not held during solving (detached default) |
+| `SolveCoordinator::drain_lock` | drain fan-out bookkeeping | Coordinator cursor consistency; µs; retired with the seam (task `SZJUKL`) |
+| `EpochDelta` internals (`RwLock<Epoch>` + `Mutex<HashSet>`) | Streaming (writes), drain (take) | The touched-pool ledger; `take_keys` is a single brief swap |
+
 ## 6. Reproduction commands
 
 ```bash
@@ -168,4 +203,4 @@ curl -s 'http://host.docker.internal:16686/api/traces?service=degenbot-bot&opera
 2. **262,144-entry (≈33 MB) superlinear clone anomaly** is real but reproduces only far outside the live distribution (max 1,536 entries). Should the registry ever host >10⁵-tick pools, revisit COW for that pool before cloning.
 3. DB read was taken read-only beside a live WAL; counts are point-in-time (2026-09-07) but the shape (p99 ≤ 22 ticks) has been stable across this epic's span.
 4. Rule leg-2 reasoning relies on structural write confinement (Streaming ↔ Resolved..Solved separation), which is the A+D hybrid's settled design (Q1/Q3), not a measurement — the measured `state_lock_wait` p99 ≤ 0.1 ms on 19.6 M events is the empirical bound available *above* it (i.e. before that confinement exists).
-5. The harness is deliberately throwaway (`stateview_feasibility_probe.rs`); it is uncommitted in this worktree and may be deleted after supervisor sign-off.
+5. The harness (`stateview_feasibility_probe.rs`) is committed and lint-exempted with a dated throwaway header; supervisor decision at 2UVG3E sign-off: KEEP it as the reusable budget-regression probe (deletion is no longer planned).

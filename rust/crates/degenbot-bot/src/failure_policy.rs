@@ -115,17 +115,8 @@ pub const fn default_action(severity: Severity) -> Action {
 )]
 pub fn bucket(kind: &str, reason: Option<&str>) -> (Severity, Scope) {
     match (kind, reason) {
-        // ---- solver-state tripwire (ADR-021 classes → ADR-040 buckets) ----
-        // Strict-gate defect classes (ADR-021 D2): divergent pool state -
-        // assume the worst until classified (Unclassified/None included).
-        // DeliveryLag + sim revert-pool-state stay Degraded (lag is
-        // report-only per ADR-021 Part B; a suspect revert needs tripwire
-        // corroboration before escalating to the tainted class).
-        (
-            "solver_state_desync",
-            Some("missed_log" | "unhandled_reorg" | "storage_mutated" | "unclassified") | None,
-        )
-        | ("verify_mismatch", _) => (Severity::Tainted, Scope::Pool),
+        // ---- upstream completeness (the ADR-021 remnant, task 2UVG3E) ----
+        ("verify_mismatch", _) => (Severity::Tainted, Scope::Pool),
         ("sim_failure", Some("revert_pool_state")) => (Severity::Degraded, Scope::Pool),
 
         // simulator reason split (ADR-040; the discriminator is
@@ -167,7 +158,6 @@ type OverrideMap = HashMap<String, Action>;
 static OVERRIDES: OnceLock<OverrideMap> = OnceLock::new();
 
 static KNOWN_KINDS: &[&str] = &[
-    "solver_state_desync",
     "ws_completeness",
     "sim_failure",
     "submit_failure",
@@ -178,11 +168,6 @@ static KNOWN_KINDS: &[&str] = &[
 ];
 
 static KNOWN_REASONS: &[(&str, &str)] = &[
-    ("solver_state_desync", "missed_log"),
-    ("solver_state_desync", "unhandled_reorg"),
-    ("solver_state_desync", "storage_mutated"),
-    ("solver_state_desync", "delivery_lag"),
-    ("solver_state_desync", "unclassified"),
     ("sim_failure", "pre_encode"),
     ("sim_failure", "revert_pool_state"),
     ("sim_failure", "revert_economics"),
@@ -326,7 +311,6 @@ mod tests {
         // every declared reason pair must resolve WITHOUT the fallback floor.
         use crate::telemetry::error_kind;
         let kinds = [
-            error_kind::SOLVER_STATE_DESYNC,
             error_kind::WS_COMPLETENESS,
             error_kind::SIM_FAILURE,
             error_kind::SUBMIT_FAILURE,
@@ -354,21 +338,6 @@ mod tests {
     /// ADR-040 decision-table spot checks (the load-bearing row semantics).
     #[test]
     fn matrix_rows_match_adr_040_table() {
-        // strict-gate desync classes quarantine their pool
-        for r in [
-            "missed_log",
-            "unhandled_reorg",
-            "storage_mutated",
-            "unclassified",
-        ] {
-            assert_eq!(action("solver_state_desync", Some(r)), Action::Quarantine);
-            assert_eq!(scope("solver_state_desync", Some(r)), Scope::Pool);
-        }
-        // delivery lag never trips (ADR-021 Part B, retained)
-        assert_eq!(
-            action("solver_state_desync", Some("delivery_lag")),
-            Action::Event
-        );
         // sim reasons
         assert_eq!(
             action("sim_failure", Some("pre_encode")),

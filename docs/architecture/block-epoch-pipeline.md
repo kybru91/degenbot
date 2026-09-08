@@ -135,7 +135,7 @@ The parallel accounting system is deleted, not wrapped (Q6: hard cutover):
 | 2 | `KWKEVV` ✅ | StateView spike — cheap-read for all families; Q3 gate closed | data plane |
 | 3 | `T6IYKY` | `Epoch` + `BlockContext`; delete the anchor soup (seam #5) | context for all stages |
 | 4 | `LXDY4C` | `EpochDelta` dirty tracking; delete `DirtySets` + subscriber classification (seam #2) under a capture-replay parity gate | Streaming → Resolved |
-| 5 | `2UVG3E` | StateView data plane: write confinement + engine lock off the solve path (seam #4); reposition the ADR-021 tripwire | Streaming ↔ Quiesced..Simulated; Published (`Verify`) |
+| 5 | `2UVG3E` | StateView data plane: write confinement + engine lock off the solve path (seam #4); reposition the ADR-021 tripwire | Streaming ↔ Quiesced..Simulated; Published (`Verify`) — **landed (cheap-read branch): `DEGENBOT_DETACHED_SOLVES` default ON (engine Mutex off the solve path); the in-process chain-vs-solver tripwire module deleted; `EpochDelta` placeholder unified onto the real ledger; lock inventory + p99 replay in the feasibility doc §5.1** |
 | 6 | `YM2FZR` | The `StageHandlers` trait + `NoopStubEngine` conformance harness (target shape of seam #1) | all (trait shape) |
 | 7 | `7NFYQW` | Unified stage machine: fold the six machines, `BlockPump` → thin driver, pinned tests ported verbatim; Q2's only sanctioned internal A/B gate lives here and must be deleted by task end | all |
 | 8 | `BF43PM` | Per-stage OTel spans + metrics carrying epoch attributes | observable across all |

@@ -105,8 +105,6 @@ pub mod instruments {
         /// no-op (ADR-040)
         pub fn set_quarantined_pools(&self, _count: usize) {}
         /// no-op (ADR-040)
-        pub fn count_quarantine_event(&self, _cause: &str, _scope: &str) {}
-        /// no-op (ADR-040)
         pub fn count_sim_error_reason(&self, _reason: &str) {}
         /// no-op (FRKBGP)
         pub fn set_process_rss_bytes(&self, _bytes: u64) {}

@@ -18,12 +18,11 @@
 //! sites out of the decision loop. Until then, behavior is byte-identical to
 //! the inline instrumentation it replaces.
 //!
-//! Psst — naming: this seals the *block-pump* telemetry. The solver-state
-//! tripwire's config-gated probes (`solve_anchor_probe`, `staged_clock_probe`,
-//! `divergence_scan`) stay grouped in `solver_state_tripwire.rs` (behind the
-//! `judge` interface, packed by the pump into its `TripwireConfig`) and are
-//! not part of the pump's hot
-//! loop.
+//! Psst — naming: this seals the *block-pump* telemetry. The ADR-021
+//! solver-state tripwire retired with epic MROOY7 task 2UVG3E (its upstream
+//! RPC-disagreement check lives in `block_pump::assert_ws_block_complete`,
+//! driven by `CompletenessDecision::Verify`), and is not part of the pump's
+//! hot loop.
 
 use std::time::Duration;
 

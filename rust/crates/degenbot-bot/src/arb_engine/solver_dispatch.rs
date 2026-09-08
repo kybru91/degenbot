@@ -18,12 +18,14 @@ use super::{ArbitrageEngine, BlockMetadata, HashMap, HashSet};
 // distinguish "quiet but current" from "genuinely moved but only moderately
 // behind" (AV42C7 — the zero-tolerance retread was already REVERTED for the same
 // over-deferral). The accurate discriminator requires a fresh on-chain read, which
-// the ADR-021 tripwire (`solver_state_tripwire::judge`) already performs at
-// the publish point, diffing each hop at its OWN `update_block` anchor and
-// `std::process::abort`ing on the first real desync before simulation. That
-// tripwire — not an age heuristic — is the sole chain/solver-mismatch guard; on a
-// genuine stale/desync pool it fails HARD and LOUDLY, which is the preferred
-// behavior (develop on loud failures).
+// the ADR-021 publish-edge verifier used to perform at
+// publish (per-hop anchor diff + process abort). Task 2UVG3E (epic MROOY7)
+// retired that in-process chain-vs-solver-state gate — the stage-separated
+// data plane makes its desync class unrepresentable — and keeps ONLY the
+// upstream RPC-disagreement verification (CompletenessDecision::Verify →
+// assert_ws_block_complete) at the Published edge. No age heuristic replaced
+// it: solve-on-quiet is correct by construction under the stage-separated
+// data plane; stale results are dropped by the Q1a merge gate, never applied.
 
 use crate::arb_engine::inline_sim::{PendingSim, SimPoll, SimulatedPathResult};
 use crate::bot_core::resolve::resolve_hops;
@@ -194,12 +196,32 @@ pub(crate) static STREAMING_DELIVERY_ENABLED: std::sync::atomic::AtomicBool =
 pub(crate) static SOLVE_EXECUTOR_TOKIO: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Epic SRQEK5 (WV62TX): `DEGENBOT_DETACHED_SOLVES` — the detached solve
-/// cycle (enqueue-and-return + sidecar merge). Default OFF until the T3 soak
-/// flips the streaming/detached pair (construction-time stance like the
-/// executor field — never read at call time).
+/// `DEGENBOT_DETACHED_SOLVES` — the detached solve cycle (enqueue-and-return
+/// with sidecar merge). Default ON since task 2UVG3E (epic MROOY7, stage-table
+/// seam #4): the DRIVEN solve path takes NO engine-level Mutex — the
+/// `EngineHandle` hold collapses to enqueue end (µs) and each result merges on
+/// the sidecar under its own short per-item acquisition (the Q1a stale
+/// policy makes that safe). Opt OUT with `DEGENBOT_DETACHED_SOLVES=0` (the
+/// in-cycle arm reappears, engine Mutex held through the fan-out). The
+/// in-flight cap remains the safety valve when the merge sidecar lags
+/// (construction-time stance like the executor field — never read at call time).
 pub(crate) static DETACHED_SOLVES_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
+
+/// `DEGENBOT_DETACHED_SOLVES` parse (2UVG3E default flip): unset/empty/1/
+/// unknown values all route DETACHED (the shipped posture — the solve path
+/// takes no engine-level Mutex); only an explicit 0/false/off opts back into
+/// the in-cycle arm (engine Mutex through the fan-out). Pure so the unit
+/// tests can exercise it without env races.
+///
+/// NOTE the test-build override in `install_engine_env_stances`: the large
+/// in-cycle engine test suite assumes the SYNCHRONOUS in-cycle solve (it was
+/// written when this stance was default-off); detached tests opt in per-test
+/// via `set_detached_solving(true)` instead.
+#[must_use]
+fn detached_solves_stance_from_env(raw: Option<&str>) -> bool {
+    !matches!(raw.map(str::trim), Some("0" | "false" | "off"))
+}
 
 /// `DEGENBOT_SOLVE_EXECUTOR` parse: "tokio" routes the solve fan-out through
 /// the dedicated low-priority runtime; "rayon" (and the default/unset, plus
@@ -269,6 +291,20 @@ mod streaming_stance_tests {
     fn streaming_delivery_static_default_is_streaming() {
         assert!(super::STREAMING_DELIVERY_ENABLED.load(std::sync::atomic::Ordering::Relaxed,));
     }
+
+    /// 2UVG3E detached-solve default flip policy matrix: unset / empty / 1 /
+    /// unknown values route DETACHED (shipped posture); explicit 0/false/off
+    /// opt back into the in-cycle arm.
+    #[test]
+    fn detached_solves_stance_policy_matrix() {
+        assert!(super::detached_solves_stance_from_env(None));
+        assert!(super::detached_solves_stance_from_env(Some("")));
+        assert!(super::detached_solves_stance_from_env(Some("1")));
+        assert!(super::detached_solves_stance_from_env(Some(" spin ")));
+        assert!(!super::detached_solves_stance_from_env(Some("0")));
+        assert!(!super::detached_solves_stance_from_env(Some(" false ")));
+        assert!(!super::detached_solves_stance_from_env(Some("off")));
+    }
 }
 
 /// Degenerate-path capture config parse (M6776W) — the owner side of the
@@ -310,7 +346,17 @@ pub fn install_engine_env_stances() {
         std::sync::atomic::Ordering::Relaxed,
     );
     DETACHED_SOLVES_ENABLED.store(
-        std::env::var("DEGENBOT_DETACHED_SOLVES").as_deref() == Ok("1"),
+        if cfg!(test) {
+            // Test build: deterministic IN-CYCLE default. The large engine test
+            // suite assumes the synchronous in-cycle solve; the detached-cycle
+            // tests opt in explicitly via set_detached_solving(true). Env=1
+            // still opts in for cadence tests that pin the env contract.
+            std::env::var("DEGENBOT_DETACHED_SOLVES").as_deref() == Ok("1")
+        } else {
+            detached_solves_stance_from_env(
+                std::env::var("DEGENBOT_DETACHED_SOLVES").ok().as_deref(),
+            )
+        },
         std::sync::atomic::Ordering::Relaxed,
     );
     INLINE_SIM_ENABLED.store(
@@ -966,8 +1012,9 @@ pub(crate) struct SolveCycleShared {
 // liquidity event (V3 Mint/Burn, V4 ModifyLiquidity) advances the pool
 // clock AND re-solves the path, so any stamp mismatch at merge time means
 // the straggler's intake is stale and the result is DROPPED, never applied.
-// The ADR-021 solver-state publish tripwire stays the correctness backstop;
-// this gate is the fast filter in front of it.
+// This gate is now the SOLE staleness guard on the solve path (the ADR-021
+// in-process solver-state tripwire retired with task 2UVG3E; only the
+// upstream RPC-disagreement check survives at the Published edge).
 
 /// Design-locked in-flight cap (~8): more than this many un-merged detached
 /// results outstanding degrades the issuing cycle to the pre-epic in-cycle
@@ -1253,12 +1300,9 @@ impl ArbitrageEngine {
             worker_clamp_twins,
             payload,
         );
-        // ADR-021 publish-verifier scoping (epic SRQEK5 T2): a straggler that
-        // lands AFTER a publish consumed its cycle's change set must still be
-        // covered by the NEXT publish's verifier diff — re-add it here, so a
-        // late merge can never bypass the solver-state audit. Q1a-DROPPED
-        // stragglers reach this line never: nothing publishable was applied.
-        self.last_solved_path_ids.insert(pid);
+        // ADR-021 publish-verifier scoping retired (task 2UVG3E): the
+        // solver-state verifier (and its publish change set) is gone — merges
+        // apply the Q1a stale policy only.
     }
 
     /// Hand the parked merge-pipe Receiver to the spawner (epic SRQEK5
@@ -1610,16 +1654,6 @@ impl ArbitrageEngine {
         // dropping their results.
         affected_path_ids.extend(&self.pending_new_paths);
         self.pending_new_paths.clear();
-
-        // ADR-021 change-set accumulation (pump-freeze fix): record every path
-        // re-solved this solve cycle so the solver-state verifier can scope its
-        // per-block on-chain diff to ONLY the paths actually solved (consumed
-        // + cleared at the publish point via `take_solver_path_pool_refs_change_set`)
-        // instead of the whole registered set — the verified root of the
-        // confirmed O(registered × hops × RPC) pump freeze. Union/accumulate
-        // (not overwrite) so a multi-solve-before-publish batch is fully
-        // covered rather than only its final solve.
-        self.last_solved_path_ids.extend(&affected_path_ids);
 
         // Solve-block anchor (rule owner + history: `crate::bot_core::solve_anchor`):
         // the batch's `solve_block` (= `results_block`) is the block the pool
