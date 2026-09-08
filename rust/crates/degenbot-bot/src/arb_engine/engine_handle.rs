@@ -157,7 +157,7 @@ impl Engine for EngineHandle {
         // P5FEOI (epic 2LXPPV): the drain-path solve is one Jaeger node
         // (OTel tier-1). Entered for the whole lock-hold so sim/dispatch/
         // monitor spans fired inside inherit it, and it parents under
-        // `degenbot.pump.block` when pump-driven (MQUKB6). Inert without
+        // `degenbot.epoch` when pump-driven (MQUKB6/BF43PM). Inert without
         // a subscriber; lock-hold invariant untouched.
         //
         // T0 no-op gating: most per-block solves find nothing dirty (a ~2µs
@@ -170,7 +170,7 @@ impl Engine for EngineHandle {
         // log burst applied by the pump thread between them landed in
         // dirty_sets after the probe — the solve then did REAL work (1518
         // affected paths) through the no-span branch and its phase spans
-        // orphaned into the drainer's pump.block context. That also dropped
+        // orphaned into the drainer’s epoch-root context. That also dropped
         // the solve_duration histogram sample + solves_executed count. The
         // gate and the work now share ONE mutex acquisition — dirt marking
         // requires the same mutex, so probe and take cannot disagree. The

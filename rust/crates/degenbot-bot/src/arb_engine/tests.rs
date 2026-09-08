@@ -5213,7 +5213,7 @@ mod tests {
     /// two-acquisition gate let a concurrent dirty marker land BETWEEN the
     /// probe and the take - the solve then did real work (1518 affected
     /// paths) through the no-span branch, orphaning its phase spans under
-    /// `pump.block` and escaping the `solve_duration` histogram. The gate and
+    /// `degenbot.epoch` and escaping the `solve_duration` histogram. The gate and
     /// the work now share ONE mutex acquisition (dirt marking needs the same
     /// mutex, so probe and take cannot disagree). Invariant under test:
     /// every fanout span's parent is an arb.solve span (a fanout implies
@@ -5512,14 +5512,14 @@ mod tests {
     }
 
     /// ZZS6CG (trace hygiene): a solve span must parent to its OWN block's
-    /// published pump.block span - exact-match only. The stale
+    /// published epoch root span (`degenbot.epoch`) - exact-match only. The stale
     /// `DrainWork::Finalize` crossing a block boundary parked block N-1's
     /// `arb.solve` inside block N's trace in 19/20 of the recent traces
     /// analyzed (the drain/finalize arms inherited the dispatch-time loop
     /// context unconditionally). RED before `attach_published_parent_exact`
     /// existed. Two assertions:
     /// 1. exact hit - solve(100) with a published context for 100 parents to
-    ///    the published pump.block(100) span, not the ambient newer block;
+    ///    the published epoch(100) span, not the ambient newer block;
     /// 2. exact miss - solve with NO published context keeps its ambient
     ///    parent (no fallback onto an unrelated older block, no orphan).
     #[cfg(feature = "otel")]
@@ -5548,18 +5548,18 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             // Published context for block 100 (a completed earlier settle).
             {
-                let block100 = tracing::info_span!("degenbot.pump.block", block.number = 100u64);
+                let block100 = tracing::info_span!("degenbot.epoch", block.number = 100u64);
                 let _guard = block100.enter();
                 crate::telemetry::publish_block_context(100);
             }
 
             // The newer block's loop context is ambient during both solves
             // (the stale-crossing shape: block 101's context is current).
-            let ambient = tracing::info_span!("degenbot.pump.block", block.number = 101u64);
+            let ambient = tracing::info_span!("degenbot.epoch", block.number = 101u64);
             let _ambient_guard = ambient.enter();
 
             // (1) Exact hit: solve of the PUBLISHED block 100 re-attaches to
-            // the published pump.block(100) span, not the ambient 101 span.
+            // the published epoch(100) span, not the ambient 101 span.
             let h100 = Arc::clone(&handles[0]);
             h100.solve_dirty(&oracle.to_affected_keys(), 100, &BlockMetadata::default());
 
@@ -5584,8 +5584,8 @@ mod tests {
                 }).map_or_else(|| panic!("{name} for block {blk} must be exported"), |sp| sp.span_context.span_id())
         };
 
-        let published_100 = span_for_block(100, "degenbot.pump.block");
-        let ambient_101 = span_for_block(101, "degenbot.pump.block");
+        let published_100 = span_for_block(100, "degenbot.epoch");
+        let ambient_101 = span_for_block(101, "degenbot.epoch");
         let solve_100 = span_for_block(100, "degenbot.arb.solve");
         let solve_101 = span_for_block(101, "degenbot.arb.solve");
 

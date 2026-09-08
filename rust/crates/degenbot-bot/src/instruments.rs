@@ -165,6 +165,14 @@ pub struct PipelineInstruments {
     /// ADR-040: per-error-reason tally for error-outcome simulations. The
     /// `reason` label is the closed `telemetry::error_reason` set.
     sim_error_reasons: Counter<u64>,
+    /// Epic MROOY7 (BF43PM): first relevant log → publish per quiesce cycle
+    /// (the publish-cycle duration for the Final-integration A/B).
+    publish_cycle: Histogram<f64>,
+    /// Epic MROOY7 (BF43PM): Rewind frequency (one per `EnterReorg` — the
+    /// stage-table Rewind row; pairs with `reorg_windows` above).
+    rewind_total: Counter<u64>,
+    /// Epic MROOY7 (BF43PM): Rewind open → close duration.
+    rewind_duration: Histogram<f64>,
     /// ADR-040: pools currently quarantine-excluded from solve resolution.
     /// Maintained by `BotState::quarantine_pool`/`release_pool`.
     ///
@@ -432,6 +440,26 @@ impl PipelineInstruments {
                 .with_unit("s")
                 .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
                 .with_description("Time a guard was held after acquisition (per site, mode)")
+                .build(),
+            publish_cycle: meter
+                .f64_histogram("degenbot.stage.publish_cycle")
+                .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
+                .with_description(
+                    "First relevant log to publish, per quiesce cycle (publish-cycle duration)",
+                )
+                .build(),
+            rewind_total: meter
+                .u64_counter("degenbot.stage.rewind")
+                .with_description(
+                    "Rewind episodes entered (EnterReorg; the stage-table Rewind row)",
+                )
+                .build(),
+            rewind_duration: meter
+                .f64_histogram("degenbot.stage.rewind_duration")
+                .with_unit("s")
+                .with_boundaries(LATENCY_BUCKETS_SECONDS.to_vec())
+                .with_description("Rewind (reorg unwind window) open to close duration")
                 .build(),
             sim_error_reasons: meter
                 .u64_counter("degenbot.sim.error_reason")
@@ -726,6 +754,22 @@ impl PipelineInstruments {
                 KeyValue::new("mode", mode.to_owned()),
             ],
         );
+    }
+
+    /// Epic MROOY7 (BF43PM): one publish-cycle duration (first relevant log
+    /// → publish).
+    pub fn observe_publish_cycle(&self, secs: f64) {
+        self.publish_cycle.record(secs, &[]);
+    }
+
+    /// Epic MROOY7 (BF43PM): one Rewind entered (`EnterReorg`).
+    pub fn count_rewind(&self) {
+        self.rewind_total.add(1, &[]);
+    }
+
+    /// Epic MROOY7 (BF43PM): one Rewind open→close duration.
+    pub fn observe_rewind_duration(&self, secs: f64) {
+        self.rewind_duration.record(secs, &[]);
     }
 
     /// ADR-040: one error-outcome sim tallied by its closed reason.

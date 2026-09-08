@@ -522,7 +522,8 @@ impl LogDispatcher {
         }
         // Telemetry: raw-event arrival (field exprs evaluate lazily — zero
         // cost unless RUST_LOG enables debug for this target). Attaches to the
-        // per-log dispatch span, which parents under `degenbot.pump.block`.
+        // per-log dispatch span, which parents under `degenbot.epoch` (the
+        // per-epoch root, BF43PM).
         tracing::debug!(
             target: "degenbot::dispatch",
             block = log.block_number,

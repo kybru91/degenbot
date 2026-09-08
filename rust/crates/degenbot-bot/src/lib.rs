@@ -108,6 +108,12 @@ pub mod instruments {
         pub fn count_sim_error_reason(&self, _reason: &str) {}
         /// no-op (FRKBGP)
         pub fn set_process_rss_bytes(&self, _bytes: u64) {}
+        /// no-op (MROOY7 BF43PM)
+        pub fn observe_publish_cycle(&self, _secs: f64) {}
+        /// no-op (MROOY7 BF43PM)
+        pub fn count_rewind(&self) {}
+        /// no-op (MROOY7 BF43PM)
+        pub fn observe_rewind_duration(&self, _secs: f64) {}
         /// no-op
         pub fn set_drain_queue_depth(&self, _depth: u64) {}
         /// no-op
