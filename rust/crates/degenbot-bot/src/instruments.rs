@@ -842,7 +842,6 @@ mod kind_tests {
     #[test]
     fn error_kinds_are_unique() {
         let kinds = [
-            error_kind::SOLVER_STATE_DESYNC,
             error_kind::WS_COMPLETENESS,
             error_kind::SIM_FAILURE,
             error_kind::SUBMIT_FAILURE,

@@ -5534,6 +5534,7 @@ mod tests {
         let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
+        let mut oracle = crate::arb_engine::tests::test_keys::DirtyKeys::new();
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
@@ -5629,15 +5630,16 @@ mod tests {
         let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
+        let mut oracle = crate::arb_engine::tests::test_keys::DirtyKeys::new();
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
         oracle.insert(0x0BAD_F00D, HopType::V2);
         let engine_arc = Arc::clone(&engine);
         let handle = EngineStages::new(engine);
         tracing::subscriber::with_default(subscriber, || {
             handle.solve_dirty(
+                &oracle.to_affected_keys(),
                 MY_SOLVE_BLOCK,
                 &BlockMetadata::default(),
-                &oracle.to_affected_keys(),
             );
         });
 
@@ -5680,14 +5682,15 @@ mod tests {
 
         // T0 no-op gating: the span fires only when the engine holds dirty
         // paths — mark one so this test still exercises the emitted-span path.
+        let mut oracle = crate::arb_engine::tests::test_keys::DirtyKeys::new();
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
         oracle.insert(0x0BAD_F00D, HopType::V2);
         let handle = EngineStages::new(engine);
         tracing::subscriber::with_default(subscriber, || {
             handle.solve_dirty(
+                &oracle.to_affected_keys(),
                 MY_SOLVE_BLOCK,
                 &BlockMetadata::default(),
-                &oracle.to_affected_keys(),
             );
         });
 
@@ -5736,14 +5739,15 @@ mod tests {
         let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
+        let mut oracle = crate::arb_engine::tests::test_keys::DirtyKeys::new();
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
         oracle.insert(0x0BAD_F00D, HopType::V2);
         let handle = EngineStages::new(engine);
         tracing::subscriber::with_default(subscriber, || {
             handle.solve_dirty(
+                &oracle.to_affected_keys(),
                 0x0BAD_F00D,
                 &BlockMetadata::default(),
-                &oracle.to_affected_keys(),
             );
         });
 
@@ -5862,6 +5866,7 @@ mod tests {
         let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
+        let mut oracle = crate::arb_engine::tests::test_keys::DirtyKeys::new();
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
         oracle.insert(0x0BAD_F00D, HopType::V2);
         // Gate ON: only a configured max_age justifies the core write.
@@ -5869,9 +5874,9 @@ mod tests {
         let handle = EngineStages::new(engine);
         tracing::subscriber::with_default(subscriber, || {
             handle.solve_dirty(
+                &oracle.to_affected_keys(),
                 0x0BAD_F00D,
                 &BlockMetadata::default(),
-                &oracle.to_affected_keys(),
             );
         });
 
@@ -5937,7 +5942,7 @@ mod tests {
 
         let handle = EngineStages::new(Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new())));
         tracing::subscriber::with_default(subscriber, || {
-            handle.solve_dirty(1, &BlockMetadata::default(), &[]);
+            handle.solve_dirty(&[], 1, &BlockMetadata::default());
         });
 
         provider.force_flush().expect("flush");

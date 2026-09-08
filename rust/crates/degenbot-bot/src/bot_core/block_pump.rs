@@ -99,14 +99,6 @@ const BACKFILL_TIMEOUT_SECS: u64 = 60;
 /// deadline even under dense log pressure) and runs the same
 /// `handle_timeout_eager` catch-up the no-activity path uses.
 const HEADER_STALENESS_SECS: u64 = 30;
-/// SONJQA: the `pump.log_wait` waterfall child is force-closed (with an
-/// explicit stall warning) once it ages past this horizon - the observed
-/// failure shape (trace a1ad51bd, block 25913381) was a 12.7s all-quiet
-/// header gap leaving `log_wait` open until the NEXT header while its parent
-/// `pump.block` span exported at arm-exit (319us), corrupting the waterfall.
-/// Degenerate relative to the 30s staleness watchdog, a fresh 5s bound keeps
-/// children within a healthy block cadence.
-const LOG_WAIT_MAX_AGE_SECS: u64 = 5;
 
 /// Default window (seconds) for the logs-subscription liveness watchdog: if
 /// headers keep flowing (`newHeads` fresh) but the pump has received NO log
@@ -213,11 +205,12 @@ pub struct BlockPump {
     /// `HEADER_STALENESS_SECS`). Overridable in tests via
     /// `set_header_staleness_for_test`.
     header_staleness: Duration,
-    /// SONJQA: max age of the `pump.log_wait` waterfall child before the pump
-    /// force-closes it (with a stall warning). Default 5s; the tick
+    /// SONJQA: max age of a held stage-span interval before the pump
+    /// force-closes it (with a stall warning) — the G3 stall lesson, see
+    /// `STAGE_MAX_AGE_SECS` / `stage_telemetry`. Default 5s; the tick
     /// granularity is the 500ms timed-exit interval. Tests may set the field
     /// directly (`pump_for_test` construction + assignment) - no env race.
-    log_wait_max_age: Duration,
+    stage_max_age: Duration,
     /// If no log arrives within this window WHILE headers stay fresh, the
     /// `eth_subscribe "logs"` subscription is presumed dead/stalled and the
     /// logs-silence watchdog emits a `[pump] logs subscription silent`
@@ -325,7 +318,7 @@ impl BlockPump {
             provider: Arc::new(provider),
             shutdown,
             header_staleness: Duration::from_secs(HEADER_STALENESS_SECS),
-            log_wait_max_age: Duration::from_secs(LOG_WAIT_MAX_AGE_SECS),
+            stage_max_age: Duration::from_secs(super::stage_telemetry::STAGE_MAX_AGE_SECS),
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
             header_ms: std::sync::atomic::AtomicU64::new(0),
@@ -699,7 +692,7 @@ impl BlockPump {
     // MQUKB6-T0: the former `#[tracing::instrument]` here was a root span that
     // stayed open for the whole bot run. OTel only exports CLOSED spans, so the
     // root never reached Jaeger while every pump-task span referenced it as a
-    // missing parent — one giant orphaned trace. Per-block `degenbot.pump.block`
+    // missing parent — one giant orphaned trace. Per-epoch `degenbot.epoch`
     // spans (below) are the trace roots now.
     pub async fn run_with_stream(
         &mut self,
@@ -927,7 +920,7 @@ impl BlockPump {
 
         // Pre-solve gap decomposition (GC? tracking epilogue to the pump/`
         // solve-gap investigation): per-block marks so the gap between the
-        // `degenbot.pump.block` span start (header accepted) and the solve
+        // `degenbot.epoch` span start (header accepted) and the solve
         // dispatch decomposes into WS delivery (header → first relevant
         // log), burst jitter (first → last log), and the settle wait (last
         // log → settle decision). Reset on every accepted header; recorded
@@ -956,21 +949,17 @@ impl BlockPump {
         let mut reorg_span: Option<tracing::Span> = None;
         let mut reorg_pools_restored: u64 = 0;
         let mut reorg_idempotent_noops: u64 = 0;
-        // Pre-solve gap waterfall spans (Jaeger): `log_wait` fills the
-        // header→first-relevant-log stretch (WS delivery), `apply_stream`
-        // fills first-log→settle (burst + applies + quiesce hold). Both are
-        // created/dropped at their actual boundaries so the Jaeger waterfall
-        // shows WHAT happens between `degenbot.pump.block` and
-        // `degenbot.arb.solve` instead of an empty stretch.
-        let mut log_wait_span: Option<tracing::Span> = None;
-        // SONJQA: creation instant of the stored log_wait child, so the 500ms
-        // timed-exit tick can force-close it past the max age.
-        let mut log_wait_created_at: Option<std::time::Instant> = None;
-        let mut apply_span: Option<tracing::Span> = None;
+        // BF43PM (epic MROOY7): the per-stage waterfall seam. The legacy
+        // `pump.log_wait` / `pump.apply_stream` children are replaced by the
+        // machine's stage cycle rendered as `degenbot.stage.*` spans under
+        // the per-epoch root, and the SONJQA force-close law carries over
+        // (`force_close_aged` from the timed-exit tick below).
+        let mut stage_tel = super::stage_telemetry::StageTelemetry::new();
         // REMED1 T3: per-block phase attribution - the apply-stream start
-        // (first relevant log) vs the settle point, recorded on the block
-        // span + the throttled diag line so slow-block serialization between
-        // the WS log wait and the solve is visible from the console.
+        // (first relevant log) vs the settle point, recorded on the throttled
+        // diag line so slow-block serialization between the WS log wait and
+        // the solve is visible from the console. (The apply-stream span
+        // itself was folded into the stage waterfall's streaming interval.)
         let mut apply_started_at: Option<std::time::Instant> = None;
         loop {
             // Span lifecycle (TQ7PD6 fix): an enter guard must never outlive a
@@ -1029,27 +1018,16 @@ impl BlockPump {
                         tracing::info!("timed exit: shutdown signaled — unwinding pump loop");
                         break;
                     }
-                    // SONJQA: force-close a stale log_wait child. Its parent
-                    // pump.block span exports when the header arm's ENTERED
-                    // scope exits (TQ7PD6 entry-refcount law) - microseconds
-                    // after header acceptance on an all-quiet block - so a
-                    // log_wait dangling until the next header extends a
-                    // waterfall child far past a closed parent (trace
-                    // a1ad51bd, block 25913381: 12.7s child on a 319us
-                    // parent). Bound the child with an explicit stall event.
-                    if let Some(created) = log_wait_created_at {
-                        let age = created.elapsed();
-                        if age > self.log_wait_max_age {
-                            if let Some(wait) = log_wait_span.take() {
-                                drop(wait);
-                            }
-                            tracing::warn!(
-                                stall_secs = age.as_secs(),
-                                "[pump] log_wait expired without logs; waterfall child force-closed"
-                            );
-                            log_wait_created_at = None;
-                        }
-                    }
+                    // SONJQA (G3, preserved — BF43PM): force-close a stale
+                    // held stage interval. The epoch root exports when the
+                    // header arm's ENTERED scope exits (TQ7PD6 entry-refcount
+                    // law) - microseconds after header acceptance on an
+                    // all-quiet block - so an open stage span dangling until
+                    // the next transition would extend a waterfall child far
+                    // past a closed parent (trace a1ad51bd, block 25913381:
+                    // 12.7s child on a 319us parent). Bound the child with an
+                    // explicit stall event.
+                    stage_tel.force_close_aged(self.stage_max_age);
                     // Flag not yet raised: re-park. `continue` keeps both arm
                     // paths diverging so the arm types coerce to the event
                     // arm's `Option<WsEvent>`.
@@ -1175,28 +1153,17 @@ impl BlockPump {
                                         }
                                     }
                                 }
-                                // Waterfall bookkeeping: the settle closes the
-                                // apply-stream child (its duration carries the
-                                // burst + applies + quiesce hold); the solve
-                                // spans that follow sit beside it, parented to
-                                // the same pump.block.
-                                if let Some(ap) = apply_span.take() {
-                                    ap.record("logs.n", pregap.logs);
-                                    drop(ap);
-                                    // REMED1 T3: attribute the apply-stream
-                                    // wall (log arrival + applies + quiesce)
-                                    // on the block span next to the pregap
-                                    // fields; the slow-block scan showed this
-                                    // phase is the larger half of p95 blocks.
-                                    if let Some(span_ref) = block_span.as_ref() {
-                                        if let Some(apply_start) = apply_started_at {
-                                            span_ref.record(
-                                                "apply_stream_us",
-                                                apply_start.elapsed().as_micros() as u64,
-                                            );
-                                        }
-                                    }
-                                }
+                                // BF43PM: the publish stage span (parented to
+                                // this epoch's root) carries the from/to/
+                                // queue-age attrs; the publish-cycle histogram
+                                // (first relevant log → publish, per quiesce
+                                // cycle) is recorded with it. The solve spans
+                                // that follow sit beside it under the same
+                                // epoch root.
+                                stage_tel.on_publish(
+                                    block_span.as_ref().unwrap_or(&tracing::Span::none()),
+                                    Epoch::with_generation(open, fsm.rewind_seq()),
+                                );
                                 // REMED1 T3: throttled per-block phase
                                 // attribution on the console (every 20th block
                                 // - the Jaeger span carries all blocks).
@@ -1252,11 +1219,17 @@ impl BlockPump {
                     gas_used,
                     gas_limit,
                 })) => {
-                    // MQUKB6 (epic KDUED5): the per-block beat — one entered
-                    // span per observed header. Future solver/submission spans
-                    // fired within this arm inherit it as parent for free.
+                    // MQUKB6 (epic KDUED5) + BF43PM (epic MROOY7): the
+                    // per-epoch beat — one entered root span per observed
+                    // header, carrying the EPOCH context (block + rewind
+                    // generation) every span in the epoch waterfall answers
+                    // to. Future solver/submission/stage spans fired within
+                    // this arm nest under it for free.
+                    let epoch_seq = fsm.rewind_seq();
                     let new_block_span = tracing::info_span!(
-                        "degenbot.pump.block",
+                        "degenbot.epoch",
+                        epoch.block = number,
+                        epoch.seq = epoch_seq,
                         block.number = number,
                         // pre-solve gap decomposition, recorded at the settle
                         // point (declared Empty so `record` at settle actually
@@ -1295,17 +1268,10 @@ impl BlockPump {
                     // PWPPAZ T2: new block window — re-arm the early slice.
                     slice_first_dirty = None;
                     slice_done = false;
-                    // Waterfall bookkeeping: close any leftover child spans
-                    // (an all-quiet prior block never reached a settle) and
-                    // open the delivery-wait child. its duration IS the
-                    // header→first-log latency in the waterfall.
-                    apply_span = None;
-                    log_wait_span = Some(tracing::info_span!(
-                        parent: new_block_span.clone(),
-                        "degenbot.pump.log_wait",
-                        block.number = number,
-                    ));
-                    log_wait_created_at = Some(std::time::Instant::now());
+                    // BF43PM: a new epoch root — close any held stage interval
+                    // from the prior epoch (an all-quiet prior block never
+                    // reached a settle) so nothing dangles into the new one.
+                    stage_tel.new_epoch();
                     // Sync-only header-processing scope (TQ7PD6): this enter
                     // guard dies before the first await below, so it can never
                     // leak across a task migration. The backfill future below
@@ -1444,22 +1410,18 @@ impl BlockPump {
                         pregap.last_log = Some(now);
                         pregap.logs += 1;
                     }
-                    // Waterfall bookkeeping: the delivery wait is over; open
-                    // the apply-stream child (it runs until the settle point
-                    // and carries the burst + applies + quiesce hold).
-                    if let Some(wait) = log_wait_span.take() {
-                        drop(wait);
-                        log_wait_created_at = None;
-                    }
-                    if apply_span.is_none() {
+                    // BF43PM: the Streaming stage interval opens at the first
+                    // relevant log of the epoch (idempotent within the epoch —
+                    // the burst's remaining logs only bump its age); it runs
+                    // until the quiesce/tombstone/rewind transition. REMED1 T3
+                    // keeps the apply-start anchor for the throttled diag line.
+                    if apply_started_at.is_none() {
                         apply_started_at = Some(std::time::Instant::now());
-                        apply_span = Some(tracing::info_span!(
-                            parent:
-                                block_span.clone().unwrap_or_else(tracing::Span::none),
-                            "degenbot.pump.apply_stream",
-                            block.number = log_block,
-                        ));
                     }
+                    stage_tel.on_first_log(
+                        block_span.as_ref().unwrap_or(&tracing::Span::none()),
+                        Epoch::with_generation(log_block, fsm.rewind_seq()),
+                    );
                     // BQ7ZBC — FSM single-writer recovery discard. After an
                     // authoritative eth_getLogs catch-up (`fsm.recovery_anchor`), a
                     // stalled WS that recovers flushes buffered forward logs for
@@ -1517,6 +1479,9 @@ impl BlockPump {
                     // for N+1), a reorg signal, or an unreliable-WS late
                     // forward (→ shutdown), and returns the verdict for the
                     // driver to execute the I/O.
+                    // BF43PM: the stage row BEFORE this log's transition —
+                    // the `stage.from` side of the transition attrs below.
+                    let prev_stage = fsm.stage();
                     let log_decision = fsm.on_log(log_block, log.removed);
                     // The reorg classification may have just bumped the
                     // rewind generation (I2). SZJUKL: the dissolved FIFO's
@@ -1556,6 +1521,13 @@ impl BlockPump {
                             // silent — the prior success path logged nothing,
                             // making a duplicate block log ambiguous (reorg
                             // vs. WS duplication).
+                            // BF43PM: the Rewind stage opens (from ANY row —
+                            // I6), counted for the A/B Rewind-frequency series.
+                            stage_tel.on_enter_reorg(
+                                block_span.as_ref().unwrap_or(&tracing::Span::none()),
+                                Epoch::with_generation(log_block, fsm.rewind_seq()),
+                                prev_stage,
+                            );
                             tracing::warn!(
                                 reorg_block,
                                 "BlockPump: chain reorg detected (removed log) — entering unwind path"
@@ -1684,6 +1656,13 @@ impl BlockPump {
                             if let Some(bs) = block_span.as_ref() {
                                 bs.record("reorg.closed", new_head);
                             }
+                            // BF43PM: the Rewind interval closes (its duration
+                            // histogram records) and the fresh epoch's cycle
+                            // restarts at Streaming.
+                            stage_tel.on_close_reorg(
+                                block_span.as_ref().unwrap_or(&tracing::Span::none()),
+                                Epoch::with_generation(new_head, fsm.rewind_seq()),
+                            );
                             reorg_pools_restored = 0;
                             reorg_idempotent_noops = 0;
                             // Fall through to dispatch this forward log (the FSM
@@ -1746,6 +1725,13 @@ impl BlockPump {
                                 .block_metadata_for(prev)
                                 .unwrap_or(fsm.current_metadata());
                             let _ctx = block_span.as_ref().map(tracing::Span::enter);
+                            // BF43PM: the tombstone is the Finalize row of the
+                            // EPOCH `prev` (the machine's coordinate, stamped
+                            // with the current rewind generation).
+                            stage_tel.on_tombstone(
+                                block_span.as_ref().unwrap_or(&tracing::Span::none()),
+                                Epoch::with_generation(prev, fsm.rewind_seq()),
+                            );
                             self.drive_finalize(
                                 &fsm,
                                 fsm.context_for(prev, prev_meta),
@@ -1794,6 +1780,14 @@ impl BlockPump {
                     let _block_ctx = block_span.as_ref().map(tracing::Span::enter);
                     self.bot.dispatch_log(&log);
                     fsm.on_log_applied(log_block);
+                    // BF43PM: the apply completed — the epoch's Streaming
+                    // interval closes and the Quiesced (StreamingComplete)
+                    // point span fires with the burst's log count.
+                    stage_tel.on_quiesced(
+                        block_span.as_ref().unwrap_or(&tracing::Span::none()),
+                        Epoch::with_generation(log_block, fsm.rewind_seq()),
+                        pregap.logs,
+                    );
                     telemetry.note_apply();
 
                     // LEZJAS: engine owns `has_logs_this_block` now — routed
@@ -1818,6 +1812,13 @@ impl BlockPump {
                         match decision {
                             StageDecision::Publish { open, metadata } => {
                                 let _ctx = block_span.as_ref().map(tracing::Span::enter);
+                                // BF43PM: the final settle's publish carries
+                                // the same publish stage span as the timed
+                                // settle path.
+                                stage_tel.on_publish(
+                                    block_span.as_ref().unwrap_or(&tracing::Span::none()),
+                                    Epoch::with_generation(open, fsm.rewind_seq()),
+                                );
                                 self.drive_publish(
                                     &fsm,
                                     fsm.context_for(open, metadata),
@@ -2479,7 +2480,7 @@ impl BlockPump {
             provider,
             shutdown,
             header_staleness: Duration::from_secs(HEADER_STALENESS_SECS),
-            log_wait_max_age: Duration::from_secs(LOG_WAIT_MAX_AGE_SECS),
+            stage_max_age: Duration::from_secs(super::stage_telemetry::STAGE_MAX_AGE_SECS),
             log_silence: Duration::from_secs(LOG_SILENCE_SECS),
             log_silence_alarms: 0,
             header_ms: std::sync::atomic::AtomicU64::new(0),
@@ -3787,10 +3788,10 @@ mod tests {
             window_fields("reorg.idempotent_noops").as_deref(),
             Some("1")
         );
-        // Breadcrumbs on the interrupted block's pump.block span.
+        // Breadcrumbs on the interrupted block's epoch root span.
         let block_spans: Vec<u64> = spans
             .iter()
-            .filter(|(n, _, _)| n == "degenbot.pump.block")
+            .filter(|(n, _, _)| n == "degenbot.epoch")
             .map(|(_, id, _)| *id)
             .collect();
         assert!(!block_spans.is_empty());
@@ -6583,7 +6584,7 @@ mod tests {
         }
     }
 
-    /// MQUKB6 (epic KDUED5): one entered `degenbot.pump.block` span per
+    /// MQUKB6 (epic KDUED5): one entered `degenbot.epoch` root span per
     /// observed header, carrying a `block.number` field, parented under the
     /// `run_with_stream` instrument span. In-memory exporter +
     /// `set_global_default` (the repo convention: the thread-local `set_default`
@@ -6647,9 +6648,9 @@ mod tests {
         let my_spans: Vec<_> = spans
             .iter()
             .filter(|sp| {
-                sp.name.as_ref() == "degenbot.pump.block"
+                sp.name.as_ref() == "degenbot.epoch"
                     && sp.attributes.iter().any(|kv| {
-                        kv.key == opentelemetry::Key::from_static_str("block.number")
+                        kv.key == opentelemetry::Key::from_static_str("epoch.block")
                             && (matches!(kv.value, opentelemetry::Value::I64(v) if v == MY_BLOCK_I64)
                                 || matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == MY_BLOCK.to_string().as_str()))
                     })
@@ -6663,6 +6664,17 @@ mod tests {
             spans.iter().map(|sp| sp.name.as_ref()).collect::<Vec<_>>()
         );
         let block_span = &my_spans[0];
+
+        // BF43PM: the epoch root carries the rewind generation (no reorg yet
+        // in this fixture — seq 0).
+        assert!(
+            block_span.attributes.iter().any(|kv| {
+                kv.key == opentelemetry::Key::from_static_str("epoch.seq")
+                    && matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == "0")
+            }),
+            "epoch root must carry epoch.seq; got {:?}",
+            block_span.attributes
+        );
 
         // MQUKB6-T0: the per-block span is now a trace ROOT — the former
         // `run_with_stream` instrument span was a never-closing root that OTel
@@ -6682,9 +6694,9 @@ mod tests {
         let next_spans: Vec<_> = spans
             .iter()
             .filter(|sp| {
-                sp.name.as_ref() == "degenbot.pump.block"
+                sp.name.as_ref() == "degenbot.epoch"
                     && sp.attributes.iter().any(|kv| {
-                        kv.key == opentelemetry::Key::from_static_str("block.number")
+                        kv.key == opentelemetry::Key::from_static_str("epoch.block")
                             && (matches!(kv.value, opentelemetry::Value::I64(v) if v == i64::try_from(NEXT_BLOCK).unwrap_or(i64::MAX))
                                 || matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == NEXT_BLOCK.to_string().as_str()))
                     })
@@ -6706,7 +6718,7 @@ mod tests {
     }
 
     /// TQ7PD6 regression: a header burst through the pump must CLOSE (export)
-    /// every per-block span, never leaking still-entered spans on worker
+    /// every per-epoch span, never leaking still-entered spans on worker
     /// threads (the pre-fix loop-wide `Span::enter()` guard lived across the
     /// select's await points; when the multi-threaded runtime migrated the task
     /// between workers, it entered on one thread and dropped on another, so the
@@ -6715,97 +6727,13 @@ mod tests {
     /// structural fix (no `enter` guard may outlive a poll); this test locks
     /// the observable symptom — all N spans closed — and exercises cross-await
     /// parking so CI load that DOES migrate the task surfaces the old leak.
-    /// SONJQA (trace a1ad51bd, block 25913381): the waterfall child spans
-    /// (`pump.log_wait`) must never dangle for their WHOLE quiet gap. The
-    /// parent `pump.block` span exports when the header arm's ENTERED scope
-    /// exits (TQ7PD6 entry-refcount law - observed 58us on this fixture,
-    /// 319us in production), while an un-entered child lives by handle until
-    /// first-log or next-header. An all-quiet 12.7s gap left a 12.7s child
-    /// against a 319us parent. The fix: the 500ms timed-exit tick force-
-    /// closes a `log_wait` past `log_wait_max_age` with an explicit stall
-    /// warning. Deterministic contract under test:
-    /// 1. `log_wait` parents under its block span (linkage intact),
-    /// 2. a `log_wait` quiet longer than the max age closes AT the tick
-    ///    boundary (bounded duration), not at the next header.
-    #[cfg(feature = "otel")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn log_wait_never_outlives_its_block_span() {
-        use crate::otel;
-        use opentelemetry_sdk::trace::InMemorySpanExporter;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        const BASE: u64 = 0xCAFE_0000;
-        const GAP_MS: u64 = 700; // quiet window between headers
-
-        let (mut pump, _sink) = pump_for_test(None);
-        // Short max age: the tick (500ms) must close stale log_waits mid-gap.
-        pump.log_wait_max_age = std::time::Duration::from_millis(100);
-        let exporter = InMemorySpanExporter::default();
-        let (provider, tracer) = otel::provider_with_exporter(exporter.clone());
-        let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
-        let _guard = tracing::subscriber::set_default(subscriber);
-
-        let events: Vec<WsEvent> = vec![
-            WsEvent::BlockHeader {
-                number: BASE,
-                timestamp: 1,
-                base_fee_per_gas: Some(1),
-                gas_used: 1,
-                gas_limit: 1,
-            },
-            WsEvent::BlockHeader {
-                number: BASE + 1,
-                timestamp: 1,
-                base_fee_per_gas: Some(1),
-                gas_used: 1,
-                gas_limit: 1,
-            },
-        ];
-        let combined = stream::iter(events)
-            .then(|e| async move {
-                tokio::time::sleep(std::time::Duration::from_millis(GAP_MS)).await;
-                e
-            })
-            .boxed();
-        pump.run_test_loop(combined, BASE - 1).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        provider.force_flush().expect("flush");
-        let spans = exporter.get_finished_spans().expect("spans");
-
-        let span_rec = |name: &'static str, blk: u64| {
-            spans
-                .iter()
-                .find(|sp| {
-                    sp.name.as_ref() == name
-                        && sp.attributes.iter().any(|kv| {
-                            kv.key == opentelemetry::Key::from_static_str("block.number")
-                                && matches!(kv.value, opentelemetry::Value::String(ref v) if v.as_str() == blk.to_string().as_str())
-                        })
-                })
-                .unwrap_or_else(|| panic!("{name}({blk}) must be exported; got {:?}", spans.iter().map(|sp| sp.name.as_ref()).collect::<Vec<_>>()))
-        };
-        let block = span_rec("degenbot.pump.block", BASE);
-        let wait = span_rec("degenbot.pump.log_wait", BASE);
-        let dur = |sp: &opentelemetry_sdk::trace::SpanData| {
-            sp.end_time
-                .duration_since(sp.start_time)
-                .unwrap_or_default()
-        };
-        assert_eq!(
-            wait.parent_span_id,
-            block.span_context.span_id(),
-            "log_wait must parent under its block span"
-        );
-        // With max_age=100ms and a 700ms quiet gap, the log_wait must close
-        // at a tick boundary (~100-600ms), NOT at the next header (700ms).
-        assert!(
-            dur(wait) <= std::time::Duration::from_millis(GAP_MS),
-            "stale log_wait must be force-closed at the expiry tick, not dangle \
-             until the next header; dur={:?}",
-            dur(wait)
-        );
-    }
-
+    ///
+    /// SONJQA/G3 note (BF43PM): the pump-level `log_wait` force-close test
+    /// was retired with the `pump.log_wait` waterfall — quiet headers now open
+    /// NO stage span at all. The force-close law it pinned lives on as the
+    /// `stage_telemetry::otel_tests::stale_stage_span_exports_force_closed`
+    /// pinned export test against `StageTelemetry::force_close_aged`, driven
+    /// from the timed-exit tick with the same `stage_max_age` bound.
     #[cfg(feature = "otel")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn header_burst_closes_every_block_span() {
@@ -6856,9 +6784,9 @@ mod tests {
 
         let mut seen = std::collections::HashSet::new();
         for sp in &spans {
-            if sp.name.as_ref() == "degenbot.pump.block" {
+            if sp.name.as_ref() == "degenbot.epoch" {
                 for kv in &sp.attributes {
-                    if kv.key == opentelemetry::Key::from_static_str("block.number") {
+                    if kv.key == opentelemetry::Key::from_static_str("epoch.block") {
                         if let opentelemetry::Value::String(ref v) = kv.value {
                             if let Ok(n) = v.as_str().parse::<u64>() {
                                 seen.insert(n);
@@ -6871,7 +6799,7 @@ mod tests {
         assert_eq!(
             seen.len(),
             usize::try_from(COUNT).unwrap_or(usize::MAX),
-            "every header must export a CLOSED pump.block span; got {}/{}",
+            "every header must export a CLOSED epoch span; got {}/{}",
             seen.len(),
             COUNT
         );
