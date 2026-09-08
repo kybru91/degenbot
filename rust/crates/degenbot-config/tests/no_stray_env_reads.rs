@@ -97,6 +97,15 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            // Skip build/package output trees (`target/` carries vendored
+            // crate copies that mirror crate sources and double-report) and
+            // agent worktrees (`.pi/` holds per-branch checkouts of this
+            // same repo, pre-cutover surfaces included).
+            let fname = entry.file_name();
+            let name = fname.to_str().unwrap_or("");
+            if name == "target" || name == ".pi" {
+                continue;
+            }
             collect_rs_files(&path, out);
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
             out.push(path);
