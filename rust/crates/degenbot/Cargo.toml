@@ -30,6 +30,7 @@ degenbot-math.workspace = true
 hashbrown.workspace = true
 degenbot-bot.workspace = true
 degenbot-core.workspace = true
+degenbot-ingestion.workspace = true
 degenbot-db.workspace = true
 degenbot-decoders.workspace = true
 degenbot-execution.workspace = true

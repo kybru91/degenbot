@@ -3769,7 +3769,13 @@ mod tests {
             gas_used: 15_000_000,
             gas_limit: 30_000_000,
         };
-        let notif = crate::arb_engine::BlockNotification::from_metadata(25_390_117, &metadata);
+        let notif = crate::arb_engine::BlockNotification {
+            number: 25_390_117,
+            timestamp: metadata.timestamp,
+            base_fee_per_gas: metadata.base_fee_per_gas,
+            gas_used: metadata.gas_used,
+            gas_limit: metadata.gas_limit,
+        };
         assert_eq!(notif.number, 25_390_117);
         assert_eq!(notif.timestamp, metadata.timestamp);
         assert_eq!(notif.base_fee_per_gas, metadata.base_fee_per_gas);

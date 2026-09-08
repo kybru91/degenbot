@@ -28,6 +28,10 @@ degenbot-core.workspace = true
 degenbot-db.workspace = true
 degenbot-decoders.workspace = true
 degenbot-rpc.workspace = true
+# MROOY7 5WTYYQ: the WS transport (subscriptions, topic filter, backfill
+# fetch, watchdog windows) lives in the pyo3-free degenbot-ingestion crate;
+# the runtime consumes its IngestEvent/PoolEvent stream + fetch handle.
+degenbot-ingestion.workspace = true
 degenbot-pools.workspace = true
 degenbot-solvers.workspace = true
 degenbot-executor.workspace = true

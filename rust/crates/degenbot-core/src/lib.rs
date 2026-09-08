@@ -19,6 +19,7 @@
 //! - [`eip_1559`] — EIP-1559 `next_base_fee` (next-block base fee).
 
 pub mod address_utils;
+pub mod block_clock_pipe;
 pub mod eip_1559;
 pub mod errors;
 pub mod hex_utils;

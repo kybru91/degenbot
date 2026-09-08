@@ -15,7 +15,6 @@ pub mod apply_telemetry;
 pub mod balance_vector_orchestration;
 pub mod balancer_stable_state;
 pub mod balancer_weighted_state;
-pub mod block_clock_pipe;
 pub mod block_pump;
 pub mod bot;
 pub mod cl_orchestration;
@@ -74,9 +73,16 @@ pub use balancer_stable_state::{
 pub use balancer_weighted_state::{
     BalancerWeightedPoolIdentity, BalancerWeightedPoolState, RegisterBalancerWeightedPoolParams,
 };
-pub use block_clock_pipe::BlockNotification;
+// MROOY7 5WTYYQ: the block-clock channel type is a shared-kernel fact type
+// (degenbot-core), not bot_runtime knowledge — the runtime’s engine merely
+// relays header ticks through it and the PyO3 layer subscribes at the edge.
+pub use degenbot_core::block_clock_pipe::{BlockClockPipe, BlockNotification};
+// (5WTYYQ) The subscription topic filter is transport knowledge now; the
+// dispatcher’s defensive re-check + the FSM’s relevance gate consume the same
+// list the ingestion crate filters with.
 pub use cl_orchestration::{InstallWordOutcome, RegisteredV4, StagedWordFetch};
 pub use curve_state::{CurvePoolIdentity, CurvePoolState, RegisterCurvePoolParams};
+pub use degenbot_ingestion::RELEVANT_TOPICS;
 use degenbot_math::curve::{CurveBasePoolPort, CurveSwapError};
 pub use divergence_probe::{TrackedSlotKind, TrackedSlotProbe};
 pub use epoch::{BlockContext, Epoch, StaleEpoch};

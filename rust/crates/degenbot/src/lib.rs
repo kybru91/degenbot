@@ -11,6 +11,10 @@ pub mod investigation;
 pub use degenbot_bot as bot;
 /// `BotState` state-owner surface, re-exported alongside [`crate::bot`].
 pub use degenbot_bot::bot_core;
+/// WS ingestion (subscriptions, topic filter, backfill fetch, watchdog
+/// windows) emitting `PoolEvent` into the runtime — the standalone-Rust
+/// consumer subscribes to its event stream without Python (MROOY7).
+pub use degenbot_ingestion as ingestion;
 /// traits (ADR-005 standalone-by-design pool value/trait layer).
 pub use degenbot_pools as pools;
 
