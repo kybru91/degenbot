@@ -708,7 +708,8 @@
                             "fixed": 5
                         },
                         "pointStrokeWidth": 1,
-                        "show": "points"
+                        "show": "points",
+                        "lineWidth": 1
                     }
                 },
                 "overrides": [
@@ -731,6 +732,157 @@
                 ]
             },
             "pluginVersion": "13.2.1"
+        },
+        {
+            "id": 67,
+            "type": "timeseries",
+            "title": "Log funnel per interval (applied / ignored / seen) \u2014 bars",
+            "description": "Stacked bars of per-scrape log counts; the XY panel beside it binds the same counts to block numbers.",
+            "datasource": {
+                "type": "prometheus",
+                "uid": "eea7hc2lizlz4d"
+            },
+            "gridPos": {
+                "h": 9,
+                "w": 12,
+                "x": 0,
+                "y": 27
+            },
+            "pluginVersion": "13.2.1",
+            "targets": [
+                {
+                    "refId": "A",
+                    "expr": "degenbot_epoch_logs_applied{instance=~\"$instance\"}",
+                    "legendFormat": "applied",
+                    "instant": false,
+                    "format": "time_series",
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "eea7hc2lizlz4d"
+                    }
+                },
+                {
+                    "refId": "B",
+                    "expr": "degenbot_epoch_logs_ignored{instance=~\"$instance\"}",
+                    "legendFormat": "ignored",
+                    "instant": false,
+                    "format": "time_series",
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "eea7hc2lizlz4d"
+                    }
+                },
+                {
+                    "refId": "C",
+                    "expr": "degenbot_epoch_logs_seen{instance=~\"$instance\"}",
+                    "legendFormat": "seen",
+                    "instant": false,
+                    "format": "time_series",
+                    "datasource": {
+                        "type": "prometheus",
+                        "uid": "eea7hc2lizlz4d"
+                    }
+                }
+            ],
+            "transformations": [],
+            "fieldConfig": {
+                "defaults": {
+                    "color": {
+                        "mode": "palette-classic"
+                    },
+                    "custom": {
+                        "drawStyle": "bars",
+                        "barAlignment": 0,
+                        "lineWidth": 1,
+                        "fillOpacity": 90,
+                        "showPoints": "never",
+                        "pointSize": 5,
+                        "gradientMode": "none",
+                        "stacking": {
+                            "mode": "normal",
+                            "group": "A"
+                        },
+                        "hideFrom": {
+                            "legend": false,
+                            "tooltip": false,
+                            "viz": false
+                        },
+                        "axisPlacement": "auto",
+                        "axisColorMode": "text",
+                        "axisLabel": "",
+                        "axisCenteredZero": false,
+                        "axisBorderShow": false,
+                        "scaleDistribution": {
+                            "type": "linear"
+                        },
+                        "thresholdsStyle": {
+                            "mode": "off"
+                        },
+                        "barsCenterWidth": 1.0
+                    },
+                    "unit": "short",
+                    "min": 0
+                },
+                "overrides": [
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "seen"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "blue",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "ignored"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "yellow",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        "matcher": {
+                            "id": "byName",
+                            "options": "applied"
+                        },
+                        "properties": [
+                            {
+                                "id": "color",
+                                "value": {
+                                    "fixedColor": "green",
+                                    "mode": "fixed"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+            "options": {
+                "legend": {
+                    "displayMode": "list",
+                    "placement": "bottom",
+                    "showLegend": true
+                },
+                "tooltip": {
+                    "mode": "multi",
+                    "sort": "none",
+                    "hideZeros": false
+                }
+            }
         },
         {
             "id": 10,
