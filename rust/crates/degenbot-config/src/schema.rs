@@ -177,11 +177,13 @@ crate::config_schema! {
         ws_completeness [bool] = true, env = "DEGENBOT_WS_COMPLETENESS", def = "true",
             doc = "WS completeness gating (newHeads + logs double-delivery check); `0` disables.";
         // BM35LK (epic FIMZES; design logs/quiesce-design-20260908.md §6): the
-        // adaptive trailing-quiesce estimator. `fixed` keeps today's
-        // `pump_debounce_ms` behavior (defer hard cutover); `adaptive` arms
-        // the settle timers with W = clamp(EWMA·quiesce_margin, floor, ceil)
-        // where the EWMA tracks each block's max intra-block silence gap.
-        quiesce_mode [enum QuiesceMode Fixed Adaptive] = QuiesceMode::Fixed, env = "DEGENBOT_PUMP_QUIESCE_MODE", def = "fixed",
+        // adaptive trailing-quiesce estimator. Default flipped to `adaptive`
+        // after the 2026-09-09 live A/B (logs/perf-after-20260909.md: settle
+        // p50 25→10ms, publish p95 100→50ms, zero late-admit tripwires);
+        // `fixed` retains the historical `pump_debounce_ms` behavior. W =
+        // clamp(EWMA·quiesce_margin, floor, ceil), the EWMA tracking each
+        // block's max intra-block silence gap.
+        quiesce_mode [enum QuiesceMode Fixed Adaptive] = QuiesceMode::Adaptive, env = "DEGENBOT_PUMP_QUIESCE_MODE", def = "adaptive",
             doc = "Settle-window mode: `fixed` = constant pump.pump_debounce_ms debounce; `adaptive` = EWMA trailing-quiesce estimator (never below quiesce_floor_ms, never above quiesce_ceil_ms; late-admit budget overruns hold at the ceiling).";
         quiesce_floor_ms [ms] = 2, env = "DEGENBOT_PUMP_QUIESCE_FLOOR_MS", def = "2",
             doc = "Adaptive mode: lower bound (ms) of the trailing settle window (clamped >= 1; a 0/garbage value never collapses the window to zero).";

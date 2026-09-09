@@ -70,8 +70,8 @@ fn defaults_feed_every_representative_type() {
     // BM35LK quiesce-estimator keys: f64 + enum + ms defaults.
     assert_eq!(
         cfg.config.pump.quiesce_mode,
-        degenbot_config::QuiesceMode::Fixed,
-        "quiesce mode default (fixed = historical debounce)"
+        degenbot_config::QuiesceMode::Adaptive,
+        "quiesce mode default (adaptive = post-2026-09-09 A/B cutover)"
     );
     assert_eq!(
         (
@@ -196,8 +196,8 @@ fn quiesce_keys_precedence_chain_env_beats_file_beats_default() {
     let default = must_ok(&BotConfigLoader::new().without_env());
     assert_eq!(
         default.config.pump.quiesce_mode,
-        degenbot_config::QuiesceMode::Fixed,
-        "default mode is fixed"
+        degenbot_config::QuiesceMode::Adaptive,
+        "default mode is adaptive"
     );
     let from_file = must_ok(&BotConfigLoader::new().without_env().with_config_path(&path));
     assert_eq!(

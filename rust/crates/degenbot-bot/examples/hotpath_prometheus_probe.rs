@@ -52,7 +52,7 @@ fn main() -> Result<(), String> {
 
     // The exact production seam the pump uses (not a bare
     // `HotpathGuardBuilder`), so the probe exercises the real call site.
-    let guard = degenbot_bot::profiling::hotpath_guard("hotpath_prometheus_probe").ok_or(
+    let _guard = degenbot_bot::profiling::hotpath_guard("hotpath_prometheus_probe").ok_or(
         "hotpath_guard returned None — was the degenbot-bot 'hotpath' Cargo \
          feature enabled for this build?",
     )?;
@@ -85,9 +85,12 @@ fn main() -> Result<(), String> {
         REQUIRED_FAMILIES
     );
 
-    // Guard drop writes the end-of-profile report (HOTPATH_OUTPUT_* knobs);
-    // kept in scope so the exporter's lifetime matches the guard's.
-    drop(guard);
+    // The guard's scope exit (main returning) writes the end-of-profile
+    // report (HOTPATH_OUTPUT_* knobs) and stops the exporter thread it
+    // started. Binding as `_guard` keeps it alive to this point; the
+    // feature-off stub types identically (the external `hotpath` crate's
+    // no-op guard has no Drop impl, so an explicit `drop` would trip
+    // clippy::drop_non_drop in default-feature builds).
     Ok(())
 }
 
