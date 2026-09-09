@@ -13,7 +13,13 @@
 //! Tokio runtime enables true parallelism for these I/O-bound operations,
 //! while a current-thread runtime would serialize them into a bottleneck.
 //!
-//! Thread count is tunable via the `TOKIO_WORKER_THREADS` environment variable.
+//! Two-runtime sizing: the worker count comes from the cgroup-aware CPU
+//! budget (`crate::cpu_budget`) — the leftover after the solve bins take
+//! theirs — and NOT from `available_parallelism`, which reads 24 host cores
+//! inside an 8-core cgroup quota in this devcontainer. Operators pin it
+//! with the typed `runtime.io_workers` key (env `DEGENBOT_IO_WORKERS`); the
+//! legacy tokio-conventional `TOKIO_WORKER_THREADS` env name is rejected at
+//! config load.
 //!
 //! # Lazy Initialization
 //!
@@ -36,31 +42,16 @@
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
 
-const ENV_VAR: &str = "TOKIO_WORKER_THREADS";
-
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 fn build_runtime() -> Result<Runtime, std::io::Error> {
-    let env_raw = std::env::var(ENV_VAR).ok();
-    let env_worker_count = env_raw.as_deref().and_then(|v| v.parse::<usize>().ok());
-
-    if env_worker_count.is_none() && env_raw.is_some() {
-        tracing::warn!(
-            ENV_VAR,
-            "env var set but could not be parsed as a usize; ignoring"
-        );
-        // Remove the invalid env var so Tokio's internal machinery
-        // doesn't panic when it tries to parse it.
-        std::env::remove_var(ENV_VAR);
-    }
-
-    let mut builder = Builder::new_multi_thread();
-
-    if let Some(n) = env_worker_count {
-        builder.worker_threads(n);
-    }
-
-    builder.enable_all().build()
+    // SMTH6M: the cgroup-aware budget is the single sizing authority for the
+    // ambient runtime (see `crate::cpu_budget::ambient_io_worker_count`).
+    let workers = crate::cpu_budget::ambient_io_worker_count();
+    Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
 }
 
 /// Get the shared Tokio runtime instance.
@@ -68,8 +59,9 @@ fn build_runtime() -> Result<Runtime, std::io::Error> {
 /// This function lazily initializes a multi-threaded Tokio runtime
 /// on first call. Subsequent calls return the same runtime instance.
 ///
-/// Worker thread count defaults to the number of CPU cores, and can be
-/// overridden with the `TOKIO_WORKER_THREADS` environment variable.
+/// Worker thread count is sized by the cgroup-aware CPU budget
+/// ([`crate::cpu_budget`]) and can be pinned explicitly with the typed
+/// `runtime.io_workers` key (env `DEGENBOT_IO_WORKERS`).
 ///
 /// # Panics
 ///
@@ -89,11 +81,25 @@ pub fn get_runtime() -> &'static Runtime {
 #[expect(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Serialize tests that mutate the `TOKIO_WORKER_THREADS` environment
-    /// variable to prevent race conditions when running tests concurrently.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    #[test]
+    fn test_build_runtime_sizes_from_cgroup_budget_policy() {
+        // SMTH6M: the ambient runtime is sized by the relocated cpu_budget
+        // policy (cgroup+affinity budget, minus the solve bins, floored at
+        // 1) — never from tokio's available_parallelism default, which reads
+        // 24 host cores inside an 8-core cgroup quota here.
+        let expected = crate::cpu_budget::ambient_io_worker_count_from(
+            ::degenbot_config::holder::config().runtime.io_workers,
+            crate::cpu_budget::solve_worker_count(),
+            crate::cpu_budget::effective_cpu_budget(),
+        );
+        let rt = build_runtime().unwrap();
+        assert_eq!(
+            rt.metrics().num_workers(),
+            expected,
+            "ambient runtime workers must follow the CPU-budget policy"
+        );
+    }
 
     #[test]
     fn test_runtime_singleton() {
@@ -115,49 +121,5 @@ mod tests {
         });
 
         assert_eq!(result, 42);
-    }
-
-    #[test]
-    fn test_build_runtime_respects_env_var() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        std::env::set_var(ENV_VAR, "2");
-        let rt = build_runtime().unwrap();
-        std::env::remove_var(ENV_VAR);
-
-        let result = rt.block_on(async {
-            let handle = tokio::spawn(async { 99 });
-            handle.await.unwrap()
-        });
-        assert_eq!(result, 99);
-    }
-
-    #[test]
-    fn test_build_runtime_ignores_invalid_env() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        // Use a fresh runtime with the invalid env var unset so Tokio's
-        // internal machinery doesn't panic during startup.
-        std::env::remove_var(ENV_VAR);
-        let rt = build_runtime().unwrap();
-
-        let result = rt.block_on(async {
-            let handle = tokio::spawn(async { 77 });
-            handle.await.unwrap()
-        });
-        assert_eq!(result, 77);
-    }
-
-    #[test]
-    fn test_build_runtime_handles_invalid_env_var() {
-        let _guard = ENV_MUTEX.lock().unwrap();
-        // Verify that an invalid TOKIO_WORKER_THREADS value is silently
-        // ignored by build_runtime(). The function removes the invalid
-        // var internally so Tokio's internal machinery doesn't panic.
-        std::env::set_var(ENV_VAR, "not_a_number");
-        let result = build_runtime();
-        std::env::remove_var(ENV_VAR);
-        assert!(
-            result.is_ok(),
-            "build_runtime should ignore invalid env var"
-        );
     }
 }

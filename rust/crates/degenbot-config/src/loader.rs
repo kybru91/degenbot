@@ -240,6 +240,21 @@ impl BotConfigLoader {
                     }
                 }
             }
+
+            // SMTH6M: the ambient runtime used to size itself from the raw
+            // `TOKIO_WORKER_THREADS` env var (a tokio-conventional name, not
+            // a DEGENBOT_* key). That read is retired — the runtime now takes
+            // `runtime.io_workers` / the cgroup budget derivation — so a
+            // surviving legacy setting FAILS the load loudly and points at
+            // the replacement. Silent fail-open here would resurrect the
+            // quota-violating sizing this migration removes.
+            if let Some(raw) = env.get("TOKIO_WORKER_THREADS") {
+                problems.push(format!(
+                    "legacy env var TOKIO_WORKER_THREADS={raw:?} is no longer supported; \
+                     size the ambient I/O runtime via runtime.io_workers \
+                     (env DEGENBOT_IO_WORKERS) or let it derive from the cgroup CPU budget"
+                ));
+            }
         }
 
         // Layer 4 (highest): CLI / explicit argument overrides.

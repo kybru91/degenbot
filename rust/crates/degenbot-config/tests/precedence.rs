@@ -250,6 +250,81 @@ fn missing_config_file_is_reported() {
     assert!(format!("{err}").contains("unreadable"));
 }
 
+// ---- SMTH6M: ambient-runtime sizing key (`runtime.io_workers`) ----
+
+#[test]
+fn runtime_io_workers_unset_by_default_and_derived_marker() {
+    let loaded = must_ok(&BotConfigLoader::new().without_env());
+    assert_eq!(
+        loaded.config.runtime.io_workers, None,
+        "ambient workers default to the CPU-budget derivation, not a fixed count"
+    );
+}
+
+#[test]
+fn runtime_io_workers_env_key_loads_with_provenance() {
+    let loaded =
+        must_ok(&BotConfigLoader::new().with_env(map_env(&[("DEGENBOT_IO_WORKERS", "4")])));
+    assert_eq!(loaded.config.runtime.io_workers, Some(4));
+    assert_eq!(
+        loaded.source_of("DEGENBOT_IO_WORKERS"),
+        Some(Source::Env),
+        "the declared DEGENBOT_* env name must map onto the typed field"
+    );
+}
+
+#[test]
+fn runtime_io_workers_file_and_env_precedence() {
+    let path = temp_toml("runtime", "[runtime]\nio_workers = 6\n");
+    let loaded = must_ok(
+        &BotConfigLoader::new()
+            .with_env(map_env(&[("DEGENBOT_IO_WORKERS", "4")]))
+            .with_config_path(&path),
+    );
+    assert_eq!(loaded.config.runtime.io_workers, Some(4), "env beats file");
+    assert_eq!(loaded.source_of("DEGENBOT_IO_WORKERS"), Some(Source::Env));
+    let from_file = must_ok(&BotConfigLoader::new().without_env().with_config_path(&path));
+    assert_eq!(from_file.config.runtime.io_workers, Some(6), "file wins");
+    assert_eq!(
+        from_file.source_of("DEGENBOT_IO_WORKERS"),
+        Some(Source::File)
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn runtime_io_workers_invalid_value_fails_closed() {
+    let err =
+        must_err(&BotConfigLoader::new().with_env(map_env(&[("DEGENBOT_IO_WORKERS", "lots")])));
+    assert!(
+        format!("{err}").contains("runtime.io_workers"),
+        "error names the typed key: {err}"
+    );
+}
+
+#[test]
+fn legacy_tokio_worker_threads_env_fails_the_load() {
+    // SMTH6M: the raw `TOKIO_WORKER_THREADS` read that sized the ambient
+    // runtime is retired. Its name is NOT a schema key; a surviving setting
+    // must fail the load loudly (config-loader fail-closed convention) and
+    // point at the replacement, never silently size the runtime.
+    let ok = BotConfigLoader::new().with_env(map_env(&[])).load();
+    assert!(
+        ok.is_ok(),
+        "absence of the legacy name must not fail the load"
+    );
+    let err = must_err(&BotConfigLoader::new().with_env(map_env(&[("TOKIO_WORKER_THREADS", "2")])));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("TOKIO_WORKER_THREADS"),
+        "the legacy name is named in the error: {msg}"
+    );
+    assert!(
+        msg.contains("DEGENBOT_IO_WORKERS"),
+        "the error points at the replacement key: {msg}"
+    );
+}
+
 #[test]
 fn unset_option_keys_stay_unset_and_default_provenance_holds() {
     let loaded = must_ok(&BotConfigLoader::new().without_env());

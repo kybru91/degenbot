@@ -16,6 +16,11 @@ Highest wins (12-factor parity; recorded here by the schema and asserted by the 
 
 The loader is fail-closed: unparsable values and unknown file keys are reported, never silently ignored.
 
+## `runtime`
+
+| Env var | TOML key | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `DEGENBOT_IO_WORKERS` | `runtime.io_workers` | `Option<usize>` | `(unset; derived from the cgroup CPU budget)` | Ambient I/O runtime worker count; when unset it is derived from the cgroup CPU budget after the solve bins take theirs (see solve.solve_cpus / solve.solve_headroom). The legacy TOKIO_WORKER_THREADS env name is rejected at load. |
 ## `telemetry`
 
 | Env var | TOML key | Type | Default | Description |

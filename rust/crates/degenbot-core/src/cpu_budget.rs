@@ -1,4 +1,4 @@
-//! Container-aware runtime CPU budget detection.
+//! Container-aware runtime CPU budget detection, shared by every consumer.
 //!
 //! `nproc`/`sched_getaffinity` lie inside containers: the devcontainer caps
 //! the cgroup at `cpu.max = 800000 100000` (8 cores) while the affinity mask
@@ -12,9 +12,18 @@
 //! whose parents may be tighter) and takes the tightest limit found, min'd
 //! with the affinity budget.
 //!
-//! Solve worker policy: budget minus headroom (the main tokio runtime,
-//! Python, the pump, and the `OTel` exporter share the quota and must not
-//! starve during bursts), overridable with `DEGENBOT_SOLVE_CPUS`.
+//! Two-runtime sizing policy (SMTH6M: this module is the single sizing
+//! authority for BOTH runtimes):
+//! - solve bins: budget minus solve headroom (the main runtime, Python, the
+//!   pump, and the `OTel` exporter share the quota and must not starve
+//!   during bursts), overridable with `DEGENBOT_SOLVE_CPUS`;
+//! - the ambient I/O runtime (`crate::runtime`): the leftover after the
+//!   solve bins take theirs - i.e. the headroom - floored at 1, overridable
+//!   with `DEGENBOT_IO_WORKERS`.
+//!
+//! Everything CPU-adjacent that is NOT a solve bin (inline-sim drivers
+//! behind the `sim_slots` cap, sim runtime sizing) derives from the same
+//! leftover budget.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -171,7 +180,8 @@ pub(crate) fn effective_budget_from_with_roots(
 
 /// Solve-worker count from overrides: `override_cpu` (`DEGENBOT_SOLVE_CPUS`)
 /// wins outright (headroom ignored); otherwise budget minus the headroom
-/// (`override_headroom`, default 2), floored at 1.
+/// (`override_headroom`, default [`DEFAULT_SOLVE_HEADROOM`]), floored at 1.
+#[must_use]
 pub(crate) fn solve_worker_count_from(
     override_cpu: Option<&str>,
     override_headroom: Option<&str>,
@@ -204,26 +214,15 @@ pub(crate) fn effective_cpu_budget() -> usize {
 
 /// Cached solve worker count; logs the detection verdict once via `tracing`.
 /// The leftover of the effective CPU budget after the solve bins take
-/// theirs - the solve worker count already embeds the I/O headroom. This
-/// is the two-runtime contract: the ambient I/O runtime keeps the
-/// headroom workers, and everything CPU-adjacent that is NOT a solve bin
-/// (inline-sim drivers behind the `sim_slots` cap, sim runtime sizing)
-/// derives from this value. Floor 1: one worker always remains for I/O
-/// latency even under a headroom-less operator override.
-#[must_use]
-pub fn leftover_worker_budget() -> usize {
-    effective_cpu_budget()
-        .saturating_sub(solve_worker_count())
-        .max(1)
-}
-
-pub(crate) fn solve_worker_count() -> usize {
+/// theirs is computed by [`leftover_worker_budget`].
+pub fn solve_worker_count() -> usize {
     static SOLVE_WORKERS: OnceLock<usize> = OnceLock::new();
     *SOLVE_WORKERS.get_or_init(|| {
         let budget = effective_cpu_budget();
         // KAHU5W: typed schema overrides (`solve.solve_cpus` /
-        // `solve.solve_headroom`); the loader owns the env read.
-        let cfg = crate::bot_core::stance::config().solve.clone();
+        // `solve.solve_headroom`); the loader owns the env read, and the
+        // holder lives in degenbot-config (installed once at boot).
+        let cfg = ::degenbot_config::holder::config().solve.clone();
         let override_cpu = cfg.solve_cpus.map(|v| v.to_string());
         let override_headroom = cfg.solve_headroom.map(|v| v.to_string());
         let workers = solve_worker_count_from(
@@ -237,6 +236,57 @@ pub(crate) fn solve_worker_count() -> usize {
             solve_workers = workers,
             solve_headroom = DEFAULT_SOLVE_HEADROOM,
             "[cpu-budget] solve worker count detected from cgroup + affinity"
+        );
+        workers
+    })
+}
+
+/// Cached solve worker count's leftover: the ambient I/O budget everything
+/// non-solve derives from. Floor 1: one worker always remains for I/O
+/// latency even under a headroom-less operator override.
+#[must_use]
+pub fn leftover_worker_budget() -> usize {
+    effective_cpu_budget()
+        .saturating_sub(solve_worker_count())
+        .max(1)
+}
+
+/// Ambient I/O runtime worker count from explicit inputs (SMTH6M): the
+/// `runtime.io_workers` override (`DEGENBOT_IO_WORKERS`) wins, floored at
+/// 1; otherwise the two-runtime contract — the ambient runtime takes the
+/// headroom the solve bins leave behind (`budget - solve_workers`), so the
+/// two runtimes tile the cgroup budget instead of each sizing from raw
+/// core counts.
+#[must_use]
+pub(crate) fn ambient_io_worker_count_from(
+    io_workers_override: Option<usize>,
+    solve_workers: usize,
+    budget: usize,
+) -> usize {
+    io_workers_override
+        .unwrap_or_else(|| budget.saturating_sub(solve_workers))
+        .max(1)
+}
+
+/// Cached ambient I/O runtime worker count consumed by
+/// [`crate::runtime::build_runtime`]. Tagged onto the same `[cpu-budget]`
+/// boot-log family as [`solve_worker_count`] so one grep shows the whole
+/// two-runtime split: the derived budget, the solve bins, and the ambient
+/// I/O workers (plus whether an explicit override pinned the latter).
+pub(crate) fn ambient_io_worker_count() -> usize {
+    static AMBIENT_WORKERS: OnceLock<usize> = OnceLock::new();
+    *AMBIENT_WORKERS.get_or_init(|| {
+        let budget = effective_cpu_budget();
+        let io_override = ::degenbot_config::holder::config().runtime.io_workers;
+        let solve = solve_worker_count();
+        let workers = ambient_io_worker_count_from(io_override, solve, budget);
+        tracing::info!(
+            target: "degenbot::solver",
+            cpu_budget = budget,
+            solve_workers = solve,
+            ambient_io_workers = workers,
+            io_workers_override = ?io_override,
+            "[cpu-budget] ambient I/O runtime sized from the cgroup + affinity budget minus the solve bins"
         );
         workers
     })
@@ -281,7 +331,7 @@ fn walk_quota(root: &Path, start: &Path, probe: fn(&Path) -> Option<u64>) -> Opt
 
 /// Parsed throttle fields from a cgroup v2 `cpu.stat` body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ThrottleStats {
+pub struct ThrottleStats {
     pub nr_throttled: u64,
     pub throttled_usec: u64,
 }
@@ -316,7 +366,7 @@ pub(crate) fn parse_cpu_stat(text: &str) -> Option<ThrottleStats> {
 
 /// Delta of throttle counters since the previous call, zero on the first
 /// call. None when the cgroup file is unreadable (no counter tape here).
-pub(crate) fn cgroup_throttle_delta() -> Option<ThrottleStats> {
+pub fn cgroup_throttle_delta() -> Option<ThrottleStats> {
     static LAST: OnceLock<parking_lot::Mutex<Option<(u64, u64)>>> = OnceLock::new();
     let last = LAST.get_or_init(|| parking_lot::Mutex::new(None));
     let text = std::fs::read_to_string(CGROUP_CPU_STAT).ok()?;
@@ -546,7 +596,7 @@ mod tests {
         assert_eq!(effective_budget_from_with_roots(text, mounts, 24, None), 24);
     }
 
-    // ---- worker-count policy ----
+    // ---- solve worker-count policy ----
 
     #[test]
     fn worker_count_is_budget_minus_headroom() {
@@ -569,6 +619,93 @@ mod tests {
     #[test]
     fn invalid_override_is_ignored() {
         assert_eq!(solve_worker_count_from(Some("notanumber"), None, 8), 6);
+    }
+
+    // ---- ambient I/O worker policy (SMTH6M) ----
+
+    #[test]
+    fn ambient_workers_are_the_leftover_after_solve_bins() {
+        // budget 8, solve 6 -> ambient keeps the 2 headroom cores
+        assert_eq!(ambient_io_worker_count_from(None, 6, 8), 2);
+        assert_eq!(ambient_io_worker_count_from(None, 0, 3), 3);
+    }
+
+    #[test]
+    fn ambient_workers_floor_at_one() {
+        // solution override consuming the whole budget leaves 1 I/O worker
+        assert_eq!(ambient_io_worker_count_from(None, 8, 8), 1);
+        assert_eq!(ambient_io_worker_count_from(None, 9, 8), 1);
+        assert_eq!(ambient_io_worker_count_from(None, 0, 1), 1);
+    }
+
+    #[test]
+    fn ambient_override_wins_and_floors_at_one() {
+        assert_eq!(ambient_io_worker_count_from(Some(4), 6, 8), 4);
+        assert_eq!(ambient_io_worker_count_from(Some(0), 6, 8), 1);
+    }
+
+    // ---- [cpu-budget] boot log (SMTH6M acceptance) ----
+
+    /// Minimal recording subscriber so the boot-log contract is asserted
+    /// without a tracing-subscriber dependency in this leaf crate.
+    struct RecordingSubscriber(std::sync::Mutex<String>);
+
+    /// Field visitor that collapses one event into a `k=v ` line.
+    struct LogLineVisitor<'a>(&'a mut String);
+
+    impl tracing_core::field::Visit for LogLineVisitor<'_> {
+        fn record_debug(
+            &mut self,
+            field: &tracing_core::field::Field,
+            value: &dyn std::fmt::Debug,
+        ) {
+            std::fmt::write(self.0, format_args!("{}={:?} ", field.name(), value)).ok();
+        }
+    }
+
+    impl tracing_core::Subscriber for RecordingSubscriber {
+        fn enabled(&self, _: &tracing_core::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing_core::span::Attributes<'_>) -> tracing_core::span::Id {
+            tracing_core::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing_core::span::Id, _: &tracing_core::span::Record<'_>) {}
+        fn enter(&self, _: &tracing_core::span::Id) {}
+        fn exit(&self, _: &tracing_core::span::Id) {}
+        fn record_follows_from(&self, _: &tracing_core::span::Id, _: &tracing_core::span::Id) {}
+        fn event(&self, event: &tracing_core::event::Event<'_>) {
+            let mut buf = String::new();
+            event.record(&mut LogLineVisitor(&mut buf));
+            if let Ok(mut s) = self.0.lock() {
+                s.push_str(&buf);
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_sizing_logs_the_cpu_budget_verdict_once() {
+        // First sizing call runs initialization inside a recording subscriber;
+        // the line must carry the ambient worker count AND the budget/solve
+        // split it was derived from, under the `[cpu-budget]` boot-log tag.
+        let rec = std::sync::Arc::new(RecordingSubscriber(std::sync::Mutex::new(String::new())));
+        let _ = tracing::subscriber::with_default(rec.clone(), ambient_io_worker_count);
+        let logged = rec.0.lock().expect("log buffer").clone();
+        for needle in [
+            "[cpu-budget]",
+            "ambient_io_workers",
+            "cpu_budget",
+            "solve_workers",
+        ] {
+            assert!(
+                logged.contains(needle),
+                "[cpu-budget] line missing {needle}: {logged}"
+            );
+        }
+        // Idempotent: the OnceLock must not re-log on later calls.
+        let rec2 = std::sync::Arc::new(RecordingSubscriber(std::sync::Mutex::new(String::new())));
+        let _ = tracing::subscriber::with_default(rec2.clone(), ambient_io_worker_count);
+        assert_eq!(rec2.0.lock().expect("log buffer 2").clone(), "");
     }
 
     // ---- cgroup throttle counters ----

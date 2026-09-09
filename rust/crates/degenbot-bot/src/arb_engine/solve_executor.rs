@@ -116,7 +116,7 @@ pub(crate) fn global_solve_executor() -> &'static SolveExecutor {
         // DEGENBOT_SOLVE_CPUS overrides.
         SolveExecutor::new(
             "degenbot-solve-tokio",
-            crate::bot_core::cpu_budget::solve_worker_count(),
+            degenbot_core::cpu_budget::solve_worker_count(),
         )
     })
 }

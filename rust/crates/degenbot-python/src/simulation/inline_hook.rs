@@ -290,7 +290,7 @@ fn inline_sim_worker_count() -> usize {
     // of the CPU budget after the solve bins (not raw available
     // parallelism), so sim runtime workers + solve bins never exceed
     // the quota.
-    let default = degenbot_bot::bot_core::cpu_budget::leftover_worker_budget();
+    let default = degenbot_core::cpu_budget::leftover_worker_budget();
     // KAHU5W: typed schema key `solve.inline_sim_workers`
     // (`DEGENBOT_INLINE_SIM_WORKERS`); the loader owns the env read.
     match ::degenbot_config::holder::config().solve.inline_sim_workers {
@@ -599,7 +599,7 @@ mod tests {
     // budget (7LV6VN T5), NOT raw available_parallelism.
     #[test]
     fn inline_sim_worker_count_defaults_to_leftover_budget() {
-        let default = degenbot_bot::bot_core::cpu_budget::leftover_worker_budget();
+        let default = degenbot_core::cpu_budget::leftover_worker_budget();
         assert_eq!(super::inline_sim_worker_count(), default);
     }
 }

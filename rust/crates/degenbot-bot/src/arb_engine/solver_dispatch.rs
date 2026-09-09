@@ -2045,7 +2045,7 @@ impl ArbitrageEngine {
             // VPD5ZH: bins follow the cgroup-budget worker count (not the
             // rayon pool width) so the tokio arm is exactly n_workers tasks
             // on n_workers persistent threads, per the solve_executor doc.
-            let n_threads = crate::bot_core::cpu_budget::solve_worker_count();
+            let n_threads = degenbot_core::cpu_budget::solve_worker_count();
             // Loop-12 KUKHMX: previous-block measured walk sims refine the
             // LPT cost; snapshot once (single lock) before binning.
             // Loop-18: measured gate us rides the same snapshot - gate-heavy
@@ -2716,7 +2716,7 @@ impl ArbitrageEngine {
         // The cold-start path has the same cost skew as the hot path - and
         // the same quota problem, so it bins to the budget worker count too
         // (rayon work-steals, so bins <= pool width is safe here).
-        let n_threads = crate::bot_core::cpu_budget::solve_worker_count();
+        let n_threads = degenbot_core::cpu_budget::solve_worker_count();
         // Cold-start has no previous-block sims/gate yet: structural proxy only.
         let last_sims_snapshot: HashMap<u64, u64> = HashMap::new();
         let last_gate_snapshot: HashMap<u64, u64> = HashMap::new();
