@@ -560,10 +560,14 @@ impl ArbitrageEngine {
 
     #[must_use]
     pub fn with_core(core: Arc<StateLock<BotState>>) -> Self {
-        Self::with_core_cfg(
-            core,
-            &std::sync::Arc::new(::degenbot_config::BotConfig::default()),
-        )
+        // KAHU5W/P6YXA6 production-boot fix: pack from the INSTALLED loader
+        // config (the _ffi module init installs the env/file-loaded BotConfig
+        // before any engine construction). A fresh `BotConfig::default()`
+        // here meant the python-driven pump's engine never observed
+        // construction stances like fleet.stance — schema defaults only
+        // apply when no owner installed one (tests / standalone clean-env
+        // constructions, byte-compatible per the holder docs).
+        Self::with_core_cfg(core, ::degenbot_config::holder::config_arc())
     }
 
     /// KAHU5W: config-threaded construction. `cfg` is the typed `BotConfig`

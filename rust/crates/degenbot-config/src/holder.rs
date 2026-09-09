@@ -32,15 +32,18 @@ pub fn install(cfg: Arc<BotConfig>) -> bool {
 /// (tests / standalone constructions in a clean environment).
 #[must_use]
 pub fn config() -> &'static BotConfig {
-    static DEFAULT: OnceLock<Box<BotConfig>> = OnceLock::new();
-    CFG.get().map_or_else(
-        || {
-            DEFAULT
-                .get_or_init(|| Box::new(BotConfig::default()))
-                .as_ref()
-        },
-        |a| a.as_ref(),
-    )
+    config_arc().as_ref()
+}
+
+/// The same value as [`config`], behind the process-shared Arc — the
+/// construction-time packer (`ArbitrageEngine::with_core`) clones this into
+/// the engine instead of building a fresh default, so production boots
+/// observe the loader's value for every construction stance.
+#[must_use]
+pub fn config_arc() -> &'static Arc<BotConfig> {
+    static DEFAULT: OnceLock<Arc<BotConfig>> = OnceLock::new();
+    CFG.get()
+        .unwrap_or_else(|| DEFAULT.get_or_init(|| Arc::new(BotConfig::default())))
 }
 
 /// Was a config installed by a real boot (vs test defaults)?
