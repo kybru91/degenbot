@@ -310,18 +310,6 @@ pub struct ResultBatch {
 /// [`ArbitrageEngine::with_core`]; `new()` standalone sugar allocates its own)
 /// and reads/writes pool state through it. Lock ordering when nested is
 /// **engine-then-core** — no code path ever nests core-then-engine.
-/// Which dispatch mechanism drives the solve fan-out (epic BXUSGL T1).
-/// `Rayon` is today's `rayon::scope` LPT path, byte-for-byte; `Tokio` routes
-/// the same LPT bins through a private, lower-priority tokio runtime whose
-/// workers stream each path's result into the result queue as it completes.
-/// The stance is resolved ONCE at engine construction from the environment —
-/// never read at call time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SolveExecutorKind {
-    Rayon,
-    Tokio,
-}
-
 #[expect(clippy::struct_excessive_bools)] // 4th bool (detached_solving) added by epic SRQEK5 — each bool is a distinct construction-time stance, not flag soup
 pub struct ArbitrageEngine {
     /// KAHU5W: the owner-loaded typed bot config (one loader process-wide;
@@ -437,9 +425,6 @@ pub struct ArbitrageEngine {
     /// (dense-CL envelope compose, sims≈0) were invisible to the LPT cost —
     /// bin-packed as cheap while dominating wall time.
     last_gate_us: std::sync::Arc<parking_lot::Mutex<HashMap<u64, u64>>>,
-    /// Which dispatch drives the solve fan-out (epic BXUSGL T1); see
-    /// [`SolveExecutorKind`].
-    solve_executor: SolveExecutorKind,
     /// ADR-042 Q6 migration stance (`fleet.stance`, construction-time):
     /// when true the fleet-hosted executor is the SOLE executor of solve
     /// bins (detached + in-cycle arms) and the merge sidecar runs as the
@@ -562,16 +547,6 @@ impl ArbitrageEngine {
         self.streaming_delivery
     }
 
-    /// Probe the packed solve-dispatch executor kind (smoke-boot
-    /// observability; no environment read).
-    #[must_use]
-    pub fn solve_executor_probe(&self) -> &'static str {
-        match self.solve_executor {
-            SolveExecutorKind::Tokio => "tokio",
-            SolveExecutorKind::Rayon => "rayon",
-        }
-    }
-
     /// Probe the packed fleet-stance (ADR-042 Q6; smoke-boot observability;
     /// no environment read): `fleet` = the fleet hosts all solve bins.
     #[must_use]
@@ -625,13 +600,6 @@ impl ArbitrageEngine {
             resolved_update_snapshot: HashMap::new(),
             last_walk_sims: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             last_gate_us: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            solve_executor: if solver_dispatch::SOLVE_EXECUTOR_TOKIO
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                SolveExecutorKind::Tokio
-            } else {
-                SolveExecutorKind::Rayon
-            },
             fleet_hosted: solver_dispatch::SOLVE_FLEET_HOSTED
                 .load(std::sync::atomic::Ordering::Relaxed),
             streaming_delivery: solver_dispatch::STREAMING_DELIVERY_ENABLED
@@ -818,15 +786,11 @@ impl ArbitrageEngine {
 
 // ---------------------------------------------------------------------------
 // Epic BXUSGL T1: test-only knobs. Never compiled outside `cargo test` — the
-// streaming-orchestration test needs per-test control of the executor stance,
-// a deterministic per-path delay, and an observation point on the drain.
+// streaming-orchestration test needs a deterministic per-path delay and an
+// observation point on the drain.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 impl ArbitrageEngine {
-    pub(crate) fn set_solve_executor(&mut self, kind: SolveExecutorKind) {
-        self.solve_executor = kind;
-    }
-
     pub(crate) fn set_solve_delay_hook(&mut self, hook: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
         self.test_solve_delay = Some(hook);
     }

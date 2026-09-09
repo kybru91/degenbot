@@ -57,13 +57,11 @@ fn main() -> Result<(), String> {
     let engine = degenbot_bot::arb_engine::ArbitrageEngine::with_core_cfg(core, &cfg);
 
     // Observe the packed stances end-to-end (config file -> engine field):
-    // the file sets pump.streaming_delivery=false, solve.executor=rayon and
-    // solve.min_profit_wei; failure to surface them proves a wiring break.
+    // the file sets pump.streaming_delivery=false and solve.min_profit_wei;
+    // failure to surface them proves a wiring break.
     println!(
-        "config-only smoke boot OK: file={path}, solve.executor={}, \
-         streaming_delivery={}, min_profit_wei={}, solve_cpus_unset={}, \
-         metrics_addr={}",
-        engine.solve_executor_probe(),
+        "config-only smoke boot OK: file={path}, streaming_delivery={}, \
+         min_profit_wei={}, solve_cpus_unset={}, metrics_addr={}",
         engine.streaming_delivery_probe(),
         cfg.solve.min_profit_wei,
         cfg.solve.solve_cpus.is_none(),

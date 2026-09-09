@@ -227,8 +227,6 @@ crate::config_schema! {
             doc = "Override the detected solve CPU budget (worker bin count).";
         solve_headroom [opt usize] = None, env = "DEGENBOT_SOLVE_HEADROOM", def = "(unset)",
             doc = "Override the I/O headroom carved out of the CPU budget before solve bins.";
-        executor [enum SolveExecutor Tokio Rayon] = SolveExecutor::Tokio, env = "DEGENBOT_SOLVE_EXECUTOR", def = "tokio",
-            doc = "Solve fan-out executor: tokio (low-priority dedicated runtime, production default) or rayon.";
         solve_inline_sim [bool] = true, env = "DEGENBOT_SOLVE_INLINE_SIM", def = "true",
             doc = "Inline-sim stance (T2 worker-side clamp path); `0`/`false` disables.";
         solve_resolve_par [bool] = true, env = "DEGENBOT_SOLVE_RESOLVE_PAR", def = "true",

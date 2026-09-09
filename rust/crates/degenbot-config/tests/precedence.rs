@@ -3,13 +3,15 @@
 
 use std::path::PathBuf;
 
-use degenbot_config::{BotConfigLoader, MapEnv, SolveExecutor, Source};
+use degenbot_config::{BotConfigLoader, FleetStance, MapEnv, Source};
 
 // Representative keys, one per type:
 // - bool   : `allocator.mimalloc_auto_purge` / `DEGENBOT_MIMALLOC_AUTO_PURGE`
 // - ms     : `state_lock.warn_ms`            / `DEGENBOT_LOCK_WARN_MS`
 // - usize  : `solve.envelope_max_tangent_lines` / `DEGENBOT_ENVELOPE_MAX_TANGENT_LINES`
-// - enum   : `solve.executor` / `DEGENBOT_SOLVE_EXECUTOR`
+// - enum   : `fleet.stance` / `DEGENBOT_FLEET`
+//          (the former enum representative `solve.executor` /
+//          `DEGENBOT_SOLVE_EXECUTOR` was retired at the P6YXA6 hard cutover
 
 // Test env provider.
 fn map_env(pairs: &[(&str, &str)]) -> Box<dyn degenbot_config::EnvVars> {
@@ -62,11 +64,9 @@ fn defaults_feed_every_representative_type() {
         cfg.config.solve.envelope_max_tangent_lines, 32,
         "usize default"
     );
-    assert_eq!(
-        cfg.config.solve.executor,
-        SolveExecutor::Tokio,
-        "enum default"
-    );
+    // The enum representative retired with solve.executor (P6YXA6);
+    // fleet.stance is the standing enum key.
+    assert_eq!(cfg.config.fleet.stance, FleetStance::Legacy, "enum default");
     // BM35LK quiesce-estimator keys: f64 + enum + ms defaults.
     assert_eq!(
         cfg.config.pump.quiesce_mode,
@@ -123,7 +123,7 @@ fn file_layer_overrides_defaults() {
 fn env_layer_overrides_file_layer() {
     let path = temp_toml(
         "env",
-        "[state_lock]\nwarn_ms = 1500\n\n[solve]\nexecutor = \"rayon\"\n",
+        "[state_lock]\nwarn_ms = 1500\n\n[fleet]\nstance = \"fleet\"\n",
     );
     let loaded = must_ok(
         &BotConfigLoader::new()
@@ -133,11 +133,8 @@ fn env_layer_overrides_file_layer() {
     assert_eq!(loaded.config.state_lock.warn_ms, 2500, "env beats file");
     assert_eq!(loaded.source_of("DEGENBOT_LOCK_WARN_MS"), Some(Source::Env));
     // Env NOT set -> file value still applies.
-    assert_eq!(loaded.config.solve.executor, SolveExecutor::Rayon);
-    assert_eq!(
-        loaded.source_of("DEGENBOT_SOLVE_EXECUTOR"),
-        Some(Source::File)
-    );
+    assert_eq!(loaded.config.fleet.stance, FleetStance::Fleet);
+    assert_eq!(loaded.source_of("DEGENBOT_FLEET"), Some(Source::File));
     cleanup(&path);
 }
 
@@ -153,7 +150,7 @@ fn cli_layer_overrides_env_and_file() {
                 ("DEGENBOT_LOCK_WARN_MS", "2500"),
                 ("DEGENBOT_ENVELOPE_MAX_TANGENT_LINES", "96"),
                 ("DEGENBOT_MIMALLOC_AUTO_PURGE", "0"),
-                ("DEGENBOT_SOLVE_EXECUTOR", "rayon"),
+                ("DEGENBOT_FLEET", "fleet"),
             ]))
             .with_config_path(&path)
             // A CLI override key accepts the env name OR the TOML dotted path.
@@ -174,15 +171,12 @@ fn cli_layer_overrides_env_and_file() {
         "cli beats env (bool)"
     );
     assert_eq!(
-        loaded.config.solve.executor,
-        SolveExecutor::Rayon,
+        loaded.config.fleet.stance,
+        FleetStance::Fleet,
         "no cli override -> env wins (enum)"
     );
     assert_eq!(loaded.source_of("DEGENBOT_LOCK_WARN_MS"), Some(Source::Cli));
-    assert_eq!(
-        loaded.source_of("DEGENBOT_SOLVE_EXECUTOR"),
-        Some(Source::Env)
-    );
+    assert_eq!(loaded.source_of("DEGENBOT_FLEET"), Some(Source::Env));
     cleanup(&path);
 }
 
@@ -224,6 +218,28 @@ fn quiesce_keys_precedence_chain_env_beats_file_beats_default() {
     cleanup(&path);
 }
 
+/// P6YXA6 hard cutover: `solve.executor` is retired — the role-switching
+/// worker fleet (and its private-runtime tokio fallback) is the ONLY solve
+/// executor. A surviving `DEGENBOT_SOLVE_EXECUTOR` setting must FAIL the
+/// load loudly and point at the replacement (the deprecation-style hard
+/// error kept for one release; not silence, not a warn-and-default).
+/// RED before the key was removed: the loader accepted the enum happily.
+#[test]
+fn retired_executor_env_fails_the_load_loudly() {
+    let err = must_err(
+        &BotConfigLoader::new().with_env(map_env(&[("DEGENBOT_SOLVE_EXECUTOR", "tokio")])),
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("DEGENBOT_SOLVE_EXECUTOR"),
+        "the error names the retired variable: {msg}"
+    );
+    assert!(
+        msg.contains("fleet"),
+        "the error names the replacement (the worker fleet): {msg}"
+    );
+}
+
 #[test]
 fn every_layer_for_every_type_in_sequence() {
     // (BM35LK: the quiesce keys ride the same loader machinery — asserted
@@ -231,13 +247,13 @@ fn every_layer_for_every_type_in_sequence() {
     // One full precedence chain per representative type.
     let path = temp_toml(
         "chain",
-        "[solve]\nenvelope_max_tangent_lines = 64\nexecutor = \"rayon\"\n\n[state_lock]\nwarn_ms = 1500\n\n[allocator]\nmimalloc_auto_purge = false\n",
+        "[fleet]\nstance = \"legacy\"\n\n[solve]\nenvelope_max_tangent_lines = 64\n\n[state_lock]\nwarn_ms = 1500\n\n[allocator]\nmimalloc_auto_purge = false\n",
     );
     let loaded = must_ok(
         &BotConfigLoader::new()
             .with_env(map_env(&[
                 ("DEGENBOT_ENVELOPE_MAX_TANGENT_LINES", "96"),
-                ("DEGENBOT_SOLVE_EXECUTOR", "tokio"),
+                ("DEGENBOT_FLEET", "fleet"),
                 ("DEGENBOT_LOCK_WARN_MS", "2500"),
                 ("DEGENBOT_MIMALLOC_AUTO_PURGE", "0"),
             ]))
@@ -247,7 +263,7 @@ fn every_layer_for_every_type_in_sequence() {
                     "DEGENBOT_ENVELOPE_MAX_TANGENT_LINES".to_string(),
                     "7".to_string(),
                 ),
-                ("DEGENBOT_SOLVE_EXECUTOR".to_string(), "rayon".to_string()),
+                ("DEGENBOT_FLEET".to_string(), "legacy".to_string()),
                 ("DEGENBOT_LOCK_WARN_MS".to_string(), "42".to_string()),
                 (
                     "DEGENBOT_MIMALLOC_AUTO_PURGE".to_string(),
@@ -268,8 +284,8 @@ fn every_layer_for_every_type_in_sequence() {
         "cli top (bool)"
     );
     assert_eq!(
-        loaded.config.solve.executor,
-        SolveExecutor::Rayon,
+        loaded.config.fleet.stance,
+        FleetStance::Legacy,
         "cli top (enum)"
     );
     cleanup(&path);
@@ -281,11 +297,25 @@ fn loader_fails_closed_on_bad_values_and_unknown_keys() {
     let err = must_err(
         &BotConfigLoader::new()
             .without_env()
-            .with_cli("DEGENBOT_SOLVE_EXECUTOR", "ninja"),
+            .with_cli("DEGENBOT_FLEET", "ninja"),
     );
     assert!(
-        format!("{err}").contains("SolveExecutor"),
+        format!("{err}").contains("FleetStance"),
         "error names the key"
+    );
+
+    // P6YXA6: the RETIRED executor key is not a schema key anymore — a CLI
+    // override naming it is rejected as unknown (the env-layer path fails
+    // loudly with the actionable retirement message; see
+    // retired_executor_env_fails_the_load_loudly).
+    let err = must_err(
+        &BotConfigLoader::new()
+            .without_env()
+            .with_cli("DEGENBOT_SOLVE_EXECUTOR", "tokio"),
+    );
+    assert!(
+        format!("{err}").contains("DEGENBOT_SOLVE_EXECUTOR"),
+        "the retired key is rejected: {err}"
     );
 
     // Unknown TOML key -> error.

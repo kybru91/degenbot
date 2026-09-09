@@ -5980,7 +5980,6 @@ mod tests {
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         let mut engine = ArbitrageEngine::new();
-        engine.set_solve_executor(crate::arb_engine::SolveExecutorKind::Tokio);
 
         // Seven independent mispriced V2->V2 pairs -> seven profitable paths
         // (>=2 cores: LPT puts the slow path FIRST in its bin, so at least
@@ -6217,7 +6216,6 @@ mod tests {
         let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut engine = ArbitrageEngine::new();
-        engine.set_solve_executor(crate::arb_engine::SolveExecutorKind::Tokio);
         engine.set_streaming_delivery(true);
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
         engine.set_result_channel(result_tx);

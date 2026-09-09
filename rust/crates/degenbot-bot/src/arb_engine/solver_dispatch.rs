@@ -1,7 +1,7 @@
 //! Path resolution, solver dispatch, and rebuild logic.
 
 use alloy::primitives::{I256, U256};
-use rayon::prelude::*;
+use std::sync::PoisonError;
 
 use ::degenbot_pools::v3_state::{v3_simulate_swap, V3PoolState};
 use ::degenbot_pools::v4_state::v4_simulate_swap;
@@ -123,17 +123,6 @@ fn sims_aware_cost(proxy: usize, last_sims: Option<u64>, last_gate_us: Option<u6
     proxy.max(measured.saturating_add(measured_gate))
 }
 
-#[expect(clippy::doc_markdown)]
-/// RAYPAR T3: LPT-pre-balanced scoped-thread partition replaces rayon
-/// par_iter work-stealing fan-out for the solve phase. Default ON; set
-/// DEGENBOT_LPT_PARTITION=0 to fall back to rayon par_iter for A/B comparison.
-/// The lab report shows LPT achieves 7.80/8 vs rayon 4.91/8.
-/// (T4: the stance is an engine construction field set once from env —
-/// never read at call time.)
-fn lpt_partition_enabled() -> bool {
-    LPT_PARTITION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 /// 7LV6VN T2: chunked parallel resolve of the affected paths (sharded hop
 /// cache preserves cross-path hit reuse). Default ON; set
 /// `DEGENBOT_SOLVE_RESOLVE_PAR=0` for the serial A/B fallback.
@@ -174,12 +163,6 @@ fn min_profit_floor() -> U256 {
 /// upsert-idempotent, so a lost race only rewrites the same row).
 static ARB_SIM_CENSUS_SEEDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
-/// PE4FPM: first-spawn latch for the `detached_solve_bins` census row
-/// (thread-kind fallback arm; registration is upsert-idempotent).
-static DETACH_BIN_CENSUS_SEEDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
-static LPT_PARTITION_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
 static MIN_PROFIT_FLOOR_WEI: std::sync::OnceLock<U256> = std::sync::OnceLock::new();
 
 /// T3 (epic BXUSGL): `DEGENBOT_STREAMING_DELIVERY` — emit each clamp-passed
@@ -197,13 +180,6 @@ static MIN_PROFIT_FLOOR_WEI: std::sync::OnceLock<U256> = std::sync::OnceLock::ne
 /// (A/B); any other value (or unset) streams.
 pub(crate) static STREAMING_DELIVERY_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
-
-/// BXUSGL T1: which dispatch drives the solve fan-out — see
-/// [`solve_executor_stance_from_env`]/[`SolveExecutorKind`]. Parsed ONCE at
-/// engine construction ([`install_engine_env_stances`]); the hot path reads
-/// the engine's construction-time field, never this static directly.
-pub(crate) static SOLVE_EXECUTOR_TOKIO: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// ADR-042 Q6 migration stance: `fleet.stance=fleet` routes the solve fan-
 /// out (detached AND in-cycle arms) through the degenbot-workers fleet —
@@ -236,16 +212,7 @@ pub(crate) static DETACHED_SOLVES_ENABLED: std::sync::atomic::AtomicBool =
 /// `DEGENBOT_DETACHED_SOLVES` parse (2UVG3E default flip): unset/empty/1/
 /// unknown values all route DETACHED (the shipped posture — the solve path
 /// takes no engine-level Mutex); only an explicit 0/false/off opts back into
-/// KAHU5W: solve-executor stance comes from the typed schema enum
-/// (`solve.executor`); the fail-open "unknown value warns and defaults"
-/// legacy parse is gone — the loader is fail-closed (Q6 breaking change,
-/// recorded). "tokio" routes the solve fan-out through the dedicated
-/// low-priority runtime; "rayon" keeps the rayon-scope path.
-#[must_use]
-fn solve_executor_tokio(cfg: &::degenbot_config::BotConfig) -> bool {
-    matches!(cfg.solve.executor, ::degenbot_config::SolveExecutor::Tokio)
-}
-
+/// the in-cycle arm (engine Mutex held through the fan-out).
 #[cfg(test)]
 mod streaming_stance_tests {
     /// KAHU5W (presence-gated bools resolved): `pump.streaming_delivery` is
@@ -309,14 +276,6 @@ pub fn solve_runtime_config_from_cfg(
 /// holds an instance value built by [`solve_runtime_config_from_cfg`] and
 /// threads it down (KAHU5W: the solver `OnceLock` is retired).
 pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
-    LPT_PARTITION_ENABLED.store(
-        cfg.solve.lpt_partition,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    SOLVE_EXECUTOR_TOKIO.store(
-        solve_executor_tokio(cfg),
-        std::sync::atomic::Ordering::Relaxed,
-    );
     // ADR-042 Q6: the fleet.stance migration flag. Under `fleet` the solve
     // bins ride the fleet-hosted executor; the typed boot descriptor
     // (quota + overrides + posture) is parsed here once.
@@ -845,50 +804,6 @@ impl PipelinedSims {
 
     fn is_empty(&self) -> bool {
         self.pending.is_empty()
-    }
-}
-
-/// Walk-batch sim attach for the rayon fallback arm (7LV6VN T5): park
-/// walk outcomes, schedule their pipelined sims on the budget-derived
-/// slot pool, drain non-blockingly, and block-join at the end -
-/// payload-complete outcomes reach the tail merge unchanged.
-struct RayonAttach<'a> {
-    pending: PipelinedSims,
-    held: Vec<Option<SolveArmOutcome>>,
-    span: &'a tracing::Span,
-    shared: &'a SolveCycleShared,
-}
-
-impl RayonAttach<'_> {
-    fn park(&mut self, idx: usize, pid: u64, r: SolvePathResult, twins: u64) {
-        let scheduled = self
-            .pending
-            .schedule_one(self.shared, idx, pid, &r, self.span);
-        self.held.push(Some((pid, r, twins, None)));
-        if !scheduled {
-            // No sim rides this item - deliver immediately.
-            self.flush_one(pid, None);
-        }
-    }
-
-    fn flush_one(&mut self, done_pid: u64, payload: Option<SimulatedPathResult>) {
-        if let Some(slot) = self
-            .held
-            .iter_mut()
-            .find(|it| matches!(it, Some((p, ..)) if *p == done_pid))
-        {
-            if let Some(outcome) = slot.as_mut() {
-                outcome.3 = payload;
-            }
-        }
-    }
-
-    fn finish(mut self) -> Vec<SolveArmOutcome> {
-        let pending = std::mem::take(&mut self.pending);
-        for (done_pid, payload) in pending.join_all() {
-            self.flush_one(done_pid, payload);
-        }
-        self.held.into_iter().flatten().collect()
     }
 }
 
@@ -1758,7 +1673,7 @@ impl ArbitrageEngine {
             paths.affected = affected_path_ids.len(),
         )
         .entered();
-        // 7LV6VN T2: chunked rayon fan-out over the affected paths. The
+        // 7LV6VN T2: chunked fan-out over the affected paths. The
         // sharded hop cache keeps cross-path hit reuse intact (a chunk-local
         // cache would multiply the expensive CL tick-walk per shared pool),
         // so chunks contend only on shard locks, never on each other's work.
@@ -1855,23 +1770,58 @@ impl ArbitrageEngine {
                 out
             };
 
-            let _ = RESOLVE_CHUNK;
             // Deterministic chunking: hashbrown iteration order varies per
             // process; a sorted snapshot keeps chunk boundaries (and thus
             // debug-log ordering) identical across runs for ~microsecond cost.
             let mut affected_vec: Vec<u64> = affected_path_ids.iter().copied().collect();
             affected_vec.sort_unstable();
-            let chunk_outs: Vec<ResolveChunkOut> = hotpath::measure_block!(
-                "resolve.chunks",
-                if resolve_parallel_enabled() && affected_vec.len() >= RESOLVE_PAR_MIN {
-                    affected_vec
-                        .par_chunks(RESOLVE_CHUNK)
-                        .map(resolve_chunk)
-                        .collect()
-                } else {
+            let chunk_outs: Vec<ResolveChunkOut> = hotpath::measure_block!("resolve.chunks", {
+                if !resolve_parallel_enabled() || affected_vec.len() < RESOLVE_PAR_MIN {
                     vec![resolve_chunk(&affected_vec)]
+                } else {
+                    // P6YXA6: the resolve chunk fan-out leaves rayon with
+                    // the hard cutover (the rayon global pool retires).
+                    // Chunk boundaries stay byte-identical (the sorted
+                    // snapshot chunked at RESOLVE_CHUNK); the parallel
+                    // window moves onto short-lived scoped std::threads —
+                    // thread t takes chunks t, t+N, … and the index-keyed
+                    // collect restores the deterministic merge order.
+                    let chunk_ids: Vec<&[u64]> = affected_vec.chunks(RESOLVE_CHUNK).collect();
+                    let n_threads =
+                        degenbot_core::cpu_budget::solve_worker_count().min(chunk_ids.len());
+                    // A panicking child propagates out of `thread::scope` (the
+                    // join is implicit) — the loud-failure posture the rayon
+                    // join used to have. Results stage behind a mutex AFTER
+                    // each chunk resolves (never held during the resolve)
+                    // and the index sort restores the deterministic merge
+                    // order; slot coverage is structural (round-robin over
+                    // the chunk list), so no slot dummy is needed.
+                    let staged: std::sync::Mutex<Vec<(usize, ResolveChunkOut)>> =
+                        std::sync::Mutex::new(Vec::new());
+                    std::thread::scope(|scope| {
+                        for t in 0..n_threads {
+                            let staged_ref = &staged;
+                            let chunk_ids_ref = &chunk_ids;
+                            scope.spawn(move || {
+                                let local: Vec<(usize, ResolveChunkOut)> = (t..chunk_ids_ref.len())
+                                    .step_by(n_threads)
+                                    .map(|i| (i, resolve_chunk(chunk_ids_ref[i])))
+                                    .collect();
+                                let mut ready =
+                                    staged_ref.lock().unwrap_or_else(PoisonError::into_inner);
+                                ready.extend(local);
+                            });
+                        }
+                    });
+                    let mut chunk_pairs =
+                        staged.into_inner().unwrap_or_else(PoisonError::into_inner);
+                    chunk_pairs.sort_unstable_by_key(|(i, _)| *i);
+                    chunk_pairs
+                        .into_iter()
+                        .map(|(_, out)| out)
+                        .collect::<Vec<ResolveChunkOut>>()
                 }
-            );
+            });
 
             // Serial, deterministic merge (the engine mutex is held by this
             // cycle, so no other task can race these stores).
@@ -2165,13 +2115,13 @@ impl ArbitrageEngine {
         // DETACHED arm (epic SRQEK5 WV62TX): under `detached_solving` with
         // in-flight backpressure satisfied (< `DETACHED_INFLIGHT_CAP`
         // un-merged stragglers), enqueue the SOLVES on a plain std::thread
-        // per LPT bin (DEADLOCK NOTE: no scoped rayon install — a scoped
-        // install JOINS its tasks and can starve against a held parking_lot
-        // guard; std::thread cannot deadlock with rayon) and RETURN at
+        // per LPT bin — since the P6YXA6 hard cutover those bins ride the
+        // fleet executor (fleet.stance=fleet) or the dedicated tokio solve
+        // executor, never a scoped install — and RETURN at
         // enqueue end. Every result flows through the unbounded mpsc to the
         // merge sidecar, which applies the Q1a stale policy under the engine
-        // Mutex. The executor stance (DEGENBOT_SOLVE_EXECUTOR) is an
-        // INDEPENDENT axis: it governs the in-cycle arms below, unchanged.
+        // Mutex. The detached arm is INDEPENDENT of the in-cycle dispatch
+        // below.
         // -----------------------------------------------------------------
         if self.detached_solving
             && self
@@ -2238,12 +2188,11 @@ impl ArbitrageEngine {
                     let outstanding_bin = std::sync::Arc::clone(&outstanding_in_bins);
                     let tx = merge_tx.clone();
                     let solve_span_bin = solve_span.clone();
-                    // ergo INYMDG: bin jobs ride the dedicated tokio solve
-                    // executor (persistent warm workers, BXUSGL T1) when the
-                    // solve.executor stance is tokio — per-cycle named
-                    // std-threads remain the rayon-stance fallback. The body
+                    // ergo INYMDG: bin jobs ride the fleet executor
+                    // (fleet.stance=fleet) or the dedicated tokio solve
+                    // executor (persistent warm workers, BXUSGL T1). The body
                     // is unchanged; same 'static + Send move semantics, and
-                    // concurrent detached cycles now share the persistent
+                    // concurrent detached cycles share the persistent
                     // worker set instead of forking one thread per bin.
                     let run_bin = move || {
                         // 7LV6VN T5 (pipelined arm): results park until
@@ -2363,40 +2312,12 @@ impl ArbitrageEngine {
                         // unit (per-bin pin, per-path streaming preserved).
                         crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
                             .spawn(bin_idx, run_bin);
-                    } else if matches!(
-                        self.solve_executor,
-                        crate::arb_engine::SolveExecutorKind::Tokio
-                    ) {
-                        crate::arb_engine::solve_executor::global_solve_executor().spawn(run_bin);
                     } else {
-                        // PE4FPM: thread-kind fallback bins census-register
-                        // under their own id — the Tokio arm above runs on the
-                        // registered solve_executor_fleet instead.
-                        if DETACH_BIN_CENSUS_SEEDED.get().is_none() {
-                            DETACH_BIN_CENSUS_SEEDED.set(()).ok();
-                            degenbot_core::worker_census::register(
-                                degenbot_core::worker_census::WorkerCensusEntry {
-                                    resource: "detached_solve_bins",
-                                    kind: "per-cycle detached solve-bin threads (thread-kind fallback arm)",
-                                    count: degenbot_core::cpu_budget::solve_worker_count(),
-                                    thread_name: "arb-detach-bin-{n}",
-                                    sizing: "one detached thread per LPT bin per cycle (bin count = solve_worker_count); only when the solve executor kind is not Tokio — the Tokio arm rides solve_executor_fleet",
-                                },
-                            );
-                        }
-                        if let Err(err) = std::thread::Builder::new()
-                            .name(format!("arb-detach-bin-{bin_idx}"))
-                            .spawn(run_bin)
-                        {
-                            // LOUD (loud-failure discipline): a lost bin would
-                            // strand its affected paths' results forever.
-                            tracing::error!(
-                                error = %err,
-                                bin = bin_idx,
-                                "[detached] solve-bin spawn failed — aborting"
-                            );
-                            std::process::abort();
-                        }
+                        // P6YXA6: the executor-stance gate is gone — the
+                        // private tokio solve executor hosts every non-fleet
+                        // bin (the per-cycle std-thread fallback retired with
+                        // the rayon stance it existed for).
+                        crate::arb_engine::solve_executor::global_solve_executor().spawn(run_bin);
                     }
                 }
                 if let Some(p) = crate::instruments::pipeline() {
@@ -2431,56 +2352,48 @@ impl ArbitrageEngine {
             return;
         }
 
-        let tokio_solve_mode = matches!(
-            self.solve_executor,
-            crate::arb_engine::SolveExecutorKind::Tokio
-        );
-        let streaming_merge: bool;
+        // P6YXA6 hard cutover: ONE in-cycle dispatch. The LPT bins ride the
+        // fleet-hosted executor under `fleet.stance=fleet`, else the
+        // dedicated private tokio runtime — no executor-stance gate
+        // (`solve.executor` is retired with the `DEGENBOT_SOLVE_EXECUTOR`
+        // loud load error), and the rayon arms are gone.
         let mut clamp_twin_count: u64 = 0;
         let mut solved_count: usize = 0;
-        let mut solved: Vec<SolveArmOutcome> = Vec::new();
-        if tokio_solve_mode {
-            streaming_merge = true;
-            hotpath::measure_block!("arb_solve.tokio_solve", {
-                // BXUSGL T1: the dedicated executor streams PER-PATH
-                // results to the caller result queue - one bin task per
-                // persistent worker (no splitting/stealing: RAYPAR T3),
-                // and this drain merges each path result CLAMP-AND-ALL
-                // as its own solve completes. Fast paths land in
-                // `self.results` while heavy bins still run. The engine
-                // Mutex stays held by THIS cycle, so merging here cannot
-                // overlap the next block cycle; the drain runs on the
-                // calling thread (T2 moves it to spawn_blocking for the
-                // async seam).
-                // ADR-042 F3: under the fleet stance the fleet-hosted
-                // executor owns these bins (the same keyed Solver units the
-                // detached arm submits — the fleet is the SOLE executor of
-                // solve bins); the legacy arm keeps the private runtime.
-                let fleet_executor = self
-                    .fleet_hosted
-                    .then(crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor);
-                let executor = crate::arb_engine::solve_executor::global_solve_executor();
-                let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<SolveArmOutcome>>();
-                let bins = compute_bins();
-                for (bin_idx, bin) in bins.iter().enumerate() {
-                    let bin = bin.clone();
-                    let res_tx = res_tx.clone();
-                    let shared_bin = std::sync::Arc::clone(&shared);
-                    let to_solve_bin = std::sync::Arc::clone(&to_solve);
-                    let solve_span_bin = solve_span.clone();
-                    let run_bin = move || {
-                        // 7LV6VN T5 (pipelined arm): outcomes park until
-                        // their sim lands; the walk never waits on a sim.
-                        let mut held: Vec<(u64, Option<SolveArmOutcome>)> = Vec::new();
-                        let mut pending = PipelinedSims::default();
-                        for &i in &bin {
-                            let (pid, resolved) = &to_solve_bin[i];
-                            let outcome = solve_one_path(
-                                &shared_bin,
-                                &solve_span_bin,
-                                *pid,
-                                resolved,
-                            )
+        hotpath::measure_block!("arb_solve.tokio_solve", {
+            // BXUSGL T1: the dedicated executor streams PER-PATH
+            // results to the caller result queue - one bin task per
+            // persistent worker (no splitting/stealing: RAYPAR T3),
+            // and this drain merges each path result CLAMP-AND-ALL
+            // as its own solve completes. Fast paths land in
+            // `self.results` while heavy bins still run. The engine
+            // Mutex stays held by THIS cycle, so merging here cannot
+            // overlap the next block cycle; the drain runs on the
+            // calling thread (T2 moves it to spawn_blocking for the
+            // async seam).
+            // ADR-042 F3: under the fleet stance the fleet-hosted
+            // executor owns these bins (the same keyed Solver units the
+            // detached arm submits — the fleet is the SOLE executor of
+            // solve bins); the legacy arm keeps the private runtime.
+            let fleet_executor = self
+                .fleet_hosted
+                .then(crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor);
+            let executor = crate::arb_engine::solve_executor::global_solve_executor();
+            let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<SolveArmOutcome>>();
+            let bins = compute_bins();
+            for (bin_idx, bin) in bins.iter().enumerate() {
+                let bin = bin.clone();
+                let res_tx = res_tx.clone();
+                let shared_bin = std::sync::Arc::clone(&shared);
+                let to_solve_bin = std::sync::Arc::clone(&to_solve);
+                let solve_span_bin = solve_span.clone();
+                let run_bin = move || {
+                    // 7LV6VN T5 (pipelined arm): outcomes park until
+                    // their sim lands; the walk never waits on a sim.
+                    let mut held: Vec<(u64, Option<SolveArmOutcome>)> = Vec::new();
+                    let mut pending = PipelinedSims::default();
+                    for &i in &bin {
+                        let (pid, resolved) = &to_solve_bin[i];
+                        let outcome = solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved)
                             .map(|(pid, mut result)| {
                                 // SIMPIPE2 T2: clamp in the worker
                                 // (stance-gated) BEFORE the
@@ -2492,191 +2405,101 @@ impl ArbitrageEngine {
                                     clamp_result_in_worker(&shared_bin, i, pid, &mut result);
                                 (pid, result, twins)
                             });
-                            {
-                                // The profitless filter runs BEFORE the sim
-                                // is scheduled - a clamp-zeroed candidate
-                                // never needs its payload.
-                                match outcome {
-                                    Some((pid, result, twins)) => {
-                                        if result.optimal_input.is_zero() || result.profit.is_zero()
-                                        {
-                                            if !result.solver_pool_states.is_empty() {
-                                                tracing::debug!(
-                                                    "[solver-st] path_id={pid} hops=[{}]",
-                                                    result.solver_pool_states.join(";")
-                                                );
-                                            }
-                                            continue;
-                                        }
-                                        if !pending.schedule_one(
-                                            &shared_bin,
-                                            i,
-                                            pid,
-                                            &result,
-                                            &solve_span_bin,
-                                        ) {
-                                            // No sim rides this item — flush
-                                            // immediately.
-                                            held.push((pid, Some((pid, result, twins, None))));
-                                            flush_tokio_item(&mut held, &res_tx, pid, None);
-                                            continue;
-                                        }
+                        {
+                            // The profitless filter runs BEFORE the sim
+                            // is scheduled - a clamp-zeroed candidate
+                            // never needs its payload.
+                            match outcome {
+                                Some((pid, result, twins)) => {
+                                    if result.optimal_input.is_zero() || result.profit.is_zero() {
                                         if !result.solver_pool_states.is_empty() {
                                             tracing::debug!(
                                                 "[solver-st] path_id={pid} hops=[{}]",
                                                 result.solver_pool_states.join(";")
                                             );
                                         }
+                                        continue;
+                                    }
+                                    if !pending.schedule_one(
+                                        &shared_bin,
+                                        i,
+                                        pid,
+                                        &result,
+                                        &solve_span_bin,
+                                    ) {
+                                        // No sim rides this item — flush
+                                        // immediately.
                                         held.push((pid, Some((pid, result, twins, None))));
-                                        // Fan: flush sims that landed mid-walk.
-                                        for (done_pid, payload) in pending.drain_ready() {
-                                            flush_tokio_item(&mut held, &res_tx, done_pid, payload);
-                                        }
+                                        flush_tokio_item(&mut held, &res_tx, pid, None);
+                                        continue;
                                     }
-                                    // Same failed-solve stream the legacy arm
-                                    // sends (the drain skips None).
-                                    None => {
-                                        let _ = res_tx.send(None);
+                                    if !result.solver_pool_states.is_empty() {
+                                        tracing::debug!(
+                                            "[solver-st] path_id={pid} hops=[{}]",
+                                            result.solver_pool_states.join(";")
+                                        );
                                     }
+                                    held.push((pid, Some((pid, result, twins, None))));
+                                    // Fan: flush sims that landed mid-walk.
+                                    for (done_pid, payload) in pending.drain_ready() {
+                                        flush_tokio_item(&mut held, &res_tx, done_pid, payload);
+                                    }
+                                }
+                                // Same failed-solve stream the legacy arm
+                                // sends (the drain skips None).
+                                None => {
+                                    let _ = res_tx.send(None);
                                 }
                             }
                         }
-                        if !pending.is_empty() {
-                            for (done_pid, payload) in pending.join_all() {
-                                flush_tokio_item(&mut held, &res_tx, done_pid, payload);
-                            }
+                    }
+                    if !pending.is_empty() {
+                        for (done_pid, payload) in pending.join_all() {
+                            flush_tokio_item(&mut held, &res_tx, done_pid, payload);
                         }
-                    };
-                    if let Some(fleet) = fleet_executor {
-                        fleet.spawn(bin_idx, run_bin);
-                    } else {
-                        executor.spawn(run_bin);
                     }
-                }
-                drop(res_tx);
-                // MQUKB6-T2: the drain-side merge is its own phase node
-                // under the cycle span - fast paths merge here WHILE the
-                // executor workers still solve, and `merge.paths` records
-                // on completion (handle dropped at scope end, so the node
-                // closes with the drain).
-                let merge_span = tracing::info_span!(
-                    target: "degenbot::solver",
-                    "degenbot.arb.merge",
-                    merge.paths = tracing::field::Empty,
-                );
-                let merge_ctx = merge_span.enter();
-                while let Ok(item) = res_rx.recv() {
-                    let Some((pid, solve_result, worker_clamp_twins, payload)) = item else {
-                        continue;
-                    };
-                    if !solve_result.solver_pool_states.is_empty() {
-                        tracing::debug!(
-                            "[solver-st] path_id={pid} hops=[{}]",
-                            solve_result.solver_pool_states.join(";")
-                        );
-                    }
-                    clamp_twin_count += self.merge_one_result(
-                        solve_block,
-                        metadata,
-                        pid,
-                        solve_result,
-                        worker_clamp_twins,
-                        payload,
-                    );
-                    solved_count += 1;
-                }
-                drop(merge_ctx);
-                merge_span.record("merge.paths", solved_count);
-            });
-        } else {
-            streaming_merge = false;
-            solved = hotpath::measure_block!("arb_solve.rayon_solve", {
-                // BXUSGL T1: the per-path dispatch moved to the free fn
-                // `solve_one_path`; this closure is the per-item dispatch
-                // for the rayon arms (borrowed locals only). Behavior
-                // identical to the pre-change code: per-bin send, join on
-                // ALL bins, then the tail clamp merge.
-                // 7LV6VN T5: the rayon fallback arm walks without sims; the
-                // sims schedule in one pipelined batch AFTER the walk joins
-                // (two-phase). The batch shape keeps the arm's semantics
-                // (results carry payloads before the tail merge) at the
-                // cost of one extra join - acceptable for a fallback arm.
-                // 7LV6VN T5: the rayon fallback arm walks WITHOUT sims (the
-                // per-item par_iter has no bin tail to join on). After the
-                // walk batch joins, sims schedule in one pipelined batch on
-                // the budget-derived slot pool, drain non-blockingly, and
-                // block-join at the end - payload-complete results reach the
-                // tail merge unchanged.
-                let solve_fn = |idx: usize,
-                                pid: u64,
-                                resolved: &ResolvedMixedPath|
-                 -> Option<(usize, u64, SolvePathResult, u64)> {
-                    solve_one_path(&shared, &solve_span, pid, resolved).map(|(pid, mut r)| {
-                        let twins = clamp_result_in_worker(&shared, idx, pid, &mut r);
-                        (idx, pid, r, twins)
-                    })
                 };
-
-                let walk_batch: Vec<(usize, u64, SolvePathResult, u64)> = if lpt_partition_enabled()
-                {
-                    // RAYPAR T3: LPT-pre-balanced partition on rayon persistent
-                    // global pool. Each LPT bin is one s.spawn task - exactly
-                    // n_threads tasks on n_threads persistent workers means no
-                    // splitting and no stealing: pure static partition with warm
-                    // L1/L2 + allocator arenas across drains (the pool was built
-                    // once at import by configure_rayon_solver_pool).
-                    let bins = compute_bins();
-                    let to_solve_ref = &to_solve;
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    rayon::scope(|s| {
-                        for bin in &bins {
-                            let tx = tx.clone();
-                            s.spawn(move |_| {
-                                let mut out = Vec::with_capacity(bin.len());
-                                for &i in bin {
-                                    let (pid, resolved) = &to_solve_ref[i];
-                                    out.push(solve_fn(i, *pid, resolved));
-                                }
-                                let _ = tx.send(out);
-                            });
-                        }
-                    });
-                    drop(tx);
-                    rx.into_iter().flatten().flatten().collect()
+                if let Some(fleet) = fleet_executor {
+                    fleet.spawn(bin_idx, run_bin);
                 } else {
-                    to_solve
-                        .par_iter()
-                        .enumerate()
-                        .filter_map(|(i, (pid, resolved))| solve_fn(i, *pid, resolved))
-                        .collect()
-                };
-
-                let mut attach = RayonAttach {
-                    pending: PipelinedSims::default(),
-                    held: Vec::with_capacity(walk_batch.len()),
-                    span: &solve_span,
-                    shared: shared.as_ref(),
-                };
-                for (idx, pid, r, twins) in walk_batch {
-                    if !r.solver_pool_states.is_empty() {
-                        tracing::debug!(
-                            "[solver-st] path_id={pid} hops=[{}]",
-                            r.solver_pool_states.join(";")
-                        );
-                    }
-                    if r.optimal_input.is_zero() || r.profit.is_zero() {
-                        continue; // profitless: no sim, dropped like the old filter did
-                    }
-                    attach.park(idx, pid, r, twins);
-                    // Fan: flush sims that finished during the walk batches.
-                    for (done_pid, payload) in attach.pending.drain_ready() {
-                        attach.flush_one(done_pid, payload);
-                    }
+                    executor.spawn(run_bin);
                 }
-                attach.finish()
-            });
-            solved_count = solved.len();
-        }
+            }
+            drop(res_tx);
+            // MQUKB6-T2: the drain-side merge is its own phase node
+            // under the cycle span - fast paths merge here WHILE the
+            // executor workers still solve, and `merge.paths` records
+            // on completion (handle dropped at scope end, so the node
+            // closes with the drain).
+            let merge_span = tracing::info_span!(
+                target: "degenbot::solver",
+                "degenbot.arb.merge",
+                merge.paths = tracing::field::Empty,
+            );
+            let merge_ctx = merge_span.enter();
+            while let Ok(item) = res_rx.recv() {
+                let Some((pid, solve_result, worker_clamp_twins, payload)) = item else {
+                    continue;
+                };
+                if !solve_result.solver_pool_states.is_empty() {
+                    tracing::debug!(
+                        "[solver-st] path_id={pid} hops=[{}]",
+                        solve_result.solver_pool_states.join(";")
+                    );
+                }
+                clamp_twin_count += self.merge_one_result(
+                    solve_block,
+                    metadata,
+                    pid,
+                    solve_result,
+                    worker_clamp_twins,
+                    payload,
+                );
+                solved_count += 1;
+            }
+            drop(merge_ctx);
+            merge_span.record("merge.paths", solved_count);
+        });
         if let Some(c) = shared.capture.as_ref() {
             tracing::info!(
                 target: "degenbot::solver",
@@ -2753,41 +2576,10 @@ impl ArbitrageEngine {
             memo.negative = memo_stats.negative_entries,
             memo.sims = memo_stats.probes_sims,
             memo.hit_sims = memo_stats.hits_sims,
-            "[solve-phase] rayon solve complete"
+            "[solve-phase] streaming solve complete"
         );
 
-        // Sequential merge - the RAYON arms only (BXUSGL T1): the tokio arm
-        // already clamp-merged each result during its per-path drain, so the
-        // fast paths never waited for the slowest bin. Apply the pool-state-
-        // aware CL-hop capacity clamp per path (reads `core` to reconcile each
-        // CL hop committed input against the pools twin) BEFORE inserting,
-        // so the stored result carries truthful `consumed_inputs` (a CL hop
-        // fed past its max-convertible capacity would march empty bitmap
-        // words on-chain - UO3JM4).
         let clamp_twins_start = std::time::Instant::now();
-        if !streaming_merge {
-            // MQUKB6-T2: same phase node as the tokio arm's streaming drain,
-            // so both arms produce an identical trace shape.
-            let merge_span = tracing::info_span!(
-                target: "degenbot::solver",
-                "degenbot.arb.merge",
-                merge.paths = solved_count,
-            );
-            let _merge_ctx = merge_span.enter();
-            hotpath::measure_block!("arb_solve.clamp_merge", {
-                for (pid, solve_result, worker_clamp_twins, payload) in solved {
-                    clamp_twin_count += self.merge_one_result(
-                        solve_block,
-                        metadata,
-                        pid,
-                        solve_result,
-                        worker_clamp_twins,
-                        payload,
-                    );
-                }
-            });
-        }
-
         // Telemetry: clamp phase done - the twin simulations are a known
         // multi-second contributor on CL-heavy batches, so they get their own
         // line item.
@@ -3882,12 +3674,6 @@ mod lpt_partition_tests {
         assert_eq!(sims_aware_cost(1, Some(0), Some(14_000)), 14_000);
         // Sims + gate terms ADD (both µs-scale) before the proxy comparison.
         assert_eq!(sims_aware_cost(500, Some(300), Some(14_000)), 14_300);
-    }
-
-    #[test]
-    fn lpt_partition_enabled_default_on() {
-        // Default is ON (the env var is unset in test environments).
-        assert!(lpt_partition_enabled());
     }
 
     #[test]
