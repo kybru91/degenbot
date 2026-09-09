@@ -267,9 +267,7 @@ class TestSessionOwner:
         # SIMPIPE: the "same owner" contract now rides the pipeline seam -
         # the consumer must hand THE session owner into the pipeline (which
         # the sim+submit leaves read exclusively).
-        assert captured_pipelines == [owner], (
-            "dispatch pipeline did not receive the session owner"
-        )
+        assert captured_pipelines == [owner], "dispatch pipeline did not receive the session owner"
 
     async def test_owner_advances_with_the_block_clock(
         self, monkeypatch: pytest.MonkeyPatch

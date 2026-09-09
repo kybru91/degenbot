@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -1280,6 +1282,45 @@ class Test6VZN7HOngoingDiscovery:
         assert reg.cancelled()
 
 
+class _ScriptedReceipt:
+    """Receipt double (PRG-5): the unit runs to completion AT SUBMISSION
+    (the seat-equivalent for a test double), storing the outcome — done()
+    flips like a receipt parked on a seat, result() re-raises the failure,
+    wait_async() delivers the stored outcome."""
+
+    def __init__(self, work: object) -> None:
+        self._value: object | None = None
+        self._error: Exception | None = None
+        try:
+            self._value = work()
+        except Exception as exc:  # ruff: ignore[blind-except] the seat
+            # re-raises the callable's exact failure through receipt.result()
+            self._error = exc
+
+    async def wait_async(self) -> None:
+        pass
+
+    def result(self) -> object:
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+    def done(self) -> bool:
+        return True
+
+
+_POOL_ID_LOCK = threading.Lock()
+_POOL_IDS: dict[str, int] = {}
+
+
+def _pool_id_for(address: str) -> int:
+    """Deterministic fake pool ids keyed by address (the dedup key)."""
+    with _POOL_ID_LOCK:
+        if address not in _POOL_IDS:
+            _POOL_IDS[address] = len(_POOL_IDS) + 1
+        return _POOL_IDS[address]
+
+
 class TestPathRegistrationPipeline:
     """NWTUM3 S1: the reusable, pump-concurrent `PathRegistrationPipeline`.
 
@@ -1296,13 +1337,32 @@ class TestPathRegistrationPipeline:
     class _FakePool:
         address: str
 
+        # PRG-5: the unit resolves the engine hop key off the build handle.
+        _py_pool: object = None
+        _fee_token0: int = 1
+        _fee_token1: int = 1
+
     class _FakeCtxBot:
         def __init__(self) -> None:
             self.chain_id = 1
             self.db = object()
+            self.receipts: list[object] = []
+
+        # PRG-5: the pipeline constructs ONLY over the fleet intake.
+        def registration_fleet_hosted(self) -> bool:
+            return True
+
+        def submit_registration_unit(self, fn: object) -> object:
+            receipt = _ScriptedReceipt(fn)
+            self.receipts.append(receipt)
+            return receipt
 
         def build_pool(self, address: str, **kwargs: object):
-            return TestPathRegistrationPipeline._FakePool(address)
+            pool = TestPathRegistrationPipeline._FakePool(address)
+            # Deterministic per-address engine key: the engine dedup keys on
+            # the hop signature, so a repeat path must resolve the SAME id.
+            pool._py_pool = SimpleNamespace(pool_id=_pool_id_for(address))
+            return pool
 
     class _FakeReg:
         def __init__(self) -> None:
@@ -1310,18 +1370,26 @@ class TestPathRegistrationPipeline:
             # PRG-4: the engine dedups by construction — first registration
             # of a signature is created, repeats answer the existing id.
             self._seen: set[object] = set()
+            # D7KMQO: the unit evaluates the path predicate before hop
+            # building (the operator surface's register_path pre-check).
+            from degenbot.arbitrage.policy import NoOpPathPredicate
+
+            self.path_predicate = NoOpPathPredicate()
 
         def register_v2_pool(self, pool: object) -> None:
             pass
 
-        def register_path(self, zipped: object) -> tuple[int, bool]:
+        def register_crawl_path(self, engine_hops: object) -> tuple[int, bool]:
             self.register_path_calls += 1
-            # The producer hands a zip-iterator of (pool, zfo); the engine
-            # keys on pool identity — mirror that with the pool address.
-            signature = tuple((getattr(p, "address", None), z) for p, z in zipped)
+            # The unit hands resolved (pool_id, zfo) hops; the fake keys on
+            # object identity to mirror the engine signature dedup.
+            signature = tuple(engine_hops)
             created = signature not in self._seen
             self._seen.add(signature)
             return (self.register_path_calls, created)
+
+        def register_path(self, zipped: object) -> tuple[int, bool]:
+            return self.register_crawl_path(zipped)
 
     @dataclass
     class _Step:
@@ -1340,9 +1408,10 @@ class TestPathRegistrationPipeline:
         bot = TestPathRegistrationPipeline._FakeCtxBot()
 
         class _Reg(TestPathRegistrationPipeline._FakeReg):
-            def register_v2_pool(self, pool: object) -> None:
+            def register_crawl_path(self, engine_hops: object) -> tuple[int, bool]:
                 if fail_on_register is not None:
                     raise fail_on_register
+                return super().register_crawl_path(engine_hops)
 
         reg = _Reg()
         weth = type("_Weth", (), {"address": "0x" + "1" * 40})()
@@ -1439,9 +1508,6 @@ class TestPathRegistrationPipeline:
         WITHOUT aborting the pipeline (a raw ``object()`` would make `_consume`
         do `list(object())` → TypeError, masking the real composition).
         """
-        from degenbot.runner._driver_constants import REG_QUEUE_BOUND, REG_WORKERS
-        from degenbot.runner.build_paths import run_registration_pipeline
-
         pipeline, reg, t_base = self._make_pipeline()
         prior_skips = pipeline.skip_count
 
@@ -1455,16 +1521,11 @@ class TestPathRegistrationPipeline:
                 await asyncio.sleep(0)
                 yield [self._Step(type=object, address="0x" + f"{i:x}" * 40)]
 
-        # Run the unbounded discovery producer through the pipeline's bounded
-        # producer/consumer as a background task (never returns).
-        reg_task = asyncio.create_task(
-            run_registration_pipeline(
-                producer=forever_producer(),
-                consume=pipeline._consume,
-                queue_size=REG_QUEUE_BOUND,
-                worker_count=REG_WORKERS,
-            )
-        )
+        # Run the unbounded discovery producer through the crawl as a
+        # background task (never returns). PRG-5: the bounded producer/consumer
+        # queue retired — the crawl is bounded-window submission over the
+        # fleet intake (the scripted receipts self-resolve inline).
+        reg_task = asyncio.create_task(pipeline.run_registration(producer=forever_producer()))
         try:
             # Let forever discovery climb a few cooperative steps.
             for _ in range(5):
@@ -1674,4 +1735,3 @@ class TestPumpFinishedWatchdog:
         async with session:
             # plain _FakeEngine has no pump_finished → watchdog returns at once
             await asyncio.wait_for(session._pump_finished_watchdog(), timeout=2.0)
-

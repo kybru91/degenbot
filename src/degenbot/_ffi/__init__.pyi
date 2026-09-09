@@ -924,6 +924,17 @@ class Bot:
         pool_id_hex: str,
         snapshot_block: int | None,
     ) -> Coroutine[Any, Any, None]: ...
+    def run_v3_registration_lifecycle_sync(
+        self,
+        address: str,
+        snapshot_block: int | None,
+    ) -> None: ...
+    def run_v4_registration_lifecycle_sync(
+        self,
+        pool_manager_address: str,
+        pool_id_hex: str,
+        snapshot_block: int | None,
+    ) -> None: ...
     def register_curve_pool(
         self,
         address: str,
@@ -1141,6 +1152,17 @@ class ArbitrageEngine:
     def __anext__(self) -> Coroutine[Any, Any, dict[str, Any]]: ...
 
     # ── Verify config (consumer-safe: nothing emits before resume). ──
+    def run_v3_registration_lifecycle_sync(
+        self,
+        address: str,
+        snapshot_block: int | None,
+    ) -> None: ...
+    def run_v4_registration_lifecycle_sync(
+        self,
+        pool_manager_address: str,
+        pool_id_hex: str,
+        snapshot_block: int | None,
+    ) -> None: ...
     def set_verify_rpc_url(self, rpc_url: str) -> None: ...
     def set_verify_state_view(self, state_view_address: str) -> None: ...
     def verify_v3_pool(

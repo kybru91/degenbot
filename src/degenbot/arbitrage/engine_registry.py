@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from degenbot import Bot, UniswapV2Pool
 from degenbot.aerodrome.pools import AerodromeV2Pool
 from degenbot.arbitrage import ArbitrageEngine
+from degenbot.arbitrage.verification_retry import retry_verification_call
 from degenbot.logging import logger as bot_logger
 
 # XEANMB: the `load_*_from_py` ingestion surface + `_v3_snapshot_to_py_dict`
@@ -405,6 +406,75 @@ class EngineRegistry:
 
         """
         return pool_id_hex in self._v4_keys
+
+    @property
+    def verify_snapshot_block(self) -> int | None:
+        """The seeded snapshot block for the two-step verify (T1/T6).
+
+        PRG-5 seat-thread surface: the crawl units run on fleet seats (no
+        asyncio loop) and read this once per unit to pass into the blocking
+        lifecycle FFI — the same value the async register path stashes.
+        """
+        return self._verify_snapshot_block
+
+    def run_v3_verify_lifecycle_sync(self, address: str) -> None:
+        """Drive a V3 pool's core-owned verify lifecycle, BLOCKING (PRG-5).
+
+        The seat-thread twin of the lifecycle inside :meth:`register_v3_pool`:
+        same core choreography, same retry contract
+        (:class:`VerificationRpcError` retried; :class:`VerificationMismatchError`
+        fatal), and the same snapshot seed block — only the park shape
+        differs (a fleet seat owns no asyncio loop).
+
+        The loop-bound bookkeeping of :meth:`register_v3_pool` (the key cache
+        + the asyncio in-flight claims, DMZ3DD) is NOT touched here — those
+        structures remain single-loop state for the operator surface; the
+        crawl's own at-most-once verify lifecycle is the pipeline's
+        thread-safe seat claims table.
+        """
+        retry_verification_call(
+            self.retry_policy_obj,
+            self.engine.run_v3_registration_lifecycle_sync,
+            address,
+            self._verify_snapshot_block,
+        )
+
+    def run_v4_verify_lifecycle_sync(
+        self,
+        pool_manager: str,
+        pool_id_hex: str,
+    ) -> None:
+        """V4 seat-thread twin of :meth:`run_v3_verify_lifecycle_sync`."""
+        retry_verification_call(
+            self.retry_policy_obj,
+            self.engine.run_v4_registration_lifecycle_sync,
+            pool_manager,
+            pool_id_hex,
+            self._verify_snapshot_block,
+        )
+
+    def register_crawl_path(
+        self,
+        engine_hops: Sequence[tuple[int, bool]],
+    ) -> tuple[int, bool]:
+        """Register a resolved hop list straight into the engine (PRG-5).
+
+        The seat-thread pathRegistration used by the crawl units: unlike
+        :meth:`register_path` it takes ALREADY-RESOLVED ``(pool_id,
+        zero_for_one)`` hops (the unit gets the ids off the build handles —
+        the loop-bound ``_vN_keys`` caches are not consulted or populated).
+        The D7KMQO path predicate is evaluated by the caller over the concrete
+        pools BEFORE hop building. Returns ``(path_id, created)`` with the
+        same semantics as :meth:`register_path` (dedup by construction in the
+        engine, PRG-4; the cap refusal surfaces as typed
+        :class:`PathRegistryFullError`).
+
+        Returns:
+            ``(path_id, created)`` — `created` is False when the engine's
+            signature dedup answered (PRG-4).
+
+        """
+        return self.engine.register_and_solve_path(list(engine_hops))
 
     def register_path(
         self,

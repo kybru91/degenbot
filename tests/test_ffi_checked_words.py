@@ -138,12 +138,10 @@ def test_v4_sparse_checked_zero_word_survives_in_snapshot() -> None:
         state_block=0,
         coverage="sparse",
     )
-    handle = pool._py_pool  # ruff:ignore[private-member-access] — factory seams the same way
+    handle = pool._py_pool
     handle.update_tick_data({1: (0, 100)}, {}, 100)
     snap = _snapshot(handle)
     assert snap.get(1) == (0, 100), f"V4 checked-empty word must survive: {snap}"
-
-
 
 
 # ── T3 (OMDCIY) — Tracked intake consistency rejection ──────────────────────
@@ -216,7 +214,8 @@ def test_assemble_v3_inconsistent_tracked_snapshot_rejected_at_intake(tmp_path):
     # the contradiction (the side reported may vary by HashMap order).
     assert "word 0" in message
     assert "(tick 10)" in message or "(tick 20)" in message
-    assert "bitmap_bit" in message and "row_gross_positive" in message
+    assert "bitmap_bit" in message
+    assert "row_gross_positive" in message
 
     # A consistent snapshot (bit 2 ↔ row tick 20) is accepted as Tracked.
     # Fresh Bot: the first bot's held read transaction predates the UPDATE

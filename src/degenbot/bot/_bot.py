@@ -319,6 +319,35 @@ class Bot:
         # Check database migration version
         self._check_database_version()
 
+    def registration_fleet_hosted(self) -> bool:
+        """Return the construction-time registration-intake stance (PRG-3/5).
+
+        Thin pass-through to the core: True once the engine has installed the
+        fleet intake boot (the module-init stance holder is read at FFI init,
+        the boot descriptor installs at engine construction). The crawl
+        driver requires this hard-True from pipeline construction on (PRG-5:
+        the legacy crawl shell is retired — no getattr-default fallback).
+
+        Returns:
+            True once the fleet intake boot is installed (stance = fleet).
+
+        """
+        return self._py_bot.registration_fleet_hosted()
+
+    def submit_registration_unit(self, fn: object) -> object:
+        """Submit ONE registration-intake unit for fleet-seat execution.
+
+        The receipt exposes ``done()`` / ``result()`` / ``wait()`` /
+        ``wait_async()``. The crawl's per-path units (build + verify
+        lifecycles + path registration) ride the fleet's duty-counted
+        ``PoolStateUpdater`` seats through this seam (PRG-5).
+
+        Returns:
+            The unit's receipt (``IntakeReceipt``).
+
+        """
+        return self._py_bot.submit_registration_unit(fn)
+
     @staticmethod
     def _enforce_provider_chain(provider: AlloyProvider, expected: ChainId) -> None:
         """Raise if the provider's chain_id doesn't match ``expected``.

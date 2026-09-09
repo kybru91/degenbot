@@ -62,9 +62,21 @@ FEE_PERCENTILES = (10, 50)
 # ``DEGENBOT_ERC6909_PROFIT=1``.
 ERC6909_PROFIT = os.environ.get("DEGENBOT_ERC6909_PROFIT", "0") == "1"
 
-# Build/registration tunables.
-REG_QUEUE_BOUND = int(os.environ.get("DEGENBOT_REG_QUEUE_BOUND", "64"))
-REG_WORKERS = int(os.environ.get("DEGENBOT_REG_WORKERS", "4"))
+# ── Retired at the PRG-5 hard cutover (IRUMXD) ─────────────────────────
+# The crawl shell (bounded producer/consumer queue + the bounded offload
+# executor) retired: pool builds and the registration work host on the
+# fleet's duty-counted `PoolStateUpdater` intake seats (ADR-042; PRG-3).
+# Setting either knob fails the config load LOUDLY for one release (the
+# DEGENBOT_SOLVE_EXECUTOR precedent, P6YXA6) — not a silent ignore.
+for _RETIRED_SHELL_KNOB in ("DEGENBOT_REG_QUEUE_BOUND", "DEGENBOT_REG_WORKERS"):
+    if os.environ.get(_RETIRED_SHELL_KNOB):
+        _retire_msg = (
+            f"{_RETIRED_SHELL_KNOB} was retired at the PRG-5 hard cutover "
+            "(epic IRUMXD): the registration crawl is hosted by the fleet "
+            "PoolStateUpdater intake (fleet.pool_state_updater_slots) — there "
+            "is no crawl queue or worker pool to size. Remove the knob."
+        )
+        raise RuntimeError(_retire_msg)
 
 # V3 factories (Ethereum mainnet).
 UNISWAP_V3_MAINNET_FACTORY = "0x33128a8fC17869897dcE68Ed026d694621f6FDfD"

@@ -57,6 +57,8 @@ class _FakePipeline:
         self.direction_fail_count = 0
         self.register_fail_count = 0
         self.v4_pool_count = 0
+        # PRG-5: the benign path-cap stop witness (read by build_paths).
+        self.capped = False
 
     def discovery_sweep(self) -> object:
         # The fake run_registration ignores the producer; an empty iterator

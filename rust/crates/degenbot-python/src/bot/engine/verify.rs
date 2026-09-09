@@ -47,6 +47,40 @@ impl PyArbitrageEngine {
         )
     }
 
+    /// Blocking (seat-thread) twin of `run_v3_registration_lifecycle` — the
+    /// PRG-5 registration-intake units run on fleet `PoolStateUpdater` seats
+    /// (plain threads, no asyncio loop), so the crawl drives the core-owned
+    /// choreography parked on the shared tokio runtime via `block_on` inside
+    /// `py.detach`. Telemetry + typed errors are identical to the async twin;
+    /// only the park shape differs.
+    #[pyo3(signature = (address, snapshot_block))]
+    fn run_v3_registration_lifecycle_sync(
+        &self,
+        py: Python<'_>,
+        address: &str,
+        snapshot_block: Option<u64>,
+    ) -> PyResult<()> {
+        self.pump
+            .run_v3_registration_lifecycle_blocking(py, address.to_string(), snapshot_block)
+    }
+
+    /// Blocking (seat-thread) V4 twin of `run_v3_registration_lifecycle_sync`.
+    #[pyo3(signature = (pool_manager_address, pool_id_hex, snapshot_block))]
+    fn run_v4_registration_lifecycle_sync(
+        &self,
+        py: Python<'_>,
+        pool_manager_address: &str,
+        pool_id_hex: &str,
+        snapshot_block: Option<u64>,
+    ) -> PyResult<()> {
+        self.pump.run_v4_registration_lifecycle_blocking(
+            py,
+            pool_manager_address.to_string(),
+            pool_id_hex.to_string(),
+            snapshot_block,
+        )
+    }
+
     /// Verify a single V3 pool's liquidity map against on-chain state.
     ///
     /// Takes a pool address and verifies the `tick_data` at the given block.

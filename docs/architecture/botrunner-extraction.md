@@ -143,7 +143,7 @@ Full table of files reaching into the examples (all in `tests/`):
 
 | Test file | Symbol(s) reached | Switch target |
 |---|---|---|
-| `arbitrage/test_backrun_session.py` | `BackrunSession`, `BackrunConfig`, `ConstructionContext`, `PathRegistrationPipeline`, `run_registration_pipeline`, `REG_QUEUE_BOUND`, `REG_WORKERS`, factory/WETH constants | `degenbot.runner` (BotRunner, config) + `runner.build_paths` |
+| `arbitrage/test_backrun_session.py` | `BackrunSession`, `BackrunConfig`, `ConstructionContext`, `PathRegistrationPipeline`, `resolve_directions`, factory/WETH constants (PRG-5: the bounded crawl shell — queue + offload executor + `REG_WORKERS`/`REG_QUEUE_BOUND` — retired in favor of the fleet intake) | `degenbot.runner` (BotRunner, config) + `runner.build_paths` |
 | `arbitrage/test_consumer_block_stream.py` | `Dispatcher`, `consume_result_batches`, `_dispatch_profitable`, `_tee_block_stream` | `degenbot.runner.*` |
 | `arbitrage/test_registration_pipeline.py` | `run_registration_pipeline`, `PathRegistrationPipeline` | `degenbot.runner.build_paths` |
 | `arbitrage/test_render_sim_failures.py` | `_render_sim_failures` | `degenbot.runner._render` |

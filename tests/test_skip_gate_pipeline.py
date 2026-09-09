@@ -17,7 +17,7 @@ from degenbot.runner.build_paths import PathRegistrationPipeline
 
 def make_pipeline(py_bot: object | None = None) -> PathRegistrationPipeline:
     ctx = SimpleNamespace(
-        bot=SimpleNamespace(_py_bot=py_bot),
+        bot=SimpleNamespace(_py_bot=py_bot, registration_fleet_hosted=lambda: True),
         chain_id=1,
         db=None,
         uniswap_v3_tracker=None,
@@ -32,7 +32,7 @@ class _RecordingPyBot:
     def __init__(self) -> None:
         self.reasons: list[str] = []
 
-    def record_registration_skip(self, reason: str) -> None:  # ruff:ignore[undocumented-public-method]
+    def record_registration_skip(self, reason: str) -> None:
         self.reasons.append(reason)
 
 
@@ -57,7 +57,7 @@ def test_record_skip_without_a_bot_only_counts() -> None:
     # Construction contexts without a live core (pipeline tests) must not
     # attempt the meter record.
     ctx = SimpleNamespace(
-        bot=None,
+        bot=SimpleNamespace(_py_bot=None, registration_fleet_hosted=lambda: True),
         chain_id=1,
         db=None,
         uniswap_v3_tracker=None,

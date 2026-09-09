@@ -1,387 +1,305 @@
-"""Unit tests for the bounded producer/consumer registration pipeline.
+"""The PRG-5 registration crawl: bounded-window submission over the fleet.
 
-Covers the backpressure + concurrency contract of
-`run_registration_pipeline` (the helper `build_paths` uses to decouple path
-discovery from pool activation):
+The bounded producer/consumer queue (`run_registration_pipeline`) retired
+with the crawl shell — discovery iterates directly and every path leaves as
+ONE `PoolStateUpdater` intake unit (build + verify lifecycles + path
+registration, all Rust-coordinated). These tests prove, over receipt
+doubles (the same scripted shape the intake-station tests use):
 
-- Backpressure: the producer must never have more than `queue_size` items
-  in flight ahead of the workers (a flood is held at the queue boundary).
-- FIFO: items are consumed in the order discovered (registration order is
-  preserved, matching the previous one-at-a-time semantics).
-- Sentinel / completion: when the producer exhausts, all workers drain and
-  the call returns.
-- Worker count: with `worker_count` workers, up to `worker_count` items are
-  being processed concurrently (overlapping lock-free RPC latency).
-- Fatal propagation: an exception escaping `consume` (verification fatal)
-  cancels the sibling workers + producer and re-raises.
+- the submission window: at most `REG_INTAKE_WINDOW` receipts outstanding,
+  FIFO resolution order (the retired workers' ordering guarantee),
+- the benign cap stop: the driver stops submitting after a cap outcome and
+  drains the window (the engine is full — the drain is cheap),
+- the fatal contract: a unit's VerificationMismatchError propagates through
+  the receipt and aborts the crawl loudly,
+- counter parity: `_absorb_outcome` folds the unit outcomes into the exact
+  counter shapes the retired inline `_consume` produced.
 
-These use a fake producer/consumer (no Rust engine, no RPC), per AGENTS.md's
-preference for Fakes.
+All work runs through the SAME `_consume` body the operator surfaces use,
+so behavior cannot diverge by input source (the NWTUM3 bar).
+
+Adapted from the retired pipeline tests (the shell tests back to
+5TSYKN/JKYVST, retargeted at the fleet intake by epic IRUMXD PRG-5).
 """
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
-from degenbot.runner.build_paths import run_registration_pipeline
+from degenbot.exceptions import VerificationMismatchError
+from degenbot.runner.build_paths import (
+    REG_INTAKE_WINDOW,
+    PathRegistrationPipeline,
+    RegistrationUnitOutcome,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
 
 
-async def _n_items(n: int) -> list[int]:
-    """Produce integers 0..n-1, recording the max in-flight count."""
-    return list(range(n))
+class _Receipt:
+    """A receipt double: wait_async runs the stored work (raising included)."""
+
+    def __init__(self, work: Callable[[], object]) -> None:
+        self._work = work
+        self._run = False
+        self._value: object | None = None
+
+    async def wait_async(self) -> None:
+        self._value = self._work()  # raises here exactly like the Rust seat
+        self._run = True
+
+    def result(self) -> object:
+        assert self._run, "await wait_async() first"
+        return self._value
+
+    def done(self) -> bool:
+        return self._run
 
 
-async def test_backpressure_caps_producer_in_flight() -> None:
-    """The producer must never run more than `queue_size` items ahead.
+class _FleetBot:
+    """Bot double: intake surface + in-flight bookkeeping, FIFO seat pool."""
 
-    Assert by tracking the max number of yielded-but-not-yet-consumed items.
-    """
-    queue_size = 4
-    worker_count = 4
+    def __init__(self, seats: int = 2) -> None:
+        self.seats = seats
+        self.submitted: list[Callable[[], object]] = []
+        self.receipts: list[_Receipt] = []
+        self.max_inflight = 0
+        self.inflight = 0
 
-    produced = 0
-    consumed = 0
-    max_in_flight = 0
+    def registration_fleet_hosted(self) -> bool:
+        return True
 
-    async def producer():
-        nonlocal produced, max_in_flight
-        for i in range(1000):
-            produced += 1
-            in_flight = produced - consumed
-            max_in_flight = max(max_in_flight, in_flight)
-            yield i  # the yield is where the `await put` would sit
+    def submit_registration_unit(self, fn: Callable[[], object]) -> _Receipt:
+        self.submitted.append(fn)
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        receipt = _Receipt(self._seat(fn))
+        self.receipts.append(receipt)
+        return receipt
 
-    async def consume(item: int) -> None:
-        nonlocal consumed
-        consumed += 1
-        await asyncio.sleep(0.001)
+    def _seat(self, fn: Callable[[], object]) -> Callable[[], object]:
+        def _run() -> object:
+            try:
+                return fn()
+            finally:
+                self.inflight -= 1
 
-    await run_registration_pipeline(
-        producer=producer(),
-        consume=consume,
-        queue_size=queue_size,
-        worker_count=worker_count,
-    )
-
-    # The helper's backpressure bounds the BUFFER (items produced but not yet
-    # consumed): at most `queue_size` sit in the queue plus at most one item in
-    # the hand of each of `worker_count` workers inside `consume`. Without the
-    # bounded queue the producer would run all 1000 items ahead (max_in_flight
-    # ~ 1000); with it, the producer is blocked at the queue boundary so the
-    # in-flight buffer stays small and bounded.
-    assert consumed == produced
-    assert max_in_flight <= queue_size + worker_count
+        return _run
 
 
-async def test_fifo_consumption_order() -> None:
-    """Workers consume in discovery order (FIFO), preserving registration order."""
-    order: list[int] = []
+@dataclass
+class _ScriptedPath:
+    """An opaque path whose unit records its processing order."""
 
-    async def producer():
-        for i in range(50):
-            yield i
-
-    async def consume(item: int) -> None:
-        await asyncio.sleep(0)
-        order.append(item)
-
-    await run_registration_pipeline(
-        producer=producer(),
-        consume=consume,
-        queue_size=5,
-        worker_count=4,
-    )
-    assert order == list(range(50))
+    name: str
 
 
-async def test_completes_and_drains_when_producer_exhausts() -> None:
-    """Call returns after the producer exhausts and all items are consumed."""
-    consumed: list[int] = []
+@dataclass
+class _OpaqueStep:
+    """A step whose `type` is not a pool table — the unit skips it."""
 
-    async def producer():
-        for i in range(37):
-            yield i
-
-    async def consume(item: int) -> None:
-        consumed.append(item)
-        await asyncio.sleep(0)
-
-    await run_registration_pipeline(
-        producer=producer(),
-        consume=consume,
-        queue_size=7,
-        worker_count=3,
-    )
-    assert len(consumed) == 37
+    type: type
+    address: str
+    hash: object | None = None
 
 
-async def test_empty_producer_completes() -> None:
-    async def producer():
-        if False:
-            yield None
-
-    async def consume(item: object) -> None:
-        msg = "consume should never run for an empty producer"
-        raise AssertionError(msg)
-
-    await run_registration_pipeline(
-        producer=producer(),
-        consume=consume,
-        queue_size=4,
-        worker_count=3,
-    )
-
-
-async def test_validation_rejects_bad_args() -> None:
-    async def producer():
-        yield None
-
-    async def consume(item: object) -> None:
-        pass
-
-    with pytest.raises(ValueError):
-        await run_registration_pipeline(
-            producer=producer(),
-            consume=consume,
-            queue_size=0,
-            worker_count=2,
-        )
-    with pytest.raises(ValueError):
-        await run_registration_pipeline(
-            producer=producer(),
-            consume=consume,
-            queue_size=2,
-            worker_count=0,
-        )
-
-
-class _FatalError(RuntimeError):
-    pass
-
-
-async def test_fatal_error_cancels_siblings_and_reraises() -> None:
-    """An exception escaping `consume` aborts the whole pipeline, not just its
-    worker — the crash-loudly verification contract must survive concurrency.
-    """
-    started: asyncio.Event = asyncio.Event()
-
-    async def producer():
-        for i in range(50):
-            yield i
-
-    async def consume(item: int) -> None:
-        if item == 5:
-            started.set()
-            msg = "verification mismatch"
-            raise _FatalError(msg)
-        # make sure a sibling worker is mid-sleep when the fatal fires
-        await asyncio.sleep(0.01)
-
-    with pytest.raises(_FatalError):
-        await run_registration_pipeline(
-            producer=producer(),
-            consume=consume,
-            queue_size=8,
-            worker_count=4,
-        )
-
-
-async def test_fatal_error_aborts_with_unbounded_producer() -> None:
-    """A fatal `consume` error must abort FAST even when discovery is unbounded
-    (6VZN7H forever producer).
-
-    Regression for the crash-loudly swallow: the old
-    `gather(worker_tasks, return_exceptions=True)` inspected results only after
-    ALL workers finished, but with a never-ending producer the surviving
-    workers drain the queue forever — so the fatal exception sat trapped in the
-    gathered results and the bot kept trading instead of failing loudly. The
-    pipeline must now re-raise the first worker exception immediately.
-    """
-    fatal_hit: asyncio.Event = asyncio.Event()
-
-    async def producer():
-        # Never terminates — simulates the unbounded discovery re-sweep.
-        i = 0
-        while True:
-            yield i
-            i += 1
-            await asyncio.sleep(0)
-
-    async def consume(item: int) -> None:
-        if item == 0:
-            fatal_hit.set()
-            fatal = _FatalError("verification mismatch (unbounded producer)")
-            raise fatal
-        # Keep sibling workers busy so the old gather never returned.
-        await asyncio.sleep(0.01)
-
-    with pytest.raises(_FatalError):
-        # wait_for turns a regression (hang) into a fast failure.
-        await asyncio.wait_for(
-            run_registration_pipeline(
-                producer=producer(),
-                consume=consume,
-                queue_size=8,
-                worker_count=4,
-            ),
-            timeout=5.0,
-        )
-    assert fatal_hit.is_set()
-
-
-async def test_non_fatal_exceptions_do_not_abort() -> None:
-    """consume may swallow per-item errors (current `continue` semantics); only
-    uncaught exceptions abort."""
-
-    async def producer():
-        for i in range(20):
-            yield i
-
-    handled: list[int] = []
-
-    async def consume(item: int) -> None:
-        if item % 2 == 0:
-            handled.append(item)
-        else:
-            msg = "skipped path"
-            raise ValueError(msg)  # caught by consume's caller normally
-
-    # consume itself must swallow; here we simulate by try/except inside.
-    async def safe_consume(item: int) -> None:
-        if item % 2 == 0:
-            handled.append(item)
-
-    with pytest.raises(ValueError):
-        await run_registration_pipeline(
-            producer=producer(),
-            consume=consume,
-            queue_size=6,
-            worker_count=3,
-        )
-    # With a swallowing consume it completes
-    handled.clear()
-    await run_registration_pipeline(
-        producer=producer(),
-        consume=safe_consume,
-        queue_size=6,
-        worker_count=3,
-    )
-    assert len(handled) == 10
-
-
-def test_consume_offloads_pool_build_off_the_event_loop_thread() -> None:
-    """The blocking pool build must run on a WORKER thread, not the asyncio
-    loop thread (35NMBX). `_consume` must route `constr_bot.build_pool` (and
-    the V3/V4 tracker/build variants) through the bounded pool-build executor,
-    so the loop stays free to run the consumer/dispatch while registration
-    crawls.
-
-    RED phase: before offload, `build_pool` runs synchronously on the loop
-    thread -> build_thread == loop_thread -> assertion fails. GREEN: the build
-    lands on a worker thread.
-    """
-    import threading
-    from types import SimpleNamespace
-
-    from degenbot.database.models.pools import UniswapV2PoolTableBase
-    from degenbot.runner.build_paths import PathRegistrationPipeline
-
-    loop_thread: list[int] = []
-    build_thread: list[int] = []
-
-    class FakeBot:
-        def build_pool(self, address: str, *, silent: bool = False, **kwargs: object):
-            build_thread.append(threading.get_ident())
-            return SimpleNamespace(address=address)
-
-    class FakeRegistry:
-        def register_v2_pool(self, pool: object) -> int:
-            return 1
-
-        def register_path(self, path: object) -> tuple[int, bool]:
-            return (1, True)
-            return None
-
+def _pipeline_with_bot(
+    constr_bot: object, engine_registry: object = None
+) -> tuple[PathRegistrationPipeline, object]:
+    """A pipeline over a supplied construction Bot (the skip-gate pattern)."""
     ctx = SimpleNamespace(
-        bot=FakeBot(),
+        bot=constr_bot,
+        chain_id=1,
+        db=None,
         uniswap_v3_tracker=None,
         sushiswap_v3_tracker=None,
         pancakeswap_v3_tracker=None,
-        db=None,
-        chain_id=1,
-        weth=SimpleNamespace(address="0x" + "0" * 40),
+        weth=None,
     )
-    pipe = PathRegistrationPipeline(
-        context=ctx,  # type: ignore[arg-type]
-        engine_registry=FakeRegistry(),  # type: ignore[arg-type]
+    pipeline = PathRegistrationPipeline(context=ctx, engine_registry=engine_registry)
+    return pipeline, constr_bot
+
+
+async def _producer(paths: list[object]) -> AsyncIterator[object]:
+    for path in paths:
+        # Production discovery is a cooperative async iterator (the Rust DFS
+        # yields between loop ticks) — mirror that cadence.
+        await asyncio.sleep(0)
+        yield path
+
+
+async def test_crawl_submits_one_unit_per_path_and_resolves_fifo() -> None:
+    """Every discovered path = one intake unit; receipts resolve in order."""
+    order: list[str] = []
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)
+
+    def unit_shim(path_steps: object, directions: object = None) -> object:
+        order.append(path_steps.name)  # type: ignore[attr-defined]
+        return RegistrationUnitOutcome(kind="registered", created=True)
+
+    pipeline._registration_unit = unit_shim  # type: ignore[method-assign]
+
+    await pipeline.run_registration(
+        producer=_producer([_ScriptedPath(f"p{i}") for i in range(20)]),
     )
 
-    step = SimpleNamespace(type=UniswapV2PoolTableBase, address="0x" + "1" * 40)
+    assert len(bot.submitted) == 20
+    assert order == [f"p{i}" for i in range(20)], "FIFO resolution order"
+    assert pipeline.path_count == 20
+    assert not pipeline.capped
 
-    async def run() -> None:
-        loop_thread.append(threading.get_ident())
-        await pipe._consume([step], directions=[True])
 
-    asyncio.run(run())
+async def test_crawl_window_bounds_in_flight_units() -> None:
+    """Backpressure is the submission window — never more than its bound."""
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)
 
-    assert len(build_thread) == 1, "the build should have run exactly once"
-    assert build_thread[0] != loop_thread[0], (
-        "pool build ran on the asyncio loop thread; offload did not happen"
+    def unit_shim(path_steps: object, directions: object = None) -> object:
+        return RegistrationUnitOutcome(kind="registered", created=True)
+
+    pipeline._registration_unit = unit_shim  # type: ignore[method-assign]
+
+    await pipeline.run_registration(
+        producer=_producer([_ScriptedPath(f"p{i}") for i in range(100)]),
     )
 
+    assert bot.max_inflight <= REG_INTAKE_WINDOW
+    assert len(bot.submitted) == 100
 
-def test_path_cap_refusal_unwinds_as_benign_stop() -> None:
-    """PRG-4: the registered-path budget lives in the ENGINE path registry —
-    a candidate at the cap is refused by the engine's typed refusal
-    (`PathRegistryFullError`), and `_consume` unwinds as the same benign
-    `DiscoveryCrawlComplete` stop the pipeline producer expects, counted as
-    a cap skip.
 
-    The old pre-count Python gate (before any build work) retired: the
-    engine's own dedup + registry-of-record answers make capped re-offers
-    cheap by construction.
-    """
-    from types import SimpleNamespace
+async def test_crawl_stops_submitting_after_the_cap_and_drains() -> None:
+    """A cap outcome stops discovery; the window drains cheaply (PRG-4)."""
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)
+    processed: list[str] = []
 
-    from degenbot.database.models.pools import UniswapV2PoolTableBase
-    from degenbot.exceptions import PathRegistryFullError
-    from degenbot.runner.build_paths import DiscoveryCrawlComplete
-    from degenbot.runner.build_paths import PathRegistrationPipeline
+    def unit_shim(path_steps: object, directions: object = None) -> object:
+        name = path_steps.name  # type: ignore[attr-defined]
+        if len(processed) >= 3:
+            return RegistrationUnitOutcome(kind="cap", tag="path-cap")
+        processed.append(name)
+        return RegistrationUnitOutcome(kind="registered", created=True)
 
-    register_calls: list[object] = []
+    pipeline._registration_unit = unit_shim  # type: ignore[method-assign]
 
-    class FakeBot:
-        def build_pool(self, address: str, *, silent: bool = False, **kwargs: object):
-            return SimpleNamespace(address=address)
+    await pipeline.run_registration(
+        producer=_producer([_ScriptedPath(f"p{i}") for i in range(50)]),
+    )
 
-    class FakeRegistry:
-        def register_v2_pool(self, pool: object) -> int:
-            return 1
+    assert pipeline.capped is True
+    # The stop bounds the waste: discovery does not keep climbing to 50.
+    assert len(bot.submitted) < 50
+    # The benign stop folds the caps into the skip/cap counters.
+    assert pipeline.cap_skip_count >= 1
+    assert pipeline.path_count == 3
 
-        def register_path(self, path: object) -> tuple[int, bool]:
-            register_calls.append(path)
-            msg = "registered-path cap reached (1/1) - the crawl must stop discovery"
-            raise PathRegistryFullError(msg)
 
+async def test_crawl_fatal_verification_error_aborts_loudly() -> None:
+    """A unit's VerificationMismatchError propagates — no swallow, no cap."""
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)
+
+    def unit_shim(path_steps: object, directions: object = None) -> object:
+        msg = "boom"
+        raise VerificationMismatchError(msg)
+
+    pipeline._registration_unit = unit_shim  # type: ignore[method-assign]
+
+    with pytest.raises(VerificationMismatchError, match="boom"):
+        await pipeline.run_registration(
+            producer=_producer([_ScriptedPath(f"p{i}") for i in range(10)]),
+        )
+
+
+def test_absorb_outcome_counter_parity() -> None:
+    """Outcome folds mirror the retired inline branches exactly."""
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)
+
+    # Benign skip: skip_count + skip-reason tag.
+    pipeline._absorb_outcome(RegistrationUnitOutcome(kind="skip", tag="build-v3:X"))
+    assert pipeline.skip_count == 1
+    assert pipeline._skip_reasons["build-v3:X"] == 1
+
+    # V4 admission refusals are counted separately, NOT in skip_count.
+    pipeline._absorb_outcome(
+        RegistrationUnitOutcome(kind="skip", tag="v4-hook-rejected", counts_as_skip=False)
+    )
+    assert pipeline.v4_hook_rejected == 1
+    assert pipeline.skip_count == 1
+    pipeline._absorb_outcome(
+        RegistrationUnitOutcome(kind="skip", tag="v4-dynamic-fee-rejected", counts_as_skip=False)
+    )
+    assert pipeline.v4_dynamic_fee_rejected == 1
+
+    # Engine reject: engine_reject + other-Exception (parity with the two
+    # retired except-branches that incremented both).
+    pipeline._absorb_outcome(RegistrationUnitOutcome(kind="reject"))
+    assert pipeline.engine_reject_count == 1
+    assert pipeline.other_exc_count == 1
+
+    # register-fail: its own counter + the bounded warning source.
+    pipeline._absorb_outcome(RegistrationUnitOutcome(kind="register-fail", tag="ValueError: x"))
+    assert pipeline.register_fail_count == 1
+
+    # Registered: created and duplicate folds; v4 hops counted in BOTH
+    # (the retired body incremented v4_pool_count pre-dedup).
+    pipeline._absorb_outcome(RegistrationUnitOutcome(kind="registered", created=True, v4_hops=1))
+    assert pipeline.path_count == 1
+    assert pipeline.v4_pool_count == 1
+    pipeline._absorb_outcome(RegistrationUnitOutcome(kind="registered", created=False, v4_hops=2))
+    assert pipeline.path_count == 1
+    assert pipeline.dup_count == 1
+    assert pipeline.v4_pool_count == 3
+    assert pipeline._skip_reasons["dup"] == 1
+    # The cap fold stops the crawl.
+    pipeline._absorb_outcome(RegistrationUnitOutcome(kind="cap", tag="path-cap"))
+    assert pipeline.capped
+
+
+def test_legacy_stance_pipeline_construction_refuses() -> None:
+    """The hard cutover: no fleet intake, no crawl (loud, actionable)."""
     ctx = SimpleNamespace(
-        bot=FakeBot(),
+        bot=SimpleNamespace(registration_fleet_hosted=lambda: False),
+        chain_id=1,
+        db=None,
         uniswap_v3_tracker=None,
         sushiswap_v3_tracker=None,
         pancakeswap_v3_tracker=None,
-        db=None,
-        chain_id=1,
-        weth=SimpleNamespace(address="0x" + "0" * 40),
+        weth=None,
     )
-    pipe = PathRegistrationPipeline(
-        context=ctx,  # type: ignore[arg-type]
-        engine_registry=FakeRegistry(),  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="fleet-hosted only"):
+        PathRegistrationPipeline(context=ctx, engine_registry=None)
+
+
+def test_retired_skip_gate_pipeline_tests_upgraded_shape() -> None:
+    """The skip-gate pipeline shape still builds under the fleet intake."""
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)
+    pipeline._record_skip("v4-no-hash")
+    assert pipeline._skip_reasons["v4-no-hash"] == 1
+
+
+# The retired helper's tests (backpressure/FIFO/validation/fatal abort over a
+# `run_registration_pipeline` queue) were retargeted above: the queue is the
+# submission WINDOW, the fatal contract is the receipt re-raise, and the
+# non-fatal isolation is the outcome fold. The offload-executor probe (a
+# build running off the event loop thread) retired with the executor — the
+# seat execution is proven by the intake-station subprocess test.
+
+
+@pytest.fixture(autouse=True)
+def _no_progress_noise(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Keep progress logs out of the capture buffer for CI readability.
+    monkeypatch.setattr(
+        PathRegistrationPipeline,
+        "_PROGRESS_INTERVAL_S",
+        1_000_000.0,
     )
-
-    step = SimpleNamespace(type=UniswapV2PoolTableBase, address="0x" + "2" * 40)
-    with pytest.raises(DiscoveryCrawlComplete):
-        asyncio.run(pipe._consume([step], directions=[True]))
-
-    assert len(register_calls) == 1, "the refusal came from the engine at path registration"
-    assert pipe.cap_skip_count == 1, "the discard must be counted as a cap skip"
