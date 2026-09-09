@@ -100,7 +100,7 @@ impl SolveExecutor {
 static SOLVE_EXECUTOR: std::sync::OnceLock<SolveExecutor> = std::sync::OnceLock::new();
 
 /// The process-wide solve executor, built lazily on the first tokio-stance
-/// solve and persisting for the process lifetime (mirroring the rayon global
+/// solve and persisting for the process lifetime (mirroring the retired
 /// pool's construction-once contract: persistent workers keep warm L1/L2 +
 /// allocator arenas across drains).
 pub(crate) fn global_solve_executor() -> &'static SolveExecutor {
@@ -117,9 +117,9 @@ pub(crate) fn global_solve_executor() -> &'static SolveExecutor {
     SOLVE_EXECUTOR.get_or_init(|| {
         // Match the LPT bin count the engine computes at dispatch time
         // (cpu_budget::solve_worker_count, quota-derived): one runtime can
-        // never host fewer workers than there are bins. The rayon pool may
-        // be wider; extra rayon threads only serve the rayon dispatch arms.
-        // VPD5ZH: budget from the cgroup quota (not rayon width) - an 8-bin
+        // never host fewer workers than there are bins. The retired rayon
+        // global pool was the only wider pool; no dispatch arm outgrows these.
+        // VPD5ZH: budget from the cgroup quota (not a pool width) - an 8-bin
         // fleet on a quota-capped container froze the whole process under CFS
         // throttling whenever solve bursts overlapped I/O. Headroom (default
         // 2 CPUs) is left for the main runtime, Python, pump, and exporter;

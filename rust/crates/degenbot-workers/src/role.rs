@@ -34,7 +34,8 @@ pub enum WorkerRole {
     /// drivers and the per-cycle `arb-sim-*` spawn (the first pooling
     /// candidate). I/O-dominant: cordon throttles intake, never cancels.
     SimDriver,
-    /// Path resolution (the rayon partition consumers). I/O-adjacent CPU.
+    /// Path resolution (the resolve chunks; the retired rayon partition
+    /// pool's consumers now run on scoped std threads). I/O-adjacent CPU.
     Resolve,
     /// The detached merge sidecar: drains the result pipe so per-path sends
     /// land in a pipe somebody drinks from. Pinned (exactly one, T4).
@@ -153,7 +154,7 @@ impl WorkerRole {
     #[must_use]
     pub const fn census_sizing(self) -> &'static str {
         match self {
-            Self::Solver => "pins = 2x solver CPU share (2:1 parked-wait oversubscription), structural per LPT bin",
+            Self::Solver => "pins = one seat per LPT bin (floor(Q) minus the solve headroom, the structural bin count; walk admission stays the Solver share)",
             Self::SimDriver => "slot cap = 4 (today's SimSlots cap), duty-counted; fractional-quota remainder spendable here",
             Self::Resolve => "fixed v1 (1 slot, 12.4 ms/cycle measured)",
             Self::Merge => "exactly one sidecar",

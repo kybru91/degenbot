@@ -94,7 +94,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `DEGENBOT_SOLVER_WALK_MEMO` | `solve.solver_walk_memo` | `bool` | `false` | CL-solver walk memo (result caching) (`1` enables). |
 | `DEGENBOT_SOLVER_WALK_MEMO_STATS` | `solve.solver_walk_memo_stats` | `bool` | `false` | Walk-memo recomposition census (`1` enables). |
 | `DEGENBOT_CL_PROJECTION_CACHE` | `solve.cl_projection_cache` | `bool` | `true` | CL projection memo cache; `0`/`off`/`false`/`disabled` disables. |
-| `DEGENBOT_LPT_PARTITION` | `solve.lpt_partition` | `bool` | `true` | K-slowest-path LPT partitioning of solve bins; `0`/`false`/`off` disables. |
 ## `fleet`
 
 | Env var | TOML key | Type | Default | Description |

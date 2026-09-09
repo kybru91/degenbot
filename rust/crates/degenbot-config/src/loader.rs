@@ -271,6 +271,17 @@ impl BotConfigLoader {
                      needs no executor stance selection"
                 ));
             }
+
+            // P6YXA6: solve bins are ALWAYS LPT-pre-balanced now (the rayon
+            // fallback this flag disabled is retired) — a surviving variable
+            // fails the load loudly for one release.
+            if let Some(raw) = env.get("DEGENBOT_LPT_PARTITION") {
+                problems.push(format!(
+                    "retired env var DEGENBOT_LPT_PARTITION={raw:?} is no longer supported; \
+                     solve bins are always LPT-pre-balanced since the hard cutover \
+                     (ADR-042 / ergo P6YXA6) — remove the variable"
+                ));
+            }
         }
 
         // Layer 4 (highest): CLI / explicit argument overrides.

@@ -45,7 +45,7 @@ const BOOTSTRAP_KEYS: &[&str] = &["DEGENBOT_CONFIG"];
 /// they fail the load loudly and point at the replacement rather than
 /// silently falling back — the deprecation-style hard error. They are not
 /// schema keys anymore; the guard lives in the env layer of `loader.rs`.
-const RETIRED_KEYS: &[&str] = &["DEGENBOT_SOLVE_EXECUTOR"];
+const RETIRED_KEYS: &[&str] = &["DEGENBOT_LPT_PARTITION", "DEGENBOT_SOLVE_EXECUTOR"];
 
 /// Real static keys the artifact regex cannot capture (digit-terminated
 /// matches expand to these full names).

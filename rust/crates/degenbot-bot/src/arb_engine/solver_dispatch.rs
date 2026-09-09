@@ -325,7 +325,7 @@ type PathTimeRecord = (u128, u64, u64, u64, u64, u64, u64, u64, u64, u64);
 pub(crate) type PathTimesHeap = std::collections::BinaryHeap<std::cmp::Reverse<PathTimeRecord>>;
 
 /// Per-path solve + diagnostics (epic BXUSGL T1): the former `solve_fn`
-/// closure moved out verbatim so BOTH dispatch arms - the rayon scope and
+/// closure moved out verbatim so every dispatch arm (the legacy
 /// the dedicated tokio executor - dispatch a path identically. Takes the
 /// shared per-cycle context by reference; workers touch NO engine state
 /// and NO core.lock (engine-then-core lock ordering preserved unchanged),
@@ -913,9 +913,9 @@ pub(crate) struct SolveCycleShared {
 // (`DEGENBOT_DETACHED_SOLVES`, construction-time stance) the whole solve
 // cycle RETURNS at ENQUEUE end — every result then flows through an
 // UNBOUNDED mpsc to the merge sidecar, a plain `std::thread` (see the
-// epic DEADLOCK note: a scoped rayon install JOINS its tasks and can starve
+// epic DEADLOCK note: a JOINING scope (a scoped rayon install of old, or
 // against a held `parking_lot` guard; `std::thread` cannot deadlock with
-// rayon) that applies each item under the engine Mutex. The Q1a stale policy
+// impatient pool) would starve against the Mutex; the sidecar cannot. The Q1a stale policy
 // (apply-if-unchanged / drop-on-touched) makes the enqueue-time per-hop
 // `update_block` snapshot a complete staleness oracle: a price-neutral
 // liquidity event (V3 Mint/Burn, V4 ModifyLiquidity) advances the pool
@@ -1022,7 +1022,7 @@ impl ArbitrageEngine {
     /// solve event, insert into the result map, and (test-only) probe-
     /// record the merge. BOTH dispatch arms funnel here - the tokio arm
     /// calls it per streamed result (before the slowest path lands),
-    /// the rayon path from the tail loop. Returns the twin-simulation
+    /// the batched path from the tail loop. Returns the twin-simulation
     /// count (clamp.twins).
     ///
     /// SIMPIPE2 T2: `worker_clamp_twins > 0` means the solving worker
@@ -1236,7 +1236,7 @@ impl ArbitrageEngine {
     /// so the authoritative bound comes from pool state, not the solver).
     ///
     /// `solve_path` runs lock-free on its `IntV3TickRangeSequence` snapshot
-    /// (ADR-015: the guard drops before the rayon `par_iter`) and reports
+    /// (ADR-015: the guard drops before parallel work) and reports
     /// `consumed_inputs[i] = hop_outputs[i-1]` — the FULL forward, which can
     /// over-feed a CL pool past its on-chain capacity. When that happens the
     /// exact-in loop cannot exhaust the input and marches empty bitmap words to
@@ -1519,7 +1519,7 @@ impl ArbitrageEngine {
         block_number: u64,
         metadata: &BlockMetadata,
     ) {
-        // MQUKB6-T0: worker threads (rayon-scope tasks, the dedicated tokio
+        // MQUKB6-T0: worker threads (executor bins, resolve chunk threads,
         // solve executor's workers, AND the detached solve-bin std-threads)
         // have no ambient tracing context — any span emitted inside a
         // dispatch closure would orphan into a root trace. Capture the
@@ -1927,7 +1927,7 @@ impl ArbitrageEngine {
 
         // Solve affected paths and insert new results.
         //
-        // ADR-005 slice 15b-1: rayon `par_iter` parallelizes the solve across
+        // ADR-005 slice 15b-1: the solve fans out across executor bins
         // the affected-path set. `Self::solve_path` is a free-standing dispatch
         // (no `&self` read); each work item takes the `path_id` + an **Arc-
         // shared** `ResolvedMixedPath` snapshot (f701ccd3 staging fix: the
@@ -1940,11 +1940,11 @@ impl ArbitrageEngine {
         // `Mutex`-free pattern: collect `(path_id, SolvePathResult)` pairs
         // into a Vec, then merge sequentially into `self.results`. The
         // parallel workers touch NO engine state and NO core.lock —
-        // engine-then-core lock ordering is preserved unchanged (rayon's
+        // engine-then-core lock ordering is preserved unchanged (the
         // internal thread pool never re-enters the engine `Mutex`). For tiny
-        // batches the par_iter dispatch overhead is bounded by rayon's lazy
+        // batches the dispatch overhead is bounded by the lazy
         // split (see `par_iter` docs); the sequential cost dominates below
-        // the rayon internal cutoff.
+        // executor internals.
         //
         // Pre-collect the work items (path_id + resolved-snapshot). The Arc
         // clones drop the immutable borrow on `self.path_resolved` that
@@ -1985,7 +1985,7 @@ impl ArbitrageEngine {
         // -----------------------------------------------------------------
         // BXUSGL T1: per-cycle shared solve context. The pure solver phase
         // is a pure function of the resolved snapshots + this context:
-        // workers (rayon scope OR the dedicated tokio executor) hold Arc
+        // workers (the dedicated tokio executor bins) hold Arc
         // CLONES and touch NO engine state, NO core.lock - engine-then-core
         // lock ordering is preserved unchanged. The SINGLE engine-Mutex hold
         // still covers the whole cycle (the drain-side merge happens before
@@ -2063,12 +2063,12 @@ impl ArbitrageEngine {
             inline_sim: self.inline_sim.clone(),
             sim_fleet_hosted: self.fleet_hosted,
         });
-        // The LPT bins need Arc-shared access in the tokio arm; the rayon
+        // The LPT bins are Arc-shared for every arm; the
         // arms index through the same deref (byte-identical semantics).
         let to_solve = std::sync::Arc::new(to_solve);
 
         // LPT cost + binning shared by the LPT arms (both dispatch modes);
-        // called lazily inside the arms so the rayon-vs-tokio hotpath labels
+        // called lazily inside the arms so the per-mode hotpath labels
         // keep each arm measured span (a few us of bin-pack included, as
         // before).
         let compute_bins = || {
@@ -2081,7 +2081,7 @@ impl ArbitrageEngine {
             )
             .entered();
             // VPD5ZH: bins follow the cgroup-budget worker count (not the
-            // rayon pool width) so the tokio arm is exactly n_workers tasks
+            // old pool width) so each arm is exactly n_bins tasks
             // on n_workers persistent threads, per the solve_executor doc.
             // P6YXA6 sizing reconciliation: fleet-hosted cycles bin at the
             // fleet's STRUCTURAL seat count — pins and bins are the same
@@ -2608,25 +2608,27 @@ impl ArbitrageEngine {
     /// `solve_all_paths` which calls this only at cold start; subsequent
     /// re-solves go through `rebuild_and_solve_affected`.
     ///
-    /// ADR-005 slice 15b-1: the solve loop runs under rayon `par_iter` over
-    /// the registered `path_resolved` map. `Self::solve_path` is receiver-free
-    /// (slice 15b-1: pure dispatch to the freestanding math helpers), so the
-    /// parallel closure borrows only the `path_resolved` entry — no `&self`
-    /// mutation under the workers; they collect pairs that the outer loop
-    /// inserts into the fresh result map sequentially. The engine-then-core
-    /// lock ordering is unchanged: this method is `&self` (no core.lock taken
-    /// here; the caller already resolved the paths under `core.read()` at the
-    /// `solve_all_paths` entry).
+    /// P6YXA6 hard cutover: the cold start rides the SAME executors as the
+    /// in-cycle arms — the fleet-hosted Solver pins under
+    /// `fleet.stance=fleet`, else the dedicated private tokio runtime —
+    /// with LPT binning over the structural bin count kept. Bins are
+    /// 'static closures over Arc-cloned state: they take NO engine lock
+    /// (engine-then-core invariant intact), stream each profitable result
+    /// over an mpsc as its OWN solve completes, and the caller drains the
+    /// pipe into the fresh result map. Bin jobs clamp each result against
+    /// the pool state (UO3JM4) exactly as the merge-site clamp did.
     #[must_use]
     pub fn solve_all(&self) -> HashMap<u64, SolvePathResult> {
-        // MQUKB6-T0: same rayon context re-entry as rebuild_and_solve_affected.
+        // MQUKB6-T0: same span-context re-entry as rebuild_and_solve_affected:
+        // bin jobs re-enter this cycle span per work item, so per-path child
+        // spans parent under the cold-start cycle instead of forking roots.
         let solve_span = tracing::Span::current();
 
         // Pre-collect work items (path_id + Arc-shared resolved). The Arc
-        // clones drop the immutable borrow on self.path_resolved so the LPT
-        // scoped threads don't borrow &self during the parallel solve
-        // (f701ccd3 staging fix: deep clones copied the CL tick-range
-        // sequences per path).
+        // clones drop the immutable borrow on self.path_resolved so the
+        // 'static bin jobs don't capture &self at all (f701ccd3 staging fix:
+        // Arc clones are refcount bumps, not deep clones of the CL
+        // tick-range sequences).
         let to_solve: Vec<(u64, std::sync::Arc<ResolvedMixedPath>)> = self
             .path_resolved
             .iter()
@@ -2634,77 +2636,88 @@ impl ArbitrageEngine {
             .map(|(&pid, r)| (pid, std::sync::Arc::clone(r)))
             .collect();
 
-        // RAYPAR T3: LPT-pre-balanced partition on rayons persistent pool.
-        // The cold-start path has the same cost skew as the hot path - and
-        // the same quota problem, so it bins to the budget worker count too
-        // (rayon work-steals, so bins <= pool width is safe here).
-        // P6YXA6: fleet-hosted builds bin at the fleet's structural seat
-        // count (pins == bins) instead of the global pool width.
-        let n_threads = if self.fleet_hosted {
+        // RAYPAR T3: LPT-pre-balanced partition. The cold start has the
+        // same cost skew as the hot path, so it bins over the structural
+        // bin count too — the fleet's Solver seats when fleet-hosted
+        // (pins == bins), else solve_worker_count's dedicated-runtime bins.
+        let n_bins = if self.fleet_hosted {
             crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor().bin_count()
         } else {
             degenbot_core::cpu_budget::solve_worker_count()
         };
-        // Cold-start has no previous-block sims/gate yet: structural proxy only.
-        let last_sims_snapshot: HashMap<u64, u64> = HashMap::new();
-        let last_gate_snapshot: HashMap<u64, u64> = HashMap::new();
+        // Cold start has no previous-block sims/gate yet: structural proxy only.
         let costs: Vec<usize> = to_solve
             .iter()
-            .map(|(pid, r)| {
-                sims_aware_cost(
-                    path_cost_proxy(r),
-                    last_sims_snapshot.get(pid).copied(),
-                    last_gate_snapshot.get(pid).copied(),
-                )
-            })
+            .map(|(_, r)| sims_aware_cost(path_cost_proxy(r), None, None))
             .collect();
-        let bins = lpt_partition(to_solve.len(), n_threads, |i| costs[i]);
-        let to_solve_ref = &to_solve;
-        let solve_span_ref = &solve_span;
-        let self_ref = &self;
+        let bins = lpt_partition(to_solve.len(), n_bins, |i| costs[i]);
 
-        // Cold start: no capture wiring — deps with the registered-epoch
-        // guard + the engine's walk-memo handle.
-        let mut gate_deps = ::degenbot_solvers::profit_envelope::GateDeps::per_block_with(
-            self.results_block,
-            None,
-            self.runtime_cfg,
-        );
-        gate_deps.walk_memo = Some(&self.walk_memo);
-        let (tx, rx) = std::sync::mpsc::channel();
-        rayon::scope(|s| {
-            for bin in &bins {
-                let tx = tx.clone();
-                s.spawn(move |_| {
-                    let mut out = Vec::with_capacity(bin.len());
-                    for &i in bin {
-                        let (path_id, resolved) = &to_solve_ref[i];
-                        let _solve_ctx = solve_span_ref.enter();
-                        if let Some(mut r) = ::degenbot_solvers::mixed::solve_path_with_min_profit(
-                            resolved,
-                            min_profit_floor(),
-                            &gate_deps,
-                        )
-                        .result
-                        .filter(|r| !r.optimal_input.is_zero() && !r.profit.is_zero())
-                        .inspect(|r| {
-                            if !r.solver_pool_states.is_empty() {
-                                tracing::debug!(
-                                    "[solver-st] path_id={path_id} hops=[{}]",
-                                    r.solver_pool_states.join(";")
-                                );
-                            }
-                        }) {
-                            self_ref.clamp_cl_hop_capacity(*path_id, &mut r);
-                            out.push((*path_id, r));
+        // Bin jobs are 'static over Arc-cloned state: walk memo, core and
+        // the pool-ref map for the UO3JM4 clamp. No engine state is touched
+        // (engine-then-core invariant intact; the mixer only reads core).
+        let memo = std::sync::Arc::clone(&self.walk_memo);
+        let path_pools: HashMap<u64, std::sync::Arc<MixedPath>> = self.path_pools.clone();
+        let core = std::sync::Arc::clone(self.core());
+        let results_block = self.results_block;
+        let runtime_cfg = self.runtime_cfg;
+        let (tx, rx) = std::sync::mpsc::channel::<(u64, SolvePathResult)>();
+        for (bin_idx, bin) in bins.iter().enumerate() {
+            let bin = bin.clone();
+            let to_solve_bin = to_solve.clone();
+            let memo = std::sync::Arc::clone(&memo);
+            let path_pools = path_pools.clone();
+            let core = std::sync::Arc::clone(&core);
+            let tx = tx.clone();
+            let solve_span_bin = solve_span.clone();
+            let run_bin = move || {
+                // Cold start: no capture wiring — deps with the
+                // registered-epoch guard + the engine walk-memo handle.
+                let mut gate_deps = ::degenbot_solvers::profit_envelope::GateDeps::per_block_with(
+                    results_block,
+                    None,
+                    runtime_cfg,
+                );
+                gate_deps.walk_memo = Some(&memo);
+                for &i in &bin {
+                    let (path_id, resolved) = &to_solve_bin[i];
+                    let _solve_ctx = solve_span_bin.enter();
+                    if let Some(mut r) = ::degenbot_solvers::mixed::solve_path_with_min_profit(
+                        resolved,
+                        min_profit_floor(),
+                        &gate_deps,
+                    )
+                    .result
+                    .filter(|r| !r.optimal_input.is_zero() && !r.profit.is_zero())
+                    .inspect(|r| {
+                        if !r.solver_pool_states.is_empty() {
+                            tracing::debug!(
+                                "[solver-st] path_id={path_id} hops=[{}]",
+                                r.solver_pool_states.join(";")
+                            );
                         }
+                    }) {
+                        if let Some(path) = path_pools.get(path_id) {
+                            let core_read = core.read();
+                            let _ = Self::clamp_result_with_state(
+                                &core_read,
+                                *path_id,
+                                &path.pools,
+                                &mut r,
+                            );
+                        }
+                        let _ = tx.send((*path_id, r));
                     }
-                    let _ = tx.send(out);
-                });
+                }
+            };
+            if self.fleet_hosted {
+                crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
+                    .spawn(bin_idx, run_bin);
+            } else {
+                crate::arb_engine::solve_executor::global_solve_executor().spawn(run_bin);
             }
-        });
+        }
         drop(tx);
-        rx.into_iter().flatten().collect()
+        rx.into_iter().collect()
     }
 }
 
@@ -3753,7 +3766,6 @@ mod solve_path_span_tests {
 //   cargo test --release -p degenbot-bot --lib executor_ab_probe -- --ignored --nocapture
 #[cfg(test)]
 #[expect(
-    clippy::panic,
     clippy::print_stderr,
     clippy::print_stdout,
     clippy::cast_possible_truncation,
@@ -3764,13 +3776,16 @@ mod solve_path_span_tests {
 // misload; CSV is the output). Outer allow/expects at module level are the
 // documented-permitted form for cross-lint bulk suppression.
 pub(super) mod executor_ab_probe {
-    // Offline A/B probe (epic BXUSGL T4): production dispatch emulation, rayon
-    // LPT scope vs the dedicated tokio solve executor, on the heavy-CL capture
-    // corpus. NOT part of the normal suite: `#[ignore]`d, env-driven, run
+    // Offline A/B probe (epic BXUSGL T4): emit-granularity A/B on the
+    // dedicated tokio solve executor, over the heavy-CL capture corpus.
+    // Since the P6YXA6 hard cutover the executor is unambiguous — the rayon
+    // arms are gone — so the probe measures the STREAMING property: per-PATH
+    // sends (production) vs per-BIN sends (the pre-streaming granularity).
+    // NOT part of the normal suite: `#[ignore]`d, env-driven, run
     // manually with `cargo test --release -p degenbot-bot --lib executor_ab --
     // --ignored --nocapture`. Uses the crate-internal production components
     // (`solve_one_path`, `SolveCycleShared`, `SolveExecutor`, `lpt_partition`,
-    // `path_cost_proxy`) so the arms differ ONLY in dispatch mechanics. Fixture
+    // `path_cost_proxy`) so the arms differ ONLY in emit granularity. Fixture
     // parse replicates rust/crates/degenbot-solvers/examples/rayon_scale_probe.rs.
     //
     // Env:
@@ -3782,9 +3797,9 @@ pub(super) mod executor_ab_probe {
     // CSV columns (stdout):
     //   arm,threads,items,wall_ms,first_emit_ms,p50_emit_ms,p95_emit_ms
     // `emit` = wall offset when a path's result is AVAILABLE to the merge - the
-    // streaming property. For the `rayon` arm (production semantics: per-BIN
-    // sends + join) every emit lands at cycle end by construction; `rayon-perpath`
-    // is a control that isolates the emit granularity from the executor switch.
+    // streaming property. For the `tokio-perbin` control every emit lands at
+    // cycle end by construction (per-BIN sends); `tokio` (production) sends
+    // per PATH.
 
     use std::sync::Arc;
     use std::time::Instant;
@@ -3960,11 +3975,10 @@ pub(super) mod executor_ab_probe {
         lpt_partition(items.len(), threads, |i| path_cost_proxy(&items[i]))
     }
 
-    /// One full cycle over the corpus, per-path `emit` timestamps (offsets from
+    /// One full cycle over the corpus, `emit` timestamps (offsets from
     /// cycle start) relative to when the result is AVAILABLE to the merge:
-    ///  - rayon         : per-BIN send + join (production rayon arm)
-    ///  - rayon-perpath : per-PATH send in rayon scope (granularity control)
-    ///  - tokio         : dedicated executor, per-PATH send (T1 arm)
+    ///  - tokio         : dedicated executor, per-PATH send (production)
+    ///  - tokio-perbin  : per-BIN send (granularity control)
     fn run_cycle(
         items: &[Arc<::degenbot_solvers::mixed::ResolvedMixedPath>],
         threads: usize,
@@ -4009,40 +4023,26 @@ pub(super) mod executor_ab_probe {
                     });
                 }
             }
-            "rayon" | "rayon-perpath" => {
-                // Scoped pool: thread-count fidelity (the global rayon pool is
-                // sized by available parallelism, not by the probe's arm n).
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .thread_name(|i| format!("ab-probe-rayon-{i}"))
-                    .build()
-                    .unwrap_or_else(|e| panic!("probe rayon pool: {e}"));
-                let per_path = arm == "rayon-perpath";
-                pool.install(|| {
-                    rayon::scope(|s| {
-                        for bin in &bins {
-                            let tx = tx.clone();
-                            s.spawn(move |_| {
-                                for &i in &bin[..] {
-                                    solve_one_path(
-                                        ctx,
-                                        &tracing::Span::none(),
-                                        i as u64,
-                                        &items[i],
-                                    );
-                                    if per_path {
-                                        let _ = tx.send(t0.elapsed().as_secs_f64() * 1000.0);
-                                    }
-                                }
-                                // PRODUCTION rayon semantics: the whole bin is
-                                // visible to the merge only at bin completion.
-                                if !per_path {
-                                    let _ = tx.send(t0.elapsed().as_secs_f64() * 1000.0);
-                                }
-                            });
+            "tokio-perbin" => {
+                // Granularity control: identical executor + bins, but the
+                // whole BIN is visible to the merge only at bin completion
+                // (the pre-streaming emit shape the rayon arm embodied).
+                let executor = SolveExecutor::new("probe-solve-tokio", threads);
+                for bin in &bins {
+                    let bin = bin.clone();
+                    let tx = tx.clone();
+                    let ctx = Arc::clone(ctx);
+                    let items = items.to_vec();
+                    executor.spawn(move || {
+                        for &i in &bin {
+                            let _ =
+                                solve_one_path(&ctx, &tracing::Span::none(), i as u64, &items[i]);
                         }
+                        let _ = tx.send(t0.elapsed().as_secs_f64() * 1000.0);
+                        // Bin-complete sentinel (NaN): see the "tokio" arm.
+                        let _ = tx.send(f64::NAN);
                     });
-                });
+                }
             }
             other => unreachable!("unknown arm {other}"),
         }
@@ -4087,7 +4087,7 @@ pub(super) mod executor_ab_probe {
         println!("arm,threads,items,wall_ms,first_emit_ms,p50_emit_ms,p95_emit_ms");
         let ctx = probe_ctx();
         for &n in &threads {
-            for arm in ["tokio", "rayon", "rayon-perpath"] {
+            for arm in ["tokio", "tokio-perbin"] {
                 for _ in 0..passes {
                     let (wall, emits) = run_cycle(&items, n, arm, &ctx);
                     println!(

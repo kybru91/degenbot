@@ -255,8 +255,6 @@ crate::config_schema! {
             doc = "Walk-memo recomposition census (`1` enables).";
         cl_projection_cache [bool] = true, env = "DEGENBOT_CL_PROJECTION_CACHE", def = "true",
             doc = "CL projection memo cache; `0`/`off`/`false`/`disabled` disables.";
-        lpt_partition [bool] = true, env = "DEGENBOT_LPT_PARTITION", def = "true",
-            doc = "K-slowest-path LPT partitioning of solve bins; `0`/`false`/`off` disables.";
     }
 
     fleet FleetConfig {
