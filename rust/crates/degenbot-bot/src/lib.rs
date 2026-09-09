@@ -226,6 +226,17 @@ pub mod telemetry;
 /// leftover, never from raw `available_parallelism`.
 pub fn configure_rayon_solver_pool() {
     let workers = degenbot_core::cpu_budget::solve_worker_count();
+    // PE4FPM: self-register the global rayon pool in the worker census
+    // BEFORE the build call: `build_global` fails when another thread won
+    // the once-race or a pool already exists — the census row still
+    // describes the pool the process actually runs (same sizing rule).
+    degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+        resource: "rayon_global_pool",
+        kind: "rayon global pool (path resolve — RAYPAR partitions run here too)",
+        count: workers,
+        thread_name: "degenbot-solve-{i}",
+        sizing: "cpu_budget::solve_worker_count (cgroup budget minus headroom, DEGENBOT_SOLVE_CPUS override); an already-configured global pool wins and is kept",
+    });
     let result = rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .thread_name(|i| format!("degenbot-solve-{i}"))

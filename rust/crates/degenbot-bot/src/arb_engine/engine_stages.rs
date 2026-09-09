@@ -211,6 +211,16 @@ impl EngineStages {
             // detached enqueue (rx take + spawn atomic under the held guard).
             if let Some(merge_rx) = engine.take_detached_merge_rx() {
                 let engine_arc = Arc::clone(&self.engine);
+                // PE4FPM: self-register the pinned merge sidecar.
+                degenbot_core::worker_census::register(
+                    degenbot_core::worker_census::WorkerCensusEntry {
+                        resource: "detached_merge_sidecar",
+                        kind: "detached merge sidecar (drains the result pipe)",
+                        count: 1,
+                        thread_name: "arb-detached-merge",
+                        sizing: "exactly one (spawned at the FIRST detached enqueue; loud abort on spawn failure — a stranded merge pipe orphans every detached result)",
+                    },
+                );
                 if let Err(err) = std::thread::Builder::new()
                     .name("arb-detached-merge".to_string())
                     .spawn(move || {
@@ -240,6 +250,17 @@ impl EngineStages {
             return;
         };
         let engine_arc = Arc::clone(&self.engine);
+        // PE4FPM: self-register the pinned merge sidecar (same row as the
+        // first-spawn site above; upsert-idempotent).
+        degenbot_core::worker_census::register(
+            degenbot_core::worker_census::WorkerCensusEntry {
+                resource: "detached_merge_sidecar",
+                kind: "detached merge sidecar (drains the result pipe)",
+                count: 1,
+                thread_name: "arb-detached-merge",
+                sizing: "exactly one (spawned at the first detached enqueue; loud abort on spawn failure — a stranded merge pipe orphans every detached result)",
+            },
+        );
         if let Err(err) = std::thread::Builder::new()
             .name("arb-detached-merge".to_string())
             .spawn(move || {

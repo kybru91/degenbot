@@ -20,6 +20,10 @@
 //! - [`cpu_budget`] — cgroup-aware CPU budget detection and the two-runtime
 //!   (solve bins / ambient I/O) sizing policy.
 //! - [`runtime`] — shared Tokio runtime singleton, sized by [`cpu_budget`].
+//! - [`worker_census`] — boot-time registry of every execution resource
+//!   (name/kind/count/thread-name/sizing) exported as the
+//!   `degenbot_worker_census` gauge (ergo PE4FPM); NEW SPAWN SITES MUST
+//!   REGISTER — see the module docs.
 //! - [`eip_1559`] — EIP-1559 `next_base_fee` (next-block base fee).
 
 pub mod address_utils;
@@ -30,3 +34,4 @@ pub mod errors;
 pub mod hex_utils;
 pub mod libzip;
 pub mod runtime;
+pub mod worker_census;

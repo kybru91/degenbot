@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 /// `DEGENBOT_SOLVE_SIM_INFLIGHT` (1..=64) is terminal when set; otherwise
 /// the leftover of the effective CPU budget after the solve bins take
 /// theirs (`effective_cpu_budget` - `solve_worker_count`, floor 1).
-fn sim_slot_capacity() -> usize {
+pub(crate) fn sim_slot_capacity() -> usize {
     /// Sims are I/O-dominant: a slot is mostly an RPC/storage await, not a
     /// core. Allow the leftover budget x I/O oversubscribe so the sim
     /// pipeline stays saturated without stacking CPU demand past the
@@ -56,8 +56,18 @@ pub(crate) struct SimSlots {
 
 impl SimSlots {
     fn new() -> Self {
+        let cap = sim_slot_capacity();
+        // PE4FPM: self-register the hoisted sim capacity (the semaphore that
+        // paces every pipelined sim driver).
+        degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+            resource: "sim_slots",
+            kind: "hoisted in-flight semaphore (pipelined sim drivers; the arb-sim-{pid} detached threads pace on it)",
+            count: cap,
+            thread_name: "n/a (hoisted capacity)",
+            sizing: "leftover_worker_budget x SIM_IO_OVERSUBSCRIBE(2), clamp 1..=64; override `solve.solve_sim_inflight` (env DEGENBOT_SOLVE_SIM_INFLIGHT)",
+        });
         Self {
-            free: parking_lot::Mutex::new(sim_slot_capacity()),
+            free: parking_lot::Mutex::new(cap),
             cv: parking_lot::Condvar::new(),
         }
     }

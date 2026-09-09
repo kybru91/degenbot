@@ -39,17 +39,43 @@
 //! });
 //! ```
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use tokio::runtime::{Builder, Runtime};
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
+/// Worker-thread sequence for the distinct thread names below. tokio 1.53
+/// spawns every worker through the blocking pool's `spawn_thread`, calling
+/// the `thread_name_fn` closure once per spawned thread — so an internal
+/// counter yields the distinct `degenbot-io-rt-N` names the census declares
+/// (GOQWCL: two defaulting `tokio-runtime-worker` pools made thread dumps
+/// unattributable).
+static IO_RT_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn io_runtime_thread_name() -> String {
+    format!(
+        "degenbot-io-rt-{}",
+        IO_RT_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn build_runtime() -> Result<Runtime, std::io::Error> {
     // SMTH6M: the cgroup-aware budget is the single sizing authority for the
     // ambient runtime (see `crate::cpu_budget::ambient_io_worker_count`).
     let workers = crate::cpu_budget::ambient_io_worker_count();
+    // PE4FPM: self-register in the worker census; fail-destructive-free (the
+    // registry never rejects — see worker_census module docs).
+    crate::worker_census::register(crate::worker_census::WorkerCensusEntry {
+        resource: "io_runtime_workers",
+        kind: "tokio multi-thread runtime (ambient I/O — pump, dispatch, delivery, pyo3-async)",
+        count: workers,
+        thread_name: "degenbot-io-rt-{n}",
+        sizing: "cpu_budget::ambient_io_worker_count — cgroup budget minus the solve bins, floored at 1 (SMTH6M); override `runtime.io_workers` (env DEGENBOT_IO_WORKERS)",
+    });
     Builder::new_multi_thread()
         .worker_threads(workers)
+        .thread_name_fn(io_runtime_thread_name)
         .enable_all()
         .build()
 }
@@ -99,6 +125,38 @@ mod tests {
             expected,
             "ambient runtime workers must follow the CPU-budget policy"
         );
+    }
+
+    /// PE4FPM (GOQWCL): ambient runtime workers must carry the DISTINCT
+    /// census thread name (no `tokio-runtime-worker` collisions with the
+    /// inline-sim runtime or the solve fleet).
+    #[test]
+    fn ambient_runtime_workers_carry_the_census_thread_name() {
+        let rt = build_runtime().unwrap();
+        let name = rt.block_on(async {
+            tokio::spawn(async move { std::thread::current().name().map(str::to_owned) })
+                .await
+                .expect("worker spawn")
+        });
+        let name = name.expect("worker thread name");
+        assert!(
+            name.starts_with("degenbot-io-rt-"),
+            "ambient worker must be census-named, got {name}"
+        );
+    }
+
+    /// PE4FPM: the runtime self-registers; the census row must agree with
+    /// the built runtime (count == worker count, thread-name pattern).
+    #[test]
+    fn ambient_runtime_registers_a_census_row_matching_its_worker_count() {
+        let rt = build_runtime().unwrap();
+        let row = crate::worker_census::snapshot()
+            .into_iter()
+            .find(|e| e.resource == "io_runtime_workers")
+            .expect("ambient runtime must self-register in the census");
+        assert_eq!(row.count, rt.metrics().num_workers());
+        assert_eq!(row.thread_name, "degenbot-io-rt-{n}");
+        assert_eq!(row.sizing, row.sizing); // sizing text is documentation; presence is the contract
     }
 
     #[test]

@@ -104,6 +104,16 @@ static SOLVE_EXECUTOR: std::sync::OnceLock<SolveExecutor> = std::sync::OnceLock:
 /// pool's construction-once contract: persistent workers keep warm L1/L2 +
 /// allocator arenas across drains).
 pub(crate) fn global_solve_executor() -> &'static SolveExecutor {
+    // PE4FPM: self-register the fleet (upsert-idempotent; the OnceLock below
+    // guards re-entry, the census call is deliberately outside it so the row
+    // exists even if build aborts loudly).
+    degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+        resource: "solve_executor_fleet",
+        kind: "tokio multi-thread runtime (solve bins — the LPT-pin fleet host)",
+        count: degenbot_core::cpu_budget::solve_worker_count(),
+        thread_name: "degenbot-solve-tokio (+ -host dispatcher)",
+        sizing: "one persistent worker per cpu_budget::solve_worker_count (cgroup budget minus headroom); DEGENBOT_SOLVE_CPUS override (VPD5ZH)",
+    });
     SOLVE_EXECUTOR.get_or_init(|| {
         // Match the LPT bin count the engine computes at dispatch time
         // (cpu_budget::solve_worker_count, quota-derived): one runtime can

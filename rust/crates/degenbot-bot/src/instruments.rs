@@ -125,6 +125,10 @@ pub struct PipelineInstruments {
     solves_executed: Counter<u64>,
     /// Registered solver paths (engine gauge).
     registered_paths: Gauge<f64>,
+    /// PE4FPM worker census: one row per registered execution resource
+    /// (`resource` = the `degenbot_core::worker_census` registry id, a
+    /// small closed set). Rendered as `degenbot_worker_census{resource=...}`.
+    worker_census: Gauge<f64>,
     /// Candidates entering the simulate fan-out (per-batch sizes summed).
     candidates_found: Counter<u64>,
     /// Solver CL-hop self-corrections (input/forward clamp + output align).
@@ -382,6 +386,12 @@ impl PipelineInstruments {
             registered_paths: meter
                 .f64_gauge("degenbot.engine.registered_paths")
                 .with_description("Registered solver paths")
+                .build(),
+            worker_census: meter
+                .f64_gauge("degenbot.worker.census")
+                .with_description(
+                    "Worker census (PE4FPM): declared worker/slot count per execution resource; the resource label is the census registry id",
+                )
                 .build(),
             candidates_found: meter
                 .u64_counter("degenbot.candidates.found")
@@ -700,6 +710,13 @@ impl PipelineInstruments {
             .record(f64::from(u32::try_from(count).unwrap_or(u32::MAX)), &[]);
     }
 
+    /// PE4FPM: one census row — declared workers/slots of `resource`.
+    /// `resource` is a small closed set: the census registry ids.
+    pub fn set_worker_census(&self, resource: &str, workers: f64) {
+        self.worker_census
+            .record(workers, &[KeyValue::new("resource", resource.to_owned())]);
+    }
+
     /// A batch of `n` candidates entered the simulate fan-out.
     pub fn count_candidates_found(&self, n: u64) {
         self.candidates_found.add(n, &[]);
@@ -920,9 +937,40 @@ pub fn pipeline() -> Option<&'static PipelineInstruments> {
             // against forever (observed live 2026-08-22: DegenbotHeaderStall
             // stuck FIRING while the real series advanced). Empty-vs-absent
             // scrapes are already distinguishable via target_info.
-            crate::metrics::try_global_meter().map(|meter| PipelineInstruments::new(&meter))
+            crate::metrics::try_global_meter().map(|meter| {
+                // PE4FPM: the census registry re-fires this hook on every
+                // registration, so the scrape always reflects the table —
+                // including lazily-booted resources registered after the
+                // boot dump.
+                degenbot_core::worker_census::set_export_hook(export_worker_census);
+                PipelineInstruments::new(&meter)
+            })
         })
         .as_ref()
+}
+
+/// PE4FPM production census exporter — installed as the
+/// [`degenbot_core::worker_census`] export hook at instruments init.
+/// No-op while the pipeline is un-built (non-otel builds / gate off).
+fn export_worker_census(entries: &[degenbot_core::worker_census::WorkerCensusEntry]) {
+    if let Some(p) = pipeline() {
+        export_worker_census_with(p, entries);
+    }
+}
+
+/// Exporter body (test seam): one gauge row per census entry.
+fn export_worker_census_with(
+    p: &PipelineInstruments,
+    entries: &[degenbot_core::worker_census::WorkerCensusEntry],
+) {
+    for e in entries {
+        p.set_worker_census(e.resource, census_count_f64(e.count));
+    }
+}
+
+#[expect(clippy::cast_precision_loss)]
+fn census_count_f64(n: usize) -> f64 {
+    n as f64
 }
 
 #[cfg(test)]
@@ -930,7 +978,7 @@ pub fn pipeline() -> Option<&'static PipelineInstruments> {
 mod kind_tests {
     use opentelemetry::metrics::MeterProvider as _;
 
-    use crate::instruments::PipelineInstruments;
+    use crate::instruments::{export_worker_census_with, PipelineInstruments};
     use crate::telemetry::error_kind;
     use std::collections::HashSet;
 
@@ -1069,6 +1117,52 @@ mod kind_tests {
             text.contains("degenbot_cgroup_throttle_time_seconds_total"),
             "throttled-cpu-time counter missing"
         );
+    }
+
+    /// PE4FPM: the worker-census gauge renders as `degenbot_worker_census`
+    /// with the stable `resource` label (one row per resource).
+    #[test]
+    fn worker_census_gauge_is_scrapeable_by_resource() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test"));
+        instruments.set_worker_census("io_runtime_workers", 2.0);
+        instruments.set_worker_census("solve_executor_fleet", 6.0);
+        let text = crate::metrics::render(&registry);
+        assert!(
+            text.contains("degenbot_worker_census"),
+            "worker-census family missing from exposition: {text}"
+        );
+        assert!(text.contains("resource=\"io_runtime_workers\""));
+        assert!(text.contains("resource=\"solve_executor_fleet\""));
+        drop(provider);
+    }
+
+    /// PE4FPM: the REGISTER→EXPORT round trip through the production helper:
+    /// a registered census entry lands on the scrape with its count.
+    #[test]
+    fn worker_census_register_export_round_trip_reaches_the_scrape() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test"));
+        degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+            resource: "census-roundtrip",
+            kind: "test probe",
+            count: 3,
+            thread_name: "census-roundtrip-{n}",
+            sizing: "test sizing rule",
+        });
+        export_worker_census_with(&instruments, &degenbot_core::worker_census::snapshot());
+        let text = crate::metrics::render(&registry);
+        assert!(
+            text.contains("degenbot_worker_census"),
+            "missing family: {text}"
+        );
+        assert!(
+            text.contains("resource=\"census-roundtrip\""),
+            "missing row: {text}"
+        );
+        drop(provider);
     }
 
     /// ADR-040: the quarantine depth gauge renders under its coupled

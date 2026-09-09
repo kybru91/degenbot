@@ -120,6 +120,16 @@ fn start_gil_probe(interval_ms: u64, threshold_ms: u64, stuck_ms: u64) -> PyResu
     let threshold = Duration::from_millis(threshold_ms.max(1));
     let stuck = Duration::from_millis(stuck_ms.max(1));
 
+    // PE4FPM: self-register the probe pair (probe + stuck-watchdog; the
+    // profiler-owned hp-* threads are untouched by the census).
+    degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+        resource: "gil_probe",
+        kind: "std probe + watchdog threads (GIL-held sampler + main-loop stuck watchdog, 66H3KJ)",
+        count: 2,
+        thread_name: "gil-probe + gil-probe-watchdog",
+        sizing: "exactly two (fixed; started once, guarded by the PROBE_RUNNING swap)",
+    });
+
     // ── Probe thread: periodic GIL acquire + latency log. ──
     thread::Builder::new()
         .name("gil-probe".to_string())

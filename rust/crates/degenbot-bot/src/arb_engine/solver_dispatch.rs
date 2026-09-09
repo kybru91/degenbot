@@ -169,6 +169,15 @@ fn min_profit_floor() -> U256 {
     MIN_PROFIT_FLOOR_WEI.get().copied().unwrap_or(U256::ZERO)
 }
 
+/// PE4FPM: first-spawn latch for the `arb_sim_workers` census row — keeps
+/// the per-sim hot path off the census mutex (the registration itself is
+/// upsert-idempotent, so a lost race only rewrites the same row).
+static ARB_SIM_CENSUS_SEEDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+/// PE4FPM: first-spawn latch for the `detached_solve_bins` census row
+/// (thread-kind fallback arm; registration is upsert-idempotent).
+static DETACH_BIN_CENSUS_SEEDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 static LPT_PARTITION_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 static MIN_PROFIT_FLOOR_WEI: std::sync::OnceLock<U256> = std::sync::OnceLock::new();
@@ -687,6 +696,23 @@ impl PipelinedSims {
         // replacement for the pacing the synchronous sim join used to
         // provide. The guard releases exactly when the sim finishes.
         let slots = crate::arb_engine::sim_slots::sim_slots_global();
+        // PE4FPM: the per-path detached sim threads are a burst resource; the
+        // census row declares the pacing bound (the sim-slot cap) as the
+        // sustained count and documents the burst in `sizing`. One short
+        // registration at first spawn (hot path stays off the census lock).
+        if ARB_SIM_CENSUS_SEEDED.get().is_none() {
+            // First detached-sim spawn of the process: register the burst
+            // resource. The OnceLock short-circuit keeps the hot path off the
+            // census mutex; a lost race just upserts the same row.
+            ARB_SIM_CENSUS_SEEDED.set(()).ok();
+            degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+                resource: "arb_sim_workers",
+                kind: "detached per-path sim threads (burst; one per scheduled sim, joined per cycle)",
+                count: crate::arb_engine::sim_slots::sim_slot_capacity(),
+                thread_name: "arb-sim-{pid}",
+                sizing: "burst paced by the sim_slots semaphore; sustained concurrent cap = the slot cap (leftover x 2, DEGENBOT_SOLVE_SIM_INFLIGHT override)",
+            });
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(format!("arb-sim-{pid}"))
@@ -2271,18 +2297,35 @@ impl ArbitrageEngine {
                         crate::arb_engine::SolveExecutorKind::Tokio
                     ) {
                         crate::arb_engine::solve_executor::global_solve_executor().spawn(run_bin);
-                    } else if let Err(err) = std::thread::Builder::new()
-                        .name(format!("arb-detach-bin-{bin_idx}"))
-                        .spawn(run_bin)
-                    {
-                        // LOUD (loud-failure discipline): a lost bin would
-                        // strand its affected paths' results forever.
-                        tracing::error!(
-                            error = %err,
-                            bin = bin_idx,
-                            "[detached] solve-bin spawn failed — aborting"
-                        );
-                        std::process::abort();
+                    } else {
+                        // PE4FPM: thread-kind fallback bins census-register
+                        // under their own id — the Tokio arm above runs on the
+                        // registered solve_executor_fleet instead.
+                        if DETACH_BIN_CENSUS_SEEDED.get().is_none() {
+                            DETACH_BIN_CENSUS_SEEDED.set(()).ok();
+                            degenbot_core::worker_census::register(
+                                degenbot_core::worker_census::WorkerCensusEntry {
+                                    resource: "detached_solve_bins",
+                                    kind: "per-cycle detached solve-bin threads (thread-kind fallback arm)",
+                                    count: degenbot_core::cpu_budget::solve_worker_count(),
+                                    thread_name: "arb-detach-bin-{n}",
+                                    sizing: "one detached thread per LPT bin per cycle (bin count = solve_worker_count); only when the solve executor kind is not Tokio — the Tokio arm rides solve_executor_fleet",
+                                },
+                            );
+                        }
+                        if let Err(err) = std::thread::Builder::new()
+                            .name(format!("arb-detach-bin-{bin_idx}"))
+                            .spawn(run_bin)
+                        {
+                            // LOUD (loud-failure discipline): a lost bin would
+                            // strand its affected paths' results forever.
+                            tracing::error!(
+                                error = %err,
+                                bin = bin_idx,
+                                "[detached] solve-bin spawn failed — aborting"
+                            );
+                            std::process::abort();
+                        }
                     }
                 }
                 if let Some(p) = crate::instruments::pipeline() {
@@ -4046,6 +4089,18 @@ mod executor_ab_probe {
         let t0 = Instant::now();
         match arm {
             "tokio" => {
+                // PE4FPM: the verification probe builds its own ephemeral
+                // fleet; it census-registers under its own id so it can never
+                // be confused with the production solve_executor_fleet.
+                degenbot_core::worker_census::register(
+                    degenbot_core::worker_census::WorkerCensusEntry {
+                        resource: "solve_probe_executor",
+                        kind: "ephemeral probe executor (solve-verify diagnostics)",
+                        count: threads,
+                        thread_name: "probe-solve-tokio",
+                        sizing: "probe parameter (thread count passed to the verify run; torn down with the probe)",
+                    },
+                );
                 let executor = SolveExecutor::new("probe-solve-tokio", threads);
                 for bin in &bins {
                     let bin = bin.clone();

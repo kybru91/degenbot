@@ -318,6 +318,13 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // correctly (see degenbot_bot::configure_rayon_solver_pool).
     degenbot_bot::configure_rayon_solver_pool();
 
+    // PE4FPM: dump the ONE structured worker-census boot line with the full
+    // table (see degenbot_core::worker_census). Resources that boot lazily
+    // (solve executor, drainers, sim slots) register later and emit their
+    // own census line on first use — the metric gauge picks every row up
+    // through the export hook either way.
+    degenbot_core::worker_census::emit_boot_table();
+
     // Register the shutdown pyfunction on the module.
     python_log_layer::PythonLogLayer::register_pyfunction(m)?;
 
