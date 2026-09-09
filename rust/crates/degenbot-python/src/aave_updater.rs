@@ -252,6 +252,19 @@ fn run_aave_update(
     aave_report_to_dict(py, &report)
 }
 
+/// The typed error for a Python-called verify path with no ambient tokio
+/// runtime (VJGZJ2): these seams used to build + drop a full
+/// multi-thread runtime per call (default worker count = the raw core
+/// count), churning dead tokio-rt-worker threads in the live process. They
+/// now run only on the caller's ambient runtime and fail loudly here
+/// otherwise. Uses the existing `RunError::Runtime(io::Error)` variant so
+/// `run_err_to_py` maps it to `ValueError` like every other failure.
+fn no_ambient_runtime_err() -> RunError {
+    RunError::Runtime(std::io::Error::other(
+        "no ambient tokio runtime: refusing to build a per-call multi-thread runtime (VJGZJ2); run under the shared degenbot-core ambient runtime",
+    ))
+}
+
 /// Map a [`RunError`] to a Python exception. Mirrors the pool seam's
 /// `run_err_to_py`: `RunError::Cancelled` → `RuntimeError` (so the driver
 /// distinguishes a cooperative cancel from a failure);
@@ -355,6 +368,15 @@ fn verify_touched_positions_on_chain(
     let divergences = py
         .detach(move || {
             use tokio::runtime::Handle;
+            // VJGZJ2: resolve the ambient runtime BEFORE any DB work. With no
+            // ambient runtime we return a typed error instead of building +
+            // dropping a per-call multi-thread runtime (its default
+            // worker count is the raw core count — the dead tokio-rt-worker
+            // churn source in the live process). The ambient fast path below
+            // is unchanged.
+            let Ok(handle) = Handle::try_current() else {
+                return Err(no_ambient_runtime_err());
+            };
 
             // Lock the DB handle for a read-only connection (verify uses no
             // SQL writes; the lock guarantees no concurrent mutator inside
@@ -363,39 +385,24 @@ fn verify_touched_positions_on_chain(
             let db = DegenbotDb::open(&path)?.0;
             let conn = db.lock();
             let touched_ref = touched.as_deref();
-            // Runtime strategy: if invoked from inside an existing tokio
-            // runtime (e.g. the JGQHBX drive harness's `progress_callback`
-            // running on `run_aave_update`'s worker thread — its runtime
-            // context is set + it's multi-thread), use `block_in_place` +
-            // `handle.block_on` (avoids the "creating runtime within runtime"
-            // panic). Otherwise build our own multi-thread runtime.
-            //
-            // The `AlloyProvider` is constructed inside the chosen runtime's
-            // context to avoid its internals' runtime-handle binding.
-            if let Ok(handle) = Handle::try_current() {
-                let provider = handle.block_on(AlloyProvider::new(rpc_url, 5))?;
-                let fut = verify_touched_positions_on_conn(
-                    &conn,
-                    &provider,
-                    market_id,
-                    block_number,
-                    touched_ref,
-                );
-                Ok(tokio::task::block_in_place(|| handle.block_on(fut))?)
-            } else {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                let provider = rt.block_on(AlloyProvider::new(rpc_url, 5))?;
-                let fut = verify_touched_positions_on_conn(
-                    &conn,
-                    &provider,
-                    market_id,
-                    block_number,
-                    touched_ref,
-                );
-                Ok(rt.block_on(fut)?)
-            }
+            // Runtime strategy: the ambient handle is resolved up front (the
+            // VJGZJ2 policy — a missing runtime errors, never a per-call
+            // build). Invoking from inside an existing runtime (e.g. the
+            // JGQHBX drive harness's `progress_callback` on
+            // `run_aave_update`'s worker — context set + multi-thread) uses
+            // `block_in_place` + `handle.block_on` (avoids the "creating
+            // runtime within runtime" panic). The `AlloyProvider` is
+            // constructed inside that runtime's context to avoid its
+            // internals' runtime-handle binding.
+            let provider = handle.block_on(AlloyProvider::new(rpc_url, 5))?;
+            let fut = verify_touched_positions_on_conn(
+                &conn,
+                &provider,
+                market_id,
+                block_number,
+                touched_ref,
+            );
+            tokio::task::block_in_place(|| handle.block_on(fut))
         })
         .map_err(run_err_to_py)?;
 
@@ -458,7 +465,6 @@ fn verify_touched_positions_on_chain(
 ///   `Some(["0x...", ...])` verifies only those users.
 #[pyfunction]
 #[pyo3(signature = (database_path, rpc_url, market_id, chain_id, block_number, touched_users=None))]
-#[expect(clippy::too_many_lines)]
 fn verify_all_positions_on_chain(
     py: Python<'_>,
     database_path: &str,
@@ -478,37 +484,32 @@ fn verify_all_positions_on_chain(
     let divergences = py
         .detach(move || {
             use tokio::runtime::Handle;
+            // VJGZJ2: same ambient-runtime policy as the touched-positions
+            // sibling — typed error when no ambient runtime exists; never a
+            // per-call multi-thread build.
+            let Ok(handle) = Handle::try_current() else {
+                return Err(no_ambient_runtime_err());
+            };
 
             let db = DegenbotDb::open(&path)?.0;
             let conn = db.lock();
             let touched_ref = touched.as_deref();
 
-            if let Ok(handle) = Handle::try_current() {
-                let provider = handle.block_on(AlloyProvider::new(rpc_url, 5))?;
-                let fut = verify_all_positions_on_conn(
-                    &conn,
-                    &provider,
-                    market_id,
-                    chain_id,
-                    block_number,
-                    touched_ref,
-                );
-                Ok(tokio::task::block_in_place(|| handle.block_on(fut))?)
-            } else {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                let provider = rt.block_on(AlloyProvider::new(rpc_url, 5))?;
-                let fut = verify_all_positions_on_conn(
-                    &conn,
-                    &provider,
-                    market_id,
-                    chain_id,
-                    block_number,
-                    touched_ref,
-                );
-                Ok(rt.block_on(fut)?)
-            }
+            // Runtime strategy: the ambient handle is resolved up front (the
+            // VJGZJ2 policy — a missing runtime errors, never a per-call
+            // build). The `AlloyProvider` is constructed inside that
+            // runtime's context to avoid its internals' runtime-handle
+            // binding.
+            let provider = handle.block_on(AlloyProvider::new(rpc_url, 5))?;
+            let fut = verify_all_positions_on_conn(
+                &conn,
+                &provider,
+                market_id,
+                chain_id,
+                block_number,
+                touched_ref,
+            );
+            tokio::task::block_in_place(|| handle.block_on(fut))
         })
         .map_err(run_err_to_py)?;
 
@@ -704,6 +705,64 @@ pub fn add_aave_updater_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[expect(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// VJGZJ2: with NO ambient tokio runtime, the aave verify seams must fail
+    /// with the typed no-ambient-runtime error INSTEAD of building + dropping
+    /// a per-call multi-thread runtime (default worker count = raw core
+    /// count — the dead tokio-rt-worker churn source). An empty in-memory DB +
+    /// an unroutable RPC keep the tests offline; the runtime-policy check
+    /// fires before any DB work.
+    #[test]
+    fn verify_touched_no_ambient_runtime_errors_instead_of_spawning() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "test thread must have no ambient tokio runtime"
+        );
+        Python::attach(|py| {
+            let err = verify_touched_positions_on_chain(
+                py,
+                ":memory:",
+                "http://127.0.0.1:1",
+                1,
+                1,
+                1,
+                None,
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no ambient tokio runtime"),
+                "expected the typed no-ambient-runtime error, got: {msg}"
+            );
+            assert!(
+                !msg.contains("database error"),
+                "must fail on runtime policy before DB work, got: {msg}"
+            );
+        });
+    }
+
+    /// VJGZJ2: full-verify sibling of the touched-positions no-ambient pin.
+    #[test]
+    fn verify_all_no_ambient_runtime_errors_instead_of_spawning() {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "test thread must have no ambient tokio runtime"
+        );
+        Python::attach(|py| {
+            let err =
+                verify_all_positions_on_chain(py, ":memory:", "http://127.0.0.1:1", 1, 1, 1, None)
+                    .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("no ambient tokio runtime"),
+                "expected the typed no-ambient-runtime error, got: {msg}"
+            );
+            assert!(
+                !msg.contains("database error"),
+                "must fail on runtime policy before DB work, got: {msg}"
+            );
+        });
+    }
 
     /// `aave_report_to_dict` produces the six-key report dict the `.pyi`
     /// contract promises (the `run_aave_update` return shape).
