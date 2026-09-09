@@ -92,6 +92,7 @@ degenbot-simulation = { version = "0.6.0-alpha.9", path = "crates/degenbot-simul
 degenbot-solvers = { version = "0.6.0-alpha.9", path = "crates/degenbot-solvers" }
 degenbot-submission = { version = "0.6.0-alpha.9", path = "crates/degenbot-submission" }
 degenbot-uniswap = { version = "0.6.0-alpha.9", path = "crates/degenbot-uniswap" }
+degenbot-workers = { version = "0.6.0-alpha.9", path = "crates/degenbot-workers" }
 # hashbrown: foldhash-based HashMap/HashSet for the hot maps (small int/string
 # keys generated in-process — no DoS surface). 0.17.1 + foldhash 0.2.0 already
 # resolve transitively (indexmap 2.14 / lru 0.18), so this direct dependency
@@ -131,6 +132,7 @@ members = [
     "crates/degenbot-submission",
     "crates/degenbot-uniswap",
     "crates/degenbot-order-index",
+    "crates/degenbot-workers",
 ]
 
 # Release profile.

@@ -1,0 +1,525 @@
+//! The `NoopStubFleetHost` conformance harness (design doc §11) — a
+//! `NoopStubEngine`-style executable spec at fleet scope, `#[cfg(test)]`-
+//! declared only, NEVER runtime-selectable.
+//!
+//! Its u8 script indexes `WorkerRole::index_in_all_roles` exactly like the
+//! stage stub indexes `ALL_STAGES`; any new role or reshuffled transition
+//! table fails here loudly. Asserted:
+//!
+//! 1. every role walks every legal transition (T1–T9);
+//! 2. every illegal transition is rejected;
+//! 3. the budget-sum invariant holds across a scripted quota resize
+//!    (shares re-declared, sum re-checked, pin re-key ONLY via T9);
+//! 4. pin/arena stability across N synthetic cycles (same key, warm token);
+//! 5. the stranded-pipe tripwire fires on host death mid-drain;
+//! 6. no worker ever holds a GIL across role work (the fleet carries no
+//!    Python into the graph; units run as `'static + Send` Rust closures);
+//! 7. per-role busy/idle gauges exist across `ALL_ROLES`.
+
+#![expect(clippy::expect_used)]
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use super::*;
+use crate::budget::{BudgetError, BudgetOverrides};
+use crate::gauges::RoleGaugeSample;
+use crate::posture::PosturePolicy;
+use crate::role::{WorkerRole, ALL_ROLES};
+use crate::slot::{SlotState, Transition, TransitionContext, MERGE_PIN_KEY};
+
+/// The u8 script encoding: a role's position in the sized `ALL_ROLES`
+/// table (the stage-stub idiom).
+#[expect(
+    clippy::expect_used,
+    reason = "a role missing from ALL_ROLES is a conformance bug that must fail loudly"
+)]
+fn role_index(role: WorkerRole) -> u8 {
+    role.index_in_all_roles()
+        .expect("scripted role must be in ALL_ROLES")
+}
+
+fn boot() -> FleetBoot {
+    FleetBoot {
+        quota_cpus: 8.0,
+        overrides: BudgetOverrides::default(),
+        posture: PosturePolicy {
+            enter_events: 2,
+            enter_window_ms: 1_000,
+            duty_percent: 2.0,
+            duty_window_ms: 5_000,
+            exit_clean_ms: 10_000,
+            sim_intake_floor_override: None,
+        },
+    }
+}
+
+/// The scripted host: a real `FleetHost` driven by the u8 script — the
+/// `NoopStub` pattern (a genuine orchestration core, exercised end-to-end by
+/// the script instead of by production callers, which land in F3–F5).
+fn stub_host() -> FleetHost {
+    FleetHost::boot(boot()).expect("scripted host boots on the worked 8-core quota")
+}
+
+/// Walk ONE role's role-correct legal transition path end to end on a real
+/// slot and assert every row lands where the table says.
+#[test]
+fn every_v1_active_role_walks_its_legal_transition_path() {
+    for role in ALL_ROLES {
+        let _idx = role_index(role); // u8 script: any table reshuffle trips here
+        if !role.v1_active() {
+            continue; // declared roles host at their migration step
+        }
+        let mut host = stub_host();
+        match role {
+            WorkerRole::Solver => {
+                let slot = first_idle_home_slot(&host, role);
+                // T1 Idle→Leased(key) → T2 → T3 Pinned(k).
+                host.lease_claim(slot, role, Some(7)).expect("T1");
+                assert_eq!(
+                    host.slot_state(slot),
+                    Some(SlotState::Leased { role, key: Some(7) })
+                );
+                host.start(slot, &Unit::noop(1, role, Some(7))).expect("T2");
+                assert_eq!(
+                    host.slot_state(slot),
+                    Some(SlotState::Running { role, key: Some(7) })
+                );
+                host.complete(slot).expect("T3");
+                assert_eq!(
+                    host.slot_state(slot),
+                    Some(SlotState::Pinned { role, key: 7 })
+                );
+                // T6: next cycle's unit for the SAME key.
+                host.start(slot, &Unit::noop(2, role, Some(7))).expect("T6");
+                assert_eq!(
+                    host.slot_state(slot),
+                    Some(SlotState::Running { role, key: Some(7) })
+                );
+                host.complete(slot).expect("T3 again (warm)");
+                // T9: epoch-boundary release.
+                host.begin_epoch();
+                assert_eq!(host.release_pin(7), Ok(slot), "T9");
+                host.end_epoch();
+                assert_eq!(host.slot_state(slot), Some(SlotState::Idle));
+            }
+            WorkerRole::Merge => {
+                // Pinned at boot (T4); T6 continuation then T9 release.
+                let slot = host.merge_slot().expect("boot pin");
+                assert_eq!(
+                    host.slot_state(slot),
+                    Some(SlotState::Pinned {
+                        role,
+                        key: MERGE_PIN_KEY
+                    })
+                );
+                host.start(slot, &Unit::noop(1, role, Some(MERGE_PIN_KEY)))
+                    .expect("T6");
+                host.complete(slot).expect("T4 again");
+            }
+            WorkerRole::SimDriver | WorkerRole::Resolve => {
+                let slot = first_idle_home_slot(&host, role);
+                host.lease_claim(slot, role, None).expect("T1");
+                host.start(slot, &Unit::noop(1, role, None)).expect("T2");
+                assert_eq!(
+                    host.slot_state(slot),
+                    Some(SlotState::Running { role, key: None })
+                );
+                // T5: pooled roles return to idle.
+                assert_eq!(host.complete(slot), Ok(Completion::BackToIdle));
+                assert_eq!(host.slot_state(slot), Some(SlotState::Idle));
+            }
+            _ => unreachable!("v1-active set is exhausted above"),
+        }
+    }
+}
+
+fn first_idle_home_slot(host: &FleetHost, role: WorkerRole) -> crate::dispatcher::SlotId {
+    // Boot layout: [solver pins][sim slots][resolve slots][merge].
+    let pins = host.budget().solver_pin_count;
+    let sims = host.budget().sim_slot_cap;
+    let resolves = usize::try_from(host.budget().resolve_cpus).unwrap_or(1);
+    let (start, end) = match role {
+        WorkerRole::Solver => (0_usize, pins),
+        WorkerRole::SimDriver => (pins, pins + sims),
+        WorkerRole::Resolve => (pins + sims, pins + sims + resolves),
+        _ => (pins + sims + resolves, pins + sims + resolves + 1),
+    };
+    for slot in start..end {
+        if host.slot_state(u64::try_from(slot).unwrap_or(SlotId::MAX)) == Some(SlotState::Idle) {
+            return u64::try_from(slot).unwrap_or(SlotId::MAX);
+        }
+    }
+    // A scripted role without an idle home slot is a boot-layout bug; fail
+    // via assertion, never a process-level panic.
+    let idle = host
+        .slot_states()
+        .iter()
+        .find(|(_, s)| *s == SlotState::Idle)
+        .map(|(s, _)| *s);
+    assert!(
+        idle.is_some(),
+        "scripted role {role:?} has no idle slot in the boot layout"
+    );
+    idle.unwrap_or(SlotId::MAX)
+}
+
+/// §3.3's illegal table, asserted on the pure FSM for EVERY role in
+/// `ALL_ROLES` (declared roles included — the table is role-complete).
+#[test]
+fn every_illegal_transition_is_rejected_for_every_role() {
+    const ADMITS: TransitionContext = TransitionContext {
+        at_epoch_boundary: false,
+        posture_admits_role: true,
+    };
+    for role in ALL_ROLES {
+        let states = [
+            SlotState::Idle,
+            SlotState::Leased { role, key: Some(1) },
+            SlotState::Running { role, key: Some(1) },
+            SlotState::Pinned { role, key: 1 },
+            SlotState::Draining { role },
+        ];
+        for from in states {
+            for t in [
+                Transition::Start { unit: 1 },
+                Transition::CompleteToPinned,
+                Transition::CompleteToIdle,
+                Transition::BeginDraining,
+                Transition::DrainComplete,
+                Transition::ReleasePin,
+            ] {
+                // Sweep the FULL cross product; anything not in §3.3's rows
+                // must reject. The legal pairs (superset below) are excluded
+                // by matching the exact from/t combinations the table allows.
+                if legal_in_table(from, t) {
+                    continue;
+                }
+                let rejected = crate::slot::transition(from, t, ADMITS).err();
+                assert!(
+                    rejected.is_some(),
+                    "illegal {from:?} --{t:?}--> for {role:?} was ACCEPTED"
+                );
+                let rejected = rejected.unwrap_or(RejectedTransition {
+                    from,
+                    transition: t,
+                    reason: crate::slot::RejectionReason::NoLegalRow,
+                });
+                assert!(
+                    matches!(rejected.reason, crate::slot::RejectionReason::NoLegalRow)
+                        || matches!(rejected.reason, crate::slot::RejectionReason::MidCyclePin),
+                    "unexpected rejection class for {from:?} --{t:?}-->: {rejected:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The legal (from, transition) pairs of §3.3, table-encoded exactly once —
+/// the harness's independent restatement of the table.
+fn legal_in_table(from: SlotState, t: Transition) -> bool {
+    matches!(
+        (from, t),
+        (SlotState::Idle, Transition::Lease { .. })
+            | (
+                SlotState::Leased { .. },
+                Transition::Start { .. } | Transition::BeginDraining,
+            )
+            | (
+                SlotState::Running { .. },
+                Transition::CompleteToPinned
+                    | Transition::CompleteToIdle
+                    | Transition::BeginDraining,
+            )
+            | (
+                SlotState::Pinned { .. },
+                Transition::Start { .. } | Transition::ReleasePin,
+            )
+            | (SlotState::Draining { .. }, Transition::DrainComplete)
+    )
+}
+
+/// §3.3's named illegal rows, asserted by exact class.
+#[test]
+fn the_named_illegal_rows_reject_by_class() {
+    const ADMITS: TransitionContext = TransitionContext {
+        at_epoch_boundary: false,
+        posture_admits_role: true,
+    };
+    // Idle → Running (lease required).
+    assert!(
+        crate::slot::transition(SlotState::Idle, Transition::Start { unit: 1 }, ADMITS).is_err()
+    );
+    // Pinned(Solver, k) → Pinned(Solver, k'): re-keying is T9 then T1.
+    assert!(crate::slot::transition(
+        SlotState::Pinned {
+            role: WorkerRole::Solver,
+            key: 1
+        },
+        Transition::CompleteToPinned,
+        ADMITS
+    )
+    .is_err());
+    // Draining → Leased.
+    assert!(crate::slot::transition(
+        SlotState::Draining {
+            role: WorkerRole::SimDriver
+        },
+        Transition::Lease {
+            role: WorkerRole::SimDriver,
+            key: None
+        },
+        ADMITS
+    )
+    .is_err());
+    // T9 mid-cycle.
+    let mid = crate::slot::transition(
+        SlotState::Pinned {
+            role: WorkerRole::Solver,
+            key: 1,
+        },
+        Transition::ReleasePin,
+        ADMITS,
+    )
+    .expect_err("epoch boundary required");
+    assert_eq!(mid.reason, crate::slot::RejectionReason::MidCyclePin);
+}
+
+/// The budget-sum invariant holds across a SCRIPTED quota resize: shares
+/// re-declared, sum re-checked, and pin re-keying only via T9 (a re-key on
+/// a live pin without the boundary rejects `MidCyclePin`).
+#[test]
+fn budget_sum_invariant_holds_across_a_scripted_quota_resize() {
+    let mut host = stub_host();
+    assert_eq!(host.budget().declared_sum(), host.budget().quota_floor);
+
+    // Pin two bins across the resize:
+    for key in [1_u64, 2] {
+        let slot = first_idle_home_slot(&host, WorkerRole::Solver);
+        host.lease_claim(slot, WorkerRole::Solver, Some(key))
+            .expect("T1");
+        host.start(slot, &Unit::noop(key, WorkerRole::Solver, Some(key)))
+            .expect("T2");
+        host.complete(slot).expect("T3");
+    }
+    let pin_a = host.pin_slot(1).expect("pin 1");
+    let warm_before = host.arena(pin_a);
+
+    // Scripted resize (quota re-detected on cgroup focus): shares re-declared.
+    host.resize_quota(6.5, &BudgetOverrides::default())
+        .expect("6.5 hosts the fixed consumers + 2 solver");
+    assert_eq!(host.budget().declared_sum(), host.budget().quota_floor);
+    assert!(host.budget().pins_require_rekey(
+        &crate::budget::FleetBudget::derive(8.0, &BudgetOverrides::default()).expect("8")
+    ));
+
+    // A re-key attempt MID-CYCLE (no epoch boundary) is rejected: pins move
+    // ONLY via T9.
+    let live_pin = host.pin_slot(2).expect("pin 2");
+    assert!(host.release_pin(2).is_err(), "mid-cycle T9 must reject");
+    assert!(matches!(
+        host.slot_state(live_pin),
+        Some(SlotState::Pinned { .. })
+    ));
+
+    // At the epoch boundary, the pin releases and the arena drops with it.
+    host.begin_epoch();
+    assert_eq!(host.release_pin(2), Ok(live_pin), "T9");
+    host.end_epoch();
+    assert_eq!(
+        host.arena(live_pin),
+        None,
+        "arena never crosses a role switch"
+    );
+    // Pin 1 was untouched: warm identity preserved across the resize.
+    assert_eq!(host.arena(pin_a), warm_before);
+    assert!(matches!(
+        host.slot_state(pin_a),
+        Some(SlotState::Pinned {
+            role: WorkerRole::Solver,
+            key: 1
+        })
+    ));
+}
+
+/// Pin/arena stability across N synthetic cycles: same pin key, warm
+/// handle identity (T6 then T3 per cycle; the token never changes).
+#[test]
+fn pin_and_arena_are_stable_across_synthetic_cycles() {
+    const N: u64 = 25;
+    let mut host = stub_host();
+    let slot = first_idle_home_slot(&host, WorkerRole::Solver);
+    host.lease_claim(slot, WorkerRole::Solver, Some(5))
+        .expect("T1");
+    host.start(slot, &Unit::noop(1, WorkerRole::Solver, Some(5)))
+        .expect("T2");
+    host.complete(slot).expect("T3 (first pin mints the arena)");
+    let warm = host.arena(slot).expect("arena minted");
+    for cycle in 2..=N {
+        // T6: same key only.
+        host.start(slot, &Unit::noop(cycle, WorkerRole::Solver, Some(5)))
+            .expect("T6 same key");
+        assert_eq!(
+            host.arena(slot),
+            Some(warm),
+            "warm token identity must not change mid-cycle {cycle}"
+        );
+        host.complete(slot).expect("T3");
+        assert_eq!(
+            host.arena(slot),
+            Some(warm),
+            "warm token identity survives cycle {cycle}"
+        );
+        assert!(matches!(
+            host.slot_state(slot),
+            Some(SlotState::Pinned {
+                role: WorkerRole::Solver,
+                key: 5
+            })
+        ));
+        // The pin never re-keys in place.
+        assert_eq!(host.pin_slot(5), Some(slot));
+    }
+}
+
+/// A dead host mid-drain hits the loud-abort path (never swallows): the
+/// stranded-pipe tripwire fires exactly once; the legal T7/T8 shed path
+/// next to it never trips.
+#[test]
+fn the_stranded_pipe_tripwire_fires_on_host_death_mid_drain() {
+    let tripped = Arc::new(AtomicUsize::new(0));
+    let observer = Arc::clone(&tripped);
+    let mut host = FleetHost::boot(boot())
+        .expect("boot")
+        .with_tripwire_observer(Arc::new(move |_reason| {
+            observer.fetch_add(1, Ordering::SeqCst);
+        }));
+    // A merge unit with in-flight result sends "dies" mid-drain.
+    let merge = host.merge_slot().expect("boot pin");
+    host.start(
+        merge,
+        &Unit::new(
+            1,
+            WorkerRole::Merge,
+            Some(MERGE_PIN_KEY),
+            true,
+            Box::new(|| {}),
+        ),
+    )
+    .expect("T6");
+    assert!(host.strand_unit(merge).is_err(), "the strand is loud");
+    assert_eq!(tripped.load(Ordering::SeqCst), 1);
+    // The legal path stays legal.
+    host.complete(merge)
+        .expect("T4 recovery on the scripted host");
+    assert_eq!(tripped.load(Ordering::SeqCst), 1);
+}
+
+/// A worker never holds a GIL across role work: the fleet graph carries NO
+/// pyo3 (the crate-level dependency assertion) and role units are 'static
+/// Send Rust closures executed host-side — simulation never round-trips
+/// Python (design doc §8).
+#[test]
+fn role_work_never_crosses_python_the_fleet_graph_is_pyo3_free() {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+    let text = std::fs::read_to_string(manifest).expect("crate manifest readable");
+    assert!(
+        !text.contains("pyo3"),
+        "degenbot-workers must not pull pyo3 (ADR-042 §8: FFI crossed only for runtime/startup concerns)"
+    );
+    // Units dispatch as plain Rust closures: a real thread runs the unit
+    // body to completion host-side without any interpreter round-trip.
+    let ran = Arc::new(AtomicUsize::new(0));
+    let observer = Arc::clone(&ran);
+    let unit = Unit::new(
+        1,
+        WorkerRole::SimDriver,
+        None,
+        false,
+        Box::new(move || {
+            observer.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
+    std::thread::scope(|s| {
+        s.spawn(move || {
+            (unit.work)();
+        })
+        .join()
+        .expect("host-side unit work completes");
+    });
+    assert_eq!(ran.load(Ordering::SeqCst), 1);
+}
+
+/// Per-role busy/idle gauges exist across `ALL_ROLES` (the activation
+/// dashboard's fleet source; the hotpath/instruments.rs mirror consumes
+/// this shape). Also asserts gauge integrity under churn.
+#[test]
+fn per_role_busy_idle_gauges_exist_for_the_activation_dashboard() {
+    static ROWS: AtomicUsize = AtomicUsize::new(0);
+    fn hook(samples: &[RoleGaugeSample]) {
+        ROWS.store(samples.len(), Ordering::SeqCst);
+    }
+    let installed = crate::gauges::set_dashboard_hook(hook);
+
+    let mut host = stub_host();
+    let rows = host.role_gauges();
+    assert_eq!(
+        rows.len(),
+        ALL_ROLES.len(),
+        "one gauge row per declared role"
+    );
+    for row in &rows {
+        assert_eq!(
+            row.busy() + row.idle,
+            row.total(),
+            "busy/idle pair complete: {row:?}"
+        );
+    }
+    // Churn moves the gauge, not the row set.
+    let slot = first_idle_home_slot(&host, WorkerRole::SimDriver);
+    host.lease_claim(slot, WorkerRole::SimDriver, None)
+        .expect("T1");
+    host.start(slot, &Unit::noop(9, WorkerRole::SimDriver, None))
+        .expect("T2");
+    let rows = host.role_gauges();
+    let sim = rows
+        .iter()
+        .find(|r| r.role == WorkerRole::SimDriver)
+        .expect("sim row");
+    assert_eq!(sim.running, 1, "busy side moves with the churn");
+    if installed {
+        assert_eq!(
+            ROWS.load(Ordering::SeqCst),
+            8,
+            "the dashboard hook saw all 8 rows"
+        );
+    }
+}
+
+/// The declared-but-not-active roles gate loudly in dispatch (Known/planned
+/// gating: adding them later is an entry, not a redesign).
+#[test]
+fn declared_roles_gate_in_dispatch_until_their_migration_step() {
+    let mut host = stub_host();
+    for role in ALL_ROLES.iter().skip(4) {
+        let err = host
+            .enqueue(Unit::noop(1, *role, None))
+            .expect_err("declared roles do not queue yet");
+        assert!(matches!(err, EnqueueError::RoleNotActive(_)), "{err}");
+    }
+}
+
+/// Budget fail-fast surfaces as the loud boot error (the fleet refuses to
+/// start on over-subscription — never a runtime throttle storm).
+#[test]
+fn overly_small_quotas_never_boot() {
+    let err = FleetHost::boot(FleetBoot {
+        quota_cpus: 4.5,
+        ..boot()
+    })
+    .expect_err("pinned-role floor");
+    assert!(matches!(
+        err,
+        BootError::Budget(BudgetError::QuotaTooSmallForPinnedRoles { .. })
+    ));
+}

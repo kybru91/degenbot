@@ -1,0 +1,19 @@
+[package]
+name = "degenbot-workers"
+description = "Role-switching worker fleet: WorkerRole FSM, one budget authority, bounded priority dispatch, cordon posture (ADR-042)."
+keywords = ["mev", "workers", "fleet", "scheduler"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+degenbot-core.workspace = true
+degenbot-config.workspace = true
+tracing = { version = "^0.1" }
+parking_lot = { version = "^0.12" }
+thiserror = { version = "^2.0" }
