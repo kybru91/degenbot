@@ -130,25 +130,7 @@ impl InlineSimHook {
             )),
             reverify_armed: std::sync::Mutex::new(std::collections::HashSet::new()),
             spotcheck_n: std::sync::atomic::AtomicU64::new(0),
-            sim_runtime: {
-                #[expect(clippy::expect_used)]
-                // unreachable in production: multi-thread Builder only fails on allocator OOM or invalid config (worker count is clamped 1..=32)
-                Arc::new(
-                    tokio::runtime::Builder::new_multi_thread()
-                        // M2 soak sizing (2026-09-05): with the hard-coded 2
-                        // workers the per-cycle wall was 72ms + 4.74ms/path
-                        // (R^2 0.89, 228 steady cycles) - the payload sims queued
-                        // on the 2-thread runtime while ~50 bins/cycle arrived
-                        // concurrently (sims p50 12ms). Sizing to the core count
-                        // lets the bins' sims actually overlap. Env-tunable for
-                        // constrained hosts; the sim bodies still block on the
-                        // DB wrap's block_on, so workers also cover that wait.
-                        .worker_threads(inline_sim_worker_count())
-                        .enable_all()
-                        .build()
-                        .expect("inline-sim runtime build"),
-                )
-            },
+            sim_runtime: Arc::new(build_inline_sim_runtime()),
         }
     }
 
@@ -277,6 +259,51 @@ where
         }
         _ => sim_runtime.block_on(fut),
     }
+}
+
+/// GOQWCL: the inline-sim runtime previously kept the default thread name
+/// (`tokio-runtime-worker`) — indistinguishable in thread dumps from every
+/// other defaulting pool. The census (PE4FPM) declares the distinct
+/// `degenbot-inline-sim-{n}` pattern; the seq closure mirrors tokio 1.53's
+/// per-thread `thread_name_fn` invocation (same mechanism as
+/// `degenbot_core::runtime`).
+static INLINE_SIM_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn inline_sim_thread_name() -> String {
+    format!(
+        "degenbot-inline-sim-{}",
+        INLINE_SIM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// The private multi-thread runtime hosting the payload sims (7LV6VN T5).
+/// Sized by [`inline_sim_worker_count`], named distinctly, census-registered
+/// (PE4FPM).
+fn build_inline_sim_runtime() -> tokio::runtime::Runtime {
+    let workers = inline_sim_worker_count();
+    degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+        resource: "inline_sim_runtime_workers",
+        kind: "tokio multi-thread runtime (inline-sim hook — payload sims; fleet-hosted SimDriver target, ADR-042)",
+        count: workers,
+        thread_name: "degenbot-inline-sim-{n}",
+        sizing: "leftover_worker_budget (7LV6VN T5); override `solve.inline_sim_workers` (env DEGENBOT_INLINE_SIM_WORKERS), clamp 1..=32",
+    });
+    #[expect(clippy::expect_used)]
+    // unreachable in production: multi-thread Builder only fails on allocator OOM or invalid config (worker count is clamped 1..=32)
+    tokio::runtime::Builder::new_multi_thread()
+        // M2 soak sizing (2026-09-05): with the hard-coded 2
+        // workers the per-cycle wall was 72ms + 4.74ms/path
+        // (R^2 0.89, 228 steady cycles) - the payload sims queued
+        // on the 2-thread runtime while ~50 bins/cycle arrived
+        // concurrently (sims p50 12ms). Sizing to the core count
+        // lets the bins' sims actually overlap. Env-tunable for
+        // constrained hosts; the sim bodies still block on the
+        // DB wrap's block_on, so workers also cover that wait.
+        .worker_threads(workers)
+        .thread_name_fn(inline_sim_thread_name)
+        .enable_all()
+        .build()
+        .expect("inline-sim runtime build")
 }
 
 /// The inline-sim runtime's worker count (M2 soak sizing): core-count by
@@ -592,6 +619,7 @@ impl InlineSimulator for InlineSimHook {
 }
 
 #[cfg(test)]
+#[expect(clippy::expect_used)] // census/name assertions follow the repo's loud-assert test style
 mod tests {
     // The override parsing matrix moved to degenbot-config's precedence
     // tests (KAHU5W: the loader owns the env read). This pins the production
@@ -601,6 +629,32 @@ mod tests {
     fn inline_sim_worker_count_defaults_to_leftover_budget() {
         let default = degenbot_core::cpu_budget::leftover_worker_budget();
         assert_eq!(super::inline_sim_worker_count(), default);
+    }
+
+    /// PE4FPM (GOQWCL): the inline-sim runtime's workers must carry the
+    /// DISTINCT census thread name — never the shared
+    /// `tokio-runtime-worker` default that made thread dumps
+    /// unattributable when both runtimes overlapped.
+    #[test]
+    fn inline_sim_runtime_workers_carry_the_census_thread_name() {
+        let rt = super::build_inline_sim_runtime();
+        let name = rt.block_on(async {
+            tokio::spawn(async move { std::thread::current().name().map(str::to_owned) })
+                .await
+                .expect("worker spawn")
+        });
+        let name = name.expect("worker thread name");
+        assert!(
+            name.starts_with("degenbot-inline-sim-"),
+            "inline-sim worker must be census-named, got {name}"
+        );
+        // And the self-registration agrees with the built runtime.
+        let row = degenbot_core::worker_census::snapshot()
+            .into_iter()
+            .find(|e| e.resource == "inline_sim_runtime_workers")
+            .expect("inline-sim runtime must self-register in the census");
+        assert_eq!(row.count, rt.metrics().num_workers());
+        assert_eq!(row.thread_name, "degenbot-inline-sim-{n}");
     }
 }
 

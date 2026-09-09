@@ -202,6 +202,16 @@ pub fn init_global_metrics_with_addr(addr: SocketAddr) -> Result<(), MetricsInit
     };
     GLOBAL.get_or_init(|| global);
 
+    // PE4FPM: self-register the scrape thread (before the spawn below).
+    degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+        resource: "metrics_scrape",
+        kind: "std scrape-server thread (Prometheus text endpoint)",
+        count: 1,
+        thread_name: "degenbot-metrics",
+        sizing:
+            "exactly one (fixed; spawn failure degrades to the log — endpoint inactive, no abort)",
+    });
+
     // Serve on a dedicated std thread — the scrape endpoint must not depend on
     // the bot's tokio runtime staying alive (or vice versa). A spawn failure
     // leaves metrics initialized but unscrapeable; that degrades to the log,

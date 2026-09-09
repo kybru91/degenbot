@@ -81,6 +81,14 @@ impl PythonLogLayer {
             shutdown: AtomicBool::new(false),
         });
         let drainer_state = Arc::clone(&state);
+        // PE4FPM: self-register the drainer thread.
+        degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
+            resource: "rust_log_drainer",
+            kind: "std drainer thread (tracing → Python logging bridge)",
+            count: 1,
+            thread_name: "rust-log-drainer",
+            sizing: "exactly one (fixed; built with the layer at logging init)",
+        });
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let _drainer = thread::Builder::new()
             .name("rust-log-drainer".into())
