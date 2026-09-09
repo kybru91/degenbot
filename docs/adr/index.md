@@ -58,6 +58,7 @@ The load-bearing decisions behind the two-consumer architecture:
 | [039](ADR-039-state-lock-sim-anchor-projection.md) | State-lock — enumerated sim-anchor projection | pending status |
 | [040](ADR-040-per-bucket-failure-reactions.md) | Failure reactions are per-bucket | accepted |
 | [041](ADR-041-block-epoch-pipeline.md) | The block-epoch pipeline — one stage machine over a cheap-read data plane | implemented |
+| [042](ADR-042-role-switching-worker-fleet.md) | One role-switching worker fleet — a bounded, budgeted host for every execution resource | **proposed** |
 
 Numbering note: ADR-037 was assigned twice (engine mutex sharding; swap-simulation gate) — both kept as filed.
 
