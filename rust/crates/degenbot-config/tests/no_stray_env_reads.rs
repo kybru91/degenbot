@@ -73,6 +73,12 @@ fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
             "crates/degenbot-python/src/diagnostics/thread_registry.rs",
             &["DEGENBOT_STATE_LOCK_DIAG"][..], // test stance (feature-gated)
         );
+        m.insert(
+            "crates/degenbot-python/build.rs",
+            // The build-receipt work (1e1c0ddf7): the build script locates
+            // the repo receipt file itself (a build-time path, not config).
+            &["CARGO_MANIFEST_DIR", "DEGENBOT_BUILD_NUMBER_FILE"][..],
+        );
         m
     })
 }

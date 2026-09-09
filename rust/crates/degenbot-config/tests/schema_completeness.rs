@@ -23,6 +23,17 @@ const SWEEP_ARTIFACTS: &[&str] = &[
     "DEGENBOT_V",
 ];
 
+/// Build-receipt keys (commit 1e1c0ddf7): compile-time build-artifact
+/// variables around `degenbot-python/build.rs` — `DEGENBOT_BUILD_NUMBER_FILE`
+/// locates the receipt file at build time, and `DEGENBOT_BUILD_NUMBER` /
+/// `DEGENBOT_BUILD_FINGERPRINT` are `cargo:rustc-env` outputs consumed by
+/// `build_info`. They are not runtime configuration keys.
+const BUILD_ARTIFACT_KEYS: &[&str] = &[
+    "DEGENBOT_BUILD_FINGERPRINT",
+    "DEGENBOT_BUILD_NUMBER",
+    "DEGENBOT_BUILD_NUMBER_FILE",
+];
+
 /// Real static env keys the config crate reads BEFORE/OUTSIDE the schema:
 /// `DEGENBOT_CONFIG` selects the config FILE layer (see
 /// `with_standard_file_paths` in `loader.rs`) — chicken-and-egg, it cannot
@@ -86,7 +97,11 @@ fn schema_covers_the_full_key_inventory() {
 
     let mut expected: BTreeSet<String> = sweep
         .iter()
-        .filter(|k| !SWEEP_ARTIFACTS.contains(&k.as_str()) && !BOOTSTRAP_KEYS.contains(&k.as_str()))
+        .filter(|k| {
+            !SWEEP_ARTIFACTS.contains(&k.as_str())
+                && !BOOTSTRAP_KEYS.contains(&k.as_str())
+                && !BUILD_ARTIFACT_KEYS.contains(&k.as_str())
+        })
         .cloned()
         .collect();
     for expansion in SWEEP_EXPANSIONS {
@@ -118,7 +133,11 @@ fn snapshot_fallback_agrees_with_schema() {
     );
     let mut expected: BTreeSet<String> = sweep
         .iter()
-        .filter(|k| !SWEEP_ARTIFACTS.contains(&k.as_str()) && !BOOTSTRAP_KEYS.contains(&k.as_str()))
+        .filter(|k| {
+            !SWEEP_ARTIFACTS.contains(&k.as_str())
+                && !BOOTSTRAP_KEYS.contains(&k.as_str())
+                && !BUILD_ARTIFACT_KEYS.contains(&k.as_str())
+        })
         .cloned()
         .collect();
     for expansion in SWEEP_EXPANSIONS {
