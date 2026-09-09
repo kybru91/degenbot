@@ -176,6 +176,23 @@ crate::config_schema! {
             doc = "Stream solved arms immediately (T3 default); `0` opts out to the debounce sweep.";
         ws_completeness [bool] = true, env = "DEGENBOT_WS_COMPLETENESS", def = "true",
             doc = "WS completeness gating (newHeads + logs double-delivery check); `0` disables.";
+        // BM35LK (epic FIMZES; design logs/quiesce-design-20260908.md §6): the
+        // adaptive trailing-quiesce estimator. `fixed` keeps today's
+        // `pump_debounce_ms` behavior (defer hard cutover); `adaptive` arms
+        // the settle timers with W = clamp(EWMA·quiesce_margin, floor, ceil)
+        // where the EWMA tracks each block's max intra-block silence gap.
+        quiesce_mode [enum QuiesceMode Fixed Adaptive] = QuiesceMode::Fixed, env = "DEGENBOT_PUMP_QUIESCE_MODE", def = "fixed",
+            doc = "Settle-window mode: `fixed` = constant pump.pump_debounce_ms debounce; `adaptive` = EWMA trailing-quiesce estimator (never below quiesce_floor_ms, never above quiesce_ceil_ms; late-admit budget overruns hold at the ceiling).";
+        quiesce_floor_ms [ms] = 2, env = "DEGENBOT_PUMP_QUIESCE_FLOOR_MS", def = "2",
+            doc = "Adaptive mode: lower bound (ms) of the trailing settle window (clamped >= 1; a 0/garbage value never collapses the window to zero).";
+        quiesce_ceil_ms [ms] = 20, env = "DEGENBOT_PUMP_QUIESCE_CEIL_MS", def = "20",
+            doc = "Adaptive mode: upper bound (ms) of the trailing settle window; the estimator never grows beyond it (inherits the debounce parse contract: unset/zero/invalid falls back, never 0).";
+        quiesce_margin_ms [f64] = 3.0, env = "DEGENBOT_PUMP_QUIESCE_MARGIN_MS", def = "3.0",
+            doc = "Adaptive mode: safety multiplier over the silence-gap EWMA (W = EWMA × margin, then floor/ceiling clamp).";
+        quiesce_ewma_alpha [f64] = 0.1, env = "DEGENBOT_PUMP_QUIESCE_EWMA_ALPHA", def = "0.1",
+            doc = "Adaptive mode: EWMA smoothing constant over per-block max silence gaps (≈10-block memory); clamped to (0, 1].";
+        quiesce_late_budget [u64] = 120, env = "DEGENBOT_PUMP_QUIESCE_LATE_BUDGET", def = "120",
+            doc = "Adaptive-mode runtime backstop (HJ5HWF contract): more than this many benign late-admit events in a sliding hour holds the window at quiesce_ceil_ms until the ledger drains.";
     }
 
     trace TraceConfig {

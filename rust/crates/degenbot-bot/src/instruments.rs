@@ -99,6 +99,11 @@ pub struct PipelineInstruments {
     /// Distinct from `reorg_recovery_dropped`, which counts only single-
     /// writer duplicates inside an authoritative catch-up's owned range.
     late_log_admitted: Counter<u64>,
+    /// BM35LK: the currently-armed settle (quiesce) window in ms — fixed
+    /// mode the debounce, adaptive mode the estimator's clamped EWMA
+    /// projection. The §6.2 design instrument pair with
+    /// `late_log.admitted`.
+    quiesce_window_ms: Gauge<f64>,
     /// Header-gap / settle backfills executed.
     backfills_executed: Counter<u64>,
     /// `pool_state_head - engine clock` divergence.
@@ -297,6 +302,12 @@ impl PipelineInstruments {
                 .u64_counter("degenbot.reorg.recovery_dropped")
                 .with_description(
                     "Log events discarded by the recovery-anchor rule (DroppedRecovery)",
+                )
+                .build(),
+            quiesce_window_ms: meter
+                .f64_gauge("degenbot.quiesce.window_ms")
+                .with_description(
+                    "Currently-armed settle (quiesce) window in ms (fixed debounce or the adaptive EWMA estimator's W)",
                 )
                 .build(),
             late_log_admitted: meter
@@ -614,6 +625,14 @@ impl PipelineInstruments {
     /// says the WS feed reordered, not that the state machine misbehaved.
     pub fn count_late_log_admitted(&self) {
         self.late_log_admitted.add(1, &[]);
+    }
+
+    /// BM35LK: the window the settle timers are currently armed with (ms).
+    /// Observed once per settle point so the Grafana funnel gains the
+    /// estimator's live posture without new scrape paths.
+    #[expect(clippy::cast_precision_loss)]
+    pub fn observe_quiesce_window(&self, ms: u64) {
+        self.quiesce_window_ms.record(ms as f64, &[]);
     }
 
     /// One WS log event received by the pump (pre topic-filter).

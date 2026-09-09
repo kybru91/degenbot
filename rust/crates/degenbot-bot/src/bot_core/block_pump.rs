@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::bot_core::stage_machine::QuiesceParams;
 use crate::bot_core::stance;
 use crate::bot_core::{CompletenessDecision, StageDecision, StageMachine};
 
@@ -166,12 +167,6 @@ pub struct BlockPump {
     /// `ws_delivered` index-tracking map is not populated
     /// (no work on the hot loop).
     ws_completeness_enabled: bool,
-    /// Publish-debounce window (ms): after a dirty log, wait this long for a
-    /// straggler before settling the block (solve + dispatch). Default is the
-    /// historical 50 ms; operator-tunable via `DEGENBOT_PUMP_DEBOUNCE_MS`
-    /// (f701ccd3 lead-2: the window fired full-length on ~every block while
-    /// log bursts spaned 1.3-27.5 ms, making it a fixed per-block settle-tax).
-    debounce_ms: u64,
     /// Early-slice window (ms) for the drained-settle gate (PWPPAZ T2): when
     /// nonzero and unsolved dirt has been observed this long in the current
     /// block window, the gate dispatches ONE bounded early Drain mid-burst
@@ -181,6 +176,15 @@ pub struct BlockPump {
     /// accepted header and at each settle dispatch) keeps MBNASQ's unbounded
     /// per-gap serial solves from returning.
     early_slice_ms: u64,
+    /// BM35LK: the quiesce-estimator parameters the FSM's adaptive
+    /// trailing window arms from (a snapshot of the `pump.quiesce_*`
+    /// schema keys; `fixed` + `pump_debounce_ms` is today's behavior).
+    /// Held on the pump (not read from the ambient stance inside the loop)
+    /// so tests stay immune to the global environment — the same per-pump
+    /// pattern `early_slice_ms` established. The FSM's fixed-mode window
+    /// now carries the live debounce value (`fixed_ms`; the retired
+    /// `debounce_ms` field was its last read side).
+    quiesce_params: QuiesceParams,
 }
 
 /// State held between `subscribe()` and `resume()` calls.
@@ -234,8 +238,11 @@ impl BlockPump {
             stage_max_age: Duration::from_secs(super::stage_telemetry::STAGE_MAX_AGE_SECS),
             ws_completeness_enabled: stance::config().pump.ws_completeness,
             header_ms: std::sync::atomic::AtomicU64::new(0),
-            debounce_ms: stance::config().pump.pump_debounce_ms,
             early_slice_ms: stance::config().pump.early_slice_ms,
+            quiesce_params: QuiesceParams::from_schema(
+                stance::config(),
+                stance::config().pump.pump_debounce_ms,
+            ),
         };
         // KAHU5W: the dispatcher-side strict decode-miss fault follows the
         // pump's completeness stance (respecting any per-pump opt-out).
@@ -540,6 +547,10 @@ impl BlockPump {
         // Epic A1: the pump's decision state now lives in the StageMachine; the
         // driver routes the decision arms through it. `current_block` seeds the FSM.
         let mut fsm = StageMachine::new(current_block, 0);
+        // BM35LK: the FSM owns the adaptive quiesce estimator (pure) — the
+        // pump hands it the operator-tuned parameter snapshot once and then
+        // only feeds settle-point observations and reads the armed window.
+        fsm.set_quiesce_params(self.quiesce_params);
         // DFQYM5 single-writer, now FSM-owned (epic O3HW7E/T3): on a resume
         // where the snapshot→WS gap was backfilled (S < W), the backfill owns
         // [S+1, W] inclusive and the live WS owns [W+1, ∞). Seed the FSM's
@@ -671,6 +682,13 @@ impl BlockPump {
             logs: 0,
         };
 
+        // BM35LK — per-block intra-block silence-gap tracker: the max gap
+        // between consecutive relevant logs feeds the FSM's adaptive
+        // trailing-quiesce EWMA at each settle point (timings arrive as
+        // data; the FSM owns no clock). Reset at each accepted header.
+        let mut last_relevant_log_at: Option<std::time::Instant> = None;
+        let mut block_max_gap_us: u64 = 0;
+
         // PWPPAZ T2 early-slice state: `Some` from the first gate iteration
         // that observed unsolved dirt in the current block window; the slice
         // fires once when the age crosses `early_slice_ms`. `slice_done`
@@ -740,7 +758,10 @@ impl BlockPump {
             // inactivity backfill window. A new event arriving before the
             // window elapses cancels the flush (the burst is still in flight).
             let wait_timeout = if fsm.publish_pending() {
-                Duration::from_millis(self.debounce_ms)
+                // BM35LK: the settle timers arm the FSM's window (fixed mode
+                // = the debounce history; adaptive = the estimator's current
+                // W) instead of the raw debounce field.
+                Duration::from_millis(fsm.settle_window_ms())
             } else {
                 Duration::from_secs(BACKFILL_TIMEOUT_SECS)
             };
@@ -829,7 +850,23 @@ impl BlockPump {
                     // — the quiesce-before-publish gate + solver-release gate
                     // (ADR-008 D2) vs the inactivity backfill. The driver only
                     // executes the emitted decisions.
-                    for decision in fsm.on_settle() {
+                    //
+                    // BM35LK: feed the settled block's observed max silence
+                    // gap (when any relevant log arrived) so the estimator
+                    // re-arms W for the NEXT settle, publish the current W on
+                    // the quiesce-window gauge, and measure the
+                    // on_settle-entry-to-decision latency in the hotpath
+                    // profiler (VD62GX open item #1 — the 8.4%-of-blocks
+                    // settle-overshoot suspects become visible as a bucket).
+                    if pregap.logs > 0 {
+                        fsm.observe_settle_gap(block_max_gap_us / 1000, now_ms());
+                    }
+                    if let Some(p) = crate::instruments::pipeline() {
+                        p.observe_quiesce_window(fsm.settle_window_ms());
+                    }
+                    let settle_decisions =
+                        hotpath::measure_block!("pump.settle_decision", fsm.on_settle());
+                    for decision in settle_decisions {
                         match decision {
                             StageDecision::Publish { open, metadata } => {
                                 // Option-A solver-state accuracy gate (AV42C7):
@@ -1003,6 +1040,10 @@ impl BlockPump {
                         last_log: None,
                         logs: 0,
                     };
+                    // BM35LK: restart the silence-gap tracker for the new
+                    // block window.
+                    last_relevant_log_at = None;
+                    block_max_gap_us = 0;
                     // PWPPAZ T2: new block window — re-arm the early slice.
                     slice_first_dirty = None;
                     slice_done = false;
@@ -1167,6 +1208,16 @@ impl BlockPump {
                         }
                         pregap.last_log = Some(now);
                         pregap.logs += 1;
+                        // BM35LK: consecutive-relevant-log silence deltas —
+                        // the exact r.v. the adaptive trailing quiesce must
+                        // cover (design §2.1 intra-block gaps).
+                        if let Some(prev) = last_relevant_log_at {
+                            let gap_us = now.saturating_duration_since(prev).as_micros() as u64;
+                            if gap_us > block_max_gap_us {
+                                block_max_gap_us = gap_us;
+                            }
+                        }
+                        last_relevant_log_at = Some(now);
                     }
                     // BF43PM: the Streaming stage interval opens at the first
                     // relevant log of the epoch (idempotent within the epoch —
@@ -1520,6 +1571,11 @@ impl BlockPump {
                             if let Some(p) = crate::instruments::pipeline() {
                                 p.count_late_log_admitted();
                             }
+                            // BM35LK: feed the estimator's sliding-hour
+                            // ledger — sustained budget overruns hold the
+                            // adaptive window at the ceiling (HJ5HWF
+                            // backstop contract).
+                            fsm.record_late_admit(now_ms());
                             // The bool (first sighting vs cooldown-suppressed)
                             // is informational; the counted home is the
                             // late_log.admitted counter above.
@@ -1685,14 +1741,14 @@ impl BlockPump {
                         // Deadline passed: the slice dispatch decision is
                         // purely a function of the age below; the timed peek
                         // resolves immediately (zero wait).
-                        Duration::ZERO.min(Duration::from_millis(self.debounce_ms))
+                        Duration::ZERO.min(Duration::from_millis(fsm.settle_window_ms()))
                     } else {
                         target
                             .saturating_sub(age)
-                            .min(Duration::from_millis(self.debounce_ms))
+                            .min(Duration::from_millis(fsm.settle_window_ms()))
                     }
                 }
-                _ => Duration::from_millis(self.debounce_ms),
+                _ => Duration::from_millis(fsm.settle_window_ms()),
             };
             let has_buffered = if dirty_now {
                 // Only await when there's work to solve — otherwise skip
@@ -2295,15 +2351,23 @@ impl BlockPump {
             // synthetic log streams (which use relevant-topic logs as pure block
             // tombstones) never trip a spurious eth_getLogs comparison/abort.
             ws_completeness_enabled: false,
-            // Historical default: tests exercise the shared window (a per-
-            // pump override seam exists via the field, not env, so tests stay
-            // immune to the global environment).
-            debounce_ms: 50,
+            // Fixed-debounce posture exactly as the historical tests pin it
+            // (no ambient-env reads); adaptive-mode tests override via
+            // `set_quiesce_for_test`. The fixed 50 mirrors the retired
+            // `debounce_ms` field this constructor used to set.
+            quiesce_params: QuiesceParams::fixed(50),
             // Production default (PWPPAZ T2) — finite test streams end before
             // the slice deadline, so existing quiesce tests are unaffected;
             // the gap-stream tests below set the field explicitly.
             early_slice_ms: 25,
         }
+    }
+
+    /// Test-only override of the quiesce-estimator parameters (BM35LK) —
+    /// per-pump field override (not env) so tests stay immune to the
+    /// environment. Applied to the FSM when the run loop starts.
+    pub fn set_quiesce_for_test(&mut self, params: QuiesceParams) {
+        self.quiesce_params = params;
     }
 
     /// Test-only access to the shared `Bot` arc (FD7NFG tests inject
@@ -2366,6 +2430,8 @@ impl BlockPump {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bot_core::stage_machine::QuiesceParams;
+    use degenbot_config::QuiesceMode;
     use degenbot_decoders::v2_sync_decoder::V2_SYNC_TOPIC;
     use degenbot_decoders::v3_mint_burn_decoder::{V3_BURN_TOPIC, V3_MINT_TOPIC};
     use degenbot_decoders::v3_swap_decoder::V3_SWAP_TOPIC;
@@ -3414,6 +3480,64 @@ mod tests {
             rel >= Duration::from_millis(120),
             "slice disabled: the solve must wait out the full debounce/quiesce, got {rel:?}"
         );
+    }
+
+    /// BM35LK — adaptive quiesce: with `quiesce_mode = adaptive` (pre-seed
+    /// window = the 20 ms ceiling) the drained-settle gate arms the
+    /// ESTIMATOR window, not the fixed 50 ms debounce: the same 40 ms-gapped
+    /// burst that settles at ≥ 120 ms under the fixed debounce (see
+    /// `early_slice_disabled_restores_gate_parity`) dispatches at its
+    /// window deadline — because each 40 ms inter-log gap exceeds the
+    /// 20 ms window, exactly one dispatch fires per gap, all at block 101.
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_quiesce_arms_the_estimator_window() {
+        let bot = Arc::new(Bot::new(1));
+        register_burst_pool(&bot);
+        let (mut pump, sink, _shutdown) = pump_for_test_with_bot(bot, Some(100));
+        pump.set_early_slice_ms_for_test(0);
+        pump.set_quiesce_for_test(QuiesceParams {
+            mode: QuiesceMode::Adaptive,
+            ..QuiesceParams::default()
+        });
+        // The fake engine's dirty flag is a static test toggle, so raise it
+        // at 35 ms VIRTUAL time — after the header, just before the first
+        // log lands at 40 ms — so every drain dispatch is attributable to
+        // the settle window alone (a pre-header dirty would dispatch at the
+        // window deadline with no logs at all).
+        {
+            let sink_flag = Arc::clone(&sink);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                sink_flag.set_dirty(true);
+            });
+        }
+
+        let combined = gap_burst_stream(3, 40);
+        let t0 = tokio::time::Instant::now();
+        pump.run_test_loop(combined, 100).await;
+        drainer_settle(|| !sink.drained_blocks().is_empty()).await;
+
+        let stamps = sink.drained_at();
+        assert!(
+            !stamps.is_empty(),
+            "adaptive mode must still settle (the gate never starves)"
+        );
+        let rel_first = stamps[0] - t0;
+        // The estimator window (pre-seed = ceil 20 ms) must beat the fixed
+        // debounce's earliest possible dispatch under this stream shape
+        // (3 gaps × 40 ms + anything ≥ the 20 ms window): the fixed-50 ms
+        // posture dispatches at ≥ 120 ms.
+        assert!(
+            rel_first < Duration::from_millis(120),
+            "adaptive settle dispatched at {rel_first:?}; expected inside the estimator window (< 120 ms fixed-debounce floor)"
+        );
+        assert!(
+            rel_first >= Duration::from_millis(40),
+            "adaptive settle must still wait its window; dispatched at {rel_first:?}"
+        );
+        for (i, b) in sink.drained_blocks().iter().enumerate() {
+            assert_eq!(*b, 101, "all dispatches settle the open block (drain #{i})");
+        }
     }
 
     /// Drive a reorg scenario under the [`ReorgSpanCapture`] layer on a local

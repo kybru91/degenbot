@@ -245,6 +245,11 @@ pub struct StageMachine {
     /// `None` = Streaming; advances as the row's decisions fire; resets on a
     /// rewind (the fresh epoch restarts the cycle).
     stage_in_cycle: Option<Stage>,
+    /// BM35LK: the adaptive trailing-quiesce estimator (pure; timings
+    /// arrive as data on `observe_settle_gap`). Parameters arrive from the
+    /// driver via `set_quiesce_params`; defaults mirror the historical
+    /// fixed-debounce posture.
+    quiesce: QuiesceEstimator,
 }
 
 impl StageMachine {
@@ -268,6 +273,7 @@ impl StageMachine {
             open_block: None,
             in_reorg: false,
             stage_in_cycle: None,
+            quiesce: QuiesceEstimator::new(QuiesceParams::default()),
         }
     }
 
@@ -1313,6 +1319,285 @@ impl StageMachine {
     }
 }
 
+// ======================================================================
+// BM35LK — the adaptive trailing-quiesce estimator (epic FIMZES; design
+// logs/quiesce-design-20260908.md §6).
+// ======================================================================
+
+/// The settle-window mode declared by the typed config schema
+/// (degenbot-config `pump.quiesce_mode`). Re-exported here because the FSM
+/// owns the estimator the mode drives.
+pub use degenbot_config::QuiesceMode;
+
+/// Parameters of the adaptive trailing-quiesce estimator — one snapshot of
+/// the `pump.quiesce_*` schema keys, copied in by the driver at pump
+/// startup (the FSM owns no config access; the driver decides, see ADR-008).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuiesceParams {
+    /// `fixed` = constant `fixed_ms` (today's debounce); `adaptive` = the
+    /// EWMA map below.
+    pub mode: QuiesceMode,
+    /// How many late-admit events in a sliding hour hold the window at the
+    /// ceiling.
+    pub late_budget: u64,
+    /// Fixed-mode window; also the adaptive fallback when the estimator
+    /// cannot produce a value.
+    pub fixed_ms: u64,
+    /// Adaptive floor ms (clamped ≥ 1).
+    pub floor_ms: u64,
+    /// Adaptive ceiling ms (never exceeded, even under straggler regimes).
+    pub ceil_ms: u64,
+    /// Safety multiplier over the silence-gap EWMA.
+    pub margin: f64,
+    /// EWMA smoothing constant over per-block max silence gaps.
+    pub alpha: f64,
+}
+
+impl Default for QuiesceParams {
+    fn default() -> Self {
+        Self {
+            mode: QuiesceMode::Fixed,
+            late_budget: 120,
+            fixed_ms: 50,
+            floor_ms: 2,
+            ceil_ms: 20,
+            margin: 3.0,
+            alpha: 0.1,
+        }
+    }
+}
+
+impl QuiesceParams {
+    /// The parameters a test (or a fallback driver) that mirrors the
+    /// historical 50 ms debounce posture needs.
+    #[must_use]
+    pub fn fixed(fixed_ms: u64) -> Self {
+        Self {
+            fixed_ms: fixed_ms.max(1),
+            ..Self::default()
+        }
+    }
+
+    /// Snapshot the `pump.quiesce_*` schema keys (BM35LK). `fixed_ms` is
+    /// the pump's live debounce — the fixed-mode window AND the adaptive
+    /// fallback contract (the debounce's "never 0" parse rule carries over).
+    /// The FSM stays I/O-free: it never reads the ambient config stance
+    /// itself; the driver copies this snapshot in via `set_quiesce_params`.
+    #[must_use]
+    pub fn from_schema(config: &degenbot_config::BotConfig, fixed_ms: u64) -> Self {
+        let pump = &config.pump;
+        Self {
+            mode: pump.quiesce_mode,
+            fixed_ms: fixed_ms.max(1),
+            floor_ms: pump.quiesce_floor_ms,
+            ceil_ms: pump.quiesce_ceil_ms,
+            margin: pump.quiesce_margin_ms,
+            alpha: pump.quiesce_ewma_alpha,
+            late_budget: pump.quiesce_late_budget,
+        }
+    }
+}
+
+/// Sliding-hour retention of the late-admit ledger (the HJ5HWF backstop
+/// contract window).
+pub const LATE_LEDGER_WINDOW_MS: u64 = 60 * 60 * 1000;
+
+/// Bound on the ledger's physical length: the budget backstop needs at
+/// most `late_budget + 1` recent entries; anything beyond that can never
+/// change the hold decision, so the ring is capped for memory discipline.
+const LATE_LEDGER_CAP: usize = 4_096;
+
+/// f64 ms → u64 ms, saturating and sign-safe (the `as` cast below saturates
+/// in modern Rust; the guards keep NaN/negatives out entirely).
+#[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[must_use]
+fn f64_ms_to_u64(v: f64) -> u64 {
+    if !v.is_finite() || v <= 0.0 {
+        0
+    } else {
+        v as u64
+    }
+}
+
+/// The pure EWMA trailing-quiesce estimator (design §6.1). NO clock, NO I/O:
+/// all timings arrive as data — the driver feeds each block's observed max
+/// intra-block silence gap at the settle point and the late-admit events
+/// with their driver-clock stamps, exactly like the watchdog's `now_ms`s.
+///
+/// Window rule: `W_next = clamp(EWMA × margin, floor, ceil)`, with the
+/// backstop that exceeding `late_budget` late admits in a sliding hour
+/// holds `W` at `ceil` until the ledger drains. The EWMA's first
+/// observation seeds it fully (no halved cold-start update).
+#[derive(Debug, Clone)]
+struct QuiesceEstimator {
+    params: QuiesceParams,
+    /// EWMA of the per-block max intra-block silence gap, ms.
+    ewma_ms: f64,
+    /// Whether the EWMA has its first (fully-seeding) observation.
+    seeded: bool,
+    /// Driver-clock stamps (ms) of observed late admissions, oldest first,
+    /// kept within `LATE_LEDGER_WINDOW_MS`.
+    late_admits: std::collections::VecDeque<u64>,
+    /// Whether the backstop currently holds the window at the ceiling.
+    held_at_ceil: bool,
+}
+
+impl QuiesceEstimator {
+    fn new(params: QuiesceParams) -> Self {
+        Self {
+            params,
+            ewma_ms: 0.0,
+            seeded: false,
+            late_admits: std::collections::VecDeque::new(),
+            held_at_ceil: false,
+        }
+    }
+
+    /// Sanitized bounds: the window is never zero or crossed, the multiplier
+    /// is never negative/non-finite, the smoothing constant stays in (0, 1].
+    fn bounds(&self) -> (u64, u64, f64, f64) {
+        // floor >= 1; ceil >= floor (a 0/garbage ceil falls back, never 0).
+        let floor = self.params.floor_ms.max(1);
+        let ceil = self.params.ceil_ms.max(floor);
+        let margin = if self.params.margin.is_finite() {
+            self.params.margin.max(0.0)
+        } else {
+            0.0
+        };
+        let alpha = if self.params.alpha.is_finite() {
+            self.params.alpha.clamp(f64::EPSILON, 1.0)
+        } else {
+            1.0
+        };
+        (floor, ceil, margin, alpha)
+    }
+
+    /// The currently-armed settle window in ms.
+    fn window_ms(&self) -> u64 {
+        let (floor, ceil, margin, _alpha) = self.bounds();
+        match self.params.mode {
+            // Fixed mode ignores the estimator entirely (today's behavior).
+            QuiesceMode::Fixed => self.params.fixed_ms.max(1),
+            QuiesceMode::Adaptive => {
+                if self.held_at_ceil || !self.seeded {
+                    // Pre-seed and backstop both arm at the ceiling: an
+                    // unknown regime defaults to conservative coverage and
+                    // descends as observations accumulate.
+                    return ceil;
+                }
+                f64_ms_to_u64(self.ewma_ms * margin).clamp(floor, ceil)
+            }
+        }
+    }
+
+    /// Feed one per-block max intra-block silence-gap observation (ms) at
+    /// its settle point, and prune the late ledger against the same
+    /// driver-clock `now_ms` (the hold re-evaluates at least once per
+    /// settled block).
+    fn observe(&mut self, max_gap_ms: u64, now_ms: u64) {
+        self.prune_late_ledger(now_ms);
+        if self.mode_is_fixed() {
+            return;
+        }
+        let g = f64::from(u32::try_from(max_gap_ms).unwrap_or(u32::MAX));
+        if self.seeded {
+            let alpha = self.bounds().3;
+            self.ewma_ms = alpha * g + (1.0 - alpha) * self.ewma_ms;
+        } else {
+            // Seed fully: the first settled block anchors the estimator.
+            self.ewma_ms = g;
+            self.seeded = true;
+        }
+        self.refresh_hold();
+    }
+
+    /// Record one late-admit event (benign counted delivery noise, HJ5HWF)
+    /// at driver-clock stamp `now_ms`.
+    fn record_late_admit(&mut self, now_ms: u64) {
+        self.prune_late_ledger(now_ms);
+        if self.late_admits.len() < LATE_LEDGER_CAP {
+            self.late_admits.push_back(now_ms);
+        }
+        self.refresh_hold();
+    }
+
+    /// Whether the window is currently held at the ceiling by the backstop
+    /// (telemetry).
+    const fn held_at_ceil(&self) -> bool {
+        self.held_at_ceil
+    }
+
+    const fn mode_is_fixed(&self) -> bool {
+        matches!(self.params.mode, QuiesceMode::Fixed)
+    }
+
+    fn prune_late_ledger(&mut self, now_ms: u64) {
+        while let Some(front) = self.late_admits.front() {
+            if now_ms.saturating_sub(*front) > LATE_LEDGER_WINDOW_MS {
+                self.late_admits.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Backstop: more late admits in the trailing hour than the budget →
+    /// hold at the ceiling; otherwise the estimator may resume descending.
+    fn refresh_hold(&mut self) {
+        if !self.mode_is_fixed() {
+            self.held_at_ceil =
+                u64::try_from(self.late_admits.len()).unwrap_or(u64::MAX) > self.params.late_budget;
+        }
+    }
+}
+
+impl StageMachine {
+    /// Swap in quiesce-estimator parameters (driver, at pump startup). The
+    /// estimator state resets with the new parameters — operator tuning is
+    /// a stance, not a mid-stream instrument nudge.
+    pub fn set_quiesce_params(&mut self, params: QuiesceParams) {
+        self.quiesce = QuiesceEstimator::new(params);
+    }
+
+    /// The currently-armed settle (quiesce) window in ms — the value the
+    /// driver arms its settle timers with. Fixed mode returns the fixed
+    /// window (the `pump_debounce_ms` contract); adaptive mode the clamped
+    /// EWMA projection (design §6.1, BM35LK).
+    #[must_use]
+    pub fn settle_window_ms(&self) -> u64 {
+        self.quiesce.window_ms()
+    }
+
+    /// Feed one settle-point observation: the settled block's max
+    /// intra-block silence gap (ms) between consecutive relevant logs, and
+    /// the driver clock (`now_ms`, ms) for the late-admit ledger prune.
+    /// Pure — the FSM owns no timer; timings arrive as data.
+    pub fn observe_settle_gap(&mut self, max_gap_ms: u64, now_ms: u64) {
+        self.quiesce.observe(max_gap_ms, now_ms);
+    }
+
+    /// Record one benign late-admit event (the HJ5HWF counted class) at
+    /// driver-clock `now_ms` for the sliding-hour budget backstop: over
+    /// budget → the window is held at the ceiling (design §6.1).
+    pub fn record_late_admit(&mut self, now_ms: u64) {
+        self.quiesce.record_late_admit(now_ms);
+    }
+
+    /// Whether the late-budget backstop currently holds the window at the
+    /// ceiling (telemetry for the `quiesce_window_ms` gauge).
+    #[must_use]
+    pub const fn quiesce_held_at_ceil(&self) -> bool {
+        self.quiesce.held_at_ceil()
+    }
+
+    /// The estimator's current EWMA of per-block max silence gaps (ms; test
+    /// + telemetry read accessor).
+    #[must_use]
+    pub fn quiesce_ewma_ms(&self) -> f64 {
+        self.quiesce.ewma_ms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1580,6 +1865,192 @@ mod tests {
             "straggler settled → publish again"
         );
         assert!(!machine.consume_quiesced(100), "second consume dry");
+    }
+}
+
+#[cfg(test)]
+mod quiesce_estimator_contract {
+    use super::*;
+    use degenbot_config::QuiesceMode;
+
+    fn params(mode: QuiesceMode, overrides: impl FnOnce(&mut QuiesceParams)) -> QuiesceParams {
+        let mut p = QuiesceParams {
+            mode,
+            fixed_ms: 50,
+            floor_ms: 2,
+            ceil_ms: 20,
+            margin: 3.0,
+            alpha: 0.1,
+            late_budget: 120,
+        };
+        overrides(&mut p);
+        p
+    }
+
+    fn adaptive(overrides: impl FnOnce(&mut QuiesceParams)) -> QuiesceParams {
+        params(QuiesceMode::Adaptive, overrides)
+    }
+
+    /// Fixed mode is today's behavior: a constant window, blind to (and
+    /// unperturbed by) the estimator's observations.
+    #[test]
+    fn fixed_mode_window_is_constant_and_ignores_observations() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(params(QuiesceMode::Fixed, |p| p.fixed_ms = 50));
+        fsm.observe_settle_gap(40, 1_000);
+        fsm.observe_settle_gap(1, 2_000);
+        fsm.record_late_admit(2_000);
+        fsm.record_late_admit(3_000);
+        fsm.record_late_admit(4_000);
+        assert_eq!(
+            fsm.settle_window_ms(),
+            50,
+            "fixed mode ignores the estimator"
+        );
+        assert!(
+            !fsm.quiesce_held_at_ceil(),
+            "backstop never latches in fixed mode"
+        );
+    }
+
+    /// The `pump_debounce_ms` parse contract carried over: a fixed window
+    /// never collapses to 0.
+    #[test]
+    fn fixed_mode_window_never_collapses_to_zero() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(params(QuiesceMode::Fixed, |p| p.fixed_ms = 0));
+        assert_eq!(fsm.settle_window_ms(), 1);
+    }
+
+    /// VD62GX design §6.1: the FIRST observation seeds the EWMA fully (no
+    /// halved first update), so the estimator arms at a meaningful window
+    /// from the very first block instead of drifting up from the floor.
+    #[test]
+    fn first_observation_seeds_the_ewma_within_bounds() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(adaptive(|p| p.alpha = 0.1));
+        // Seed gap 6ms → W = min(6 × 3.0, ceil 20) = 18.
+        fsm.observe_settle_gap(6, 100);
+        assert_eq!(fsm.settle_window_ms(), 18);
+    }
+
+    /// `W_next = clamp(EWMA × SAFETY_MULT, W_FLOOR, W_CEIL)` — the EWMA
+    /// (α = 0.5 for exact-arithmetic assertions) descends toward the
+    /// coalescing regime and eventually parks at the floor.
+    #[test]
+    fn window_tracks_toward_the_gap_ewma_and_parks_at_the_floor() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(adaptive(|p| {
+            p.alpha = 0.5;
+            p.margin = 3.0;
+        }));
+        fsm.observe_settle_gap(4, 100);
+        assert_eq!(fsm.settle_window_ms(), 12, "seeded EWMA 4 → 4×3");
+        fsm.observe_settle_gap(0, 200);
+        assert_eq!(fsm.settle_window_ms(), 6, "EWMA 2 → 2×3");
+        fsm.observe_settle_gap(0, 300);
+        assert_eq!(fsm.settle_window_ms(), 3, "EWMA 1 → 1×3");
+        fsm.observe_settle_gap(0, 400);
+        assert_eq!(fsm.settle_window_ms(), 2, "EWMA 0.5 → clamped at floor 2");
+    }
+
+    /// A 20ms+ WS-straggler regime may raise W toward the ceil but never
+    /// through it (the D1 tombstone stays the correctness authority).
+    #[test]
+    fn ceiling_is_respected_under_straggler_bursts() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(adaptive(|p| p.alpha = 1.0));
+        for i in 0..10u64 {
+            fsm.observe_settle_gap(1_000, i * 100);
+        }
+        assert_eq!(
+            fsm.settle_window_ms(),
+            20,
+            "W never grows beyond the ceiling"
+        );
+    }
+
+    /// The pure-coalescing regime (sub-ms WS frame jitter) bottoms out at
+    /// the floor, never 0.
+    #[test]
+    fn floor_is_respected_under_coalescing_bursts() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(adaptive(|p| p.alpha = 1.0));
+        fsm.observe_settle_gap(0, 100);
+        assert_eq!(
+            fsm.settle_window_ms(),
+            2,
+            "W never collapses below the floor"
+        );
+    }
+
+    /// Garbage config (zero floor, crossed ceiling, zero alpha) degenerates
+    /// to a valid, nonzero, monotone window — never NaN or 0.
+    #[test]
+    fn unsanitized_config_degenerates_safely() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(adaptive(|p| {
+            p.floor_ms = 0;
+            p.ceil_ms = 0;
+            p.alpha = 0.0;
+            p.margin = f64::NAN;
+        }));
+        fsm.observe_settle_gap(9, 100);
+        let w = fsm.settle_window_ms();
+        assert!(w >= 1, "window must stay >= 1ms, got {w}");
+        assert!(fsm.quiesce_ewma_ms().is_finite(), "EWMA must stay finite");
+    }
+
+    /// HJ5HWF contract §6.1: exceeding the late-admit budget in a sliding
+    /// hour HOLDS the window at the ceiling; the hold releases once the
+    /// ledger ages out. At-budget (not over) must NOT hold.
+    #[test]
+    fn late_budget_backstop_holds_at_the_ceiling_then_relaxes() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(adaptive(|p| {
+            p.alpha = 1.0;
+            p.late_budget = 2;
+        }));
+        fsm.observe_settle_gap(0, 1_000);
+        assert_eq!(fsm.settle_window_ms(), 2);
+        assert!(!fsm.quiesce_held_at_ceil());
+        fsm.record_late_admit(1_100);
+        fsm.record_late_admit(1_200);
+        assert_eq!(fsm.settle_window_ms(), 2, "at budget is not over budget");
+        fsm.record_late_admit(1_300);
+        assert_eq!(fsm.settle_window_ms(), 20, "over budget → hold at ceiling");
+        assert!(fsm.quiesce_held_at_ceil());
+        // An hour after the NEWEST ledger event the entries drain and the
+        // estimator relaxes again (the sliding hour measures from each
+        // event's own stamp).
+        fsm.observe_settle_gap(0, 1_300 + 60 * 60 * 1000 + 1);
+        assert_eq!(
+            fsm.settle_window_ms(),
+            2,
+            "aged-out ledger releases the hold"
+        );
+    }
+
+    /// The estimator is purely additive: observations + the backstop never
+    /// perturb the settle-point decision semantics (I5 publish-once).
+    #[test]
+    fn estimator_is_additive_to_the_settle_decision() {
+        let mut fsm = StageMachine::new(0, 0);
+        fsm.set_quiesce_params(adaptive(|p| {
+            p.alpha = 1.0;
+            p.late_budget = 0;
+        }));
+        fsm.observe_header(100);
+        assert_eq!(fsm.on_log(100, false), LogDecision::DispatchForward);
+        fsm.on_log_applied(100);
+        fsm.record_late_admit(5);
+        fsm.observe_settle_gap(3, 10);
+        let decisions = fsm.on_settle();
+        assert_eq!(decisions.len(), 1, "one publish, once per quiesce cycle");
+        assert!(
+            matches!(decisions[0], StageDecision::Publish { open: 100, .. }),
+            "estimator state must not perturb the publish decision"
+        );
     }
 }
 
