@@ -323,9 +323,11 @@ pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
     let fleet_hosted = fleet_stance_enabled(cfg);
     SOLVE_FLEET_HOSTED.store(fleet_hosted, std::sync::atomic::Ordering::Relaxed);
     if fleet_hosted {
-        crate::arb_engine::fleet_solve_executor::install_boot(
-            degenbot_workers::dispatcher::FleetBoot::from_config(cfg),
-        );
+        let boot = degenbot_workers::dispatcher::FleetBoot::from_config(cfg);
+        crate::arb_engine::fleet_solve_executor::install_boot(boot);
+        // ADR-042 F4: the SimDriver seat pool shares the boot descriptor
+        // (same quota + overrides + posture as the Solver-side host).
+        crate::arb_engine::fleet_sim_executor::install_boot(boot);
     }
     STREAMING_DELIVERY_ENABLED.store(
         cfg.pump.streaming_delivery,
@@ -719,66 +721,91 @@ impl PipelinedSims {
         // zero CPU cost instead of stalling the bins mid-walk (T5 window:
         // schedule-time blocking starved the walks). Concurrent EXECUTING
         // sims stay bounded by the budget-derived cap - the explicit
-        // replacement for the pacing the synchronous sim join used to
-        // provide. The guard releases exactly when the sim finishes.
-        let slots = crate::arb_engine::sim_slots::sim_slots_global();
-        // PE4FPM: the per-path detached sim threads are a burst resource; the
-        // census row declares the pacing bound (the sim-slot cap) as the
-        // sustained count and documents the burst in `sizing`. One short
-        // registration at first spawn (hot path stays off the census lock).
-        if ARB_SIM_CENSUS_SEEDED.get().is_none() {
-            // First detached-sim spawn of the process: register the burst
-            // resource. The OnceLock short-circuit keeps the hot path off the
-            // census mutex; a lost race just upserts the same row.
-            ARB_SIM_CENSUS_SEEDED.set(()).ok();
-            degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
-                resource: "arb_sim_workers",
-                kind: "detached per-path sim threads (burst; one per scheduled sim, joined per cycle)",
-                count: crate::arb_engine::sim_slots::sim_slot_capacity(),
-                thread_name: "arb-sim-{pid}",
-                sizing: "burst paced by the sim_slots semaphore; sustained concurrent cap = the slot cap (leftover x 2, DEGENBOT_SOLVE_SIM_INFLIGHT override)",
-            });
-        }
+        // The sim EXECUTION body is stance-invariant: one span
+        // (`degenbot.bundle.simulate`, explicitly parented under the
+        // caller's span — 7LV6VN T1b), one `simulate_path` call, the
+        // SIMSPANDUP verdict records, and the receipt send. The arms differ
+        // ONLY in the machinery that runs it.
         let (tx, rx) = std::sync::mpsc::channel();
-        let spawned = std::thread::Builder::new()
-            .name(format!("arb-sim-{pid}"))
-            .spawn(move || {
-                slots.acquire();
-                let _slot = crate::arb_engine::sim_slots::SlotGuard::acquired(slots);
-                let span = tracing::info_span!(
-                    target: "degenbot::solver",
-                    parent: parent,
-                    "degenbot.bundle.simulate",
-                    sim.path = "worker_inline",
-                    path_id = request.path_id,
-                    sim_block = request.sim_block,
-                    simulate.verdict = tracing::field::Empty,
-                    simulate.expected_profit = tracing::field::Empty,
-                    // SIMSPANDUP: declared so the seam-reused span keeps the
-                    // ADR-040 error classification on the inline arm too.
-                    simulate.error_reason = tracing::field::Empty,
+        let run_sim_body = move || {
+            let span = tracing::info_span!(
+                target: "degenbot::solver",
+                parent: parent,
+                "degenbot.bundle.simulate",
+                sim.path = "worker_inline",
+                path_id = request.path_id,
+                sim_block = request.sim_block,
+                simulate.verdict = tracing::field::Empty,
+                simulate.expected_profit = tracing::field::Empty,
+                // SIMSPANDUP: declared so the seam-reused span keeps the
+                // ADR-040 error classification on the inline arm too.
+                simulate.error_reason = tracing::field::Empty,
+            );
+            let _enter = span.enter();
+            let payload = sim.simulate_path(request);
+            // SIMSPANDUP: as in the sync arm - the seam's SimSpanVerdict
+            // Drop stamps the failure verdict (`not_profitable`/`error` +
+            // error_reason) before the payload returns; not clobbering it
+            // keeps the richer classification. A `None` payload = hook
+            // miss (no sim ran), so honestly no verdict stamp at all.
+            if payload.as_ref().is_some_and(|p| p.failure.is_none()) {
+                span.record("simulate.verdict", "profitable");
+            }
+            span.record(
+                "simulate.expected_profit",
+                tracing::field::display(expected_profit),
+            );
+            let _ = tx.send(payload);
+        };
+        if ctx.sim_fleet_hosted {
+            // ADR-042 F4: the fleet is the sole executor of inline sims —
+            // the request rides a pooled SimDriver unit (dispatch lane 2:
+            // queued sims drain before new Solver intake; cordon floors the
+            // sim intake and never cancels in-flight sims). The seat pool
+            // is the budget's sim slot cap — the fleet-side bound that
+            // replaces the SimSlots semaphore. Receipts ride the SAME
+            // per-request channel, so the poll/join contract is untouched.
+            crate::arb_engine::fleet_sim_executor::global_fleet_sim_executor().spawn(run_sim_body);
+        } else {
+            // Two-runtime pacing (7LV6VN T5): the slot is acquired INSIDE the
+            // detached sim thread, so a saturated sim pipeline parks queued
+            // sims at zero CPU cost instead of stalling the bins mid-walk
+            // (T5 window: schedule-time blocking starved the walks).
+            // Concurrent EXECUTING sims stay bounded by the budget-derived
+            // cap. The guard releases exactly when the sim finishes.
+            let slots = crate::arb_engine::sim_slots::sim_slots_global();
+            // PE4FPM: the per-path detached sim threads are a burst resource; the
+            // census row declares the pacing bound (the sim-slot cap) as the
+            // sustained count and documents the burst in `sizing`. One short
+            // registration at first spawn (hot path stays off the census lock).
+            if ARB_SIM_CENSUS_SEEDED.get().is_none() {
+                // First detached-sim spawn of the process: register the burst
+                // resource. The OnceLock short-circuit keeps the hot path off
+                // the census mutex; a lost race just upserts the same row.
+                ARB_SIM_CENSUS_SEEDED.set(()).ok();
+                degenbot_core::worker_census::register(
+                    degenbot_core::worker_census::WorkerCensusEntry {
+                        resource: "arb_sim_workers",
+                        kind: "detached per-path sim threads (burst; one per scheduled sim, joined per cycle)",
+                        count: crate::arb_engine::sim_slots::sim_slot_capacity(),
+                        thread_name: "arb-sim-{pid}",
+                        sizing: "burst paced by the sim_slots semaphore; sustained concurrent cap = the slot cap (leftover x 2, DEGENBOT_SOLVE_SIM_INFLIGHT override)",
+                    },
                 );
-                let _enter = span.enter();
-                let payload = sim.simulate_path(request);
-                // SIMSPANDUP: as in the sync arm - the seam's SimSpanVerdict
-                // Drop stamps the failure verdict (`not_profitable`/`error` +
-                // error_reason) before the payload returns; not clobbering it
-                // keeps the richer classification. A `None` payload = hook
-                // miss (no sim ran), so honestly no verdict stamp at all.
-                if payload.as_ref().is_some_and(|p| p.failure.is_none()) {
-                    span.record("simulate.verdict", "profitable");
-                }
-                span.record(
-                    "simulate.expected_profit",
-                    tracing::field::display(expected_profit),
-                );
-                let _ = tx.send(payload);
-            });
-        if spawned.is_err() {
-            // Liveness: a failed spawn must not strand the receipt (the
-            // poll/join would block forever on an empty channel). The
-            // payload slot empties — the merge treats it as sim-failed.
-            return false;
+            }
+            let spawned = std::thread::Builder::new()
+                .name(format!("arb-sim-{pid}"))
+                .spawn(move || {
+                    slots.acquire();
+                    let _slot = crate::arb_engine::sim_slots::SlotGuard::acquired(slots);
+                    run_sim_body();
+                });
+            if spawned.is_err() {
+                // Liveness: a failed spawn must not strand the receipt (the
+                // poll/join would block forever on an empty channel). The
+                // payload slot empties — the merge treats it as sim-failed.
+                return false;
+            }
         }
         self.pending.push((pid, PendingSim::new(rx)));
         true
@@ -958,6 +985,10 @@ pub(crate) struct SolveCycleShared {
     /// → the worker resolves the per-path payload right after the clamp (no
     /// engine lock — the same off-lock seam the worker clamp opened).
     inline_sim: Option<std::sync::Arc<dyn crate::arb_engine::inline_sim::InlineSimulator>>,
+    /// ADR-042 F4 stance copy: `fleet.stance=fleet` routes the pipelined
+    /// sims through the fleet-hosted `SimDriver` executor (the fleet is the
+    /// sole executor of sim units — the arb-sim detached threads retire).
+    sim_fleet_hosted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2080,6 +2111,7 @@ impl ArbitrageEngine {
             pool_refs,
             worker_clamp: INLINE_SIM_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
             inline_sim: self.inline_sim.clone(),
+            sim_fleet_hosted: self.fleet_hosted,
         });
         // The LPT bins need Arc-shared access in the tokio arm; the rayon
         // arms index through the same deref (byte-identical semantics).
@@ -3372,6 +3404,7 @@ mod profit_clamp_recompute_tests {
             pool_refs,
             worker_clamp: true,
             inline_sim: None,
+            sim_fleet_hosted: false,
             solve_block: 0,
             epoch: 0,
             metadata: BlockMetadata::default(),
@@ -4113,6 +4146,7 @@ pub(super) mod executor_ab_probe {
             pool_refs: Vec::new(),
             worker_clamp: false,
             inline_sim: None,
+            sim_fleet_hosted: false,
             #[cfg(test)]
             test_solve_delay: None,
         })
@@ -4267,5 +4301,324 @@ pub(super) mod executor_ab_probe {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod fleet_sim_stance_tests {
+    //! ADR-042 F4 (task LTUE7I) fixtures: the inline-sim runtime port onto
+    //! the fleet. Parity — fleet-seat sims return byte/field-equal results
+    //! to the legacy detached-sim threads over requests derived from the
+    //! committed heavy-CL capture corpus. Identity — the stance flips the
+    //! hosting thread family: legacy `arb-sim-{pid}` detached threads vs
+    //! fleet `work-fleet-sim-{n}` `SimDriver` seats (census row included).
+
+    use alloy::primitives::{I256, U256};
+    use degenbot_solvers::mixed::{HopType, MixedPath, MixedPoolRef, SolvePathResult};
+    use hashbrown::HashMap;
+    use std::sync::Arc;
+
+    use super::executor_ab_probe::load_corpus_fixture;
+    use super::{PathTimesHeap, PipelinedSims, SolveCycleShared};
+    use crate::arb_engine::inline_sim::{
+        AccessListRow, CapturedSwapRow, InlineSimFailure, InlineSimRequest, InlineSimulator,
+        InlineSwapFamily, SimulatedPathResult,
+    };
+    use crate::arb_engine::BlockMetadata;
+
+    // ---- deterministic sim stub ------------------------------------------------
+
+    /// Deterministic primitive-payload sim: the payload is a pure function
+    /// of the request (so both stances assert on identical request streams),
+    /// and the executing thread's family is recorded for the identity
+    /// fixture. Exercises the failure-payload contract through both arms.
+    struct CorpusSim {
+        thread_names: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl CorpusSim {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                thread_names: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl InlineSimulator for CorpusSim {
+        fn simulate_path(&self, request: InlineSimRequest) -> Option<SimulatedPathResult> {
+            self.thread_names.lock().push(
+                std::thread::current()
+                    .name()
+                    .map(str::to_owned)
+                    .unwrap_or_default(),
+            );
+            let hop0 = (request.optimal_input % U256::from(u64::MAX)).to::<u64>();
+            if request.path_id % 11 == 5 {
+                // Exercise the failure-payload contract through both arms.
+                return Some(SimulatedPathResult {
+                    path_id: request.path_id,
+                    gross_profit: U256::ZERO,
+                    net_profit: U256::ZERO,
+                    gas_used: 0,
+                    priority_fee: 0,
+                    base_fee_next: 0,
+                    execute_calldata: Vec::new(),
+                    access_list: None,
+                    captured_swaps: Vec::new(),
+                    hop_count: request.hops.len(),
+                    failure: Some(InlineSimFailure {
+                        fail_index: Some(1),
+                        revert_data: vec![0x08, 0xc3, 0x79, 0xa0],
+                        bucket: "revert".to_string(),
+                    }),
+                });
+            }
+            Some(SimulatedPathResult {
+                path_id: request.path_id,
+                gross_profit: U256::from(hop0 % 1_000_000 + 7),
+                net_profit: U256::from(hop0 % 1_000_000 + 3),
+                gas_used: 40_000
+                    + u64::try_from(request.hops.len()).unwrap_or(u64::from(u8::MAX)) * 3_000,
+                priority_fee: 3,
+                base_fee_next: 31,
+                execute_calldata: vec![
+                    0xa9,
+                    u8::try_from(request.path_id % 251).unwrap_or(1),
+                    u8::try_from(request.hops.len()).unwrap_or(u8::MAX),
+                ],
+                access_list: request.path_id.is_multiple_of(2).then(|| {
+                    vec![AccessListRow {
+                        address: alloy::primitives::Address::from([0x7au8; 20]),
+                        storage_keys: vec![U256::from(request.path_id)],
+                    }]
+                }),
+                captured_swaps: vec![CapturedSwapRow {
+                    emitter: alloy::primitives::Address::from([0x11u8; 20]),
+                    family: if request.hops.len() > 2 {
+                        InlineSwapFamily::V3
+                    } else {
+                        InlineSwapFamily::V2
+                    },
+                    amount0: I256::try_from(-i128::from(hop0 % 5_000_000_000u64))
+                        .unwrap_or(I256::ZERO),
+                    amount1: I256::try_from(i128::from(hop0 % 4_900_000_000u64))
+                        .unwrap_or(I256::ZERO),
+                    sqrt_price_x96: U256::from(1u128) << 96,
+                    liquidity: U256::from(1_000_000u64),
+                    tick: 0,
+                }],
+                hop_count: request.hops.len(),
+                failure: None,
+            })
+        }
+    }
+
+    // ---- corpus-derived request fan-out ------------------------------------------
+
+    const PARITY_REQUESTS: usize = 24;
+
+    /// Stride the committed capture corpus down to `want` items (the corpus
+    /// is the request-shape oracle — hop counts and magnitude spreads ride
+    /// the real capture, not synthesized round numbers).
+    fn strided_corpus(want: usize) -> Vec<Arc<degenbot_solvers::mixed::ResolvedMixedPath>> {
+        let items = load_corpus_fixture();
+        assert!(!items.is_empty(), "capture corpus must load");
+        let stride = items.len().saturating_sub(1) / want + 1;
+        items.into_iter().step_by(stride).take(want).collect()
+    }
+
+    fn pool_refs_for(
+        items: &[Arc<degenbot_solvers::mixed::ResolvedMixedPath>],
+    ) -> Vec<Arc<MixedPath>> {
+        items
+            .iter()
+            .map(|item| {
+                let hops = (0..item.hops.len().clamp(1, 4))
+                    .map(|i| MixedPoolRef {
+                        hop_type: HopType::V3,
+                        pool_key: u64::try_from(i).unwrap_or(u64::MAX),
+                        zero_for_one: i % 2 == 0,
+                    })
+                    .collect();
+                Arc::new(MixedPath { pools: hops })
+            })
+            .collect()
+    }
+
+    fn make_ctx(
+        sim: Arc<CorpusSim>,
+        pool_refs: Vec<Arc<MixedPath>>,
+        sim_fleet_hosted: bool,
+    ) -> Arc<SolveCycleShared> {
+        Arc::new(SolveCycleShared {
+            solve_block: 42,
+            epoch: 0,
+            metadata: BlockMetadata {
+                base_fee_per_gas: Some(30),
+                ..BlockMetadata::default()
+            },
+            runtime: ::degenbot_solvers::runtime::SolveRuntimeConfig::default(),
+            gate_capture: None,
+            walk_memo: Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
+                false, false,
+            )),
+            capture: None,
+            capture_mixed: None,
+            path_times: parking_lot::Mutex::new(PathTimesHeap::new()),
+            gate_total: parking_lot::Mutex::new(
+                ::degenbot_solvers::profit_envelope::GateStats::default(),
+            ),
+            solve_cpu_us: std::sync::atomic::AtomicU64::new(0),
+            walk_pieces_total: std::sync::atomic::AtomicU64::new(0),
+            walk_sims_total: std::sync::atomic::AtomicU64::new(0),
+            walk_word_steps_total: std::sync::atomic::AtomicU64::new(0),
+            walk_refine_sims_total: std::sync::atomic::AtomicU64::new(0),
+            walk_ternary_total: std::sync::atomic::AtomicU64::new(0),
+            walk_grid_total: std::sync::atomic::AtomicU64::new(0),
+            sims_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            gate_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            core: Arc::new(crate::bot_core::state_lock::StateLock::new(
+                crate::bot_core::BotState::new(),
+            )),
+            pool_refs,
+            worker_clamp: true,
+            inline_sim: Some(sim),
+            sim_fleet_hosted,
+            #[cfg(test)]
+            test_solve_delay: None,
+        })
+    }
+
+    fn admitted_for(idx: usize, hops: usize) -> SolvePathResult {
+        SolvePathResult {
+            optimal_input: U256::from(1_000_000_000u64 + u64::try_from(idx).unwrap_or(0) * 7),
+            profit: U256::from(1_000u64 + u64::try_from(idx).unwrap_or(0)),
+            hop_outputs: (0..hops)
+                .map(|h| {
+                    U256::from(
+                        900_000_000u64
+                            + u64::try_from(idx).unwrap_or(0) * 13
+                            + u64::try_from(h).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect(),
+            consumed_inputs: (0..hops)
+                .map(|h| {
+                    U256::from(
+                        900_000_000u64
+                            + u64::try_from(idx).unwrap_or(0) * 3
+                            + u64::try_from(h).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect(),
+            state_nonces: vec![0; hops],
+            solver_pool_states: Vec::new(),
+        }
+    }
+
+    /// Schedule ONE sim through the production scheduler (`PipelinedSims::
+    /// schedule_one`, stance-routed) and join its receipt.
+    fn schedule_and_join(
+        ctx: &Arc<SolveCycleShared>,
+        idx: usize,
+        pid: u64,
+        hops: usize,
+    ) -> (bool, Option<SimulatedPathResult>) {
+        let mut pending = PipelinedSims::default();
+        let parent = tracing::Span::none();
+        let result = admitted_for(idx, hops);
+        let scheduled = pending.schedule_one(ctx, idx, pid, &result, &parent);
+        if !scheduled {
+            return (false, None);
+        }
+        pending
+            .join_all()
+            .next()
+            .map_or((true, None), |(jpid, payload)| {
+                assert_eq!(jpid, pid, "the receipt must carry its request's pid");
+                (true, payload)
+            })
+    }
+
+    /// PARITY FIXTURE (LTUE7I): fleet-stance inline sims return BYTE-EQUAL
+    /// payloads to the legacy detached-sim threads over the committed
+    /// capture corpus — same requests, same deterministic sim, only the
+    /// dispatch machinery differs (the port).
+    #[test]
+    fn fleet_stance_inline_sims_are_parity_with_legacy_threads_on_capture_corpus() {
+        let items = strided_corpus(PARITY_REQUESTS);
+        let pool_refs = pool_refs_for(&items);
+        let sim = CorpusSim::new();
+
+        let run_arm = |sim_fleet_hosted: bool| {
+            let ctx = make_ctx(Arc::clone(&sim), pool_refs.clone(), sim_fleet_hosted);
+            // Deterministic reverse order so receipts interleave like a
+            // real multi-bin fan-out (per-receipt channels, not the arm,
+            // carry order).
+            let mut joined: Vec<(u64, Option<SimulatedPathResult>)> = Vec::new();
+            for idx in (0..items.len()).rev() {
+                let pid = u64::try_from(idx).unwrap_or(u64::MAX);
+                let hops = items[idx].hops.len().clamp(1, 4);
+                let (scheduled, payload) = schedule_and_join(&ctx, idx, pid, hops);
+                assert!(scheduled, "every fixtured request must schedule");
+                joined.push((pid, payload));
+            }
+            joined.sort_unstable_by_key(|(pid, _)| *pid);
+            joined
+        };
+
+        let legacy = run_arm(false);
+        let fleet = run_arm(true);
+        assert!(!legacy.is_empty(), "fixture must schedule sims");
+        assert_eq!(
+            fleet, legacy,
+            "fleet-hosted inline sims must be result parity with the legacy detached-sim threads"
+        );
+        assert!(
+            legacy.iter().any(|(pid, _)| pid % 11 == 5),
+            "the fixture must exercise the failure-payload contract too"
+        );
+    }
+
+    /// IDENTITY FIXTURE (LTUE7I): the stance flips the runtime identity —
+    /// legacy keeps the `arb-sim-{pid}` detached threads byte-for-byte;
+    /// the fleet stance runs the SAME requests on fleet `SimDriver` seats
+    /// (`work-fleet-sim-{n}`) and the executor's census row is registered
+    /// (the `fleet_merge_slots` pattern from the BCA77G work).
+    #[test]
+    fn fleet_stance_flips_the_sim_runtime_identity_legacy_threads_vs_fleet_seats() {
+        let items = strided_corpus(4);
+        let pool_refs = pool_refs_for(&items);
+        let sim = CorpusSim::new();
+
+        let run_arm = |sim_fleet_hosted: bool| {
+            sim.thread_names.lock().clear();
+            let ctx = make_ctx(Arc::clone(&sim), pool_refs.clone(), sim_fleet_hosted);
+            for (idx, item) in items.iter().enumerate() {
+                let pid = u64::try_from(idx).unwrap_or(u64::MAX);
+                let hops = item.hops.len().clamp(1, 4);
+                let (scheduled, _payload) = schedule_and_join(&ctx, idx, pid, hops);
+                assert!(scheduled, "every fixtured request must schedule");
+            }
+            sim.thread_names.lock().clone()
+        };
+
+        let legacy_names = run_arm(false);
+        assert!(
+            !legacy_names.is_empty() && legacy_names.iter().all(|n| n.starts_with("arb-sim-")),
+            "legacy sims must run on arb-sim detached threads, got {legacy_names:?}"
+        );
+
+        let fleet_names = run_arm(true);
+        assert!(
+            !fleet_names.is_empty() && fleet_names.iter().all(|n| n.starts_with("work-fleet-sim-")),
+            "fleet sims must run on fleet SimDriver seats, got {fleet_names:?}"
+        );
+        let row = degenbot_core::worker_census::snapshot()
+            .into_iter()
+            .find(|e| e.resource == "fleet_simdriver_slots")
+            .expect("fleet SimDriver slots must be census-registered");
+        assert_eq!(row.thread_name, "work-fleet-sim-{n}");
     }
 }
