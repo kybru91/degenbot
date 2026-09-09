@@ -128,6 +128,14 @@ pub fn bucket(kind: &str, reason: Option<&str>) -> (Severity, Scope) {
         ("monitor_failure", _) => (Severity::Degraded, Scope::Path),
         ("ws_completeness" | "drain_stall" | "drain_dead", _) => (Severity::Fatal, Scope::Process),
 
+        // Post-tombstone delivery jitter (HJ5HWF no-landmine ruling): a
+        // late forward is dropped via the benign late-admit path — the
+        // tombstone already proved the block delivered, and no state is
+        // mutated. Degraded/Event (deduped) so a sustained rate stays
+        // visible WITHOUT ever reading as a structural bug; the raw rate
+        // lives in `degenbot.late_log.admitted`.
+        ("late_log", _) => (Severity::Degraded, Scope::Path),
+
         // Evolution floor — conservative, never silent (module docs).
         _ => (Severity::Degraded, Scope::Process),
     }
@@ -165,6 +173,7 @@ static KNOWN_KINDS: &[&str] = &[
     "verify_mismatch",
     "drain_stall",
     "drain_dead",
+    "late_log",
 ];
 
 static KNOWN_REASONS: &[(&str, &str)] = &[
@@ -318,6 +327,7 @@ mod tests {
             error_kind::VERIFY_MISMATCH,
             error_kind::DRAIN_STALL,
             error_kind::DRAIN_DEAD,
+            error_kind::LATE_LOG,
         ];
         for kind in kinds {
             assert!(
@@ -367,6 +377,13 @@ mod tests {
         assert_eq!(action("submit_failure", None), Action::Event);
         assert_eq!(action("monitor_failure", None), Action::Event);
         assert_eq!(scope("monitor_failure", None), Scope::Path);
+        // HJ5HWF: delivery-jitter lateness is DELIBERATELY never fatal — the
+        // late-admit path drops + counts it; the deduped event keeps the
+        // rate visible on the path scope (an out-of-order feed, not a
+        // state-machine fault).
+        assert_eq!(action("late_log", None), Action::Event);
+        assert_eq!(scope("late_log", None), Scope::Path);
+        assert_eq!(bucket("late_log", None).0, Severity::Degraded);
         // verify mismatch = deny admission = quarantine-class severity
         assert_eq!(bucket("verify_mismatch", None).0, Severity::Tainted);
     }

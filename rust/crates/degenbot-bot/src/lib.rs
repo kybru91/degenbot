@@ -88,6 +88,8 @@ pub mod instruments {
         pub fn observe_reorg_depth(&self, _blocks: u64) {}
         /// no-op (WAJEQP T-R1)
         pub fn count_reorg_recovery_dropped(&self) {}
+        /// no-op (HJ5HWF benign late-admit family)
+        pub fn count_late_log_admitted(&self) {}
         /// no-op
         pub fn count_ws_log_seen(&self) {}
         /// no-op
