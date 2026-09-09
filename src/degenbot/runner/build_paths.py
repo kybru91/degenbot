@@ -157,6 +157,13 @@ def _pool_types_from_filter(perms: set[str] | None) -> list[type]:
 #: registration load. Override with DEGENBOT_MAX_PATHS (0 = uncapped).
 MAX_REGISTERED_PATHS = int(os.environ.get("DEGENBOT_MAX_PATHS", "100000"))
 
+#: CXKACI — bounded retry for the concurrent duplicate-build race (see
+#: PathRegistrationPipeline._build_offloaded_with_race_retry). A raced loser
+#: waits out the winner's registry insertion instead of losing its path; 8
+#: attempts doubling from 25ms covers even a slow winner's Python-side wrap-up.
+_RACE_RETRY_ATTEMPTS = int(os.environ.get("DEGENBOT_REG_RACE_RETRIES", "8"))
+_RACE_RETRY_BACKOFF_S = float(os.environ.get("DEGENBOT_REG_RACE_BACKOFF_MS", "25")) / 1000.0
+
 
 class DiscoveryCrawlComplete(Exception):
     """Raised by ``_consume`` when the registered-path budget is full, to
@@ -453,6 +460,34 @@ class PathRegistrationPipeline:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._bounded_build_executor(), fn)
 
+    async def _build_offloaded_with_race_retry(self, fn: Callable[[], object]) -> object:
+        """Offloaded pool build with bounded retry across the registration race.
+
+        CXKACI: REG_WORKERS concurrent consumers mean two candidates containing
+        the same not-yet-built pool can race between the Bot registry
+        pre-check and the Rust registration — the loser raises
+        `PoolAlreadyRegisteredError` even though the pool becomes usable (via
+        the registry pre-check) milliseconds later, once the winner finishes
+        its Python-side registry insertion. Retrying the whole build lets the
+        retry hit the pre-check and return the existing pool. Without the
+        retry, the loser's path was skipped AND the pool fatally memoized,
+        making the registered-path total a function of the race outcome
+        (observed 545,511-645,329 paths across otherwise identical launches;
+        2026-09-09: 7,973,943 PoolAlreadyRegistered skips vs 566,125
+        registered from a static DB).
+        """
+        backoff_s = _RACE_RETRY_BACKOFF_S
+        attempt = 0
+        while True:
+            try:
+                return await self._run_build_offloaded(fn)
+            except PoolAlreadyRegisteredError:
+                attempt += 1
+                if attempt >= _RACE_RETRY_ATTEMPTS:
+                    raise
+                await asyncio.sleep(backoff_s)
+                backoff_s *= 2.0
+
     def _reject_v4_from_memo(self, tag: str) -> bool:
         """Replay the counter effect of a memoized fatal V4 skip.
 
@@ -643,12 +678,13 @@ class PathRegistrationPipeline:
                     skip = True
                     break
                 try:
-                    pool = await self._run_build_offloaded(
+                    pool = await self._build_offloaded_with_race_retry(
                         lambda: self.constr_bot.build_pool(step.address, silent=True)
                     )
                 except Exception as exc:
                     tag = f"build-v2:{type(exc).__name__}"
-                    fatal = isinstance(exc, PoolAlreadyRegisteredError)
+                    # CXKACI: raced duplicate builds are transient, not immutable facts
+                    fatal = False
                     if self.skip_gate.note("v2", step.address, tag, fatal=fatal):
                         bot_logger.debug(f"Skip V2 {step.address}: {exc}")
                     self._record_skip(tag)
@@ -662,32 +698,33 @@ class PathRegistrationPipeline:
                     break
                 try:
                     try:
-                        pool = await self._run_build_offloaded(
+                        pool = await self._build_offloaded_with_race_retry(
                             lambda: self.uniswap_v3_tracker.get_pool(
                                 pool_address=step.address, silent=True
                             )
                         )
                     except Exception:
                         try:
-                            pool = await self._run_build_offloaded(
+                            pool = await self._build_offloaded_with_race_retry(
                                 lambda: self.sushiswap_v3_tracker.get_pool(
                                     pool_address=step.address, silent=True
                                 )
                             )
                         except Exception:
                             try:
-                                pool = await self._run_build_offloaded(
+                                pool = await self._build_offloaded_with_race_retry(
                                     lambda: self.pancakeswap_v3_tracker.get_pool(
                                         pool_address=step.address, silent=True
                                     )
                                 )
                             except Exception:
-                                pool = await self._run_build_offloaded(
+                                pool = await self._build_offloaded_with_race_retry(
                                     lambda: self.constr_bot.build_pool(step.address, silent=True)
                                 )
                 except Exception as exc:
                     tag = f"build-v3:{type(exc).__name__}"
-                    fatal = isinstance(exc, PoolAlreadyRegisteredError)
+                    # CXKACI: raced duplicate builds are transient, not immutable facts
+                    fatal = False
                     if self.skip_gate.note("v3", step.address, tag, fatal=fatal):
                         bot_logger.debug(f"Skip V3 {step.address}: {exc}")
                     self._record_skip(tag)
@@ -705,7 +742,7 @@ class PathRegistrationPipeline:
                     skip = True
                     break
                 try:
-                    pool = await self._run_build_offloaded(
+                    pool = await self._build_offloaded_with_race_retry(
                         lambda: self.constr_bot.build_managed_pool(
                             address=UNISWAP_V4_POOL_MANAGER_ADDRESS,
                             pool_id=step.hash,
@@ -728,11 +765,13 @@ class PathRegistrationPipeline:
                     break
                 except Exception as exc:
                     tag = f"build-v4:{type(exc).__name__}"
+                    # CXKACI: PoolAlreadyRegisteredError is a CONCURRENT-BUILD race
+                    # artifact (the pool becomes registry-reachable milliseconds
+                    # later), not an immutable pool fact — never fatal-memoize it.
                     fatal = isinstance(
                         exc,
                         (
                             HighFeePoolRejectedError,
-                            PoolAlreadyRegisteredError,
                             AssertionError,
                         ),
                     )

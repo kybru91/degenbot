@@ -3,12 +3,17 @@
 ``build_paths`` re-attempts the same candidate pools on every block. Most V4
 skip reasons are immutable pool facts — hook/dynamic-fee/encoder-fee admission
 rejections, discovery pool-id mismatches, duplicate registrations. Retrying
-can never change the verdict, and re-logging floods the GIL-bridged log path
+can never change the verdict — EXCEPT raced duplicate registrations, which are
+transient concurrency artifacts, not pool facts (CXKACI; the pipeline retries
+them via ``_build_offloaded_with_race_retry`` and never fatal-memoizes them) —
+and re-logging floods the GIL-bridged log path
 (~20k skip lines/block at mainnet scale; the missed-WS-pong investigation
 measured ~1M lines/16 min, driving RSS toward the cgroup ceiling).
 
 ``SkipGate`` does two things:
-- **fatal memo**: once a (kind, key) skip is recorded as ``fatal=True``,
+- **fatal memo**: as of CXKACI never used for raced duplicate registrations —
+  those are transient; a pipeline retry recovers the pool. Otherwise, once a
+  (kind, key) skip is recorded as ``fatal=True``,
   ``fatal_tag`` reports the stored tag so the pipeline can short-circuit the
   build entirely on later blocks (no RPC, no log line);
 - **log dedupe**: log lines for transient skips are emitted at most once per

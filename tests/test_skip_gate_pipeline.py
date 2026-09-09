@@ -6,8 +6,12 @@ summary counters byte-compatible with the first-attempt branches, so the
 seen live or replayed from the memo.
 """
 
+import asyncio
 from types import SimpleNamespace
 
+import pytest
+
+from degenbot.exceptions import PoolAlreadyRegisteredError
 from degenbot.runner.build_paths import PathRegistrationPipeline
 
 
@@ -46,3 +50,60 @@ def test_memo_replay_plain_failure_is_not_admission() -> None:
     assert p.v4_hook_rejected == 0
     assert p.v4_dynamic_fee_rejected == 0
     assert p._skip_reasons["build-v4:HighFeePoolRejectedError"] == 1
+
+
+# ── CXKACI: concurrent duplicate-build race (registration variance) ──────────
+#
+# With REG_WORKERS concurrent consumers, two candidates containing the same
+# not-yet-built pool race between the Bot registry pre-check and the Rust
+# registration; the loser raises PoolAlreadyRegisteredError although the pool
+# becomes available milliseconds later. The build path must retry the whole
+# build (the retry hits the registry pre-check and returns the existing pool)
+# instead of losing the path AND fatally memoizing the pool.
+
+
+def test_concurrent_duplicate_build_race_retries_to_registry_hit() -> None:
+    async def scenario() -> object:
+        p = make_pipeline()
+        sentinel = object()
+        attempts: list[int] = []
+
+        def build() -> object:
+            attempts.append(1)
+            if len(attempts) < 3:
+                # Simulate the race loser: the concurrent winner's Rust
+                # registration is visible before its Python registry insert.
+                raise PoolAlreadyRegisteredError("V4 pool already registered")
+            return sentinel
+
+        result = await p._build_offloaded_with_race_retry(build)
+        return result
+
+    assert asyncio.run(scenario()) is not None
+
+
+def test_concurrent_duplicate_build_race_raises_after_exhaustion() -> None:
+    async def scenario() -> None:
+        p = make_pipeline()
+        calls: list[int] = []
+
+        def build() -> object:
+            calls.append(1)
+            raise PoolAlreadyRegisteredError("V4 pool already registered")
+
+        await p._build_offloaded_with_race_retry(build)
+
+    with pytest.raises(PoolAlreadyRegisteredError):
+        asyncio.run(scenario())
+
+
+def test_exhausted_race_skip_does_not_memoize_fatal() -> None:
+    """The exhausted-race skip must not treat the pool as an immutable fact."""
+    p = make_pipeline()
+    tag = "build-v4:PoolAlreadyRegisteredError"
+    # The wiring in _consume notes the tag with fatal=False: a raced pool is
+    # usable on later blocks (the winner's registry entry exists), so the
+    # fatal memo must never short-circuit it.
+    assert p.skip_gate.fatal_tag("v4", "som-mock-pool-id") is None
+    p.skip_gate.note("v4", "some-mock-pool-id", tag, fatal=False)
+    assert p.skip_gate.fatal_tag("v4", "some-mock-pool-id") is None
