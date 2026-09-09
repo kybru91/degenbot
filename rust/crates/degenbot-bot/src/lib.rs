@@ -223,7 +223,7 @@ pub mod telemetry;
 /// `sim_slots` cap — are all sized from `solve_worker_count()` and its
 /// leftover, never from raw `available_parallelism`.
 pub fn configure_rayon_solver_pool() {
-    let workers = crate::bot_core::cpu_budget::solve_worker_count();
+    let workers = degenbot_core::cpu_budget::solve_worker_count();
     let result = rayon::ThreadPoolBuilder::new()
         .num_threads(workers)
         .thread_name(|i| format!("degenbot-solve-{i}"))

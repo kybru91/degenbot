@@ -34,7 +34,7 @@ fn sim_slot_capacity() -> usize {
         if let Some(n) = crate::bot_core::stance::config().solve.solve_sim_inflight {
             return n.clamp(1, 64);
         }
-        crate::bot_core::cpu_budget::leftover_worker_budget().saturating_mul(SIM_IO_OVERSUBSCRIBE)
+        degenbot_core::cpu_budget::leftover_worker_budget().saturating_mul(SIM_IO_OVERSUBSCRIBE)
     })
 }
 

@@ -18,9 +18,9 @@ fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
     MAP.get_or_init(|| {
         let mut m = BTreeMap::new();
         // (1) Infra — OS/tooling signal variables no static schema can own.
-        // TOKIO_WORKER_THREADS is read via the const ENV_VAR (computed name;
-        // the parser reports the identifier).
-        m.insert("crates/degenbot-core/src/runtime.rs", &["ENV_VAR"][..]);
+        // (SMTH6M: TOKIO_WORKER_THREADS was retired — the ambient runtime is
+        // sized from the cgroup budget via the typed `runtime.io_workers`
+        // key, and the legacy name is rejected by the loader.)
         m.insert(
             "crates/degenbot-python/src/python_log_layer.rs",
             &["HOME", "RUST_LOG", "OTEL_EXPORTER_OTLP_ENDPOINT"][..],

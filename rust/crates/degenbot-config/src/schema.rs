@@ -124,6 +124,16 @@ impl KeyDecl {
 
 crate::config_schema! {
 
+    // SMTH6M: the ambient I/O runtime of the two-runtime contract (solve
+    // bins on one side, shared I/O runtime on the other) is sized from the
+    // cgroup CPU budget; this section carries the explicit operator
+    // override for that sizing. Declared once — the typed field, env name,
+    // TOML path, and doc entry all come from this line.
+    runtime RuntimeConfig {
+        io_workers [opt usize] = None, env = "DEGENBOT_IO_WORKERS", def = "(unset; derived from the cgroup CPU budget)",
+            doc = "Ambient I/O runtime worker count; when unset it is derived from the cgroup CPU budget after the solve bins take theirs (see solve.solve_cpus / solve.solve_headroom). The legacy TOKIO_WORKER_THREADS env name is rejected at load.";
+    }
+
     telemetry TelemetryConfig {
         otel [bool] = true, env = "DEGENBOT_OTEL", def = "true",
             doc = "Enable the OTel OTLP span layer and the Prometheus metrics endpoint; `0`/empty opts out.";

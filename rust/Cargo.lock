@@ -2255,11 +2255,14 @@ name = "degenbot-core"
 version = "0.6.0-alpha.9"
 dependencies = [
  "alloy",
+ "degenbot-config",
+ "parking_lot",
  "proptest",
  "pyo3",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-core",
 ]
 
 [[package]]

@@ -1032,8 +1032,7 @@ impl BlockPump {
                             // VPD5ZH follow-up: the kernel throttle counters
                             // that identified the >10s solve p95 belong on the
                             // dashboard, one sample per block cadence.
-                            if let Some(stats) =
-                                crate::bot_core::cpu_budget::cgroup_throttle_delta()
+                            if let Some(stats) = degenbot_core::cpu_budget::cgroup_throttle_delta()
                             {
                                 p.observe_cgroup_throttled(
                                     stats.nr_throttled,
