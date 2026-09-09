@@ -19,6 +19,17 @@
 //! literally; a deployed operator recovers the table's `A = 2, S = 3` split
 //! with `DEGENBOT_IO_WORKERS=2` (the terminal override both the table and
 //! this code honor). The SUM invariant holds under either assignment.
+//!
+//! # Pin count = the LPT bin count (P6YXA6 sizing reconciliation)
+//!
+//! Solver pins are STRUCTURAL, not a share multiple: one seat per LPT bin,
+//! the bin count following the same policy as
+//! `degenbot_core::cpu_budget`'s solve bins — `floor(Q)` minus
+//! [`degenbot_core::cpu_budget::DEFAULT_SOLVE_HEADROOM`]. At the deployed
+//! Q = 8 that is 6 pins, exactly the bin count every dispatch arm binds at
+//! (the ad-hoc `shares x 2` pin derivation — 8 seats at Q = 8 against
+//! 6 bins — retires with the hard cutover). Walk ADMISSION stays the
+//! share `S`: a gated bin parks, per design doc §5.
 
 use degenbot_config::FleetConfig;
 
@@ -132,8 +143,9 @@ pub struct FleetBudget {
     /// Solver pins `S` = `floor(Q) − H − A − R − M` (or the terminal
     /// override); `>= 2` or the boot fails.
     pub solver_cpus: u64,
-    /// Solver pin slots: 2:1 over-subscription of parked pin wait (pins are
-    /// threads; concurrent walk admission is `S`).
+    /// Solver pin seats: STRUCTURAL — one per LPT bin
+    /// (`floor(Q)` − `cpu_budget::DEFAULT_SOLVE_HEADROOM`; concurrent walk
+    /// admission stays the share `S`).
     pub solver_pin_count: usize,
     /// `SimDriver` slots (duty-counted, spendable from the fractional
     /// remainder only), capped at today's `SimSlots` cap by default.
@@ -197,7 +209,7 @@ impl FleetBudget {
                 consumer: "solver",
                 peak_cpus: self.solver_cpus,
                 thread_count: self.solver_pin_count,
-                sizing: "Q - H - A - R - M (>= 2 or fail-fast); pins 2:1 over walk admission",
+                sizing: "Q - H - A - R - M (>= 2 or fail-fast); pins = one per LPT bin (floor(Q) - solve headroom)",
             },
         ]
     }
@@ -298,8 +310,14 @@ fn derive_table(quota_cpus: f64, overrides: &BudgetOverrides) -> Result<FleetBud
         resolve_cpus,
         merge_cpus,
         solver_cpus,
-        // Pin slots are threads: 2:1 over-subscription of parked pin wait.
-        solver_pin_count: usize::try_from(solver_cpus * 2).unwrap_or(usize::MAX),
+        // Pin seats are STRUCTURAL (P6YXA6 reconciliation): one per LPT
+        // bin, the bin count following cpu_budget's solve-bin policy
+        // (floor(Q) minus the solve headroom, floored at 1). Walk admission
+        // stays the share S — a gated bin parks (design doc §5).
+        solver_pin_count: usize::try_from(quota_floor)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(degenbot_core::cpu_budget::DEFAULT_SOLVE_HEADROOM)
+            .max(1),
         sim_slot_cap,
         fractional_remainder,
     })
@@ -328,8 +346,10 @@ mod tests {
         // DEGENBOT_IO_WORKERS override — see the module discrepancy note.)
         assert_eq!(b.ambient_cpus, 1);
         assert_eq!(b.solver_cpus, 4);
-        // Pins: 2:1 over-subscription of parked pin wait.
-        assert_eq!(b.solver_pin_count, 8);
+        // Pins are STRUCTURAL: one seat per LPT bin = floor(Q) - the solve
+        // headroom (the same policy cpu_budget uses for the bin count) —
+        // not the 2:1 parked-wait over-subscription (P6YXA6 sizing note).
+        assert_eq!(b.solver_pin_count, 6);
     }
 
     #[test]
