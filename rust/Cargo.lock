@@ -2108,7 +2108,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "async-trait",
@@ -2146,7 +2146,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-aave"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-config",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-abi"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-core",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-arbitrage"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-bot"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "async-trait",
@@ -2246,14 +2246,14 @@ dependencies = [
 
 [[package]]
 name = "degenbot-config"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "toml",
 ]
 
 [[package]]
 name = "degenbot-core"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-config",
@@ -2268,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-db"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-math",
@@ -2284,14 +2284,14 @@ dependencies = [
 
 [[package]]
 name = "degenbot-decoders"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
 ]
 
 [[package]]
 name = "degenbot-execution"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-executor",
@@ -2301,7 +2301,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-execution-sample"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-execution",
@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-executor"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-abi",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-fork"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-core",
@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-ingestion"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-core",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-math"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "criterion",
@@ -2363,7 +2363,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-order-index"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy-primitives",
  "proptest",
@@ -2371,11 +2371,11 @@ dependencies = [
 
 [[package]]
 name = "degenbot-pathfinding"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 
 [[package]]
 name = "degenbot-pool-updater"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-core",
@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-pools"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-decoders",
@@ -2409,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-price"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-abi",
@@ -2422,7 +2422,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-rpc"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "dashmap",
@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-simulation"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-bot",
@@ -2472,7 +2472,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-solvers"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "criterion",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-submission"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-bot",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-uniswap"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "degenbot-abi",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot-workers"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "degenbot-config",
  "degenbot-core",
@@ -2536,7 +2536,7 @@ dependencies = [
 
 [[package]]
 name = "degenbot_rs"
-version = "0.6.0-alpha.9"
+version = "0.6.0-alpha.10"
 dependencies = [
  "alloy",
  "crossbeam-queue",
