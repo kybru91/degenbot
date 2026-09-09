@@ -6,7 +6,7 @@ fleet task can execute without it. **Implementation is gated on a user sign-off
 checkpoint: the role/state table and the budget allocation table in the
 [design doc](../architecture/worker-fleet.md) must be approved before fleet-core
 work begins.** The canonical, maintained form of the design lives in the design
-doc; this ADR records the decisions and the evidence.
+doc; this ADR records the decisions and the evidence. **The user sign-off checkpoint is satisfied (2026-09-09) — fleet-core (O4CCVX) may begin.**
 
 ## Context
 
@@ -121,6 +121,8 @@ affinity, which survives role switching by construction: a `Pinned(Solver,
 bin k)` slot is leased only to bin k, across cycles, until an explicit
 epoch-boundary rebalance.
 
+**Tokio fact-check (Q8d-1, verified against tokio 1.52/1.53 source):** tokio's multi-thread runtime is work-stealing by design and exposes **no task-to-worker affinity API** (the source tree contains none); its recommendation for CPU-bound work is spawn_blocking or a separate pool — precisely the two-runtime split this ADR keeps. Stealing only moves *runnable* tasks between workers at yield/wake boundaries, so fleet bin units (which never yield mid-unit) cannot be migrated by tokio, while pooled SimDriver/Resolve units remain freely stealable — tokio's good default, not disabled by the fleet. Conclusion: bin pinning must be owned above tokio (as designed); the no-work-stealing non-goal covers fleet-level stealing across bin units, not fighting tokio's scheduler.
+
 ### 6. Conformance harness: `NoopStubFleetHost`
 
 A `NoopStubEngine`-style executable spec (mirroring `stage_handlers::ALL_STAGES`
@@ -160,7 +162,7 @@ the stranded-pipe tripwire. Never runtime-selectable.
   re-introduction, no io_uring, no executor replace: the Tokio CPU/I-O split
   and RAYPAR T3 semantics are retained, hosted.
 - **No auto-tuning of shares.** Budget shares are declared, logged, and overridden by
-  config; they are not heuristically re-derived at runtime. Posture *thresholds* are excluded from this per the sign-off amendment: they stay data-tunable (runtime adjustment via the operator channel + soak-capture feedback, design doc section 6) and never touch shares.
+  config; they are not heuristically re-derived at runtime. Posture *thresholds* are excluded from this per the sign-off amendment: they stay data-tunable (runtime adjustment via the operator channel + soak-capture feedback, design doc section 6) and never touch shares. Share auto-tuning itself is neither ruled in nor out (Q8d-3, data-gated): v1 keeps shares declared and config-static, revisited as a follow-up once fleet telemetry (per-role busy/idle, census, throttle duty) supplies the evidence.
 - **No Python-visible fleet API.** The FFI surface is unchanged except for the
   sim-closure install and result delivery that already exist.
 - **No backwards-compatibility layer.** Legacy mechanisms are deleted at

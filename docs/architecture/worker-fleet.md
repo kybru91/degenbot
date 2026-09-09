@@ -313,7 +313,10 @@ the table or the stub fails loudly.
   overridden by config; re-derivation happens only on quota re-detection
   (a posture/logged event), and cordon adjusts *intake*, not shares. Posture *thresholds* are separately tunable (section 6, sign-off amendment) and never touch shares.
 - **No work-stealing revival**; the Tokio CPU/I-O split and RAYPAR T3 are
-  retained and hosted, not replaced.
+  retained and hosted, not replaced. (Tokio fact-check, Q8d-1, verified 1.52/1.53:
+  the multi-thread runtime work-steals by default and has no affinity API; stealing
+  moves runnable tasks at yield/wake boundaries, so never-yielding bin units are
+  immune by construction and pooled units stay freely stealable — desired.)
 - **No Python-visible fleet API.** The FFI surface is unchanged except for the
   sim-closure install and result delivery that already exist.
 - **No migration mechanics beyond the flag:** no soft handoff of in-flight
