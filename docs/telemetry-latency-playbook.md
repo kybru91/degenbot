@@ -231,8 +231,10 @@ Known incident class, not a bot bug:
 2. **Stale binary**: `uv sync` does NOT reinstall an editable package whose
    version metadata is unchanged — use
    `uv sync --reinstall-package degenbot` after Rust edits, then restart.
-   Verify which build a trace came from via `code.line.number` tags vs current
-   source lines.
+   Verify the installed build first with `just verify-build-fresh` (it exits 1
+   on a stale `.so`; see AGENTS.md "Verifying freshness with the build
+   receipt"). The `code.line.number` tag comparison in traces remains only as
+   a forensic fallback, not the primary check.
 3. Batch-exporter lag: last spans of a killed process are lost. Don't trust a
    trace count drop right after a restart as a regression.
 

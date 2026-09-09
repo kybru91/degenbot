@@ -29,6 +29,13 @@ The only reliable way to force the `.so` to pick up Rust source changes:
 uv sync --reinstall-package degenbot
 ```
 
+Workflow after any Rust edit — verify, don't guess:
+
+1. `just verify-build-fresh`. Exit 0 ⇒ the installed extension already
+   contains your edits; no rebuild needed.
+2. Exit 1 ⇒ run the reinstall above, then verify again. Only trust a bot run
+   (or a pytest suite) once the check exits 0.
+
 ### Verifying freshness with the build receipt
 
 Do not trust a silent "successful" rebuild — verify it. Every compile of
