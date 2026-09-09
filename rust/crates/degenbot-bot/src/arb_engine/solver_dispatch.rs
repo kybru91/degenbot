@@ -205,6 +205,22 @@ pub(crate) static STREAMING_DELIVERY_ENABLED: std::sync::atomic::AtomicBool =
 pub(crate) static SOLVE_EXECUTOR_TOKIO: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// ADR-042 Q6 migration stance: `fleet.stance=fleet` routes the solve fan-
+/// out (detached AND in-cycle arms) through the degenbot-workers fleet —
+/// the fleet becomes the sole executor of solve bins. Parsed ONCE at
+/// engine construction ([`install_engine_stances`]); the hot path reads
+/// the engine's construction-time field, never this static directly.
+pub(crate) static SOLVE_FLEET_HOSTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `fleet.stance` → hosting decision (ADR-042 Q6: `legacy` keeps the
+/// per-era mechanisms; `fleet` hosts Solver (and the Merge sidecar role)
+/// on the role-switching fleet). Typed enum, so both stances are explicit.
+#[must_use]
+pub(crate) fn fleet_stance_enabled(cfg: &::degenbot_config::BotConfig) -> bool {
+    matches!(cfg.fleet.stance, ::degenbot_config::FleetStance::Fleet)
+}
+
 /// `DEGENBOT_DETACHED_SOLVES` — the detached solve cycle (enqueue-and-return
 /// with sidecar merge). Default ON since task 2UVG3E (epic MROOY7, stage-table
 /// seam #4): the DRIVEN solve path takes NO engine-level Mutex — the
@@ -301,6 +317,16 @@ pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
         solve_executor_tokio(cfg),
         std::sync::atomic::Ordering::Relaxed,
     );
+    // ADR-042 Q6: the fleet.stance migration flag. Under `fleet` the solve
+    // bins ride the fleet-hosted executor; the typed boot descriptor
+    // (quota + overrides + posture) is parsed here once.
+    let fleet_hosted = fleet_stance_enabled(cfg);
+    SOLVE_FLEET_HOSTED.store(fleet_hosted, std::sync::atomic::Ordering::Relaxed);
+    if fleet_hosted {
+        crate::arb_engine::fleet_solve_executor::install_boot(
+            degenbot_workers::dispatcher::FleetBoot::from_config(cfg),
+        );
+    }
     STREAMING_DELIVERY_ENABLED.store(
         cfg.pump.streaming_delivery,
         std::sync::atomic::Ordering::Relaxed,
@@ -2292,7 +2318,13 @@ impl ArbitrageEngine {
                             }
                         }
                     };
-                    if matches!(
+                    if self.fleet_hosted {
+                        // ADR-042 F3: the fleet is the sole executor of
+                        // solve bins — this bin submits as a keyed Solver
+                        // unit (per-bin pin, per-path streaming preserved).
+                        crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
+                            .spawn(bin_idx, run_bin);
+                    } else if matches!(
                         self.solve_executor,
                         crate::arb_engine::SolveExecutorKind::Tokio
                     ) {
@@ -2381,16 +2413,23 @@ impl ArbitrageEngine {
                 // overlap the next block cycle; the drain runs on the
                 // calling thread (T2 moves it to spawn_blocking for the
                 // async seam).
+                // ADR-042 F3: under the fleet stance the fleet-hosted
+                // executor owns these bins (the same keyed Solver units the
+                // detached arm submits — the fleet is the SOLE executor of
+                // solve bins); the legacy arm keeps the private runtime.
+                let fleet_executor = self
+                    .fleet_hosted
+                    .then(crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor);
                 let executor = crate::arb_engine::solve_executor::global_solve_executor();
                 let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<SolveArmOutcome>>();
                 let bins = compute_bins();
-                for bin in &bins {
+                for (bin_idx, bin) in bins.iter().enumerate() {
                     let bin = bin.clone();
                     let res_tx = res_tx.clone();
                     let shared_bin = std::sync::Arc::clone(&shared);
                     let to_solve_bin = std::sync::Arc::clone(&to_solve);
                     let solve_span_bin = solve_span.clone();
-                    executor.spawn(move || {
+                    let run_bin = move || {
                         // 7LV6VN T5 (pipelined arm): outcomes park until
                         // their sim lands; the walk never waits on a sim.
                         let mut held: Vec<(u64, Option<SolveArmOutcome>)> = Vec::new();
@@ -2468,7 +2507,12 @@ impl ArbitrageEngine {
                                 flush_tokio_item(&mut held, &res_tx, done_pid, payload);
                             }
                         }
-                    });
+                    };
+                    if let Some(fleet) = fleet_executor {
+                        fleet.spawn(bin_idx, run_bin);
+                    } else {
+                        executor.spawn(run_bin);
+                    }
                 }
                 drop(res_tx);
                 // MQUKB6-T2: the drain-side merge is its own phase node
@@ -3887,7 +3931,7 @@ mod solve_path_span_tests {
 // Offline probe: panics/prints ARE the measurement contract (loud failure on
 // misload; CSV is the output). Outer allow/expects at module level are the
 // documented-permitted form for cross-lint bulk suppression.
-mod executor_ab_probe {
+pub(super) mod executor_ab_probe {
     // Offline A/B probe (epic BXUSGL T4): production dispatch emulation, rayon
     // LPT scope vs the dedicated tokio solve executor, on the heavy-CL capture
     // corpus. NOT part of the normal suite: `#[ignore]`d, env-driven, run
@@ -3942,6 +3986,14 @@ mod executor_ab_probe {
             .join("../degenbot-solvers/tests/fixtures/heavy_cl_solve_captures.jsonl")
     }
 
+    /// Zst-aware corpus load for the BCA77G parity fixtures: the packaged
+    /// `heavy_cl_solve_captures.jsonl.zst` decodes transparently via
+    /// `capture_fixture::read_fixture` (same corpus the probe measures).
+    pub(in crate::arb_engine) fn load_corpus_fixture(
+    ) -> Vec<Arc<::degenbot_solvers::mixed::ResolvedMixedPath>> {
+        load_corpus()
+    }
+
     fn u256(s: &str) -> Result<U256, String> {
         s.trim().parse::<U256>().map_err(|e| e.to_string())
     }
@@ -3989,10 +4041,12 @@ mod executor_ab_probe {
         })
     }
 
-    pub(super) fn load_corpus() -> Vec<Arc<::degenbot_solvers::mixed::ResolvedMixedPath>> {
+    pub(in crate::arb_engine) fn load_corpus(
+    ) -> Vec<Arc<::degenbot_solvers::mixed::ResolvedMixedPath>> {
         let path = fixture_path();
-        let content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("fixture {}: {e}", path.display()));
+        // Zst-aware (packaged fixtures decode transparently; regenerated
+        // plain captures still win the resolution order).
+        let content = ::degenbot_solvers::capture_fixture::read_fixture(&path);
         let mut items = Vec::new();
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
             let Ok(doc) = serde_json::from_str::<Value>(line) else {
@@ -4030,7 +4084,7 @@ mod executor_ab_probe {
         items
     }
 
-    pub(super) fn probe_ctx() -> Arc<SolveCycleShared> {
+    pub(in crate::arb_engine) fn probe_ctx() -> Arc<SolveCycleShared> {
         Arc::new(SolveCycleShared {
             solve_block: 0,
             epoch: 0,
@@ -4066,7 +4120,7 @@ mod executor_ab_probe {
 
     /// LPT bins per the production cost fn (empty measured-history = first-cycle
     /// structural cost, exactly like an engine cold bucket).
-    pub(super) fn prod_lpt_bins(
+    pub(in crate::arb_engine) fn prod_lpt_bins(
         items: &[Arc<::degenbot_solvers::mixed::ResolvedMixedPath>],
         threads: usize,
     ) -> Vec<Vec<usize>> {

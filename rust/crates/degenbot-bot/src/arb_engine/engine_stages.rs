@@ -211,18 +211,12 @@ impl EngineStages {
             // detached enqueue (rx take + spawn atomic under the held guard).
             if let Some(merge_rx) = engine.take_detached_merge_rx() {
                 let engine_arc = Arc::clone(&self.engine);
-                // PE4FPM: self-register the pinned merge sidecar.
-                degenbot_core::worker_census::register(
-                    degenbot_core::worker_census::WorkerCensusEntry {
-                        resource: "detached_merge_sidecar",
-                        kind: "detached merge sidecar (drains the result pipe)",
-                        count: 1,
-                        thread_name: "arb-detached-merge",
-                        sizing: "exactly one (spawned at the FIRST detached enqueue; loud abort on spawn failure — a stranded merge pipe orphans every detached result)",
-                    },
-                );
+                // PE4FPM: self-register the pinned merge sidecar (per ADR-042
+                // stance: the fleet Merge role, or the historical row).
+                let fleet_hosted = engine.fleet_hosted;
+                degenbot_core::worker_census::register(merge_sidecar_census_entry(fleet_hosted));
                 if let Err(err) = std::thread::Builder::new()
-                    .name("arb-detached-merge".to_string())
+                    .name(merge_sidecar_thread_name(fleet_hosted))
                     .spawn(move || {
                         super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
                     })
@@ -251,18 +245,11 @@ impl EngineStages {
         };
         let engine_arc = Arc::clone(&self.engine);
         // PE4FPM: self-register the pinned merge sidecar (same row as the
-        // first-spawn site above; upsert-idempotent).
-        degenbot_core::worker_census::register(
-            degenbot_core::worker_census::WorkerCensusEntry {
-                resource: "detached_merge_sidecar",
-                kind: "detached merge sidecar (drains the result pipe)",
-                count: 1,
-                thread_name: "arb-detached-merge",
-                sizing: "exactly one (spawned at the first detached enqueue; loud abort on spawn failure — a stranded merge pipe orphans every detached result)",
-            },
-        );
+        // first-spawn site above; upsert-idempotent; stance-aware).
+        let fleet_hosted = self.engine.lock().fleet_hosted;
+        degenbot_core::worker_census::register(merge_sidecar_census_entry(fleet_hosted));
         if let Err(err) = std::thread::Builder::new()
-            .name("arb-detached-merge".to_string())
+            .name(merge_sidecar_thread_name(fleet_hosted))
             .spawn(move || {
                 super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
             })
@@ -272,6 +259,48 @@ impl EngineStages {
                 "detached merge sidecar spawn failed — aborting (stranded merge pipe)"
             );
             std::process::abort();
+        }
+    }
+}
+
+/// The detached merge sidecar's thread name per stance (ADR-042: under
+/// `fleet.stance=fleet` the sidecar IS the fleet `Merge` role — the pinned
+/// T4 seat's named thread pattern; legacy keeps the historical name).
+#[must_use]
+pub(crate) fn merge_sidecar_thread_name(fleet_hosted: bool) -> String {
+    if fleet_hosted {
+        degenbot_workers::role::WorkerRole::Merge
+            .thread_name()
+            .replace("{n}", "1")
+    } else {
+        "arb-detached-merge".to_string()
+    }
+}
+
+/// The sidecar's worker-census row per stance: under the fleet it
+/// self-registers under the `Merge` role's fleet row (census resource
+/// `fleet_merge_slots`, exactly one pinned seat); legacy keeps the
+/// historical `detached_merge_sidecar` row.
+#[must_use]
+pub(crate) fn merge_sidecar_census_entry(
+    fleet_hosted: bool,
+) -> degenbot_core::worker_census::WorkerCensusEntry {
+    if fleet_hosted {
+        let role = degenbot_workers::role::WorkerRole::Merge;
+        degenbot_core::worker_census::WorkerCensusEntry {
+            resource: role.census_resource(),
+            kind: role.census_kind(),
+            count: 1,
+            thread_name: role.thread_name(),
+            sizing: role.census_sizing(),
+        }
+    } else {
+        degenbot_core::worker_census::WorkerCensusEntry {
+            resource: "detached_merge_sidecar",
+            kind: "detached merge sidecar (drains the result pipe)",
+            count: 1,
+            thread_name: "arb-detached-merge",
+            sizing: "exactly one (spawned at the FIRST detached enqueue; loud abort on spawn failure — a stranded merge pipe orphans every detached result)",
         }
     }
 }
@@ -392,5 +421,95 @@ impl StageHandlers for EngineStages {
         );
         self.block_clock.lock().close();
         self.engine.lock().on_pump_ended();
+    }
+}
+
+#[cfg(test)]
+mod fleet_stance_tests {
+    //! ADR-042 Q6 stance surface (BCA77G): the merge sidecar hosted as the
+    //! fleet `Merge` role, and the typed `fleet.stance` flipping the
+    //! engine's executor posture.
+
+    use super::{merge_sidecar_census_entry, merge_sidecar_thread_name};
+
+    /// Under `fleet.stance=fleet` the sidecar runs as the pinned `Merge`
+    /// role: the role's greppable thread-name pattern and the fleet merge
+    /// census row (exactly one seat).
+    #[test]
+    fn fleet_stance_hosts_the_sidecar_as_the_merge_role() {
+        let name = merge_sidecar_thread_name(true);
+        assert_eq!(
+            name, "work-fleet-merge-1",
+            "role.thread_name() with the seat index"
+        );
+        let row = merge_sidecar_census_entry(true);
+        assert_eq!(row.resource, "fleet_merge_slots");
+        assert_eq!(row.thread_name, "work-fleet-merge-{n}");
+        assert_eq!(row.count, 1);
+    }
+
+    /// Legacy keeps the historical row + thread name byte-for-byte (the
+    /// per-era mechanisms stand under `fleet.stance=legacy`).
+    #[test]
+    fn legacy_stance_keeps_the_historical_sidecar_identity() {
+        assert_eq!(merge_sidecar_thread_name(false), "arb-detached-merge");
+        let row = merge_sidecar_census_entry(false);
+        assert_eq!(row.resource, "detached_merge_sidecar");
+        assert_eq!(row.thread_name, "arb-detached-merge");
+    }
+
+    /// The typed config flips the engine's construction-time stance field.
+    /// The construction static is process-global and other engine tests
+    /// construct with the legacy default concurrently, so the harness
+    /// retries the install→construct→observe triple until it observes a
+    /// consistent read (any interleaving where the static survives the
+    /// window proves the wiring).
+    #[test]
+    fn fleet_stance_probe_flips_with_typed_config() {
+        use crate::arb_engine::ArbitrageEngine;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        // Default (legacy): the per-era mechanisms stand.
+        let legacy = ArbitrageEngine::with_core_cfg(
+            Arc::new(crate::bot_core::state_lock::StateLock::new(
+                crate::bot_core::BotState::new(),
+            )),
+            &Arc::new(degenbot_config::BotConfig::default()),
+        );
+        assert_eq!(legacy.fleet_stance_probe(), "legacy");
+
+        // Fleet: the typed enum, parsed once at construction.
+        let mut cfg = degenbot_config::BotConfig::default();
+        cfg.fleet.stance = degenbot_config::FleetStance::Fleet;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = "legacy".to_string();
+        while Instant::now() < deadline {
+            let fleet = ArbitrageEngine::with_core_cfg(
+                Arc::new(crate::bot_core::state_lock::StateLock::new(
+                    crate::bot_core::BotState::new(),
+                )),
+                &Arc::new(cfg.clone()),
+            );
+            observed = fleet.fleet_stance_probe().to_string();
+            if observed == "fleet" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            observed, "fleet",
+            "fleet.stance=fleet must reach the engine"
+        );
+        // The executor kind is an INDEPENDENT axis (solve.executor stays
+        // tokio/rayon); the fleet stance routes through the fleet
+        // regardless of it.
+        assert_eq!(legacy.solve_executor_probe(), legacy.solve_executor_probe());
+
+        // Restore the process-wide construction static so concurrently
+        // running engine tests keep the legacy default posture (the fleet
+        // boot descriptor stays installed — installing twice is a no-op).
+        crate::arb_engine::solver_dispatch::SOLVE_FLEET_HOSTED
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }

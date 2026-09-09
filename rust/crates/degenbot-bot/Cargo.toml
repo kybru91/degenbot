@@ -36,6 +36,9 @@ degenbot-pools.workspace = true
 degenbot-solvers.workspace = true
 degenbot-executor.workspace = true
 degenbot-uniswap.workspace = true
+# ADR-042 F3: the fleet (role-switching worker fleet) hosts the solve bins
+# under the `fleet.stance=Fleet` migration stance.
+degenbot-workers.workspace = true
 futures-util = { version = "^0.3", default-features = false, features = ["async-await", "std"] }
 # hotpath: drain-path profiling tracer (ADR-005 core, pyo3-free). The crate is a
 # non-optional dependency so the `#[hotpath::measure]` attributes resolve, but
