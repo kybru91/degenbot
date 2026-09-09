@@ -170,6 +170,10 @@ allow-star-arg-any = true
 "src/degenbot/registry/deployment_loader.py" = [
     "import-outside-top-level",  # lazy imports avoid circular dependency (pool classes → uniswap → this module)
 ]
+"src/degenbot/build_info.py" = [
+    "import-outside-top-level",  # the _ffi import is lazy so the receipt helpers work (and the module imports) even where the extension is stale/broken
+    "print",     # python -m degenbot.build_info prints its summary to stdout/stderr by design
+]
 "src/degenbot/uniswap/deployments.py" = [
     "import-outside-top-level",  # lazy import avoids circular dependency (deployment_loader → pool classes → this module)
 ]
@@ -275,6 +279,9 @@ link-mode = "copy"
 cache-keys = [
     {file = "rust/**/Cargo.toml"},
     {file = "rust/crates/*/src/**/*.rs"},
+    # build.rs bakes the stale-.so counter (DEGENBOT_BUILD_NUMBER); a change
+    # to it must invalidate the wheel cache like any other Rust source.
+    {file = "rust/crates/degenbot-python/build.rs"},
 ]
 
 [tool.maturin]

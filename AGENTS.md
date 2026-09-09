@@ -29,7 +29,34 @@ The only reliable way to force the `.so` to pick up Rust source changes:
 uv sync --reinstall-package degenbot
 ```
 
-This takes ~15s (actual recompile). Verify before trusting any bot run after edits.
+### Verifying freshness with the build receipt
+
+Do not trust a silent "successful" rebuild — verify it. Every compile of
+`degenbot_rs` runs `rust/crates/degenbot-python/build.rs`, which fingerprints
+the crate's sources and writes `<count> <fingerprint>` to a receipt file
+(`.build-number`, gitignored, at the repo root), embedding both values in the
+compiled library. The counter advances only when the fingerprint (source
+content) changes, so test/feature-variant rebuilds never false-positive.
+
+```bash
+uv run --no-sync python -m degenbot.build_info   # exit 1 if stale
+# or:
+just verify-build-fresh
+# or from Python:
+from degenbot.build_info import verify_build_fresh; verify_build_fresh()
+# raw values: degenbot._ffi.build_number() / degenbot._ffi.build_fingerprint()
+```
+
+The check compares the installed fingerprint against the repo receipt, so any
+material built from different sources than the installed artifact (the
+cached-wheel failure mode) is caught, and no-change recompiles stay fresh.
+`pytest tests/test_build_info.py` gates on this too — a stale `.so` fails the
+suite. The receipt lives outside `rust/target` so `cargo clean` and
+`just gc-target` can never roll it back. After Rust edits expect the gate to
+flag staleness until you rebuild the wheel (`uv sync --reinstall-package
+degenbot`) — that is the detector working, so run the rebuild, not a skip. A
+reported number of 0 (or a missing fingerprint) means `build.rs` did not run —
+investigate before trusting the build.
 
 ## Python Environment
 Use `uv`.

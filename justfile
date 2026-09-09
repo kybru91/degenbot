@@ -151,6 +151,15 @@ check-no-pyo3-in-cores:
 build-rust-extension:
     cargo build -p degenbot_rs --features extension-module --manifest-path rust/Cargo.toml
 
+# Verify the installed degenbot._ffi extension was built from the current
+# Rust sources: compares the monotonic build number build.rs bakes into the
+# compiled library against the repo counter file (.build-number). The primary
+# stale-.so detector - run this instead of trusting a silent maturin/uv
+# "rebuild" (see AGENTS.md "Rebuilding the Rust .so after edits"). Exit 1 on a
+# stale library:
+verify-build-fresh:
+    uv run --no-sync python -m degenbot.build_info
+
 # ========== Build-Artifact Housekeeping ==========
 
 # Reclaim disk space from the cargo build cache (rust/target). Incremental

@@ -36,6 +36,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "concentrated-liquidity-math")]
     crate::concentrated_liquidity_math::add_concentrated_liquidity_math_module(m)?;
 
+    // Build identity (stale-.so detector, AGENTS.md): the monotonic build
+    // counter `build.rs` bakes into every compile of this cdylib.
+    // Unconditional — the freshness check must work in every configuration.
+    m.add_function(wrap_pyfunction!(crate::build_info::build_number, m)?)?;
+    m.add_function(wrap_pyfunction!(crate::build_info::build_fingerprint, m)?)?;
+
     // Keccak256 + event topic (always a dependency; ergo 5JKNQH)
     m.add_function(wrap_pyfunction!(crate::crypto::keccak256, m)?)?;
     m.add_function(wrap_pyfunction!(crate::crypto::event_topic, m)?)?;

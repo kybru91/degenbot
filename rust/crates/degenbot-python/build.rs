@@ -1,0 +1,158 @@
+//! Build-identity tag: bake a monotonic build counter + source fingerprint
+//! into every compile of `degenbot_rs`. See `src/build_info.rs` and the
+//! AGENTS.md section "Rebuilding the Rust `.so` after edits" — maturin/uv have
+//! repeatedly served a stale cached cdylib after Rust edits while reporting a
+//! successful rebuild. The counter + fingerprint are the receipt that
+//! distinguishes a fresh build. Python reads them via
+//! `degenbot._ffi.build_number` / `degenbot.build_info`.
+//!
+//! The counter only advances when the crate's source fingerprint changes, so
+//! routine `cargo test` / `cargo clippy` / feature-variant rebuilds (which
+//! re-run this script but compile byte-identical sources) keep the wheel-
+//! installed copy fresh — only an actual source edit marks it stale.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Repo-root default (`<repo>/.build-number`), three levels above this crate.
+/// Lives OUTSIDE `rust/target` so a `cargo clean` or gc-target sweep can never
+/// roll the counter back, and is gitignored so builds never dirty a checkout.
+const COUNTER_NAME: &str = ".build-number";
+
+/// FNV-1a 64-bit (std-only; no hash dependency in a build script).
+fn fnv1a(data: &[u8], seed: u64) -> u64 {
+    let mut hash = seed;
+    for byte in data {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+/// Content fingerprint of everything that defines this crate's compiled
+/// behavior: `build.rs`, `Cargo.toml`, and every file under `src/` (sorted by
+/// path, path + bytes hashed — renaming a module changes the fingerprint).
+fn source_fingerprint(crate_dir: &Path) -> Option<u64> {
+    let build_rs = fs::read(crate_dir.join("build.rs")).ok()?;
+    let cargo_toml = fs::read(crate_dir.join("Cargo.toml")).ok()?;
+    let mut hash = fnv1a(&build_rs, fnv1a(&cargo_toml, 0xcbf2_9ce4_8422_2325));
+
+    let mut files = BTreeMap::new();
+    collect_source_files(&crate_dir.join("src"), &mut files);
+    for (rel, content) in files {
+        hash = fnv1a(rel.as_bytes(), hash);
+        hash = fnv1a(&content, hash);
+    }
+    Some(hash)
+}
+
+/// Recursively collect `dir`'s files, keyed by path relative to `dir`.
+fn collect_source_files(dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_source_files(&path, out);
+        } else if let (Some(rel), Ok(content)) = (
+            path.strip_prefix(dir).ok().and_then(|p| p.to_str()),
+            fs::read(&path),
+        ) {
+            out.insert(rel.to_owned(), content);
+        }
+    }
+}
+
+fn main() {
+    // Unreachable under cargo (it always sets the var, which names this
+    // crate); degrade to cwd + warn rather than aborting a build over an
+    // environment oddity.
+    let crate_dir = if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        PathBuf::from(dir)
+    } else {
+        println!(
+            "cargo:warning=degenbot build-number: CARGO_MANIFEST_DIR unset - receipt falls back to the current directory"
+        );
+        std::env::current_dir().unwrap_or_default()
+    };
+    let counter_path = match std::env::var_os("DEGENBOT_BUILD_NUMBER_FILE") {
+        Some(override_path) => PathBuf::from(override_path),
+        None => {
+            // Repo root: three levels above this crate.
+            match crate_dir.ancestors().nth(3) {
+                Some(root) => root.join(COUNTER_NAME),
+                None => PathBuf::from(COUNTER_NAME),
+            }
+        }
+    };
+
+    // Stored state is `"<count> <fingerprint-hex>"`. Missing (fresh clone
+    // before the first build), unparsable, or missing-fingerprint contents
+    // start the sequence at 0 / no-match, so the first build writes 1 with a
+    // valid fingerprint.
+    let stored = fs::read_to_string(&counter_path).ok().and_then(|text| {
+        let mut parts = text.split_whitespace();
+        let count = parts.next()?.parse::<u64>().ok()?;
+        // Optional second token: legacy (pre-fingerprint) files have only
+        // a bare count, which must still be honored (not reset).
+        let fingerprint = parts.next().and_then(|tok| tok.parse::<u64>().ok());
+        Some((count, fingerprint))
+    });
+    let fingerprint = source_fingerprint(&crate_dir);
+
+    // Advance ONLY on a content change (or unknown first-build state). No
+    // change -> re-emit the stored number unchanged, so no-change rebuilds
+    // (test/clippy/feature-variant) never mark an installed wheel stale.
+    let changed = stored.is_none()
+        || fingerprint.is_none()
+        || stored.as_ref().and_then(|(_, fp)| *fp) != fingerprint;
+    let prior_count = stored.map_or(0, |(count, _)| count);
+    let next = if changed {
+        prior_count.saturating_add(1)
+    } else {
+        prior_count
+    };
+
+    // Write-back is best-effort: a failed write degrades the cross-check
+    // (the file then reads as older than the baked values) but never breaks
+    // the build. Emit the resolved identity REGARDLESS, so this build is at
+    // least distinguishable from its predecessor even without a receipt file.
+    // Temp-file + rename keeps a concurrent reader from seeing a partial
+    // write; a true concurrent-writer tie (two cargo processes racing) is not
+    // a supported workflow and is benign here — both artifacts then carry the
+    // same identity.
+    if let Some(parent) = counter_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let line = match fingerprint {
+        Some(fp) => format!("{next} {fp:016x}\n"),
+        None => format!("{next}\n"),
+    };
+    let tmp = counter_path.with_extension("tmp");
+    if fs::write(&tmp, &line).is_ok() {
+        let _ = fs::rename(&tmp, &counter_path);
+    } else {
+        println!(
+            "cargo:warning=degenbot build-number: could not write {} - \
+             staleness cross-check may report the installed .so as fresh",
+            counter_path.display()
+        );
+    }
+
+    // NOTE: no `cargo:rerun-if-*` directives on purpose. With none emitted,
+    // cargo re-runs this script whenever ANY file in the package changes —
+    // the broadest available trigger, so every real source edit re-runs it
+    // (adding even one rerun-if line would narrow that set and reopen a
+    // stale hole). The changed rustc-env values additionally force rustc to
+    // recompile `build_info.rs` rather than reuse a cached artifact.
+    println!("cargo:rustc-env=DEGENBOT_BUILD_NUMBER={next}");
+    if let Some(fp) = fingerprint {
+        println!("cargo:rustc-env=DEGENBOT_BUILD_FINGERPRINT={fp:016x}");
+    }
+    println!(
+        "cargo:rustc-env=DEGENBOT_BUILD_NUMBER_FILE={}",
+        counter_path.display()
+    );
+}

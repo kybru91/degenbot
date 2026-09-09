@@ -109,6 +109,8 @@ from .submission import (
 # optional `0x` prefix), `bytes`, `bytearray`, or `str` (hex); return `bytes`.
 # Truncated/invalid back-references surface as `ValueError`. The Python
 # companion `degenbot.utils.solady.libzip` delegates here (sub-step C routing).
+def build_fingerprint() -> str: ...
+def build_number() -> int: ...
 def build_path_graph(
     database_path: str,
     chain_id: int,
@@ -1411,6 +1413,8 @@ __all__ = [
     "aave",
     "abi",
     "balancer_math",
+    "build_fingerprint",
+    "build_number",
     "build_path_graph",
     "cancel",
     "compute_aerodrome_v2_pool_address",

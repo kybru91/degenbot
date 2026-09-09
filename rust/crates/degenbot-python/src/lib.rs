@@ -51,6 +51,9 @@ pub mod abi;
 pub mod balancer_math;
 #[cfg(feature = "bot")]
 pub mod bot;
+/// Build identity: monotonic build counter baked by `build.rs` (stale-
+/// `.so` detector, AGENTS.md). Unconditional — see `build_info.rs`.
+pub mod build_info;
 pub mod c_api;
 /// `CancelHandle` — the cooperative cancel flag for the updater loops.
 /// Gated on `any(pool, aave-updater)` (whichever seam needs it).
