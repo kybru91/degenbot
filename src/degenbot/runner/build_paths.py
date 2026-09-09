@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from degenbot import Bot, UniswapV2Pool, UniswapV3Pool, UniswapV4Pool, get_checksum_address
-from degenbot._ffi import PoolBuildClaims
 from degenbot.arbitrage.engine_registry import EngineRegistry
 from degenbot.arbitrage.verification_retry import (
     VerificationRetryPolicy,
@@ -406,11 +405,6 @@ class PathRegistrationPipeline:
         # Bounded thread pool for the blocking pool-build RPC (35NMBX).
         self._build_pool_executor: ThreadPoolExecutor | None = None
 
-        # CXKACI: Rust-side claim table for single-flight pool builds — the
-        # first consumer of a (family, key) leads the build; concurrent
-        # consumers await the in-flight claim. See pool_build_claims.rs.
-        self._pool_claims = PoolBuildClaims()
-
         # Configured discovery inputs (set by the driver before discovery runs).
         self.pool_types: list[type] = []
         self.pool_type_per_depth: list[set[type] | None] | None = None
@@ -458,39 +452,14 @@ class PathRegistrationPipeline:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._bounded_build_executor(), fn)
 
-    async def _build_pool_claimed(
-        self, family: str, key: str, build: Callable[[], object]
-    ) -> object:
-        """Build a pool under a Rust-side claim (CXKACI).
-
-        The Rust core (degenbot._ffi.bot.PoolBuildClaims) owns the
-        coordination: the first consumer of a (family, key) claim leads the
-        build (the Rust PoolBuilder does the work under one registry
-        insertion); concurrent consumers await the in-flight claim and share
-        the built pool. A waiter whose claim window closed before it
-        subscribed re-runs the build - the Bot registry pre-check answers.
-        """
-        claims = self._pool_claims
-        if claims.try_claim(family, key):
-            try:
-                pool = await self._run_build_offloaded(build)
-            except BaseException as exc:
-                claims.fail(family, key, exc)
-                raise
-            claims.complete(family, key, pool)
-            return pool
-        claimed = await claims.wait(family, key)
-        if claimed is not None:
-            return claimed
-        return await self._run_build_offloaded(build)
-
     def _build_v3_fallback_chain(self, address: str) -> object:
         """The V3 build chain: Uniswap, Sushi, Pancake trackers, generic Bot.
 
-        Runs inside ONE offloaded call under a single (family="v3",
-        key=address) claim (CXKACI): pool-identity fallbacks cannot race the
-        Rust registration across consumers, and the whole chain occupies one
-        bounded-executor slot instead of re-queueing per rung.
+        Runs inside ONE offloaded call (PRG-1: the Rust build path itself
+        single-flights duplicate same-family-keyed builds, so pool-identity
+        fallbacks cannot race the Rust registration across consumers); the
+        whole chain occupies one bounded-executor slot instead of
+        re-queueing per rung.
         """
         try:
             return self.uniswap_v3_tracker.get_pool(pool_address=address, silent=True)
@@ -693,11 +662,12 @@ class PathRegistrationPipeline:
                     skip = True
                     break
                 try:
-                    pool = await self._build_pool_claimed(
-                        "v2",
-                        step.address,
+                    pool = await self._run_build_offloaded(
                         lambda: self.constr_bot.build_pool(step.address, silent=True),
                     )
+                    # PRG-1: the Rust build path single-flights duplicate
+                    # builds and answers already-registered addresses from
+                    # the registry of record.
                 except Exception as exc:
                     tag = f"build-v2:{type(exc).__name__}"
                     # CXKACI: raced duplicate builds are transient, not immutable facts
@@ -714,9 +684,7 @@ class PathRegistrationPipeline:
                     skip = True
                     break
                 try:
-                    pool = await self._build_pool_claimed(
-                        "v3",
-                        step.address,
+                    pool = await self._run_build_offloaded(
                         lambda: self._build_v3_fallback_chain(step.address),
                     )
                 except Exception as exc:
@@ -740,15 +708,17 @@ class PathRegistrationPipeline:
                     skip = True
                     break
                 try:
-                    pool = await self._build_pool_claimed(
-                        "v4",
-                        step.hash,
+                    pool = await self._run_build_offloaded(
                         lambda: self.constr_bot.build_managed_pool(
                             address=UNISWAP_V4_POOL_MANAGER_ADDRESS,
                             pool_id=step.hash,
                             silent=True,
                         ),
                     )
+                    # PRG-1: the Rust build path single-flights duplicate
+                    # V4 builds and answers already-registered
+                    # (pool_manager, pool_id) pairs from the registry of
+                    # record.
                 except HookedPoolRejectedError:
                     self.skip_gate.note("v4", step.hash, "v4-hook-rejected", fatal=True)
                     self.v4_hook_rejected += 1

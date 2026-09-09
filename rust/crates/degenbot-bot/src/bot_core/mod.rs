@@ -130,7 +130,8 @@ pub use stage_machine::{
 // ---------------------------------------------------------------------------
 
 pub use ::degenbot_pools::registry::{
-    ConcentratedLiquidityPool, ConcentratedLiquidityPoolMut, PoolEntry, TokenEntry,
+    ConcentratedLiquidityPool, ConcentratedLiquidityPoolMut, PoolEntry, RegisteredPoolFamily,
+    TokenEntry,
 };
 pub use ::degenbot_pools::simulate_swap::simulate_swap;
 pub use ::degenbot_pools::v2_state::{
@@ -833,6 +834,37 @@ impl BotState {
     #[must_use]
     pub fn pool_id_by_address(&self, address: &Address) -> Option<u64> {
         self.pool_addresses.get(address).copied()
+    }
+
+    /// The address-keyed registration of record, family-tagged (PRG-1 /
+    /// IRUMXD registry unification). `BotState` is the sole pool registry,
+    /// so the `PyO3` build adapters (`build_v2_pool` / `build_v3_pool` /
+    /// `build_aerodrome_v2_pool` / `build_balancer_*_pool`) consult this
+    /// pre-check INSTEAD of a Python-mirror registry: an address this core
+    /// already registered is answered by this reader — identity straight off
+    /// the registered entry — with no duplicate-handed builder replay and no
+    /// terminal `AlreadyRegistered` refusal.
+    ///
+    /// V4 pools are NOT address-keyed (one `PoolManager` hosts many pool ids,
+    /// keying is `(pool_manager, pool_id)`) and return `None` here; their
+    /// fast path is the existing `try_registered_v4`.
+    #[must_use]
+    pub fn registered_pool_by_address(
+        &self,
+        address: &Address,
+    ) -> Option<(u64, RegisteredPoolFamily)> {
+        let pool_id = self.pool_id_by_address(address)?;
+        let family = match self.pools.get(&pool_id)? {
+            PoolEntry::V2(..) => RegisteredPoolFamily::V2,
+            PoolEntry::V3(..) => RegisteredPoolFamily::V3,
+            PoolEntry::Curve(..) => RegisteredPoolFamily::Curve,
+            PoolEntry::BalancerWeighted(..) => RegisteredPoolFamily::BalancerWeighted,
+            PoolEntry::BalancerStable(..) => RegisteredPoolFamily::BalancerStable,
+            PoolEntry::AerodromeV2(..) => RegisteredPoolFamily::AerodromeV2,
+            // V4 is (PoolManager, pool_id)-keyed, never address-keyed.
+            PoolEntry::V4(..) => return None,
+        };
+        Some((pool_id, family))
     }
 
     /// Unregister a pool. ADR-007 U3.
@@ -4465,6 +4497,51 @@ mod tests {
             "re-register must allocate a fresh id (retired, not reused)",
         );
         assert_eq!(core.pool_count(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // PRG-1 / IRUMXD registry unification: BotState is the registry of record.
+    // `registered_pool_by_address` answers the PyO3 build adapters' pre-check
+    // with the family-tagged entry, so a duplicate build resolves to the
+    // registered handle instead of replaying the builder into an
+    // `AlreadyRegistered` refusal.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn registered_pool_by_address_answers_registered_families() {
+        let mut core = BotState::new();
+        let params = make_params(U112::from(1000), U112::from(2000));
+        let id = core
+            .register_v2_pool(&params)
+            .expect("test setup: V2 registration");
+
+        let (found_id, family) = core
+            .registered_pool_by_address(&make_pool_addr())
+            .expect("the registered V2 address answers");
+        assert_eq!(found_id, id);
+        assert_eq!(family, RegisteredPoolFamily::V2);
+    }
+
+    #[test]
+    fn registered_pool_by_address_is_none_for_unknown_and_v4() {
+        let mut core = BotState::new();
+        assert_eq!(
+            core.registered_pool_by_address(&Address::from([0x11u8; 20])),
+            None,
+            "an unregistered address answers None"
+        );
+
+        // V4 is (pool_manager, pool_id)-keyed — not address-keyed — so even a
+        // registered V4 pool must NOT answer here (its fast path is the
+        // `try_registered_v4` reader).
+        let v4_params = make_v4_params_in_spec();
+        core.register_v4_pool(&v4_params)
+            .expect("test setup: V4 registration");
+        assert_eq!(
+            core.registered_pool_by_address(&Address::from([0x22u8; 20])),
+            None,
+            "V4 pools do not answer the address-keyed reader"
+        );
     }
 
     #[test]

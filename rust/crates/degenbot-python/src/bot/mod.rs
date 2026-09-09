@@ -4,11 +4,11 @@
 //! relocates the other `bot` / `bot::pool` wrappers alongside.
 //! (ergo UG6FKN task WXHGOH.)
 
+pub mod build_flights;
 pub mod deployments;
 pub mod dex_identity;
 pub mod engine;
 pub mod pool;
-pub mod pool_build_claims;
 pub mod pump;
 pub mod py_bot_io;
 pub mod subscriber;
@@ -51,6 +51,7 @@ use crate::diagnostics::thread_registry::{
 };
 use degenbot_bot::bot_core::swap_simulation::{SwapOutcome, SwapRead, SwapRequest};
 use degenbot_bot::bot_core::PoolTickCoverage;
+use degenbot_bot::bot_core::RegisteredPoolFamily;
 use degenbot_bot::bot_core::{
     Bot, BotState, RegisterAerodromeV2PoolParams, RegisterBalancerStablePoolParams,
     RegisterBalancerWeightedPoolParams, RegisterCurvePoolParams, RegisterV2PoolParams,
@@ -153,6 +154,10 @@ pub struct PyBot {
     /// shares one frozen DB snapshot across `build_paths` (WAL MVCC).
     /// `close_snapshot_tx()` commits the tx at end of `build_paths`.
     db: parking_lot::Mutex<Option<Arc<degenbot_db::snapshot_db::SnapshotDb>>>,
+    /// PRG-1 / IRUMXD: the engine-internal single-flight build table —
+    /// claims collapsed into the Rust build path (was the `PoolBuildClaims`
+    /// FFI peer + the Python `(family, key)` claim driver).
+    flights: build_flights::BuildFlights,
 }
 
 /// Crate-internal Rust surface on `PyBot` (not Python-visible).
@@ -228,6 +233,182 @@ impl PyBot {
         self.db.lock().clone()
     }
 
+    // ===================== PRG-1 / IRUMXD build-flight seam ==================
+
+    /// Re-raise a single-flight peer's published failure: the exception value
+    /// the leader raised, converted back into a `PyErr` under the caller's
+    /// GIL token.
+    fn py_err_from_exc(py: Python<'_>, exc: Py<pyo3::exceptions::PyBaseException>) -> pyo3::PyErr {
+        pyo3::PyErr::from_value(exc.into_bound(py).into_any())
+    }
+
+    /// Run one pool build under the engine-internal single flight (PRG-1):
+    /// `precheck` answers from the `BotState` registry of record, `lead` runs
+    /// the full build choreography (fetch → register) exactly once under the
+    /// `(family, chain_id, key)` claim, and concurrent peers park GIL-free on
+    /// the claim and wake with the published result (id or failure).
+    ///
+    /// Publication is strictly after the leader's `BotState` insertion, so a
+    /// `Built` wake never precedes the registry. A lead whose claim window
+    /// closed before it subscribed loops back through `precheck`; past a
+    /// defensive retry bound the call falls through to an unclaimed build
+    /// (the terminal registration refuses duplicates exactly as the legacy
+    /// path did).
+    fn run_flight<T>(
+        &self,
+        py: Python<'_>,
+        key: &build_flights::FlightKey,
+        mut precheck: impl FnMut() -> Option<T>,
+        lead: impl FnOnce() -> PyResult<(u64, T)>,
+    ) -> PyResult<T> {
+        let mut iterations: u32 = 0;
+        loop {
+            if let Some(payload) = precheck() {
+                return Ok(payload);
+            }
+            match self.flights.enter(key) {
+                build_flights::FlightEnter::Lead(guard) => {
+                    let outcome = lead();
+                    match outcome {
+                        Ok((pool_id, payload)) => {
+                            guard.publish_built(pool_id);
+                            return Ok(payload);
+                        }
+                        Err(err) => {
+                            guard.publish_failed(py, &err);
+                            return Err(err);
+                        }
+                    }
+                }
+                build_flights::FlightEnter::Peer(slot) => {
+                    // Park GIL-free; `Built` re-answers through `precheck`, a
+                    // failure re-raises the leader's exact exception.
+                    if let build_flights::Parked::Failed(exc) = slot.wait(py) {
+                        return Err(Self::py_err_from_exc(py, exc));
+                    }
+                }
+            }
+            iterations += 1;
+            if iterations > 8 {
+                return lead().map(|(_, payload)| payload);
+            }
+        }
+    }
+
+    /// The address-keyed registry-of-record payload for a V2 build: identity
+    /// straight off the registered entry (parity with the builder's return
+    /// surface — token0/token1/address/variant — read from the SAME source).
+    fn registered_v2_payload(
+        &self,
+        py: Python<'_>,
+        addr: &Address,
+    ) -> Option<(u64, String, String, String, String)> {
+        self.with_state(py, |s| {
+            let (pool_id, RegisteredPoolFamily::V2) = s.registered_pool_by_address(addr)? else {
+                return None;
+            };
+            let ident = s.get_v2_identity(pool_id)?;
+            Some((
+                pool_id,
+                ident.token0.to_checksum(None),
+                ident.token1.to_checksum(None),
+                ident.address.to_checksum(None),
+                ident.variant.as_str().to_string(),
+            ))
+        })
+    }
+
+    /// The V3 twin of [`Self::registered_v2_payload`] — family string
+    /// resolved from the registered `factory` exactly as the builder's
+    /// return surface does.
+    fn registered_v3_payload(
+        &self,
+        py: Python<'_>,
+        addr: &Address,
+        chain_id: u64,
+    ) -> Option<(u64, String, String, String, String)> {
+        self.with_state(py, |s| {
+            let (pool_id, RegisteredPoolFamily::V3) = s.registered_pool_by_address(addr)? else {
+                return None;
+            };
+            let ident = s.get_v3_identity(pool_id)?;
+            let family = degenbot_uniswap::deployments::resolve_dex_name(chain_id, ident.factory)
+                .map_or_else(|| "uniswap-v3".to_string(), |d| d.as_str().to_string());
+            Some((
+                pool_id,
+                ident.token0.to_checksum(None),
+                ident.token1.to_checksum(None),
+                ident.address.to_checksum(None),
+                family,
+            ))
+        })
+    }
+
+    /// The id-only registry-of-record payload for the Aerodrome / Balancer
+    /// builds (their build adapters return just the pool id).
+    fn registered_family_pool_id(
+        &self,
+        py: Python<'_>,
+        addr: &Address,
+        want: RegisteredPoolFamily,
+    ) -> Option<u64> {
+        self.with_state(py, |s| {
+            let (pool_id, family) = s.registered_pool_by_address(addr)?;
+            (family == want).then_some(pool_id)
+        })
+    }
+
+    /// The V4 registry-of-record payload (`pool_manager`, `pool_id`)-keyed — the
+    /// already-registered fast path, EXTRACTED so the single-flight peer-wait
+    /// twin uses the same identity/fee/coverage surface as the original
+    /// inline block: identity from the core's immutable pool key,
+    /// protocol fee from the core's state machine, coverage as recorded.
+    #[expect(clippy::type_complexity)]
+    fn registered_v4_payload(
+        &self,
+        py: Python<'_>,
+        pm: Address,
+        pid: &[u8; 32],
+    ) -> Option<(
+        u64,
+        String,
+        String,
+        String,
+        String,
+        u32,
+        i32,
+        u16,
+        String,
+        u32,
+        u32,
+    )> {
+        let existing = self.with_state(py, |s| s.try_registered_v4(pm, pid))?;
+        let coverage_str = match existing.coverage {
+            degenbot_bot::bot_core::PoolTickCoverage::Tracked => "tracked",
+            degenbot_bot::bot_core::PoolTickCoverage::Sparse => "sparse",
+        };
+        let key = existing.pool_key;
+        // `lp_fee` = the static pool-key fee: dynamic-fee pools are
+        // admission-rejected and never registered, so they never reach this
+        // branch.
+        Some((
+            existing.pool_id,
+            coverage_str.to_string(),
+            key.currency0.to_checksum(None),
+            key.currency1.to_checksum(None),
+            pm.to_checksum(None),
+            key.fee,
+            key.tick_spacing,
+            // Derived mask — the driver's parity check compares it against
+            // the resolve_v4_identity mask, both derived from the same hook
+            // address.
+            degenbot_bot::bot_core::pool_builder::builder::derive_hook_flags(key.hooks),
+            format!("0x{}", alloy::hex::encode(pid)),
+            existing.protocol_fee,
+            key.fee,
+        ))
+    }
+
     /// ADR-006 D4 (T3): attach the pump lifecycle state owned by a
     /// `PyArbitrageEngine` constructed against this bot. Called from
     /// `PyArbitrageEngine::new` when `py_bot` is supplied. After this, the
@@ -264,6 +445,7 @@ impl PyBot {
             bot: Arc::new(Bot::new(chain_id)),
             pump: parking_lot::Mutex::new(None),
             db: parking_lot::Mutex::new(None),
+            flights: build_flights::BuildFlights::default(),
         }
     }
 
@@ -691,51 +873,72 @@ impl PyBot {
         address: &str,
         block: Option<u64>,
     ) -> PyResult<(u64, String, String, String, String)> {
-        use degenbot_bot::bot_core::pool_builder::builder;
-        use degenbot_core::runtime::get_runtime;
         let addr = parse_address(address)?;
-        let io = self.bot.construction_io_arc().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "build_v2_pool: no ConstructionIo attached (requires an alloy provider)",
-            )
-        })?;
         let chain_id = self.bot.chain_id();
-        let params = py
-            .detach(|| get_runtime().block_on(builder::build_v2(chain_id, addr, &io, block)))
-            .map_err(map_builder_err)?;
-        // TF7RZB-S1 (builder return surface): return the core-computed identity
-        // alongside the pool_id so a facade-free registration driver can consume
-        // token0/token1/address/family from the Rust builder instead of
-        // re-deriving them from the pool handle. `variant` is the `DexVariant`
-        // the builder resolved (kebab-case, e.g. "uniswap-v2").
-        let identity = (
-            params.token0.to_checksum(None),
-            params.token1.to_checksum(None),
-            params.address.to_checksum(None),
-            params.variant.as_str().to_string(),
+        // PRG-1 registry unification: the build (pre-check → build →
+        // publish) runs under the engine-internal single flight keyed by
+        // (V2, chain, address). The registry-of-record pre-check answers a
+        // registered address with its identity — no duplicate builder replay
+        // racing into an AlreadyRegistered refusal (the CXKACI race class).
+        let key = build_flights::FlightKey(
+            build_flights::flight_family::V2,
+            chain_id,
+            addr.to_checksum(None).to_lowercase(),
         );
-        // Incident 2026-08-20 #2: never hold the GIL while parked on the
-        // BotState write - the dispatch fan-out's per-candidate tasks hold
-        // the read end across provider fetches, and a parked GIL-writer
-        // freezes every GIL consumer (main asyncio, log drainer, gil-probe).
-        // Evidence: /tmp/degenbot-gil-deadlock-2026-08-20 (26 readers, state 0x1b).
-        let pool_id = self
-            .with_state_mut(py, |s| s.register_v2_pool(&params))
-            .map_err(map_register_v2_err)?;
-        // Telemetry: one Jaeger node per pool construction+registration
-        // (zero-duration span carrying the full identity — root span on the
-        // registration worker thread, batch-exported with startup).
-        let _reg = tracing::info_span!(
-            "degenbot.pool.register",
-            pool.version = "v2",
-            pool.address = %identity.2,
-            token0 = %identity.0,
-            token1 = %identity.1,
-            dex = %identity.3,
-            pool.id = pool_id,
+        self.run_flight(
+            py,
+            &key,
+            || self.registered_v2_payload(py, &addr),
+            || {
+                use degenbot_bot::bot_core::pool_builder::builder;
+                use degenbot_core::runtime::get_runtime;
+                let io = self.bot.construction_io_arc().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "build_v2_pool: no ConstructionIo attached (requires an alloy provider)",
+                    )
+                })?;
+                let params = py
+                    .detach(|| {
+                        get_runtime().block_on(builder::build_v2(chain_id, addr, &io, block))
+                    })
+                    .map_err(map_builder_err)?;
+                // TF7RZB-S1 (builder return surface): return the core-computed identity
+                // alongside the pool_id so a facade-free registration driver can consume
+                // token0/token1/address/family from the Rust builder instead of
+                // re-deriving them from the pool handle. `variant` is the `DexVariant`
+                // the builder resolved (kebab-case, e.g. "uniswap-v2").
+                let identity = (
+                    params.token0.to_checksum(None),
+                    params.token1.to_checksum(None),
+                    params.address.to_checksum(None),
+                    params.variant.as_str().to_string(),
+                );
+                // Incident 2026-08-20 #2: never hold the GIL while parked on the
+                // BotState write - the dispatch fan-out's per-candidate tasks hold
+                // the read end across provider fetches, and a parked GIL-writer
+                // freezes every GIL consumer (main asyncio, log drainer, gil-probe).
+                let pool_id = self
+                    .with_state_mut(py, |s| s.register_v2_pool(&params))
+                    .map_err(map_register_v2_err)?;
+                // Telemetry: one Jaeger node per pool construction+registration
+                // (zero-duration span carrying the full identity — root span on the
+                // registration worker thread, batch-exported with startup).
+                let _reg = tracing::info_span!(
+                    "degenbot.pool.register",
+                    pool.version = "v2",
+                    pool.address = %identity.2,
+                    token0 = %identity.0,
+                    token1 = %identity.1,
+                    dex = %identity.3,
+                    pool.id = pool_id,
+                )
+                .entered();
+                Ok((
+                    pool_id,
+                    (pool_id, identity.0, identity.1, identity.2, identity.3),
+                ))
+            },
         )
-        .entered();
-        Ok((pool_id, identity.0, identity.1, identity.2, identity.3))
     }
 
     /// Build + register an Aerodrome V2 pool through the Rust `PoolBuilder`
@@ -750,26 +953,40 @@ impl PyBot {
         address: &str,
         block: Option<u64>,
     ) -> PyResult<u64> {
-        use degenbot_bot::bot_core::pool_builder::builder;
-        use degenbot_core::runtime::get_runtime;
         let addr = parse_address(address)?;
-        let io = self.bot.construction_io_arc().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "build_aerodrome_v2_pool: no ConstructionIo attached (requires an alloy provider)",
-            )
-        })?;
         let chain_id = self.bot.chain_id();
-        let params = py
-            .detach(|| {
-                get_runtime().block_on(builder::build_aerodrome_v2(chain_id, addr, &io, block))
-            })
-            .map_err(map_builder_err)?;
-        // Incident 2026-08-20 #2: never hold the GIL while parked on the
-        // BotState write - the dispatch fan-out's per-candidate tasks hold
-        // the read end across provider fetches, and a parked GIL-writer
-        // freezes every GIL consumer (main asyncio, log drainer, gil-probe).
-        // Evidence: /tmp/degenbot-gil-deadlock-2026-08-20 (26 readers, state 0x1b).
-        Ok(self.with_state_mut(py, |s| s.register_aerodrome_pool(&params)))
+        // PRG-1 registry unification: single-flight + registry-of-record
+        // pre-check (see `build_v2_pool`).
+        let key = build_flights::FlightKey(
+            build_flights::flight_family::AERODROME,
+            chain_id,
+            addr.to_checksum(None).to_lowercase(),
+        );
+        self.run_flight(
+            py,
+            &key,
+            || self.registered_family_pool_id(py, &addr, RegisteredPoolFamily::AerodromeV2),
+            || {
+                use degenbot_bot::bot_core::pool_builder::builder;
+                use degenbot_core::runtime::get_runtime;
+                let io = self.bot.construction_io_arc().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "build_aerodrome_v2_pool: no ConstructionIo attached (requires an alloy provider)",
+                    )
+                })?;
+                let params = py
+                    .detach(|| {
+                        get_runtime().block_on(builder::build_aerodrome_v2(chain_id, addr, &io, block))
+                    })
+                    .map_err(map_builder_err)?;
+                // Incident 2026-08-20 #2: never hold the GIL while parked on the
+                // BotState write - the dispatch fan-out's per-candidate tasks hold
+                // the read end across provider fetches, and a parked GIL-writer
+                // freezes every GIL consumer (main asyncio, log drainer, gil-probe).
+                let pool_id = self.with_state_mut(py, |s| s.register_aerodrome_pool(&params));
+                Ok((pool_id, pool_id))
+            },
+        )
     }
 
     /// Build + register a Balancer V2 **weighted** pool through the Rust
@@ -786,28 +1003,41 @@ impl PyBot {
         vault: &str,
         block: Option<u64>,
     ) -> PyResult<u64> {
-        use degenbot_bot::bot_core::pool_builder::builder;
-        use degenbot_core::runtime::get_runtime;
         let addr = parse_address(address)?;
         let vault_addr = parse_address(vault)?;
-        let io = self.bot.construction_io_arc().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "build_balancer_weighted_pool: no ConstructionIo attached (requires an alloy provider)",
-            )
-        })?;
-        let params = py
-            .detach(|| {
-                get_runtime().block_on(builder::build_balancer_weighted(
-                    vault_addr, addr, &io, block,
-                ))
-            })
-            .map_err(map_builder_err)?;
-        // Incident 2026-08-20 #2: never hold the GIL while parked on the
-        // BotState write - the dispatch fan-out's per-candidate tasks hold
-        // the read end across provider fetches, and a parked GIL-writer
-        // freezes every GIL consumer (main asyncio, log drainer, gil-probe).
-        // Evidence: /tmp/degenbot-gil-deadlock-2026-08-20 (26 readers, state 0x1b).
-        Ok(self.with_state_mut(py, |s| s.register_balancer_weighted_pool(&params)))
+        // PRG-1 registry unification: single-flight + registry-of-record
+        // pre-check (see `build_v2_pool`).
+        let key = build_flights::FlightKey(
+            build_flights::flight_family::BALANCER_WEIGHTED,
+            self.bot.chain_id(),
+            addr.to_checksum(None).to_lowercase(),
+        );
+        self.run_flight(
+            py,
+            &key,
+            || self.registered_family_pool_id(py, &addr, RegisteredPoolFamily::BalancerWeighted),
+            || {
+                use degenbot_bot::bot_core::pool_builder::builder;
+                use degenbot_core::runtime::get_runtime;
+                let io = self.bot.construction_io_arc().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "build_balancer_weighted_pool: no ConstructionIo attached (requires an alloy provider)",
+                    )
+                })?;
+                let params = py
+                    .detach(|| {
+                        get_runtime().block_on(builder::build_balancer_weighted(
+                            vault_addr, addr, &io, block,
+                        ))
+                    })
+                    .map_err(map_builder_err)?;
+                // Incident 2026-08-20 #2: never hold the GIL while parked on the
+                // BotState write - see `build_v2_pool`.
+                let pool_id =
+                    self.with_state_mut(py, |s| s.register_balancer_weighted_pool(&params));
+                Ok((pool_id, pool_id))
+            },
+        )
     }
 
     /// Build + register a Balancer V2 **stable** pool through the Rust
@@ -828,32 +1058,45 @@ impl PyBot {
         block: Option<u64>,
         invariant_version: Option<u8>,
     ) -> PyResult<u64> {
-        use degenbot_bot::bot_core::pool_builder::builder;
-        use degenbot_core::runtime::get_runtime;
         let addr = parse_address(address)?;
         let vault_addr = parse_address(vault)?;
-        let io = self.bot.construction_io_arc().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "build_balancer_stable_pool: no ConstructionIo attached (requires an alloy provider)",
-            )
-        })?;
-        let params = py
-            .detach(|| {
-                get_runtime().block_on(builder::build_balancer_stable(
-                    vault_addr,
-                    addr,
-                    &io,
-                    block,
-                    invariant_version,
-                ))
-            })
-            .map_err(map_builder_err)?;
-        // Incident 2026-08-20 #2: never hold the GIL while parked on the
-        // BotState write - the dispatch fan-out's per-candidate tasks hold
-        // the read end across provider fetches, and a parked GIL-writer
-        // freezes every GIL consumer (main asyncio, log drainer, gil-probe).
-        // Evidence: /tmp/degenbot-gil-deadlock-2026-08-20 (26 readers, state 0x1b).
-        Ok(self.with_state_mut(py, |s| s.register_balancer_stable_pool(&params)))
+        // PRG-1 registry unification: single-flight + registry-of-record
+        // pre-check (see `build_v2_pool`).
+        let key = build_flights::FlightKey(
+            build_flights::flight_family::BALANCER_STABLE,
+            self.bot.chain_id(),
+            addr.to_checksum(None).to_lowercase(),
+        );
+        self.run_flight(
+            py,
+            &key,
+            || self.registered_family_pool_id(py, &addr, RegisteredPoolFamily::BalancerStable),
+            || {
+                use degenbot_bot::bot_core::pool_builder::builder;
+                use degenbot_core::runtime::get_runtime;
+                let io = self.bot.construction_io_arc().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "build_balancer_stable_pool: no ConstructionIo attached (requires an alloy provider)",
+                    )
+                })?;
+                let params = py
+                    .detach(|| {
+                        get_runtime().block_on(builder::build_balancer_stable(
+                            vault_addr,
+                            addr,
+                            &io,
+                            block,
+                            invariant_version,
+                        ))
+                    })
+                    .map_err(map_builder_err)?;
+                // Incident 2026-08-20 #2: never hold the GIL while parked on the
+                // BotState write - see `build_v2_pool`.
+                let pool_id =
+                    self.with_state_mut(py, |s| s.register_balancer_stable_pool(&params));
+                Ok((pool_id, pool_id))
+            },
+        )
     }
 
     /// Build + register a V3 pool through the Rust `PoolBuilder` (T4 / 4GQWZ4
@@ -875,84 +1118,97 @@ impl PyBot {
         tick_data_fetcher: Option<Bound<'_, PyAny>>,
         slot_layout: Option<&str>,
     ) -> PyResult<(u64, String, String, String, String)> {
-        use degenbot_bot::bot_core::pool_builder::builder;
-        use degenbot_core::runtime::get_runtime;
         let addr = parse_address(address)?;
-        let io = self.bot.construction_io_arc().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "build_v3_pool: no ConstructionIo attached (requires an alloy provider)",
-            )
-        })?;
         let chain_id = self.bot.chain_id();
-        let db_arc: Option<std::sync::Arc<degenbot_db::snapshot_db::SnapshotDb>> =
-            if db { self.db_handle() } else { None };
-        let db_ref: Option<&dyn degenbot_db::snapshot::TickMapDb> = db_arc
-            .as_deref()
-            .map(|d| d as &dyn degenbot_db::snapshot::TickMapDb);
-        let mut params = py
-            .detach(|| {
-                get_runtime().block_on(builder::build_v3(chain_id, addr, db_ref, &io, block))
-            })
-            .map_err(map_builder_err)?;
-        // ADR-005 sparse-map parity: `build_v3` registers a single tick word
-        // (Sparse). The core builder leaves the backfill fetcher `None`; the
-        // Python driver injects a `PyTickWordFetcher` wrapping the legacy
-        // web3-sync `tick_data_fetcher` here (GIL held) so swap-time
-        // boundary-detection can pull neighbouring words without re-entering
-        // the asyncio runtime (a Rust `block_on` fetcher would deadlock).
-        if let Some(fetcher) = tick_data_fetcher.filter(|f| !f.is_none()) {
-            params.fetcher = Some(crate::bot::pool::make_tick_fetcher(fetcher.unbind()));
-        }
-        // CL slot layout (VERIFY2 T4 / W32CAU): explicit override (the Python
-        // driver knows the pool class for non-JSON deployments) wins over the
-        // builder's deployment-table resolution.
-        match slot_layout {
-            None => {}
-            Some("pancakeswap") => {
-                params.slot_layout = degenbot_pools::v3_state::ClSlotLayout::PancakeV3;
-            }
-            Some("uniswap") => {
-                params.slot_layout = degenbot_pools::v3_state::ClSlotLayout::UniswapV3;
-            }
-            Some(other) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "build_v3_pool: slot_layout must be 'uniswap' or 'pancakeswap', got {other:?}"
-                )));
-            }
-        }
-        // TF7RZB-S1 (builder return surface): return the core-computed identity
-        // alongside the pool_id. V3 has no per-pool `DexVariant`; the family is
-        // resolved from the builder-verified `factory` via the Rust-owned
-        // `resolve_dex_name` (kebab-case, e.g. "uniswap"), falling back to the
-        // generic "uniswap-v3" when the factory is not a known deployment.
-        let family = degenbot_uniswap::deployments::resolve_dex_name(chain_id, params.factory)
-            .map_or_else(|| "uniswap-v3".to_string(), |d| d.as_str().to_string());
-        let identity = (
-            params.token0.to_checksum(None),
-            params.token1.to_checksum(None),
-            params.address.to_checksum(None),
-            family,
+        // PRG-1 registry unification: single-flight + registry-of-record
+        // pre-check (see `build_v2_pool`) — a registered V3 address answers
+        // with its identity instead of replaying the RPC tick-map assembly
+        // into an AlreadyRegistered refusal.
+        let key = build_flights::FlightKey(
+            build_flights::flight_family::V3,
+            chain_id,
+            addr.to_checksum(None).to_lowercase(),
         );
-        // Incident 2026-08-20 #2: never hold the GIL while parked on the
-        // BotState write - the dispatch fan-out's per-candidate tasks hold
-        // the read end across provider fetches, and a parked GIL-writer
-        // freezes every GIL consumer (main asyncio, log drainer, gil-probe).
-        // Evidence: /tmp/degenbot-gil-deadlock-2026-08-20 (26 readers, state 0x1b).
-        let pool_id = self
-            .with_state_mut(py, |s| s.register_v3_pool(&params))
-            .map_err(map_register_v3_err)?;
-        // Telemetry: see build_v2_pool — one Jaeger node per V3 registration.
-        let _reg = tracing::info_span!(
-            "degenbot.pool.register",
-            pool.version = "v3",
-            pool.address = %identity.2,
-            token0 = %identity.0,
-            token1 = %identity.1,
-            dex = %identity.3,
-            pool.id = pool_id,
+        self.run_flight(
+            py,
+            &key,
+            || self.registered_v3_payload(py, &addr, chain_id),
+            || {
+                use degenbot_bot::bot_core::pool_builder::builder;
+                use degenbot_core::runtime::get_runtime;
+                let io = self.bot.construction_io_arc().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "build_v3_pool: no ConstructionIo attached (requires an alloy provider)",
+                    )
+                })?;
+                let db_arc: Option<std::sync::Arc<degenbot_db::snapshot_db::SnapshotDb>> =
+                    if db { self.db_handle() } else { None };
+                let db_ref: Option<&dyn degenbot_db::snapshot::TickMapDb> = db_arc
+                    .as_deref()
+                    .map(|d| d as &dyn degenbot_db::snapshot::TickMapDb);
+                let mut params = py
+                    .detach(|| {
+                        get_runtime().block_on(builder::build_v3(chain_id, addr, db_ref, &io, block))
+                    })
+                    .map_err(map_builder_err)?;
+                // ADR-005 sparse-map parity: `build_v3` registers a single tick word
+                // (Sparse). The core builder leaves the backfill fetcher `None`; the
+                // Python driver injects a `PyTickWordFetcher` wrapping the legacy
+                // web3-sync `tick_data_fetcher` here (GIL held) so swap-time
+                // boundary-detection can pull neighbouring words without re-entering
+                // the asyncio runtime (a Rust `block_on` fetcher would deadlock).
+                if let Some(fetcher) = tick_data_fetcher.filter(|f| !f.is_none()) {
+                    params.fetcher = Some(crate::bot::pool::make_tick_fetcher(fetcher.unbind()));
+                }
+                // CL slot layout (VERIFY2 T4 / W32CAU): explicit override (the Python
+                // driver knows the pool class for non-JSON deployments) wins over the
+                // builder's deployment-table resolution.
+                match slot_layout {
+                    None => {}
+                    Some("pancakeswap") => {
+                        params.slot_layout = degenbot_pools::v3_state::ClSlotLayout::PancakeV3;
+                    }
+                    Some("uniswap") => {
+                        params.slot_layout = degenbot_pools::v3_state::ClSlotLayout::UniswapV3;
+                    }
+                    Some(other) => {
+                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                            "build_v3_pool: slot_layout must be 'uniswap' or 'pancakeswap', got {other:?}"
+                        )));
+                    }
+                }
+                // TF7RZB-S1 (builder return surface): return the core-computed identity
+                // alongside the pool_id. V3 has no per-pool `DexVariant`; the family is
+                // resolved from the builder-verified `factory` via the Rust-owned
+                // `resolve_dex_name` (kebab-case, e.g. "uniswap"), falling back to the
+                // generic "uniswap-v3" when the factory is not a known deployment.
+                let family = degenbot_uniswap::deployments::resolve_dex_name(chain_id, params.factory)
+                    .map_or_else(|| "uniswap-v3".to_string(), |d| d.as_str().to_string());
+                let identity = (
+                    params.token0.to_checksum(None),
+                    params.token1.to_checksum(None),
+                    params.address.to_checksum(None),
+                    family,
+                );
+                // Incident 2026-08-20 #2: never hold the GIL while parked on the
+                // BotState write - see `build_v2_pool`.
+                let pool_id = self
+                    .with_state_mut(py, |s| s.register_v3_pool(&params))
+                    .map_err(map_register_v3_err)?;
+                // Telemetry: see build_v2_pool — one Jaeger node per V3 registration.
+                let _reg = tracing::info_span!(
+                    "degenbot.pool.register",
+                    pool.version = "v3",
+                    pool.address = %identity.2,
+                    token0 = %identity.0,
+                    token1 = %identity.1,
+                    dex = %identity.3,
+                    pool.id = pool_id,
+                )
+                .entered();
+                Ok((pool_id, (pool_id, identity.0, identity.1, identity.2, identity.3)))
+            },
         )
-        .entered();
-        Ok((pool_id, identity.0, identity.1, identity.2, identity.3))
     }
 
     /// Build a V4 pool via the Rust `PoolBuilder` (T4 / 4GQWZ4), registered
@@ -1081,8 +1337,6 @@ impl PyBot {
         u32,
         u32,
     )> {
-        use degenbot_bot::bot_core::pool_builder::builder;
-        use degenbot_core::runtime::get_runtime;
         let pm = parse_address(pool_manager).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
                 "build_v4_pool: malformed pool_manager {pool_manager:?}: {e}"
@@ -1100,155 +1354,142 @@ impl PyBot {
             self.with_state_mut(py, |s| s.register_v4_state_view(pm, state_view));
         }
 
-        // ── Already-registered fast path (missed-WS-pong 2026-08-28) ──────────
-        // The per-block driver re-attempts build_managed_pool for V4 hops whose
-        // pools are ALREADY registered in the shared core (DB-snapshot seeds).
-        // The historical behavior re-ran the FULL builder (fresh slot0/liquidity
-        // RPC reads + tick-map assembly) and only failed at the terminal
-        // register_v4_pool with AlreadyRegistered — ~13k wasted builds per
-        // block; the RPC load + GIL/log flooding starved the WS keepalive and
-        // produced the "WS server missed a pong" teardown. Return the existing
-        // registration instead — identity from the core's immutable key,
-        // protocol_fee from the core's state machine, coverage as recorded —
-        // under ONE read guard and with NO RPC. `block`, `db`, and
-        // `tick_data_fetcher` are no-ops on this path: the core-tracked state
-        // is the freshest source, and the driver still runs the registration
-        // lifecycle (quarantine/verify/pin) off the returned handle as usual.
-        //
-        // hook_address is NOT re-resolved here: the Python driver resolves the
-        // identity (DB two-step, no RPC) before this call and passes the same
-        // immutable hook address the core registered with.
-        if let Some(existing) = self.with_state(py, |s| s.try_registered_v4(pm, &pool_id)) {
-            let coverage_str = match existing.coverage {
-                degenbot_bot::bot_core::PoolTickCoverage::Tracked => "tracked",
-                degenbot_bot::bot_core::PoolTickCoverage::Sparse => "sparse",
-            };
-            let key = existing.pool_key;
-            // `lp_fee` = the static pool-key fee: dynamic-fee pools are
-            // admission-rejected and never registered, so they never reach
-            // this branch.
-            return Ok((
-                existing.pool_id,
-                coverage_str.to_string(),
-                key.currency0.to_checksum(None),
-                key.currency1.to_checksum(None),
-                pm.to_checksum(None),
-                key.fee,
-                key.tick_spacing,
-                // Derived mask — the driver's parity check compares it against
-                // the resolve_v4_identity mask, both derived from the same
-                // hook address.
-                degenbot_bot::bot_core::pool_builder::builder::derive_hook_flags(key.hooks),
-                format!("0x{}", alloy::hex::encode(pool_id)),
-                existing.protocol_fee,
-                key.fee,
-            ));
-        }
-
-        let io = self.bot.construction_io_arc().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "build_v4_pool: no ConstructionIo attached (requires an alloy provider)",
-            )
-        })?;
-        let db_arc: Option<std::sync::Arc<degenbot_db::snapshot_db::SnapshotDb>> =
-            if db { self.db_handle() } else { None };
-        let db_ref: Option<&dyn degenbot_db::snapshot::TickMapDb> = db_arc
-            .as_deref()
-            .map(|d| d as &dyn degenbot_db::snapshot::TickMapDb);
-        let hook_addr = hook_address
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                parse_address(s).map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "build_v4_pool: malformed hook_address {s:?}: {e}"
-                    ))
-                })
-            })
-            .transpose()?
-            .unwrap_or_default();
-        let id = builder::V4PoolBuildIdentity {
-            pool_manager: pm,
-            state_view,
-            pool_id,
-            currency0: parse_address(currency0).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "build_v4_pool: malformed currency0 {currency0:?}: {e}"
-                ))
-            })?,
-            currency1: parse_address(currency1).map_err(|e| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "build_v4_pool: malformed currency1 {currency1:?}: {e}"
-                ))
-            })?,
-            fee,
-            tick_spacing,
-            hook_address: hook_addr,
-        };
-        // TF7RZB-S2 (builder return surface): capture the normalized identity
-        // tuple before `id` is moved into `build_v4`.
-        let identity_ret = (
-            id.currency0.to_checksum(None),
-            id.currency1.to_checksum(None),
-            id.pool_manager.to_checksum(None),
-            id.fee,
-            id.tick_spacing,
-            builder::derive_hook_flags(id.hook_address),
-            format!("0x{}", alloy::hex::encode(id.pool_id)),
+        // PRG-1 registry unification: the build (pre-check → build → publish)
+        // runs under the engine-internal single flight keyed by
+        // (V4, chain, pool_manager:pool_id). The registry-of-record pre-check
+        // returns the existing registration — identity from the core's
+        // immutable key, protocol_fee from the core's state machine, coverage
+        // as recorded — under ONE read guard and with NO RPC (the
+        // missed-WS-pong 2026-08-28 fast path, now shared by single-flight
+        // peers too). `block`, `db`, and `tick_data_fetcher` are no-ops on
+        // this path: the core-tracked state is the freshest source, and the
+        // driver still runs the registration lifecycle off the returned
+        // handle as usual. hook_address is NOT re-resolved here: the Python
+        // driver resolves the identity (DB two-step, no RPC) before this call
+        // and passes the same immutable hook address the core registered
+        // with.
+        let key = build_flights::FlightKey(
+            build_flights::flight_family::V4,
+            self.bot.chain_id(),
+            format!(
+                "{}:{}",
+                pm.to_checksum(None).to_lowercase(),
+                pool_id_hex.to_lowercase()
+            ),
         );
-        let result = py
-            .detach(|| get_runtime().block_on(builder::build_v4(id, db_ref, &io, block)))
-            .map_err(map_builder_err)?;
-        let mut params = result.params;
-        // CDJEPJ-1: lp_fee + protocol_fee come from the SAME head-stamped slot0
-        // read inside build_v4 (no second fetch_v4_slot0_liquidity each pool).
-        let lp_fee = result.lp_fee;
-        let protocol_fee = params.protocol_fee;
-        // Sparse-map parity (V4 twin of `build_v3_pool`): `build_v4` leaves the
-        // backfill fetcher `None`; inject the Python web3-sync fetcher here.
-        if let Some(fetcher) = tick_data_fetcher.filter(|f| !f.is_none()) {
-            params.fetcher = Some(crate::bot::pool::make_tick_fetcher(fetcher.unbind()));
-        }
-        let coverage = match params.coverage {
-            degenbot_bot::bot_core::PoolTickCoverage::Tracked => "tracked",
-            degenbot_bot::bot_core::PoolTickCoverage::Sparse => "sparse",
-        };
-        // Incident 2026-08-20 #2: never hold the GIL while parked on the
-        // BotState write - the dispatch fan-out's per-candidate tasks hold
-        // the read end across provider fetches, and a parked GIL-writer
-        // freezes every GIL consumer (main asyncio, log drainer, gil-probe).
-        // Evidence: /tmp/degenbot-gil-deadlock-2026-08-20 (26 readers, state 0x1b).
-        let pool_id = self
-            .with_state_mut(py, |s| s.register_v4_pool(&params))
-            .map_err(map_register_v4_err)?;
-        // Telemetry: see build_v2_pool — one Jaeger node per V4 registration
-        // (pool.manager is the PoolManager; pool.id is the 32-byte id).
-        let _reg = tracing::info_span!(
-            "degenbot.pool.register",
-            pool.version = "v4",
-            pool.manager = %identity_ret.2,
-            pool.id = %identity_ret.6,
-            fee = identity_ret.3,
-            tick_spacing = identity_ret.4,
+        self.run_flight(
+            py,
+            &key,
+            || self.registered_v4_payload(py, pm, &pool_id),
+            || {
+                use degenbot_bot::bot_core::pool_builder::builder;
+                use degenbot_core::runtime::get_runtime;
+                let io = self.bot.construction_io_arc().ok_or_else(|| {
+                    pyo3::exceptions::PyRuntimeError::new_err(
+                        "build_v4_pool: no ConstructionIo attached (requires an alloy provider)",
+                    )
+                })?;
+                let db_arc: Option<std::sync::Arc<degenbot_db::snapshot_db::SnapshotDb>> =
+                    if db { self.db_handle() } else { None };
+                let db_ref: Option<&dyn degenbot_db::snapshot::TickMapDb> = db_arc
+                    .as_deref()
+                    .map(|d| d as &dyn degenbot_db::snapshot::TickMapDb);
+                let hook_addr = hook_address
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        parse_address(s).map_err(|e| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "build_v4_pool: malformed hook_address {s:?}: {e}"
+                            ))
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                let id = builder::V4PoolBuildIdentity {
+                    pool_manager: pm,
+                    state_view,
+                    pool_id,
+                    currency0: parse_address(currency0).map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "build_v4_pool: malformed currency0 {currency0:?}: {e}"
+                        ))
+                    })?,
+                    currency1: parse_address(currency1).map_err(|e| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "build_v4_pool: malformed currency1 {currency1:?}: {e}"
+                        ))
+                    })?,
+                    fee,
+                    tick_spacing,
+                    hook_address: hook_addr,
+                };
+                // TF7RZB-S2 (builder return surface): capture the normalized identity
+                // tuple before `id` is moved into `build_v4`.
+                let identity_ret = (
+                    id.currency0.to_checksum(None),
+                    id.currency1.to_checksum(None),
+                    id.pool_manager.to_checksum(None),
+                    id.fee,
+                    id.tick_spacing,
+                    builder::derive_hook_flags(id.hook_address),
+                    format!("0x{}", alloy::hex::encode(id.pool_id)),
+                );
+                let result = py
+                    .detach(|| get_runtime().block_on(builder::build_v4(id, db_ref, &io, block)))
+                    .map_err(map_builder_err)?;
+                let mut params = result.params;
+                // CDJEPJ-1: lp_fee + protocol_fee come from the SAME head-stamped slot0
+                // read inside build_v4 (no second fetch_v4_slot0_liquidity each pool).
+                let lp_fee = result.lp_fee;
+                let protocol_fee = params.protocol_fee;
+                // Sparse-map parity (V4 twin of `build_v3_pool`): `build_v4` leaves the
+                // backfill fetcher `None`; inject the Python web3-sync fetcher here.
+                if let Some(fetcher) = tick_data_fetcher.filter(|f| !f.is_none()) {
+                    params.fetcher = Some(crate::bot::pool::make_tick_fetcher(fetcher.unbind()));
+                }
+                let coverage = match params.coverage {
+                    degenbot_bot::bot_core::PoolTickCoverage::Tracked => "tracked",
+                    degenbot_bot::bot_core::PoolTickCoverage::Sparse => "sparse",
+                };
+                // Incident 2026-08-20 #2: never hold the GIL while parked on the
+                // BotState write - see `build_v2_pool`.
+                let registered = self
+                    .with_state_mut(py, |s| s.register_v4_pool(&params))
+                    .map_err(map_register_v4_err)?;
+                // Telemetry: see build_v2_pool — one Jaeger node per V4 registration
+                // (pool.manager is the PoolManager; pool.id is the 32-byte id).
+                let _reg = tracing::info_span!(
+                    "degenbot.pool.register",
+                    pool.version = "v4",
+                    pool.manager = %identity_ret.2,
+                    pool.id = %identity_ret.6,
+                    fee = identity_ret.3,
+                    tick_spacing = identity_ret.4,
+                )
+                .entered();
+                // Return `(pool_id, coverage, identity..., protocol_fee, lp_fee)` so the
+                // Python driver can set the companion's `_sparse_liquidity_map` (from
+                // coverage), the normalized identity, and the fee overrides
+                // (protocol_fee/lp_fee from the builder's own slot0 read) in one return
+                // surface (TF7RZB-S2 / CDJEPJ-1).
+                Ok((
+                    registered,
+                    (
+                        registered,
+                        coverage.to_string(),
+                        identity_ret.0,
+                        identity_ret.1,
+                        identity_ret.2,
+                        identity_ret.3,
+                        identity_ret.4,
+                        identity_ret.5,
+                        identity_ret.6,
+                        protocol_fee,
+                        lp_fee,
+                    ),
+                ))
+            },
         )
-        .entered();
-        // Return `(pool_id, coverage, identity..., protocol_fee, lp_fee)` so the
-        // Python driver can set the companion's `_sparse_liquidity_map` (from
-        // coverage), the normalized identity, and the fee overrides
-        // (protocol_fee/lp_fee from the builder's own slot0 read) in one return
-        // surface (TF7RZB-S2 / CDJEPJ-1).
-        Ok((
-            pool_id,
-            coverage.to_string(),
-            identity_ret.0,
-            identity_ret.1,
-            identity_ret.2,
-            identity_ret.3,
-            identity_ret.4,
-            identity_ret.5,
-            identity_ret.6,
-            protocol_fee,
-            lp_fee,
-        ))
     }
 
     /// Prototype test-only V2 registration that bypasses CREATE2 verification.
@@ -2932,6 +3173,82 @@ pub(crate) fn journal_err_to_py(e: JournalError) -> PyErr {
 mod tests {
     #![expect(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
     use super::*;
+
+    /// PRG-1 / IRUMXD registry unification: `build_v2_pool` answers an
+    /// address that is already registered in `BotState` (the registry of
+    /// record) WITHOUT replaying the RPC choreography — proven by giving it
+    /// NO `ConstructionIo` at all: the legacy path raised
+    /// "no `ConstructionIo` attached" here; the pre-check answers identity
+    /// straight off the registered entry instead.
+    #[test]
+    fn build_v2_pool_answers_registered_address_from_the_registry_of_record() {
+        pyo3::Python::attach(|py| {
+            let bot = PyBot::new(1);
+            let addr = "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa";
+            let t0 = "0x1111111111111111111111111111111111111111";
+            let t1 = "0x2222222222222222222222222222222222222222";
+            let factory = "0x3333333333333333333333333333333333333333";
+            let r0 = pyo3::types::PyInt::new(py, 1000i64);
+            let r1 = pyo3::types::PyInt::new(py, 2000i64);
+            let pool_id = bot
+                .register_v2_pool(
+                    py,
+                    addr,
+                    t0,
+                    t1,
+                    r0.as_any(),
+                    r1.as_any(),
+                    997,
+                    1000,
+                    997,
+                    1000,
+                    factory,
+                    5,
+                    "uniswap-v2",
+                    false,
+                    None,
+                )
+                .expect("test setup: V2 registration");
+
+            // No ConstructionIo attached — the registry-of-record pre-check
+            // must answer before the io fetch.
+            let (pid, token0, token1, addr_ret, variant) = bot
+                .build_v2_pool(py, addr, Some(5))
+                .expect("registered address answers from the registry of record");
+            assert_eq!(pid, pool_id);
+            assert_eq!(token0.to_lowercase(), t0);
+            assert_eq!(token1.to_lowercase(), t1);
+            assert_eq!(addr_ret.to_lowercase(), addr.to_lowercase());
+            assert_eq!(variant, "uniswap-v2");
+
+            // And the single-flight twin: the peer path (claim window
+            // closed) re-answers through the same pre-check.
+            let (pid2, ..) = bot
+                .build_v2_pool(py, addr, None)
+                .expect("second build answers from the registry of record");
+            assert_eq!(
+                pid2, pool_id,
+                "same registered pool id — no duplicate build"
+            );
+        });
+    }
+
+    /// PRG-1: an UNREGISTERED address without an attached `ConstructionIo`
+    /// still raises the legacy `RuntimeError` (the pre-check only answers
+    /// registry hits; a fresh build still requires the choreography io).
+    #[test]
+    fn build_v2_pool_unregistered_address_requires_construction_io() {
+        pyo3::Python::attach(|py| {
+            let bot = PyBot::new(1);
+            let err = bot
+                .build_v2_pool(py, "0xbBbBbBbbBbbbBbbBbbBBbbbBbBbbBBBbbBBBbbbb", None)
+                .expect_err("no ConstructionIo attached");
+            assert!(
+                err.to_string().contains("no ConstructionIo attached"),
+                "legacy io requirement preserved for fresh builds: {err}"
+            );
+        });
+    }
 
     /// Lowercase hex encode (no `0x` prefix) — for `OfflineProvider` call keys.
     fn hex_encode(bytes: &[u8]) -> String {

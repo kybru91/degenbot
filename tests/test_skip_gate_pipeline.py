@@ -4,10 +4,17 @@ The memo short-circuit in `PathRegistrationPipeline._consume` must keep the
 summary counters byte-compatible with the first-attempt branches, so the
 `[build_paths] Progress` breakdown looks identical whether a rejection is
 seen live or replayed from the memo.
+
+The CXKACI concurrent-duplicate-build coordination that used to live in a
+Python claim driver (`_build_pool_claimed` over the `PoolBuildClaims` FFI
+peer) was DISSOLVED by the PRG-1 registry cutover (epic IRUMXD): the Rust
+build path itself single-flights duplicate builds and answers
+already-registered addresses from the registry of record (`BotState`). Its
+guarantees are enforced in Rust (`bot::build_flights` unit tests + the
+`build_v2_pool_ans*` registry-of-record FFI tests), not here.
 """
 
 import asyncio
-import time
 from types import SimpleNamespace
 
 import pytest
@@ -61,50 +68,6 @@ def test_memo_replay_plain_failure_is_not_admission() -> None:
 # becomes available milliseconds later. The build path must retry the whole
 # build (the retry hits the registry pre-check and returns the existing pool)
 # instead of losing the path AND fatally memoizing the pool.
-
-
-def test_concurrent_candidates_share_the_claims_leader_build() -> None:
-    """CXKACI: one leader builds; concurrent candidates await the claim."""
-
-    async def scenario(p: PathRegistrationPipeline) -> object:
-        attempts: list[int] = []
-
-        def build() -> object:
-            attempts.append(1)
-            # RPC-slow build (runs on the bounded executor thread): the
-            # concurrent candidate must park on the in-flight claim rather
-            # than close its claim window and rebuild.
-            time.sleep(0.05)
-            return "the-one-built-pool"
-
-        a, b = await asyncio.gather(
-            p._build_pool_claimed("v4", "hash-1", build),
-            p._build_pool_claimed("v4", "hash-1", build),
-        )
-        return a, b, len(attempts)
-
-    p = make_pipeline()
-    a, b, builds = asyncio.run(scenario(p))
-    assert builds == 1, "the first consumer builds; the second waits on the claim"
-    assert a == b == "the-one-built-pool"
-
-
-def test_claimed_build_failure_propagates_and_releases() -> None:
-    async def scenario(p: PathRegistrationPipeline) -> None:
-        def build() -> object:
-            raise PoolAlreadyRegisteredError("should not matter — leader failure")
-
-        await p._build_pool_claimed("v4", "hash-2", build)
-
-    p = make_pipeline()
-    with pytest.raises(PoolAlreadyRegisteredError):
-        asyncio.run(scenario(p))
-    # The claim is released after the failure: a fresh build claims anew.
-
-    def rebuild() -> object:
-        return "fresh"
-
-    assert asyncio.run(p._build_pool_claimed("v4", "hash-2", rebuild)) == "fresh"
 
 
 def test_exhausted_race_skip_does_not_memoize_fatal() -> None:

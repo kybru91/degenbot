@@ -28,6 +28,20 @@ pub enum PoolEntry {
     AerodromeV2(Box<(AerodromeV2PoolIdentity, AerodromeV2PoolState)>),
 }
 
+/// Family tag for the address-keyed registration readers (PRG-1 / IRUMXD
+/// registry unification): the reader returns which family owns an address so
+/// a `PyO3` build adapter can fast-path onto the registered entry of record
+/// (or see a foreign-family address and fall through to the real build).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisteredPoolFamily {
+    V2,
+    V3,
+    AerodromeV2,
+    BalancerWeighted,
+    BalancerStable,
+    Curve,
+}
+
 /// Per-variant projection methods for [`PoolEntry`] (ADR-014 D5).
 ///
 /// Each `vN()` / `vN_mut()` returns the `(identity, state)` pair when the
