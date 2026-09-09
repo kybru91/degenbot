@@ -16,6 +16,11 @@ PIDFILE="$LOGDIR/bot_run.pid"
 mkdir -p "$LOGDIR"
 
 # --------------------------------------------------------------------------
+# FLEET STANCE REQUIRED (PRG-5, epic IRUMXD): the registration crawl is
+# fleet-hosted only — this launcher exports DEGENBOT_FLEET=fleet below (see
+# that block for the retired DEGENBOT_REG_* knobs). A hand-run without it
+# dies at registration with "registration is fleet-hosted only".
+#
 # Conservative (HARD/LOUD) defaults now live in the CODE, not here (Z4KQXF).
 # Every invocation — run_bot.sh, a hand-run, a CI/harness — gets loud failure
 # by default; there is no liberal default posture anymore. Flags that follow
@@ -92,6 +97,16 @@ export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-0}"
 # settle tax. 15 ms cuts ~33 ms/block with no extra solve cycles observed.
 # Code default stays 50 ms; invalid/zero env values fall back to 50 ms.
 export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
+# Registration crawl hosting (PRG-5 hard cutover, epic IRUMXD): the crawl is
+# FLEET-HOSTED ONLY — the retired crawl shell (bounded producer/consumer
+# queue + offload executor) raises at pipeline construction under any other
+# stance ("registration is fleet-hosted only"). The stance holder is read at
+# FFI module init, so this env must be set before the interpreter starts
+# (which is exactly what this launcher does). Retired along with it:
+# DEGENBOT_REG_QUEUE_BOUND / DEGENBOT_REG_WORKERS now FAIL the config load
+# loudly if set (the DEGENBOT_SOLVE_EXECUTOR retirement precedent); the
+# intake sizing is fleet.pool_state_updater_slots (DEGENBOT_FLEET_POOL_STATE_UPDATER_SLOTS).
+export DEGENBOT_FLEET="${DEGENBOT_FLEET:-fleet}"
 # Typed-config parity (KAHU5W): every DEGENBOT_* env above still works
 # (12-factor parity) but each key also has a typed TOML path — these exports
 # map to telemetry.otel, solve.solve_inline_sim, simulation.sim_exit_on_fail,

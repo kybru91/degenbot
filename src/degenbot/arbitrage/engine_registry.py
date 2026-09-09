@@ -20,7 +20,6 @@ from typing import TYPE_CHECKING
 from degenbot import Bot, UniswapV2Pool
 from degenbot.aerodrome.pools import AerodromeV2Pool
 from degenbot.arbitrage import ArbitrageEngine
-from degenbot.arbitrage.verification_retry import retry_verification_call
 from degenbot.logging import logger as bot_logger
 
 # XEANMB: the `load_*_from_py` ingestion surface + `_v3_snapshot_to_py_dict`
@@ -421,10 +420,11 @@ class EngineRegistry:
         """Drive a V3 pool's core-owned verify lifecycle, BLOCKING (PRG-5).
 
         The seat-thread twin of the lifecycle inside :meth:`register_v3_pool`:
-        same core choreography, same retry contract
-        (:class:`VerificationRpcError` retried; :class:`VerificationMismatchError`
-        fatal), and the same snapshot seed block — only the park shape
-        differs (a fleet seat owns no asyncio loop).
+        same core choreography and the same snapshot seed block — only the
+        park shape differs (a fleet seat owns no asyncio loop). The retry
+        contract (VerificationRpcError retried; VerificationMismatchError
+        fatal) is applied by the CALLER — the unit wraps this with the
+        pipeline's policy (the registry has none).
 
         The loop-bound bookkeeping of :meth:`register_v3_pool` (the key cache
         + the asyncio in-flight claims, DMZ3DD) is NOT touched here — those
@@ -432,9 +432,7 @@ class EngineRegistry:
         crawl's own at-most-once verify lifecycle is the pipeline's
         thread-safe seat claims table.
         """
-        retry_verification_call(
-            self.retry_policy_obj,
-            self.engine.run_v3_registration_lifecycle_sync,
+        self.engine.run_v3_registration_lifecycle_sync(
             address,
             self._verify_snapshot_block,
         )
@@ -445,9 +443,7 @@ class EngineRegistry:
         pool_id_hex: str,
     ) -> None:
         """V4 seat-thread twin of :meth:`run_v3_verify_lifecycle_sync`."""
-        retry_verification_call(
-            self.retry_policy_obj,
-            self.engine.run_v4_registration_lifecycle_sync,
+        self.engine.run_v4_registration_lifecycle_sync(
             pool_manager,
             pool_id_hex,
             self._verify_snapshot_block,

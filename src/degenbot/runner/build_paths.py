@@ -26,6 +26,7 @@ from degenbot import Bot, UniswapV2Pool, UniswapV3Pool, UniswapV4Pool, get_check
 from degenbot.arbitrage.engine_registry import EngineRegistry
 from degenbot.arbitrage.verification_retry import (
     VerificationRetryPolicy,
+    retry_verification_call,
 )
 from degenbot.database.models.pools import (
     UniswapV2PoolTableBase,
@@ -55,6 +56,7 @@ from degenbot.uniswap.trackers import UniswapV3PoolTracker
 from degenbot.uniswap.v3_snapshot import UniswapV3LiquiditySnapshot
 from degenbot.uniswap.v4_liquidity_pool import NATIVE_CURRENCY_ADDRESS
 from degenbot.uniswap.v4_snapshot import UniswapV4LiquiditySnapshot
+from degenbot.utils.bytes import to_0x_hex
 
 # ──────────────────────────────────────────────────────────────────
 # Permutation filter helpers
@@ -603,13 +605,15 @@ class PathRegistrationPipeline:
                         lambda pool=pool, reg=reg: reg.run_v3_verify_lifecycle_sync(pool.address),
                     )
                 elif pt == "V4":
-                    from degenbot.utils.hex_conversions import to_0x_hex
-
                     self._verify_claims.run_exclusive(
                         f"v4:{to_0x_hex(pool.pool_id)}",
-                        lambda pool=pool, reg=reg: reg.run_v4_verify_lifecycle_sync(
-                            UNISWAP_V4_POOL_MANAGER_ADDRESS,
-                            to_0x_hex(pool.pool_id),
+                        lambda pool=pool, reg=reg, policy=self.retry_policy_obj: (
+                            retry_verification_call(
+                                policy,
+                                reg.run_v4_verify_lifecycle_sync,
+                                UNISWAP_V4_POOL_MANAGER_ADDRESS,
+                                to_0x_hex(pool.pool_id),
+                            )
                         ),
                     )
 
