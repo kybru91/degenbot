@@ -591,7 +591,7 @@ where
         .with(python_layer)
 }
 
-/// DEGENBOT_LOG_FMT: the stderr `fmt` layer copy of every record.
+/// `DEGENBOT_LOG_FMT`: the stderr `fmt` layer copy of every record.
 ///
 /// Default ON (the stderr mirror is handy for hand-runs that only capture
 /// stderr). Set `DEGENBOT_LOG_FMT=0` to route the fmt layer to `io::sink()`:

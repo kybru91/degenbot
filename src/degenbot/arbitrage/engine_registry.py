@@ -409,7 +409,7 @@ class EngineRegistry:
     def register_path(
         self,
         pools_and_zfos: Sequence[tuple[UniswapV2Pool | UniswapV3Pool | UniswapV4Pool, bool]],
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Register a path from concrete pool objects + per-hop directions.
 
         Each pool's engine key is resolved from this registry's key maps +
@@ -422,7 +422,10 @@ class EngineRegistry:
         stored copy).
 
         Returns:
-            The registered path's ``path_id``.
+            ``(path_id, created)`` — `created` is `False` when the engine's
+            own signature dedup answered with an existing `path_id` (PRG-4:
+            dedup is by construction core-side; the Python dedup set
+            retired).
 
         Raises:
             ValueError: If any pool in the path has not been registered with

@@ -85,7 +85,11 @@ impl PyArbitrageEngine {
     /// Each entry is (`hop_type_str`, `pool_key`, `zero_for_one`) where
     /// `hop_type_str` is "V2" or "V3".
     #[pyo3(signature = (pool_refs))]
-    fn register_path(&self, py: Python<'_>, pool_refs: &Bound<'_, PyList>) -> PyResult<u64> {
+    fn register_path(
+        &self,
+        py: Python<'_>,
+        pool_refs: &Bound<'_, PyList>,
+    ) -> PyResult<(u64, bool)> {
         let mut hops = Vec::with_capacity(pool_refs.len());
         for item in pool_refs.iter() {
             let tuple = item.cast::<pyo3::types::PyTuple>()?;
@@ -115,15 +119,29 @@ impl PyArbitrageEngine {
         // pump + asyncio loop keep making GIL progress while the main thread
         // awaits `engine.lock()`. `PoolHop` is `Send`; the error maps to a
         // `PyErr` OUTSIDE the closure (GIL-held).
-        let result = py.detach(move || engine.lock().register_path(hops));
-        let path_id = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+        //
+        // PRG-4: the refusal is TYPED — a full registry surfaces as the
+        // benign `PathRegistryFullError` stop; everything else stays a
+        // `ValueError` with the legacy message. The `created` flag derives
+        // from the path-count delta under the engine lock (dedup returns
+        // the existing id without growth), so the crawl keeps its
+        // new-vs-duplicate accounting without Python-side dedup state.
+        let (path_id, created) = py.detach(move || {
+            let mut engine = engine.lock();
+            let registered_before = engine.path_count();
+            let path_id = engine
+                .register_path(hops)
+                .map_err(map_path_registration_err)?;
+            let created = engine.path_count() != registered_before;
+            Ok::<(u64, bool), pyo3::PyErr>((path_id, created))
+        })?;
         // SZJUKL: no engine-side PoolStateSubscriber registration. The
         // retired `EngineSubscriber` adapter was only ever a liveness probe
         // (LXDY4C): touched-pool dirty tracking is BYPRODUCT of log
         // application (`Bot::dispatch_log` records the block's
         // `EpochDelta`, which `on_resolve` consumes). The dispatcher's
         // `Weak` fan-out now carries only Python's own subscribers.
-        Ok(path_id)
+        Ok((path_id, created))
     }
 
     /// Register a mixed arbitrage path and eagerly solve it.
@@ -137,7 +155,7 @@ impl PyArbitrageEngine {
         &self,
         py: Python<'_>,
         pool_refs: &Bound<'_, PyList>,
-    ) -> PyResult<u64> {
+    ) -> PyResult<(u64, bool)> {
         let mut hops = Vec::with_capacity(pool_refs.len());
         for item in pool_refs.iter() {
             let tuple = item.cast::<pyo3::types::PyTuple>()?;
@@ -166,10 +184,17 @@ impl PyArbitrageEngine {
         // `register_and_solve_path` (engine.lock() + core.read() + the single
         // eager `solve_path`). See `register_path`. `PoolHop` is `Send`; the
         // error maps to a `PyErr` OUTSIDE the closure.
-        let result = py.detach(move || engine.lock().register_and_solve_path(hops));
-        let path_id = result.map_err(pyo3::exceptions::PyValueError::new_err)?;
+        let (path_id, created) = py.detach(move || {
+            let mut engine = engine.lock();
+            let registered_before = engine.path_count();
+            let path_id = engine
+                .register_and_solve_path(hops)
+                .map_err(map_path_registration_err)?;
+            let created = engine.path_count() != registered_before;
+            Ok::<(u64, bool), pyo3::PyErr>((path_id, created))
+        })?;
         // No engine-side subscription — see `register_path` (SZJUKL).
-        Ok(path_id)
+        Ok((path_id, created))
     }
 
     /// Subscribe phase: open WS connections and observe until first complete block.
@@ -185,6 +210,25 @@ impl PyArbitrageEngine {
     /// authority for the gap between snapshot and WS start.
     ///
     /// Raises `RuntimeError` if the pump is already started or subscribed.
+    /// PRG-4 / IRUMXD: the registered-path cap owned by the engine path
+    /// registry. The Python driver sets it once at boot from the typed
+    /// config value; `None` = unlimited. `None` clears any set cap
+    /// (operator override).
+    #[pyo3(signature = (cap=None))]
+    fn set_path_cap(&self, cap: Option<u64>) {
+        self.engine
+            .lock()
+            .set_path_cap(cap.map(|c| usize::try_from(c).unwrap_or(usize::MAX)));
+    }
+
+    /// PRG-4: dedup hits counted engine-side — a duplicate registration
+    /// returns the existing id and never surfaces to the driver as a skip,
+    /// so the `dup` telemetry needs this witness.
+    #[getter]
+    fn path_dedups(&self) -> u64 {
+        self.engine.lock().path_dedups()
+    }
+
     #[expect(clippy::needless_pass_by_value)]
     #[pyo3(signature = (rpc_url))]
     fn subscribe(&self, py: Python<'_>, rpc_url: String) -> PyResult<u64> {
@@ -298,6 +342,25 @@ pub(crate) fn map_register_v3_err(err: degenbot_bot::bot_core::RegisterV3PoolErr
 /// The message text for the V4-specific variants is byte-for-byte unchanged
 /// from the legacy `Err(String)` formatting so `build_paths`'s classification
 /// (now `isinstance`, was substring) matches the same diagnostics.
+/// Map the typed path-registration refusal (PRG-4): a full registry is the
+/// benign `PathRegistryFullError` stop signal; every `Invalid` refusal
+/// keeps the legacy `ValueError` with its verbatim message.
+pub(crate) fn map_path_registration_err(
+    err: degenbot_bot::arb_engine::lifecycle::PathRegistrationError,
+) -> pyo3::PyErr {
+    match err {
+        degenbot_bot::arb_engine::lifecycle::PathRegistrationError::Invalid(msg) => {
+            pyo3::exceptions::PyValueError::new_err(msg)
+        }
+        degenbot_bot::arb_engine::lifecycle::PathRegistrationError::RegistryFull {
+            cap,
+            registered,
+        } => crate::bot::engine::PathRegistryFullError::new_err(format!(
+            "registered-path cap reached ({registered}/{cap}) — the crawl must stop discovery"
+        )),
+    }
+}
+
 pub(crate) fn map_register_v4_err(err: degenbot_bot::bot_core::RegisterV4PoolError) -> pyo3::PyErr {
     use crate::bot::engine::{PoolAlreadyRegisteredError, SpecViolationError};
     match err {

@@ -508,6 +508,125 @@ mod tests {
             .unwrap();
     }
 
+    use crate::arb_engine::lifecycle::PathRegistrationError;
+
+    /// PRG-4 / IRUMXD: the engine path registry owns the registered-path
+    /// cap. At the cap, a NEW path registration is refused with the typed
+    /// benign-stop refusal (`RegistryFull`) — no Python counters involve —
+    /// while a DUPLICATE registration still answers with the existing id
+    /// (dedup is by construction; the cap only gates growth).
+    #[test]
+    fn register_path_refuses_new_paths_at_the_cap() {
+        let mut engine = ArbitrageEngine::new();
+        let v2_addr = Address::from([0x11u8; 20]);
+        let v2_fwd =
+            engine.register_v2_pool(v2_addr, usdc(1_500_000), weth(800), GAMMA_03, FEE_DENOM_03);
+        let v2_addr2 = Address::from([0x12u8; 20]);
+        let v2_fwd2 = engine.register_v2_pool(
+            v2_addr2,
+            weth(1000),
+            usdc(2_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let v2_addr3 = Address::from([0x13u8; 20]);
+        let _v2_fwd3 = engine.register_v2_pool(
+            v2_addr3,
+            weth(3000),
+            usdc(3_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+
+        engine.set_path_cap(Some(1));
+
+        // Two-hop path (usdc→weth then weth→usdc), per the dedicated
+        // reversed-direction registration test above.
+        let hops = vec![
+            PoolHop {
+                pool_id: v2_fwd,
+                zero_for_one: true,
+            },
+            PoolHop {
+                pool_id: v2_fwd2,
+                zero_for_one: true,
+            },
+        ];
+        let id1 = engine
+            .register_path(hops.clone())
+            .expect("first registration fits the cap");
+
+        // A duplicate at-cap still answers (dedup precedes the cap check).
+        let dup = engine
+            .register_path(hops.clone())
+            .expect("dedup is not capped");
+        assert_eq!(dup, id1, "duplicate registration returns the existing id");
+
+        // A NEW path at the cap (same pools, reversed direction): the typed
+        // benign-stop refusal.
+        let hops2 = vec![
+            PoolHop {
+                pool_id: v2_fwd2,
+                zero_for_one: true,
+            },
+            PoolHop {
+                pool_id: v2_fwd,
+                zero_for_one: true,
+            },
+        ];
+        let err = engine
+            .register_path(hops2.clone())
+            .expect_err("cap reached");
+        assert_eq!(
+            err,
+            PathRegistrationError::RegistryFull {
+                cap: 1,
+                registered: 1
+            },
+            "the refusal carries cap + registered counts"
+        );
+
+        // Raising the cap admits the queued registration.
+        engine.set_path_cap(Some(2));
+        let id2 = engine
+            .register_path(hops2)
+            .expect("registry grown by the operator");
+        assert_ne!(id1, id2);
+    }
+
+    /// PRG-4: dedup hits are counted engine-side (the `dup` skip telemetry
+    /// no longer has a Python witness — the duplicate never crosses the FFI
+    /// as a skip).
+    #[test]
+    fn register_path_dedup_is_counted_for_the_skip_family() {
+        let mut engine = ArbitrageEngine::new();
+        let v2_addr = Address::from([0x11u8; 20]);
+        let v2_fwd =
+            engine.register_v2_pool(v2_addr, usdc(1_500_000), weth(800), GAMMA_03, FEE_DENOM_03);
+        let v2_addr2 = Address::from([0x12u8; 20]);
+        let v2_fwd2 = engine.register_v2_pool(
+            v2_addr2,
+            weth(1000),
+            usdc(2_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let hops = vec![
+            PoolHop {
+                pool_id: v2_fwd,
+                zero_for_one: true,
+            },
+            PoolHop {
+                pool_id: v2_fwd2,
+                zero_for_one: true,
+            },
+        ];
+        let _ = engine.register_path(hops.clone()).expect("first register");
+        assert_eq!(engine.path_dedups(), 0, "first registration is not a dedup");
+        let _ = engine.register_path(hops).expect("dedup hit");
+        assert_eq!(engine.path_dedups(), 1, "the duplicate was counted");
+    }
+
     /// FPGOYX: registering the same path (same pools + directions) twice
     /// must be idempotent — return the SAME `path_id`, not a new one.
     /// Unbounded registration growth (8.7k -> 107k in 25 min) caused OOM kills
@@ -3297,7 +3416,7 @@ mod tests {
             result.is_err(),
             "register_path must reject a pool_id not present in the BotState"
         );
-        let msg = result.unwrap_err();
+        let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains(&bogus_id.to_string()),
             "error must name the missing pool_id={bogus_id}, got: {msg}"

@@ -68,7 +68,7 @@ mod event_routing;
 mod fleet_sim_executor;
 mod fleet_solve_executor;
 pub mod inline_sim;
-mod lifecycle;
+pub mod lifecycle;
 pub mod path_info;
 mod path_lifecycle;
 pub mod sim_slots;
@@ -456,6 +456,14 @@ pub struct ArbitrageEngine {
     /// rebuilds) accumulated duplicate paths indefinitely — 8.7k → 107k in
     /// 25 min, causing OOM kills and multi-second CPU-bound solves (FPGOYX).
     path_signatures: HashMap<Vec<(u64, bool)>, u64>,
+    /// PRG-4 / IRUMXD: the registered-path capacity owned by the engine
+    /// path registry (was the Python `MAX_REGISTERED_PATHS` counter). `None`
+    /// = unlimited. Set via [`Self::set_path_cap`].
+    path_cap: Option<usize>,
+    /// PRG-4: dedup hits counted engine-side — the duplicate registration
+    /// never crosses the FFI, so the `dup` skip telemetry needs this
+    /// witness (feeds `degenbot.registration.skips{reason="dup"}`).
+    path_dedups: u64,
     /// Engine lifecycle phase (ZU7RAF — core-OWNED). Enforces ordering
     /// `Created → Subscribed → SnapshotLoaded → Backfilled → Resumed`.
     /// Previously the `AtomicU8` lived on the pyo3 `PumpState` wrapper;
@@ -600,6 +608,8 @@ impl ArbitrageEngine {
             pending_new_paths: HashSet::new(),
             next_path_id: 1, // path IDs start at 1
             path_signatures: HashMap::new(),
+            path_cap: None,
+            path_dedups: 0,
             path_description_cache: parking_lot::Mutex::new(HashMap::new()),
             resolved_update_snapshot: HashMap::new(),
             last_walk_sims: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),

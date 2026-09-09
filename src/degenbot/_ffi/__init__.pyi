@@ -1070,6 +1070,9 @@ class ArbitrageEngine:
     def v3_pool_count(self) -> int: ...
     def v4_pool_count(self) -> int: ...
     def path_count(self) -> int: ...
+    def set_path_cap(self, cap: int | None = None) -> None: ...
+    @property
+    def path_dedups(self) -> int: ...
     def sync_v3_pool_states(
         self,
         v3_sync_updates: list[tuple[str, int, int, int, dict[int, tuple[int, int]]]],
@@ -1153,8 +1156,8 @@ class ArbitrageEngine:
     ) -> Coroutine[Any, Any, None]: ...
 
     # ── Pool + path registration ──
-    def register_path(self, pool_refs: list[tuple[int, bool]]) -> int: ...
-    def register_and_solve_path(self, pool_refs: list[tuple[int, bool]]) -> int: ...
+    def register_path(self, pool_refs: list[tuple[int, bool]]) -> tuple[int, bool]: ...
+    def register_and_solve_path(self, pool_refs: list[tuple[int, bool]]) -> tuple[int, bool]: ...
 
     # ── Inline-sim hook (SIMPIPE2 T3/T4) ──
     # Install this session's sim config as the engine's InlineSimulator
@@ -1198,6 +1201,17 @@ class VerificationRpcError(RuntimeError):
     also not safe to silently skip (an unverifiable pool is no safer than a
     mismatched one), but a distinct type so the caller can choose
     retry/backoff vs abort. Subclasses ``RuntimeError``.
+    """
+
+class PathRegistryFullError(ValueError):
+    """The engine path registry is at its configured registered-path cap.
+
+    PRG-4: the cap lives in the Rust path registry; this refusal is a BENIGN
+    stop signal - the crawl catches it and stops discovery (it replaces the
+    Python ``DiscoveryCrawlComplete`` pre-count unwind raised from the Python
+    ``MAX_REGISTERED_PATHS`` counter). Deliberately NOT under
+    :class:`PoolRegistrationError` - a full registry is a state, not a
+    pool-admission refusal.
     """
 
 class PoolRegistrationError(ValueError):

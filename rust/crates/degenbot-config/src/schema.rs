@@ -141,6 +141,8 @@ crate::config_schema! {
             doc = "Prometheus scrape endpoint bind address (only active when otel is on).";
         jaeger_endpoint [string] = String::from("http://127.0.0.1:4318"), env = "DEGENBOT_JAEGER_ENDPOINT", def = "http://127.0.0.1:4318",
             doc = "OTLP endpoint used by the opt-in Jaeger E2E test.";
+        log_fmt_stderr [bool] = true, env = "DEGENBOT_LOG_FMT", def = "true",
+            doc = "Keep the stderr fmt-layer mirror of every record (including the Python logging bridge); 0 routes the fmt layer to the sink so a driver teeing both sinks records each line once.";
         jaeger_e2e [bool] = false, env = "DEGENBOT_JAEGER_E2E", def = "false",
             doc = "Gate for the network-accessible Jaeger E2E test (Jaeger must be reachable at jaeger_endpoint).";
     }

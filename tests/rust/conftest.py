@@ -84,5 +84,5 @@ def nxm2bf_v2_engine_and_path() -> tuple[ArbitrageEngine, int]:
     registry = EngineRegistry(bot=None, engine=ArbitrageEngine(py_bot=py_bot))
     registry.register_v2_pool(pool_a)
     registry.register_v2_pool(pool_b)
-    path_id = registry.register_path([(pool_a, True), (pool_b, False)])
+    path_id, _created = registry.register_path([(pool_a, True), (pool_b, False)])
     return registry.engine, path_id

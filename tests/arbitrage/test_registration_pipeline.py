@@ -300,7 +300,8 @@ def test_consume_offloads_pool_build_off_the_event_loop_thread() -> None:
         def register_v2_pool(self, pool: object) -> int:
             return 1
 
-        def register_path(self, path: object) -> None:
+        def register_path(self, path: object) -> tuple[int, bool]:
+            return (1, True)
             return None
 
     ctx = SimpleNamespace(
@@ -331,41 +332,38 @@ def test_consume_offloads_pool_build_off_the_event_loop_thread() -> None:
     )
 
 
-def test_path_cap_discards_candidates_without_build_work() -> None:
-    """Once path_count reaches MAX_REGISTERED_PATHS, _consume must discard
-    every further candidate BEFORE pool-build/registration work (the budget
-    exists to bound engine memory, so capped items must be nearly free) and
-    must count them as cap skips.
+def test_path_cap_refusal_unwinds_as_benign_stop() -> None:
+    """PRG-4: the registered-path budget lives in the ENGINE path registry —
+    a candidate at the cap is refused by the engine's typed refusal
+    (`PathRegistryFullError`), and `_consume` unwinds as the same benign
+    `DiscoveryCrawlComplete` stop the pipeline producer expects, counted as
+    a cap skip.
 
-    RED phase: no gate existed — build/register ran for every item.
-    GREEN: the capped item raises DiscoveryCrawlComplete (which un-winds the
-    pipeline producer in production) before any build/register work.
+    The old pre-count Python gate (before any build work) retired: the
+    engine's own dedup + registry-of-record answers make capped re-offers
+    cheap by construction.
     """
-    import threading
     from types import SimpleNamespace
 
     from degenbot.database.models.pools import UniswapV2PoolTableBase
-    from degenbot.runner.build_paths import (
-        MAX_REGISTERED_PATHS,
-        DiscoveryCrawlComplete,
-    )
+    from degenbot.exceptions import PathRegistryFullError
+    from degenbot.runner.build_paths import DiscoveryCrawlComplete
     from degenbot.runner.build_paths import PathRegistrationPipeline
 
-    work_calls: list[int] = []
-    registered_paths: list[object] = []
+    register_calls: list[object] = []
 
     class FakeBot:
         def build_pool(self, address: str, *, silent: bool = False, **kwargs: object):
-            work_calls.append(1)
             return SimpleNamespace(address=address)
 
     class FakeRegistry:
         def register_v2_pool(self, pool: object) -> int:
             return 1
 
-        def register_path(self, path: object) -> None:
-            registered_paths.append(path)
-            return None
+        def register_path(self, path: object) -> tuple[int, bool]:
+            register_calls.append(path)
+            msg = "registered-path cap reached (1/1) - the crawl must stop discovery"
+            raise PathRegistryFullError(msg)
 
     ctx = SimpleNamespace(
         bot=FakeBot(),
@@ -381,13 +379,9 @@ def test_path_cap_discards_candidates_without_build_work() -> None:
         engine_registry=FakeRegistry(),  # type: ignore[arg-type]
     )
 
-    # Simulate a full registry without doing real work.
-    pipe.path_count = MAX_REGISTERED_PATHS
-
     step = SimpleNamespace(type=UniswapV2PoolTableBase, address="0x" + "2" * 40)
     with pytest.raises(DiscoveryCrawlComplete):
         asyncio.run(pipe._consume([step], directions=[True]))
 
-    assert not work_calls, "capped candidate must not reach pool-build work"
-    assert not registered_paths, "capped candidate must not register"
+    assert len(register_calls) == 1, "the refusal came from the engine at path registration"
     assert pipe.cap_skip_count == 1, "the discard must be counted as a cap skip"

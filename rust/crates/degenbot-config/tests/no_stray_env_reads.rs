@@ -23,7 +23,14 @@ fn allowed() -> &'static BTreeMap<&'static str, &'static [&'static str]> {
         // key, and the legacy name is rejected by the loader.)
         m.insert(
             "crates/degenbot-python/src/python_log_layer.rs",
-            &["HOME", "RUST_LOG", "OTEL_EXPORTER_OTLP_ENDPOINT"][..],
+            &[
+                "HOME",
+                "RUST_LOG",
+                "OTEL_EXPORTER_OTLP_ENDPOINT",
+                // Logging-infra tooling signal (same class as RUST_LOG): the
+                // stderr fmt-layer mirror gate. Output plumbing, not config.
+                "DEGENBOT_LOG_FMT",
+            ][..],
         );
         // (2) Dev-test knobs in library code (offline tooling only).
         m.insert(

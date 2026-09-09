@@ -1003,7 +1003,7 @@ asyncio.run(registry.register_v3_pool(v3_pool))
 # ritual (subscribe, snapshot, verify config) and returns BEFORE resume();
 # after attaching the result consumer, `registry.engine.resume()` is the
 # single gate after which one result batch per block flows.
-path_id = registry.register_path(
+path_id, created = registry.register_path(
     pools_and_zfos=[(v2_pool, True), (v3_pool, False)],
 )
 # The registered path is inspectable immediately (a solved snapshot of its

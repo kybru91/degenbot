@@ -39,6 +39,7 @@ from degenbot.exceptions import (
     DirectionResolutionError,
     DynamicFeePoolRejectedError,
     HookedPoolRejectedError,
+    PathRegistryFullError,
     VerificationMismatchError,
     VerificationRpcError,
 )
@@ -58,7 +59,6 @@ from degenbot.uniswap.trackers import UniswapV3PoolTracker
 from degenbot.uniswap.v3_snapshot import UniswapV3LiquiditySnapshot
 from degenbot.uniswap.v4_liquidity_pool import NATIVE_CURRENCY_ADDRESS
 from degenbot.uniswap.v4_snapshot import UniswapV4LiquiditySnapshot
-from degenbot.utils.bytes import to_0x_hex
 
 # ──────────────────────────────────────────────────────────────────
 # Permutation filter helpers
@@ -407,7 +407,15 @@ class PathRegistrationPipeline:
         self.pool_types: list[type] = []
         self.pool_type_per_depth: list[set[type] | None] | None = None
 
-        # Summary counters + registered-path dedup set.
+        # PRG-4: the registered-path budget transfers to the engine path
+        # registry (MAX_REGISTERED_PATHS, 0 = uncapped). Counters keep the
+        # Progress summary; the dedup set and the pre-count cap gate retire.
+        # (Pipeline tests run with engine_registry=None.)
+        py_engine = getattr(self.engine_registry, "engine", None)
+        if py_engine is not None and hasattr(py_engine, "set_path_cap"):
+            py_engine.set_path_cap(MAX_REGISTERED_PATHS or None)
+
+        # Summary counters.
         self.path_count = 0
         self.cap_skip_count = 0
         self.skip_count = 0
@@ -419,7 +427,6 @@ class PathRegistrationPipeline:
         self.v4_hook_rejected = 0
         self.v4_dynamic_fee_rejected = 0
         self.other_exc_count = 0
-        self.registered_path_sigs: set[tuple[str | bool, ...]] = set()
         # INN6TK observability: reason-tagged skip breakdown + time-throttled
         # progress emission. The legacy `[build_paths] Progress` line only fires
         # when `path_count` crosses each 1000-boundary; a discovery-heavy crawl
@@ -606,27 +613,12 @@ class PathRegistrationPipeline:
         # path_count==1000 gate so a discovery-heavy skip-fest stays visible.
         self.emit_registration_progress()
 
-        # Registered-path budget (MAX_REGISTERED_PATHS): once reached, every
-        # further discovered candidate is discarded before any pool-build or
-        # RPC work so registration load cannot grow the engine's path universe
-        # past the bound. The gate sits here rather than on the dedup set size
-        # because path_count counts only paths that actually registered.
-        if MAX_REGISTERED_PATHS and self.path_count >= MAX_REGISTERED_PATHS:
-            self.skip_count += 1
-            self.cap_skip_count += 1
-            self._record_skip("path-cap")
-            if self.cap_skip_count == 1:
-                bot_logger.info(
-                    f"[build_paths] Path cap reached ({MAX_REGISTERED_PATHS} "
-                    "registered) — stopping discovery crawl"
-                )
-            # Unwind the whole pipeline: with the budget full, every further
-            # candidate is dead on arrival (~2400 discarded/sec observed),
-            # so continuing the crawl burns CPU purely to increment a counter
-            # while competing with the solve hot path. The pipeline treats any
-            # consume-exception as fatal (cancels producer + siblings);
-            # build_paths catches this sentinel and proceeds normally.
-            raise DiscoveryCrawlComplete
+        # PRG-4 / IRUMXD: the registered-path budget lives in the ENGINE path
+        # registry (set_path_cap at construction). A candidate that runs past
+        # the bound is refused with the typed PathRegistryFullError at path
+        # registration — caught below and unwound as the same benign
+        # DiscoveryCrawlComplete stop. No Python counter sits in front of the
+        # pool-build/RPC work; the engine's own dedup answers duplicates.
 
         steps = list(path_steps)
         pool_type_strs: list[str] = []
@@ -772,21 +764,22 @@ class PathRegistrationPipeline:
             self._record_skip("direction-mismatch")
             return
 
-        pool_sigs: list[str] = []
-        for p in pools:
-            if isinstance(p, UniswapV4Pool):
-                pool_sigs.append(to_0x_hex(p.pool_id))
-            else:
-                pool_sigs.append(p.address)
-        path_sig = tuple(v for pair in zip(pool_sigs, zfo_list, strict=True) for v in pair)
-        if path_sig in self.registered_path_sigs:
-            self.dup_count += 1
-            self._record_skip("dup")
-            return
-        self.registered_path_sigs.add(path_sig)
-
+        # PRG-4: the engine path registry dedups by construction (the Python
+        # registered_path_sigs set retired). `created` is False exactly when
+        # the core signature dedup answered, so the dup accounting stays
+        # identical without Python-side state.
         try:
-            self.engine_registry.register_path(list(zip(pools, zfo_list, strict=True)))
+            _path_id, created = self.engine_registry.register_path(
+                list(zip(pools, zfo_list, strict=True)),
+            )
+        except PathRegistryFullError:
+            # PRG-4: the cap refusal came from the ENGINE path registry — the
+            # benign stop, raised as the same unwrap sentinel as before.
+            self.skip_count += 1
+            self.cap_skip_count += 1
+            self._record_skip("path-cap")
+            bot_logger.info("[build_paths] Path cap reached — stopping discovery crawl")
+            raise DiscoveryCrawlComplete from None
         except Exception as exc:
             self.register_fail_count += 1
             self._record_skip(f"register-fail:{type(exc).__name__}")
@@ -794,7 +787,12 @@ class PathRegistrationPipeline:
                 bot_logger.warning(f"Path registration failed: {type(exc).__name__}: {exc}")
             return
 
-        self.path_count += 1
+        if created:
+            self.path_count += 1
+        else:
+            self.dup_count += 1
+            self._record_skip("dup")
+            return
         if self.path_count % 1000 == 0:
             bot_logger.info(
                 f"[build_paths] Progress: {self.path_count} paths registered, "

@@ -61,6 +61,7 @@ loggers, so the Python side is the **second gate**.
 | Silence third-party `alloy`/`tungstenite` entirely | `RUST_LOG=alloy=off,tungstenite=off` (or rely on the built-in `=warn` default) |
 | Get just `warn`/`error` (quietest useful run) | `RUST_LOG=warn` |
 | Disable ALL Rust core logs from the console | `RUST_LOG=off` |
+| Silence the Rust `fmt` stderr copy (single-tunnel logging) | `DEGENBOT_LOG_FMT=0` |
 
 `RUST_LOG` directives are comma-separated `target=level` pairs, applied
 most-specific-first. `level` is one of `trace`, `debug`, `info`, `warn`,
@@ -122,6 +123,18 @@ code, not by the tracing filter.
 | `DEGENBOT_DRAIN_DBG` | **OFF** | per-event debug-drain log for a specific pool address (opt-in) |
 | `DEGENBOT_TRACE_REGISTER_SEED` | **OFF** | registration-seed trace (opt-in) |
 | `DEGENBOT_PUMP_DEBOUNCE_MS` | 50 | publish-debounce window (ms) — last dirty log → settle decision. Invalid/zero/empty falls back to 50. Lower to cut the per-block settle tax (see S7 in `docs/telemetry-latency-playbook.md`); the 2026-09-04 A/B at 15 ms cut ~33 ms/block with no extra solve cycles |
+| `DEGENBOT_LOG_FMT` | ON | the stderr `fmt` layer copy of every Rust record. Set falsey (`0`/`off`/`""`) to write the fmt layer to a sink — a driver that tees BOTH stdout and stderr into one file (`run_bot.sh`) then records every degenbot line exactly once via the Python-forwarded copy (halves the run log; drops the ANSI-escaped fmt lines from the file). Set =1 to restore the stderr mirror |
+
+### INFO-only defaults (log-volume cut OPBD7L)
+
+The per-registration `[path] registered` event and the `[bundle] inline
+payload settle` event were demoted to `debug`: on a live run they produced
+~half of a 10 G `logs/bot_run.log` and duplicated detail that is already in
+OTel (the `degenbot.path.register` span / `degenbot.arb.merge` span events —
+the Jaeger record filter is uncapped) and in the Python `[sim]` summary.
+Re-enable a diagnosis with `RUST_LOG=info,degenbot_bot=debug` +
+`DEGENBOT_DEBUG=1`. `run_bot.sh` now defaults to INFO-only posture (see its
+header).
 
 `run_bot.sh` documents this set in its header. To run a long-lived soak that
 trades through the routine thin-margin/no-profit reverts (instead of trapping on

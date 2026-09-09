@@ -120,3 +120,15 @@ create_exception!(
     pyo3::exceptions::PyValueError,
     "The simulated swap crosses a pool whose amount-modifying hook may have invalidated the result; the attached amounts are the standard-math approximation."
 );
+
+// PRG-4 / IRUMXD: the registered-path cap refusal. A BENIGN stop signal, not
+// an error: the crawl catches it and stops discovery (it replaces the Python
+// DiscoveryCrawlComplete pre-count unwind). Deliberately NOT under
+// PoolRegistrationError — a full registry is a state, not a pool-admission
+// refusal.
+create_exception!(
+    degenbot._ffi,
+    PathRegistryFullError,
+    pyo3::exceptions::PyValueError,
+    "The engine path registry is at its configured registered-path cap. Benign stop: discovery must stop offering new candidate paths."
+);

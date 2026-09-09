@@ -1307,12 +1307,21 @@ class TestPathRegistrationPipeline:
     class _FakeReg:
         def __init__(self) -> None:
             self.register_path_calls = 0
+            # PRG-4: the engine dedups by construction — first registration
+            # of a signature is created, repeats answer the existing id.
+            self._seen: set[object] = set()
 
         def register_v2_pool(self, pool: object) -> None:
             pass
 
-        def register_path(self, zipped: object) -> None:
+        def register_path(self, zipped: object) -> tuple[int, bool]:
             self.register_path_calls += 1
+            # The producer hands a zip-iterator of (pool, zfo); the engine
+            # keys on pool identity — mirror that with the pool address.
+            signature = tuple((getattr(p, "address", None), z) for p, z in zipped)
+            created = signature not in self._seen
+            self._seen.add(signature)
+            return (self.register_path_calls, created)
 
     @dataclass
     class _Step:
@@ -1361,8 +1370,8 @@ class TestPathRegistrationPipeline:
         # One explicit path registered through the shared consume body.
         assert pipeline.path_count == 1
         assert reg.register_path_calls == 1
-        # Dedup set is populated so a repeat add is rejected as a duplicate.
-        assert len(pipeline.registered_path_sigs) == 1
+        # PRG-4: no Python dedup set — the engine signature dedup answers the
+        # repeat (asserted by test_enqueue_path_dedups_repeat).
 
     async def test_enqueue_path_dedups_repeat(self) -> None:
         pipeline, reg, t_base = self._make_pipeline()
@@ -1371,9 +1380,11 @@ class TestPathRegistrationPipeline:
         await pipeline.enqueue_path([step], directions=[True])
 
         # Second add of the identical (pools, directions) path is a duplicate,
-        # not a second registration.
+        # not a second registration — the ENGINE answers it (PRG-4: dedup is
+        # by construction core-side; the repeat FFI call returns the existing
+        # path_id with created=False).
         assert pipeline.path_count == 1
-        assert reg.register_path_calls == 1
+        assert reg.register_path_calls == 2
         assert pipeline.dup_count == 1
 
     async def test_trigger_discovery_bounded_feeds_shared_consume(self) -> None:

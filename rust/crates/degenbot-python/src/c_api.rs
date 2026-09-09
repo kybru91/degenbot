@@ -225,6 +225,14 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "SpecViolationError",
         m.py().get_type::<crate::bot::engine::SpecViolationError>(),
     )?;
+    // PRG-4 / IRUMXD: the registered-path cap refusal — a BENIGN stop signal
+    // the crawl catches instead of a Python counter unwind.
+    #[cfg(feature = "bot")]
+    m.add(
+        "PathRegistryFullError",
+        m.py()
+            .get_type::<crate::bot::engine::PathRegistryFullError>(),
+    )?;
 
     // Bot — Rust-owned state (feature = "bot")
     #[cfg(feature = "bot")]
