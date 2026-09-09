@@ -2135,6 +2135,7 @@ dependencies = [
  "degenbot-solvers",
  "degenbot-submission",
  "degenbot-uniswap",
+ "degenbot-workers",
  "hashbrown 0.17.1",
  "parking_lot",
  "revm",
@@ -2520,6 +2521,17 @@ dependencies = [
  "degenbot-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "degenbot-workers"
+version = "0.6.0-alpha.9"
+dependencies = [
+ "degenbot-config",
+ "degenbot-core",
+ "parking_lot",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

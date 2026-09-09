@@ -96,6 +96,21 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `DEGENBOT_SOLVER_WALK_MEMO_STATS` | `solve.solver_walk_memo_stats` | `bool` | `false` | Walk-memo recomposition census (`1` enables). |
 | `DEGENBOT_CL_PROJECTION_CACHE` | `solve.cl_projection_cache` | `bool` | `true` | CL projection memo cache; `0`/`off`/`false`/`disabled` disables. |
 | `DEGENBOT_LPT_PARTITION` | `solve.lpt_partition` | `bool` | `true` | K-slowest-path LPT partitioning of solve bins; `0`/`false`/`off` disables. |
+## `fleet`
+
+| Env var | TOML key | Type | Default | Description |
+| --- | --- | --- | --- | --- |
+| `DEGENBOT_FLEET` | `fleet.stance` | `FleetStance(Legacy|Fleet)` | `legacy` | Worker-fleet stance (ADR-042 Q6): `legacy` keeps the per-era mechanisms; `fleet` hosts Solver/SimDriver/Resolve/Merge on the role-switching fleet. Deleted at the hard cutover. |
+| `DEGENBOT_FLEET_QUOTA_CPUS` | `fleet.quota_cpus` | `Option<f64>` | `(unset; detected from the cgroup)` | Terminal override of the fractional cgroup CPU quota (cores) feeding the fleet budget sum check; unset detects from the cgroup (ADR-042 §5). |
+| `DEGENBOT_FLEET_RESERVE_CPUS` | `fleet.reserve_cpus` | `Option<usize>` | `(unset; default 1)` | Fleet-budget reserve share H (Python bridge, pump, OTel, async GC) in cores; overrides the fixed default 1 (design doc §5). |
+| `DEGENBOT_FLEET_SOLVER_CPUS` | `fleet.solver_cpus` | `Option<usize>` | `(unset; derived floor(Q)-H-A-R-M)` | Fleet Solver CPU share S in cores; terminal when set and it participates in the same startup sum check (default: floor(quota) − H − A − R − M; S < 2 fails the boot). |
+| `DEGENBOT_FLEET_SIM_SLOT_CAP` | `fleet.sim_slot_cap` | `Option<usize>` | `(unset; default 4)` | SimDriver slot cap (duty-counted; spendable from the fractional-quota remainder); default 4, today's SimSlots cap. |
+| `DEGENBOT_FLEET_CORDON_ENTER_EVENTS` | `fleet.cordon_enter_events` | `usize` | `2` | Throttle events within the enter window that cordon the fleet (design doc §6 enter trigger; Q5 amendment: runtime-tunable via the operator channel). |
+| `DEGENBOT_FLEET_CORDON_ENTER_WINDOW_MS` | `fleet.cordon_enter_window_ms` | `duration-ms (u64)` | `1000` | Rolling window (ms) for the throttle-event burst enter trigger. |
+| `DEGENBOT_FLEET_CORDON_DUTY_PERCENT` | `fleet.cordon_duty_percent` | `f64` | `2.0` | Throttled-time duty percent over the duty window that cordons the fleet (enter trigger; 2.0 = >2%). |
+| `DEGENBOT_FLEET_CORDON_DUTY_WINDOW_MS` | `fleet.cordon_duty_window_ms` | `duration-ms (u64)` | `5000` | Trailing window (ms) over which throttled-time duty is evaluated. |
+| `DEGENBOT_FLEET_CORDON_EXIT_CLEAN_MS` | `fleet.cordon_exit_clean_ms` | `duration-ms (u64)` | `10000` | Clean-window hysteresis (ms) required before cordon exits (design doc §6: 10 s of clean windows). |
+| `DEGENBOT_FLEET_CORDON_SIM_INTAKE_FLOOR` | `fleet.cordon_sim_intake_floor` | `Option<usize>` | `(unset; half the slot cap)` | SimDriver new-lease cap while cordoned; in-flight sims are never cancelled (default: half the slot cap). |
 ## `capture`
 
 | Env var | TOML key | Type | Default | Description |

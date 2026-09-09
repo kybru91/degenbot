@@ -62,7 +62,7 @@ pub mod schema_macro;
 
 pub use error::ConfigError;
 pub use loader::{BotConfigLoader, EnvVars, LoadedConfig, MapEnv, ProcessEnv, Source};
-pub use schema::{AnchorSweep, QuiesceMode, SolveExecutor};
+pub use schema::{AnchorSweep, FleetConfig, FleetStance, QuiesceMode, SolveExecutor};
 pub use schema::{BaseKind, BotConfig, KeyDecl, ValueKind, SCHEMA};
 
 /// Parse a boolean flag value using the bot-wide truthy/falsey word lists.

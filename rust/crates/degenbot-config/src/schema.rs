@@ -259,6 +259,31 @@ crate::config_schema! {
             doc = "K-slowest-path LPT partitioning of solve bins; `0`/`false`/`off` disables.";
     }
 
+    fleet FleetConfig {
+        stance [enum FleetStance Legacy Fleet] = FleetStance::Legacy, env = "DEGENBOT_FLEET", def = "legacy",
+            doc = "Worker-fleet stance (ADR-042 Q6): `legacy` keeps the per-era mechanisms; `fleet` hosts Solver/SimDriver/Resolve/Merge on the role-switching fleet. Deleted at the hard cutover.";
+        quota_cpus [opt f64] = None, env = "DEGENBOT_FLEET_QUOTA_CPUS", def = "(unset; detected from the cgroup)",
+            doc = "Terminal override of the fractional cgroup CPU quota (cores) feeding the fleet budget sum check; unset detects from the cgroup (ADR-042 §5).";
+        reserve_cpus [opt usize] = None, env = "DEGENBOT_FLEET_RESERVE_CPUS", def = "(unset; default 1)",
+            doc = "Fleet-budget reserve share H (Python bridge, pump, OTel, async GC) in cores; overrides the fixed default 1 (design doc §5).";
+        solver_cpus [opt usize] = None, env = "DEGENBOT_FLEET_SOLVER_CPUS", def = "(unset; derived floor(Q)-H-A-R-M)",
+            doc = "Fleet Solver CPU share S in cores; terminal when set and it participates in the same startup sum check (default: floor(quota) − H − A − R − M; S < 2 fails the boot).";
+        sim_slot_cap [opt usize] = None, env = "DEGENBOT_FLEET_SIM_SLOT_CAP", def = "(unset; default 4)",
+            doc = "SimDriver slot cap (duty-counted; spendable from the fractional-quota remainder); default 4, today's SimSlots cap.";
+        cordon_enter_events [usize] = 2, env = "DEGENBOT_FLEET_CORDON_ENTER_EVENTS", def = "2",
+            doc = "Throttle events within the enter window that cordon the fleet (design doc §6 enter trigger; Q5 amendment: runtime-tunable via the operator channel).";
+        cordon_enter_window_ms [ms] = 1000, env = "DEGENBOT_FLEET_CORDON_ENTER_WINDOW_MS", def = "1000",
+            doc = "Rolling window (ms) for the throttle-event burst enter trigger.";
+        cordon_duty_percent [f64] = 2.0, env = "DEGENBOT_FLEET_CORDON_DUTY_PERCENT", def = "2.0",
+            doc = "Throttled-time duty percent over the duty window that cordons the fleet (enter trigger; 2.0 = >2%).";
+        cordon_duty_window_ms [ms] = 5000, env = "DEGENBOT_FLEET_CORDON_DUTY_WINDOW_MS", def = "5000",
+            doc = "Trailing window (ms) over which throttled-time duty is evaluated.";
+        cordon_exit_clean_ms [ms] = 10000, env = "DEGENBOT_FLEET_CORDON_EXIT_CLEAN_MS", def = "10000",
+            doc = "Clean-window hysteresis (ms) required before cordon exits (design doc §6: 10 s of clean windows).";
+        cordon_sim_intake_floor [opt usize] = None, env = "DEGENBOT_FLEET_CORDON_SIM_INTAKE_FLOOR", def = "(unset; half the slot cap)",
+            doc = "SimDriver new-lease cap while cordoned; in-flight sims are never cancelled (default: half the slot cap).";
+    }
+
     capture CaptureConfig {
         gate_capture [bool] = false, env = "DEGENBOT_GATE_CAPTURE", def = "false",
             doc = "Gate degenerate-path capture (presence gates; loader parses a bool).";
@@ -377,5 +402,57 @@ mod tests {
                 k.toml_path
             );
         }
+    }
+
+    #[test]
+    fn fleet_section_declares_the_adr_042_keys() {
+        let want = [
+            ("fleet.quota_cpus", "DEGENBOT_FLEET_QUOTA_CPUS"),
+            ("fleet.stance", "DEGENBOT_FLEET"),
+            ("fleet.reserve_cpus", "DEGENBOT_FLEET_RESERVE_CPUS"),
+            ("fleet.solver_cpus", "DEGENBOT_FLEET_SOLVER_CPUS"),
+            ("fleet.sim_slot_cap", "DEGENBOT_FLEET_SIM_SLOT_CAP"),
+            (
+                "fleet.cordon_enter_events",
+                "DEGENBOT_FLEET_CORDON_ENTER_EVENTS",
+            ),
+            (
+                "fleet.cordon_enter_window_ms",
+                "DEGENBOT_FLEET_CORDON_ENTER_WINDOW_MS",
+            ),
+            (
+                "fleet.cordon_duty_percent",
+                "DEGENBOT_FLEET_CORDON_DUTY_PERCENT",
+            ),
+            (
+                "fleet.cordon_duty_window_ms",
+                "DEGENBOT_FLEET_CORDON_DUTY_WINDOW_MS",
+            ),
+            (
+                "fleet.cordon_exit_clean_ms",
+                "DEGENBOT_FLEET_CORDON_EXIT_CLEAN_MS",
+            ),
+            (
+                "fleet.cordon_sim_intake_floor",
+                "DEGENBOT_FLEET_CORDON_SIM_INTAKE_FLOOR",
+            ),
+        ];
+        for (toml_path, env) in want {
+            let key = SCHEMA.iter().find(|k| k.toml_path == toml_path);
+            assert!(
+                key.is_some(),
+                "schema key {toml_path} must be declared exactly once"
+            );
+            assert_eq!(key.map(|k| k.env), Some(env), "{toml_path} env drift");
+        }
+        // Stance default: legacy until cutover (ADR-042 Q6); the enum has
+        // exactly the two variants.
+        let stance = SCHEMA.iter().find(|k| k.toml_path == "fleet.stance");
+        assert!(stance.is_some(), "fleet.stance must be declared");
+        assert_eq!(stance.map(|k| k.default_repr), Some("legacy"));
+        assert_eq!(
+            stance.map(|k| k.kind.base),
+            Some(BaseKind::Enum("FleetStance", &["Legacy", "Fleet"]))
+        );
     }
 }
