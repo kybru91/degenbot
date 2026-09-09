@@ -136,6 +136,8 @@ stealing"). Re-pinning only occurs via T9 at an epoch boundary, e.g. on a
 quota change altering the pin count; pins release before slots re-lease, so
 an arena is never live across a role switch.
 
+**Elastic repinning (data-driven option, sign-off amendment):** v1 ships T9-only (epoch-boundary re-pin). If bin-makespan telemetry (section 7) shows systematic pinned-parked waste — slots pinned to bins that no longer earn their share — an elastic variant (quota-aware re-key at cycle boundaries) may be proposed as a follow-up amendment with its own sign-off; it must preserve release-before-re-lease so arenas never cross a role switch.
+
 ## 4. Priority and queue semantics
 
 - **sim > solve precedence.** A queued sim unit preempts *queue position*, not
@@ -209,6 +211,7 @@ Nominal ⇄ Cordoned
   window; or throttled-time duty > 2% over a trailing 5 s window. Entering is
   loud: posture transition span + counter increment (not a silent degrade).
 - **Exit:** 10 s of clean windows — hysteresis prevents flapping.
+- **Threshold tuning & runtime feedback (sign-off amendment 2026-09-09):** the enter triggers (event count/window, duty percent), exit window, and cordon effects (e.g. the sim-intake floor) are typed config keys at boot, runtime-adjustable via the operator channel, and calibrated from captured soak data; posture-transition metrics (enter/exit counts, cordoned dwell, intake suppression) are exported so thresholds are tuned against measurements rather than heuristics. This authority never touches share arithmetic (section 5).
 - **Cordon effects (v1):** (a) no *new* leases for cordon-deferrable roles —
   in v1 that set is empty among the four active roles, so the operative
   effects are (b) sim-slot *intake* throttled (new leases floored at half the
@@ -308,7 +311,7 @@ the table or the stub fails loudly.
 
 - **No auto-tuning of shares** at runtime: they are declared, logged, and
   overridden by config; re-derivation happens only on quota re-detection
-  (a posture/logged event), and cordon adjusts *intake*, not shares.
+  (a posture/logged event), and cordon adjusts *intake*, not shares. Posture *thresholds* are separately tunable (section 6, sign-off amendment) and never touch shares.
 - **No work-stealing revival**; the Tokio CPU/I-O split and RAYPAR T3 are
   retained and hosted, not replaced.
 - **No Python-visible fleet API.** The FFI surface is unchanged except for the

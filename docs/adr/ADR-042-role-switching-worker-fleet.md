@@ -109,7 +109,7 @@ consumers (sim slots, ambient I/O), whose measured duty is partial.
 `degenbot.cgroup.throttled` gets a consumer: on throttle onset the fleet
 cordons (no *new* leases for deferrable/background roles, sim-slot intake
 throttled), never sheds a running unit, never strands a result pipe, and
-hysteresis-exits after a clean window. Full policy in the design doc.
+hysteresis-exits after a clean window. Full policy in the design doc. **Threshold tuning (sign-off amendment 2026-09-09):** the enter/exit thresholds and hysteresis windows are typed config keys, runtime-adjustable through the operator channel, and calibrated from captured soak data — the posture feeds back into its own thresholds; share arithmetic (design doc section 5) is outside this authority.
 
 ### 5. RAYPAR T3 and the deadlock ledger carry over
 
@@ -159,8 +159,8 @@ the stranded-pipe tripwire. Never runtime-selectable.
 - **No new scheduling machinery beyond role dispatch.** No work-stealing
   re-introduction, no io_uring, no executor replace: the Tokio CPU/I-O split
   and RAYPAR T3 semantics are retained, hosted.
-- **No auto-tuning.** Budget shares are declared, logged, and overridden by
-  config; they are not heuristically re-derived at runtime.
+- **No auto-tuning of shares.** Budget shares are declared, logged, and overridden by
+  config; they are not heuristically re-derived at runtime. Posture *thresholds* are excluded from this per the sign-off amendment: they stay data-tunable (runtime adjustment via the operator channel + soak-capture feedback, design doc section 6) and never touch shares.
 - **No Python-visible fleet API.** The FFI surface is unchanged except for the
   sim-closure install and result delivery that already exist.
 - **No backwards-compatibility layer.** Legacy mechanisms are deleted at
