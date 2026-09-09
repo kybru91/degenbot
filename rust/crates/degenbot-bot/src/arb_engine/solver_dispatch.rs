@@ -1841,6 +1841,10 @@ impl ArbitrageEngine {
         hotpath::gauge!("resolve_paths_deferred").set(f64::from(
             u32::try_from(deferred_paths.len()).unwrap_or(u32::MAX),
         ));
+        // Dynamic-key gauge: the no-op `gauge!` discards its `$key` tokens, so
+        // this loop only compiles in instrumented builds (`reason` would be
+        // unused otherwise — zero-cost default builds are the design contract).
+        #[cfg(feature = "hotpath")]
         for (reason, count) in &invalid_reasons {
             hotpath::gauge!(format!("resolve_invalid_{reason}"))
                 .set(f64::from(u32::try_from(*count).unwrap_or(u32::MAX)));
