@@ -32,6 +32,7 @@ Closed set, one row per bucket (from `telemetry::error_kind` + reason):
 |---|---|---|
 | `solver_state_desync.missed_log` / `.unhandled_reorg` / `.storage_mutated` / `.unclassified` | `quarantine` (pool) | yes — containment must be re-declared, never assumed off |
 | `solver_state_desync.delivery_lag` | `event` (report-only per ADR-021 Part B) | yes |
+| `late_log` | `event` (path) — delivery-jitter lateness, see below | yes |
 | `sim_failure.pre_encode` | `quarantine` (path) | yes |
 | `sim_failure.revert_pool_state` | `event` (pool, escalate on tripwire corroboration) | yes |
 | `sim_failure.revert_economics` | `observe` (benign economics) | yes |
@@ -40,6 +41,34 @@ Closed set, one row per bucket (from `telemetry::error_kind` + reason):
 | `submit_failure` / `monitor_failure` | `event` | yes |
 | `verify_mismatch` | `quarantine` (deny admission) | yes |
 | `drain_stall` | `exit` | yes — `"event"` records + re-arms the watchdog (WARNING: continuing past a stalled drainer means pricing on a frozen clock; intended for bisecting only) |
+
+### The `late_log` bucket (HJ5HWF — late-log admission safety)
+
+A forward log that arrives **after its block's D1 tombstone** (the first
+successor log) is delivery-jitter lateness — the expected shape when a
+tightened settle window (the pump debounce, 50ms → 16ms) publishes a block
+before its final WS logs cross the quiesce edge, or when the WS feed delivers
+out of order. The state machine takes the **benign late-admit path**: the log
+is dropped **un-applied** (writers stay confined to the block's Streaming
+window — invariant I4), the delivery cutoff the tombstone set never moves
+(I7), and the pump **keeps running**.
+
+Lateness is never a fatal, tainted, or tripwire signal:
+
+- the raw rate lands in the dedicated metric family
+  `degenbot.late_log.admitted` (zero or near-zero on healthy feeds; a
+  sustained rate says the WS reordered, not that the state machine
+  misbehaved);
+- the deduped `late_log` `event` (one per 10 blocks per endpoint) names
+  the benign path explicitly in its message so a burst of drops under a new
+  settle window can never masquerade as a structural bug;
+- it is distinct from `degenbot.reorg.recovery_dropped`, which counts only
+  silent single-writer duplicates inside an authoritative catch-up's owned
+  range.
+
+The completeness verify at the tombstone/Published edge (the `ws_completeness`
+cross-check) remains the loud safety net for genuinely **dropped** WS logs —
+late-but-delivered logs are a disjoint, benign class.
 
 Undeclared buckets (new kinds from an upgrade before you override them) follow
 the conservative **degraded** floor and log a warning — they are never fatal

@@ -34,6 +34,12 @@ pub mod error_kind {
     pub const DRAIN_STALL: &str = "drain_stall";
     /// Drain channel closed: the background drainer task is dead.
     pub const DRAIN_DEAD: &str = "drain_dead";
+    /// Post-tombstone delivery jitter (HJ5HWF): a forward log arriving after
+    /// its block's D1 tombstone. Dropped un-applied via the benign late-admit
+    /// path — counted delivery noise, never a structural fault (the deduped
+    /// event exists so the raw rate stays visible; spikes = an out-of-order
+    /// WS feed, not a state-machine problem).
+    pub const LATE_LOG: &str = "late_log";
 }
 
 /// Closed REASON taxonomy for kinds that discriminate a sub-cause. Values

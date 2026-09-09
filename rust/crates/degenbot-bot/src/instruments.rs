@@ -93,6 +93,12 @@ pub struct PipelineInstruments {
     /// WAJEQP T-R1: log events discarded by the recovery-anchor rule
     /// (`DroppedRecovery`); spikes during reorg episodes.
     reorg_recovery_dropped: Counter<u64>,
+    /// HJ5HWF: forward logs admitted LATE — arrived after their block's D1
+    /// tombstone and dropped un-applied via the benign late-admit path (the
+    /// no-landmine ruling: counted delivery noise, never a fatal signal).
+    /// Distinct from `reorg_recovery_dropped`, which counts only single-
+    /// writer duplicates inside an authoritative catch-up's owned range.
+    late_log_admitted: Counter<u64>,
     /// Header-gap / settle backfills executed.
     backfills_executed: Counter<u64>,
     /// `pool_state_head - engine clock` divergence.
@@ -291,6 +297,12 @@ impl PipelineInstruments {
                 .u64_counter("degenbot.reorg.recovery_dropped")
                 .with_description(
                     "Log events discarded by the recovery-anchor rule (DroppedRecovery)",
+                )
+                .build(),
+            late_log_admitted: meter
+                .u64_counter("degenbot.late_log.admitted")
+                .with_description(
+                    "Forward logs dropped via the benign late-admit path (arrived after their block's D1 tombstone; HJ5HWF)",
                 )
                 .build(),
             logs_received: meter
@@ -594,6 +606,14 @@ impl PipelineInstruments {
     /// One log event discarded by the recovery-anchor rule — WAJEQP T-R1.
     pub fn count_reorg_recovery_dropped(&self) {
         self.reorg_recovery_dropped.add(1, &[]);
+    }
+
+    /// One forward log admitted LATE (past its block's D1 tombstone) and
+    /// dropped un-applied via the benign late-admit path — HJ5HWF. The
+    /// counted home for settle-window delivery jitter; a sustained rate
+    /// says the WS feed reordered, not that the state machine misbehaved.
+    pub fn count_late_log_admitted(&self) {
+        self.late_log_admitted.add(1, &[]);
     }
 
     /// One WS log event received by the pump (pre topic-filter).
@@ -926,6 +946,7 @@ mod kind_tests {
             error_kind::VERIFY_MISMATCH,
             error_kind::DRAIN_STALL,
             error_kind::DRAIN_DEAD,
+            error_kind::LATE_LOG,
         ];
         let unique: HashSet<&str> = kinds.iter().copied().collect();
         assert_eq!(unique.len(), kinds.len(), "duplicate failure kind");
@@ -961,6 +982,26 @@ mod kind_tests {
             !text.contains("header_to_solved"),
             "retired drain-era race family still present in exposition"
         );
+        drop(provider);
+    }
+
+    /// HJ5HWF: the benign late-admit counter renders through the Prometheus
+    /// exposition — every late forward dropped past its block's D1 tombstone
+    /// is counted here (never surfaced as a structural failure).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn late_log_admitted_counter_renders() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_late"));
+        instruments.count_late_log_admitted();
+        instruments.count_late_log_admitted();
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("degenbot_late_log_admitted_total"))
+            .expect("late_log.admitted family missing from exposition");
+        assert!(line.ends_with('2'), "{line} != 2");
         drop(provider);
     }
 

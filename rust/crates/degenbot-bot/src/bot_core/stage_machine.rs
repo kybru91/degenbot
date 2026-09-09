@@ -102,10 +102,17 @@ pub enum LogDecision {
     /// the window closed. Its block is the new head; the pump resumes
     /// forward tracking monotonically from there.
     CloseReorg { new_head: u64 },
-    /// A `removed: false` log on a tombstoned block, NOT in the reorg path —
-    /// unreliable WS (out-of-order / duplicated forward events). The pump
-    /// must shut down (ADR-008 D3).
-    PanicLateForward(u64),
+    /// A `removed: false` forward log for a block that is ALREADY
+    /// tombstoned (delivery jitter carried it past its quiesce/tombstone
+    /// edge) while NOT in the reorg path — the benign LATE-ADMIT class
+    /// (HJ5HWF no-landmine ruling). The pump drops it UN-applied, counts it
+    /// (`degenbot.late_log.admitted` + the deduped `late_log` failure-policy
+    /// bucket), and KEEPS RUNNING: post-tombstone lateness is counted
+    /// delivery noise, never a structural fault. The FSM mutates nothing
+    /// here (I4: writers stay Streaming-confined; I7: the cutoff never
+    /// regresses) — the tombstone already proved the block fully delivered,
+    /// and an out-of-order survivor cannot rewind or re-open it.
+    LateForward(u64),
 }
 
 use std::collections::{HashMap, HashSet};
@@ -427,7 +434,12 @@ impl StageMachine {
                     self.current_block = block;
                 }
             }
-            LogDecision::PanicLateForward(_) => {}
+            LogDecision::LateForward(_) => {
+                // Benign late admission (HJ5HWF): no FSM transition — the
+                // block is tombstoned and stays so; publication state,
+                // publish arm, and cutoff are all left untouched (I4/I5/I7).
+                // The pump owns the drop + count.
+            }
         }
         decision
     }
@@ -512,11 +524,13 @@ impl StageMachine {
     /// BQ7ZBC / DFQYM5 single-writer recovery discard. A stalled WS that
     /// recovers flushes buffered forward logs for blocks ≤ `recovery_anchor` —
     /// duplicates of state the authoritative catch-up already applied. These
-    /// are DROPPED (never reaching `observe_log`/`PanicLateForward`). Reorg
-    /// logs (`removed: true`) are NEVER dropped — they must reach the reorg
-    /// classifier to unwind the backfilled range. A forward ABOVE
-    /// `recovery_anchor` that is still stale remains a hard ADR-008 D3 fault
-    /// (only the pump's own single-writer range is benign).
+    /// are DROPPED (never reaching `observe_log`'s `LateForward` class).
+    /// Reorg logs (`removed: true`) are NEVER dropped — they must reach the
+    /// reorg classifier to unwind the backfilled range. A forward ABOVE
+    /// `recovery_anchor` that is still stale takes the same benign
+    /// `LateForward` drop as any other post-tombstone survivor (HJ5HWF:
+    /// lateness is never a fatal signal — only the pump's own single-writer
+    /// range is a silent duplicate).
     #[must_use]
     pub fn should_drop_recovered_forward(&self, log_block: u64, removed: bool) -> bool {
         let anchor_block = self.recovery_anchor.block();
@@ -883,7 +897,8 @@ mod block_clock_contract {
         assert_eq!(fsm.recovery_anchor, 205);
 
         // A recovered forward INSIDE the owned range is a benign duplicate:…
-        // dropped, not re-asserted (no BQ7ZBC / PanicLateForward fault).
+        // dropped, not re-asserted (no BQ7ZBC recover-forward re-assert; the
+        // recover flush never reaches the `LateForward` drop either).
         assert!(fsm.should_drop_recovered_forward(205, false));
         assert!(fsm.should_drop_recovered_forward(201, false));
         // A reorg log (removed:true) is NEVER dropped — it must unwind the
@@ -1062,9 +1077,12 @@ impl StageMachine {
         match self.open_block {
             Some(open) if block < open => {
                 // A forward log for a block older than the open block → the
-                // open block has moved past it; this is a late forward on a
-                // tombstoned block → unreliable WS → panic (ADR-008 D3).
-                LogDecision::PanicLateForward(block)
+                // open block has moved past it: a late forward on a
+                // tombstoned block. BENIGN under the HJ5HWF no-landmine
+                // ruling — the pump drops + counts it (the `LateForward`
+                // late-admit class); it must never mutate state or rewind
+                // the cursor here.
+                LogDecision::LateForward(block)
             }
             Some(open) if block == open => {
                 // Another log for the open block — keep arriving.
@@ -1421,11 +1439,15 @@ mod tests {
         assert_eq!(machine.state_of(100), Some(BlockState::Observed));
     }
 
-    /// A late `removed: false` log on a `Drained` block, outside a reorg, is
-    /// an unreliable-WS signal → `PanicLateForward` (ADR-008 D3). The pump
-    /// shuts down; the cursor never silently regresses.
+    /// A late `removed: false` log on a `Drained` block, outside a reorg,
+    /// takes the BENIGN late-admit class (HJ5HWF no-landmine ruling):
+    /// `LateForward` — never a fatal signal. The pinned invariants: the
+    /// cursor never silently regresses (I7), the block's tombstoned state is
+    /// untouched (I4: no re-entry into a writable state), and the publish
+    /// arm is neither armed nor consumed by the late arrival (I5: exactly
+    /// one publish per quiesce cycle, the late log is not a new quiesce).
     #[test]
-    fn late_forward_log_on_drained_block_panics() {
+    fn late_forward_log_on_drained_block_is_benign_late_admit() {
         let mut machine = StageMachine::new(0, 0);
         // Drive 100 to Drained the honest way.
         machine.observe_header(100);
@@ -1440,12 +1462,26 @@ mod tests {
         machine.advance_to_drained(101);
         assert_eq!(machine.cursor(), Some(101));
 
-        // A forward log for 100 now arrives — late forward on a Drained block.
+        // Arm a pending publish so we can pin that the late log leaves it
+        // untouched (I5).
+        machine.publish_pending = true;
+
+        // A forward log for 100 now arrives — late forward on a Drained
+        // block: benign late admission, NOT a fatal signal.
         assert_eq!(
             machine.observe_log(100, false),
-            LogDecision::PanicLateForward(100),
+            LogDecision::LateForward(100),
         );
         assert_eq!(machine.cursor(), Some(101), "cursor holds — no regression");
+        assert_eq!(
+            machine.state_of(100),
+            Some(BlockState::Drained),
+            "the tombstoned block stays tombstoned — late log cannot reopen it (I4)"
+        );
+        assert!(
+            machine.publish_pending,
+            "the late log must not arm or disarm the pending publish (I5)"
+        );
     }
 
     /// A `removed: true` log on a tombstoned block enters the reorg path; the
