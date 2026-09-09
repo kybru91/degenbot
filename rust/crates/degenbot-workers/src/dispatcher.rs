@@ -662,12 +662,22 @@ impl FleetHost {
         // 3. Solver queue intake: new pin claims, admission-capped by the
         //    Solver CPU share (a gated bin parks — §5 note). Only reached
         //    after the sim queue drained: sim-before-solve at lease time.
+        //    A unit whose key is HOT (pinned or in flight on its seat) is
+        //    skipped here — it is granted only via T6 onto its OWN seat by
+        //    the continuation lane; granting a hot key cold would seat one
+        //    bin on two workers (the pin IS the key, §3.4).
         let admission_cap = usize::try_from(self.budget.solver_cpus).unwrap_or(1);
         while self.count_leased_or_running(WorkerRole::Solver) < admission_cap {
             let Some(idle) = self.first_idle_slot() else {
                 break;
             };
-            let Some(unit) = self.take_from_role(WorkerRole::Solver) else {
+            let Some(pos) = self.first_cold_solver_pos() else {
+                break;
+            };
+            let Some(unit) = self
+                .role_queue_mut(WorkerRole::Solver)
+                .and_then(|q| q.remove(pos))
+            else {
                 break;
             };
             let key = unit.key;
@@ -706,6 +716,36 @@ impl FleetHost {
 
         self.export_gauges();
         grants
+    }
+
+    /// Position of the FIRST queued Solver unit whose key is COLD — not
+    /// pinned and not in flight on its seat. Hot-keyed units wait for their
+    /// own seat's T6 continuation (a hot key granted cold would seat one
+    /// bin on two workers, breaking the one-seat-per-bin contract).
+    fn first_cold_solver_pos(&self) -> Option<usize> {
+        self.role_queue(WorkerRole::Solver)?
+            .iter()
+            .position(|u| !self.solver_key_is_hot(u.key))
+    }
+
+    /// Whether a keyed Solver unit currently has a claimed seat — a live
+    /// pin ([`FleetHost::pin_slot`]) or an in-flight Leased/Running unit
+    /// carrying the same key.
+    fn solver_key_is_hot(&self, key: Option<PinKey>) -> bool {
+        let Some(key) = key else {
+            return false;
+        };
+        if self.pin_slot(key).is_some() {
+            return true;
+        }
+        self.slots.iter().any(|c| {
+            matches!(
+                c.state,
+                SlotState::Leased { role: WorkerRole::Solver, key: Some(k) }
+                | SlotState::Running { role: WorkerRole::Solver, key: Some(k) }
+                    if k == key
+            )
+        })
     }
 
     fn pin_queue_len(&self, key: PinKey) -> usize {

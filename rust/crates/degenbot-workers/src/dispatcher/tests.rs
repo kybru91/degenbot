@@ -115,6 +115,48 @@ fn merge_is_never_queued_and_declared_roles_are_gated() {
     }
 }
 
+/// RED→GREEN (BCA77G port): a keyed Solver unit whose pin is claimed
+/// (in-flight or running on its pinned seat) must WAIT for its own seat —
+/// the dispatch lanes must never grant a hot key as a new pin claim onto a
+/// second idle seat (the pin IS the key; a double grant breaks the
+/// one-seat-per-bin RAYPAR T3 contract).
+#[test]
+fn a_busy_pinned_key_never_grants_a_second_seat() {
+    let mut host = host();
+    // Claim the key-1 pin and leave it RUNNING (no T3 completion yet).
+    let solver_slot = first_idle_of(&host, WorkerRole::Solver);
+    host.lease_claim(solver_slot, WorkerRole::Solver, Some(1))
+        .expect("T1 claim");
+    host.start(solver_slot, &Unit::noop(1, WorkerRole::Solver, Some(1)))
+        .expect("T2");
+    // Queue: a continuation for the BUSY key 1, plus a new claim on a
+    // COLD key 2, plus another continuation for key 1 behind it.
+    host.enqueue(Unit::noop(10, WorkerRole::Solver, Some(1)))
+        .expect("continuation (busy key)");
+    host.enqueue(Unit::noop(11, WorkerRole::Solver, Some(2)))
+        .expect("cold-key claim");
+    host.enqueue(Unit::noop(12, WorkerRole::Solver, Some(1)))
+        .expect("second continuation (busy key)");
+    let grants = host.dispatch();
+    let solver_grants: Vec<_> = grants
+        .iter()
+        .filter(|(g, _)| g.kind != GrantKind::Sim)
+        .collect();
+    assert_eq!(
+        solver_grants.len(),
+        1,
+        "only the COLD key 2 may claim a seat while key 1 is hot: {solver_grants:?}"
+    );
+    assert_eq!(solver_grants[0].0.kind, GrantKind::NewPinClaim);
+    assert_ne!(
+        solver_grants[0].0.slot, solver_slot,
+        "the hot key's seat must not be touched"
+    );
+    // The busy key's units stay queued for their pin continuation (T6
+    // after T3), not dropped and not re-seated.
+    assert_eq!(host.queue_len(WorkerRole::Solver), 2);
+}
+
 #[test]
 fn queue_overflow_is_loud_and_counted_never_silent() {
     let mut host = host();

@@ -77,6 +77,20 @@ pub struct PosturePolicy {
 }
 
 impl PosturePolicy {
+    /// The design-doc §6 defaults (2 events / 1 s, >2% / 5 s, 10 s clean),
+    /// used when a host boots without a typed config (hermetic runs).
+    #[must_use]
+    pub const fn doc_defaults() -> Self {
+        Self {
+            enter_events: 2,
+            enter_window_ms: 1_000,
+            duty_percent: 2.0,
+            duty_window_ms: 5_000,
+            exit_clean_ms: 10_000,
+            sim_intake_floor_override: None,
+        }
+    }
+
     /// The typed-config projection — every threshold is a schema key.
     #[must_use]
     pub fn from_config(cfg: &FleetConfig) -> Self {
