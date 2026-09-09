@@ -287,6 +287,10 @@ pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
         // ADR-042 F4: the SimDriver seat pool shares the boot descriptor
         // (same quota + overrides + posture as the Solver-side host).
         crate::arb_engine::fleet_sim_executor::install_boot(boot);
+        // PRG-3: the registration intake station shares the same boot
+        // descriptor (duty-counted PoolStateUpdater slots, Deferrable
+        // cordon class).
+        crate::arb_engine::fleet_registration_executor::install_boot(boot);
     }
     STREAMING_DELIVERY_ENABLED.store(
         cfg.pump.streaming_delivery,

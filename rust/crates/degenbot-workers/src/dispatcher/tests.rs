@@ -83,6 +83,7 @@ fn boot_pins_exactly_one_merge_and_registers_the_census() {
         WorkerRole::SimDriver => budget.sim_slot_cap,
         WorkerRole::Resolve => usize::try_from(budget.resolve_cpus).unwrap_or(1),
         WorkerRole::Merge => usize::try_from(budget.merge_cpus).unwrap_or(1),
+        WorkerRole::PoolStateUpdater => budget.pool_state_updater_slots,
         _ => 0,
     };
     for role in V1_ACTIVE_ROLES {
@@ -403,4 +404,100 @@ fn the_stranded_pipe_trips_the_loud_abort_path() {
     host.shed(sim_slot).expect("T7");
     host.drain_done(sim_slot).expect("T8");
     assert_eq!(tripped.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_intake_station_is_booted_and_census_registered() {
+    let host = host();
+    let slots = host.budget().pool_state_updater_slots;
+    assert!(slots >= 1, "the station hosts at least one slot by default");
+    // The merge pin is still structurally the LAST slot.
+    let last = host.slot_states().last().expect("slots").1;
+    assert!(
+        matches!(
+            last,
+            SlotState::Pinned {
+                role: WorkerRole::Merge,
+                ..
+            }
+        ),
+        "merge pin is the last slot"
+    );
+    // Census row registered with the duty-counted budget.
+    let snap = degenbot_core::worker_census::snapshot();
+    let entry = snap
+        .iter()
+        .find(|e| e.resource == WorkerRole::PoolStateUpdater.census_resource())
+        .expect("census row for the intake station");
+    assert_eq!(entry.count, slots);
+    assert_eq!(
+        entry.thread_name,
+        WorkerRole::PoolStateUpdater.thread_name()
+    );
+}
+
+#[test]
+fn intake_units_admit_nominal_and_held_while_cordoned() {
+    let mut host = host();
+    host.enqueue(Unit::noop(1, WorkerRole::PoolStateUpdater, None))
+        .expect("nominal intake admits");
+
+    // Cordon onset (same trigger the sim fixture uses).
+    let change = host.observe_throttle(
+        0,
+        crate::posture::ThrottleSample {
+            events: 3,
+            throttled_usec: 0,
+            elapsed_usec: 100_000,
+        },
+    );
+    assert!(matches!(change, crate::posture::PostureChange::Entered(_)));
+    host.enqueue(Unit::noop(2, WorkerRole::PoolStateUpdater, None))
+        .expect_err("Deferrable intake is held while cordoned");
+}
+
+#[test]
+fn intake_grants_run_behind_solve_sim_and_resolve_precedence() {
+    let mut host = host();
+    // Queue one unit for EVERY grant-step role plus the station.
+    host.enqueue(Unit::noop(1, WorkerRole::SimDriver, None))
+        .expect("sim");
+    host.enqueue(Unit::noop(2, WorkerRole::Solver, Some(0x10)))
+        .expect("solver");
+    host.enqueue(Unit::noop(3, WorkerRole::Resolve, None))
+        .expect("resolve");
+    host.enqueue(Unit::noop(4, WorkerRole::PoolStateUpdater, None))
+        .expect("intake");
+    let grants = host.dispatch();
+    let kinds: Vec<GrantKind> = grants.iter().map(|(g, _)| g.kind).collect();
+    let poolupd_pos = kinds
+        .iter()
+        .position(|k| *k == GrantKind::PoolStateUpdate)
+        .expect("the intake unit was granted");
+    assert_eq!(
+        grants
+            .iter()
+            .filter(|(g, _)| g.kind == GrantKind::PoolStateUpdate)
+            .count(),
+        1,
+        "one intake grant for one queued unit"
+    );
+    // Every higher-precedence grant precedes the intake grant.
+    assert!(
+        kinds[..poolupd_pos]
+            .iter()
+            .all(|k| *k != GrantKind::PoolStateUpdate),
+        "intake grant is last"
+    );
+}
+
+#[test]
+fn the_intake_queue_is_bounded_per_role() {
+    let host = host();
+    let slots = host.budget().pool_state_updater_slots;
+    assert_eq!(
+        host.queue_cap(WorkerRole::PoolStateUpdater),
+        slots * 2,
+        "the per-role bound is 2x the slot cap (same rule as sim)"
+    );
 }

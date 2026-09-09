@@ -117,7 +117,7 @@ fn every_v1_active_role_walks_its_legal_transition_path() {
                     .expect("T6");
                 host.complete(slot).expect("T4 again");
             }
-            WorkerRole::SimDriver | WorkerRole::Resolve => {
+            WorkerRole::SimDriver | WorkerRole::Resolve | WorkerRole::PoolStateUpdater => {
                 let slot = first_idle_home_slot(&host, role);
                 host.lease_claim(slot, role, None).expect("T1");
                 host.start(slot, &Unit::noop(1, role, None)).expect("T2");
@@ -135,15 +135,20 @@ fn every_v1_active_role_walks_its_legal_transition_path() {
 }
 
 fn first_idle_home_slot(host: &FleetHost, role: WorkerRole) -> crate::dispatcher::SlotId {
-    // Boot layout: [solver pins][sim slots][resolve slots][merge].
+    // Boot layout: [solver pins][sim slots][resolve slots][poolupd slots][merge].
     let pins = host.budget().solver_pin_count;
     let sims = host.budget().sim_slot_cap;
     let resolves = usize::try_from(host.budget().resolve_cpus).unwrap_or(1);
+    let poolupd = host.budget().pool_state_updater_slots;
     let (start, end) = match role {
         WorkerRole::Solver => (0_usize, pins),
         WorkerRole::SimDriver => (pins, pins + sims),
         WorkerRole::Resolve => (pins + sims, pins + sims + resolves),
-        _ => (pins + sims + resolves, pins + sims + resolves + 1),
+        WorkerRole::PoolStateUpdater => (pins + sims + resolves, pins + sims + resolves + poolupd),
+        _ => (
+            pins + sims + resolves + poolupd,
+            pins + sims + resolves + poolupd + 1,
+        ),
     };
     for slot in start..end {
         if host.slot_state(u64::try_from(slot).unwrap_or(SlotId::MAX)) == Some(SlotState::Idle) {
@@ -497,11 +502,12 @@ fn per_role_busy_idle_gauges_exist_for_the_activation_dashboard() {
 }
 
 /// The declared-but-not-active roles gate loudly in dispatch (Known/planned
-/// gating: adding them later is an entry, not a redesign).
+/// gating: adding them later is an entry, not a redesign — PRG-3 hosted
+/// `PoolStateUpdater` exactly this way).
 #[test]
 fn declared_roles_gate_in_dispatch_until_their_migration_step() {
     let mut host = stub_host();
-    for role in ALL_ROLES.iter().skip(4) {
+    for role in ALL_ROLES.iter().skip(5) {
         let err = host
             .enqueue(Unit::noop(1, *role, None))
             .expect_err("declared roles do not queue yet");

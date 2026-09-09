@@ -270,6 +270,8 @@ crate::config_schema! {
             doc = "Fleet Solver CPU share S in cores; terminal when set and it participates in the same startup sum check (default: floor(quota) − H − A − R − M; S < 2 fails the boot).";
         sim_slot_cap [opt usize] = None, env = "DEGENBOT_FLEET_SIM_SLOT_CAP", def = "(unset; default 4)",
             doc = "SimDriver slot cap (duty-counted; spendable from the fractional-quota remainder); default 4, today's SimSlots cap.";
+        pool_state_updater_slots [opt usize] = None, env = "DEGENBOT_FLEET_POOL_STATE_UPDATER_SLOTS", def = "(unset; default 4)",
+            doc = "PoolStateUpdater slot cap (the registration intake station: duty-counted, spendable from the fractional-quota remainder, Deferrable cordon class); default 4.";
         cordon_enter_events [usize] = 2, env = "DEGENBOT_FLEET_CORDON_ENTER_EVENTS", def = "2",
             doc = "Throttle events within the enter window that cordon the fleet (design doc §6 enter trigger; Q5 amendment: runtime-tunable via the operator channel).";
         cordon_enter_window_ms [ms] = 1000, env = "DEGENBOT_FLEET_CORDON_ENTER_WINDOW_MS", def = "1000",

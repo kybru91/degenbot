@@ -158,6 +158,9 @@ pub enum GrantKind {
     Sim,
     /// A pooled resolve chunk (T1).
     Resolve,
+    /// A pooled registration-intake build unit (T1; Deferrable — a cordon
+    /// holds intake entirely, in-flight units finish).
+    PoolStateUpdate,
 }
 
 /// One dispatch grant (slot + unit id; the granted [`Unit`] travels
@@ -281,6 +284,16 @@ impl FleetHost {
                 arena: None,
             });
         }
+        // The registration intake station (PRG-3): duty-counted
+        // PoolStateUpdater slots, BEFORE the merge pin (the merge pin is
+        // structurally the LAST slot — merge_slot_id() indexes from the end).
+        for _ in 0..budget.pool_state_updater_slots {
+            slots.push(SlotCell {
+                home: WorkerRole::PoolStateUpdater,
+                state: SlotState::Idle,
+                arena: None,
+            });
+        }
         slots.push(SlotCell {
             home: WorkerRole::Merge,
             state: SlotState::Idle,
@@ -341,6 +354,7 @@ impl FleetHost {
             WorkerRole::SimDriver => self.budget.sim_slot_cap,
             WorkerRole::Resolve => usize::try_from(self.budget.resolve_cpus).unwrap_or(1),
             WorkerRole::Merge => usize::try_from(self.budget.merge_cpus).unwrap_or(1),
+            WorkerRole::PoolStateUpdater => self.budget.pool_state_updater_slots,
             _ => 0,
         }
     }
@@ -595,6 +609,7 @@ impl FleetHost {
             WorkerRole::Solver => self.budget.solver_pin_count * 2,
             WorkerRole::SimDriver => self.budget.sim_slot_cap * 2,
             WorkerRole::Resolve => usize::try_from(self.budget.resolve_cpus).unwrap_or(1) * 4,
+            WorkerRole::PoolStateUpdater => self.budget.pool_state_updater_slots * 2,
             _ => 0,
         }
     }
@@ -714,8 +729,46 @@ impl FleetHost {
             ));
         }
 
+        // 5. The registration intake station (PRG-3): strictly BEHIND
+        //    solve/sim/resolve precedence.
+        self.dispatch_pool_state_updates(&mut grants);
+
         self.export_gauges();
         grants
+    }
+
+    /// The registration intake station's grant step (PRG-3): `PoolStateUpdater`
+    /// grants run strictly BEHIND solve/sim/resolve precedence (the deferrable
+    /// role drains the leftovers). Cordon is enforced at ENQUEUE time —
+    /// Deferrable intake is held while cordoned, so this loop sees no queued
+    /// units then; in-flight units finish normally (never cancelled, §6).
+    fn dispatch_pool_state_updates(&mut self, grants: &mut Vec<(Grant, Unit)>) {
+        let poolupd_cap = self.budget.pool_state_updater_slots;
+        let mut poolupd_busy = self.count_leased_or_running(WorkerRole::PoolStateUpdater);
+        while poolupd_busy < poolupd_cap {
+            let Some(idle) = self.first_idle_slot() else {
+                break;
+            };
+            let Some(unit) = self.take_from_role(WorkerRole::PoolStateUpdater) else {
+                break;
+            };
+            if self
+                .lease(idle, WorkerRole::PoolStateUpdater, None)
+                .is_err()
+            {
+                self.return_unit(unit);
+                break;
+            }
+            grants.push((
+                Grant {
+                    slot: idle,
+                    unit: unit.id,
+                    kind: GrantKind::PoolStateUpdate,
+                },
+                unit,
+            ));
+            poolupd_busy += 1;
+        }
     }
 
     /// Position of the FIRST queued Solver unit whose key is COLD — not
@@ -851,7 +904,7 @@ impl FleetHost {
         let state = self.slot_state(slot).ok_or(HostError::UnknownSlot(slot))?;
         let to = match state {
             SlotState::Running {
-                role: WorkerRole::SimDriver | WorkerRole::Resolve,
+                role: WorkerRole::SimDriver | WorkerRole::Resolve | WorkerRole::PoolStateUpdater,
                 ..
             } => self.apply_transition(slot, Transition::CompleteToIdle)?,
             SlotState::Running {

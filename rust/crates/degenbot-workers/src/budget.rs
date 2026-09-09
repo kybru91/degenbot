@@ -40,6 +40,11 @@ pub const DEFAULT_RESERVE_CPUS: u64 = 1;
 pub const MIN_SOLVER_CPUS: u64 = 2;
 /// Today's `SimSlots` cap, preserved as the `SimDriver` slot cap (design doc §5).
 pub const DEFAULT_SIM_SLOT_CAP: usize = 4;
+/// The registration intake station's `PoolStateUpdater` slot cap (PRG-3,
+/// ADR-042 F2: the registration crawl's pool-build consumers hosted as
+/// keyed deferrable units). I/O-dominant by construction (RPC-bound
+/// builds), so the billing follows the `SimDriver` model exactly.
+pub const DEFAULT_POOL_STATE_UPDATER_SLOTS: usize = 4;
 
 /// Terminal, typed overrides (config/env) consumed by [`FleetBudget::derive`]
 /// — a configured value wins, is logged, and participates in the same sum
@@ -54,6 +59,8 @@ pub struct BudgetOverrides {
     pub solver_cpus: Option<u64>,
     /// `fleet.sim_slot_cap` — `SimDriver` slot count.
     pub sim_slot_cap: Option<usize>,
+    /// `fleet.pool_state_updater_slots` — `PoolStateUpdater` slot count.
+    pub pool_state_updater_slots: Option<usize>,
 }
 
 impl BudgetOverrides {
@@ -66,6 +73,7 @@ impl BudgetOverrides {
             ambient_io_workers: cfg.runtime.io_workers.and_then(|v| u64::try_from(v).ok()),
             solver_cpus: cfg.fleet.solver_cpus.and_then(|v| u64::try_from(v).ok()),
             sim_slot_cap: cfg.fleet.sim_slot_cap,
+            pool_state_updater_slots: cfg.fleet.pool_state_updater_slots,
         }
     }
 }
@@ -150,6 +158,10 @@ pub struct FleetBudget {
     /// `SimDriver` slots (duty-counted, spendable from the fractional
     /// remainder only), capped at today's `SimSlots` cap by default.
     pub sim_slot_cap: usize,
+    /// `PoolStateUpdater` slots (duty-counted, spendable from the
+    /// fractional remainder only) — the registration intake station's
+    /// bounded per-role unit pool. Behind Solver precedence at dispatch.
+    pub pool_state_updater_slots: usize,
     /// The fractional remainder `Q − Σ(shares)` — spendable ONLY by
     /// I/O-dominant consumers, enforced by construction: it is never
     /// included in the integer sum check.
@@ -300,6 +312,9 @@ fn derive_table(quota_cpus: f64, overrides: &BudgetOverrides) -> Result<FleetBud
     }
 
     let sim_slot_cap = overrides.sim_slot_cap.unwrap_or(DEFAULT_SIM_SLOT_CAP);
+    let pool_state_updater_slots = overrides
+        .pool_state_updater_slots
+        .unwrap_or(DEFAULT_POOL_STATE_UPDATER_SLOTS);
     let fractional_remainder = quota_cpus - (base + solver_cpus) as f64;
 
     Ok(FleetBudget {
@@ -319,6 +334,7 @@ fn derive_table(quota_cpus: f64, overrides: &BudgetOverrides) -> Result<FleetBud
             .saturating_sub(degenbot_core::cpu_budget::DEFAULT_SOLVE_HEADROOM)
             .max(1),
         sim_slot_cap,
+        pool_state_updater_slots,
         fractional_remainder,
     })
 }
@@ -431,6 +447,37 @@ mod tests {
         // Idempotent re-declaration under an unchanged quota.
         let same = big.resize(8.0, &overrides()).expect("8 again");
         assert!(!big.pins_require_rekey(&same));
+    }
+
+    #[test]
+    fn the_registration_intake_station_is_duty_counted_like_sim() {
+        // PoolStateUpdater slots default to the ADR-042 F2 station size and
+        // stay OUTSIDE the declared integer sum (I/O-dominant billing —
+        // exactly the SimDriver model).
+        let b = FleetBudget::derive(8.0, &overrides()).expect("hostable");
+        assert_eq!(b.pool_state_updater_slots, DEFAULT_POOL_STATE_UPDATER_SLOTS);
+        assert_eq!(b.declared_sum(), b.quota_floor);
+        // The terminal override wins (same terminal rule as the rest).
+        let b2 = FleetBudget::derive(
+            8.0,
+            &BudgetOverrides {
+                pool_state_updater_slots: Some(6),
+                ..overrides()
+            },
+        )
+        .expect("hostable");
+        assert_eq!(b2.pool_state_updater_slots, 6);
+        assert_eq!(b2.declared_sum(), b2.quota_floor);
+    }
+
+    #[test]
+    fn the_pool_state_updater_override_projects_from_the_typed_config() {
+        let mut cfg = degenbot_config::BotConfig::default();
+        cfg.fleet.pool_state_updater_slots = Some(6);
+        let o = BudgetOverrides::from_config(&cfg);
+        assert_eq!(o.pool_state_updater_slots, Some(6));
+        let b = FleetBudget::derive(8.0, &o).expect("hostable");
+        assert_eq!(b.pool_state_updater_slots, 6);
     }
 
     #[test]

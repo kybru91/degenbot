@@ -41,7 +41,8 @@ pub enum WorkerRole {
     /// land in a pipe somebody drinks from. Pinned (exactly one, T4).
     Merge,
     /// Pool-state update application (deferrable: sheds artifact-free).
-    /// Declared now, hosted after v1.
+    /// Hosted (PRG-3): the registration intake station — bounded per-role
+    /// unit pool of keyed build units, behind Solver precedence.
     PoolStateUpdater,
     /// Registration verify-lifecycle driver (deferrable). Declared now.
     Registrar,
@@ -67,12 +68,14 @@ pub const ALL_ROLES: [WorkerRole; 8] = [
 ];
 
 /// The v1-active prefix of [`ALL_ROLES`] (ADR-042 Q2: Solver, `SimDriver`,
-/// Resolve, Merge host slots today; the rest are declared gating only).
-pub const V1_ACTIVE_ROLES: [WorkerRole; 4] = [
+/// Resolve, Merge; PRG-3 adds `PoolStateUpdater` — the registration
+/// intake station. The rest are declared gating only).
+pub const V1_ACTIVE_ROLES: [WorkerRole; 5] = [
     WorkerRole::Solver,
     WorkerRole::SimDriver,
     WorkerRole::Resolve,
     WorkerRole::Merge,
+    WorkerRole::PoolStateUpdater,
 ];
 
 impl WorkerRole {
@@ -88,12 +91,13 @@ impl WorkerRole {
         }
     }
 
-    /// True for the four v1-active roles; false for declared-not-active.
+    /// True for the hosted roles (ADR-042 Q2 + PRG-3); false for
+    /// declared-not-active.
     #[must_use]
     pub const fn v1_active(self) -> bool {
         matches!(
             self,
-            Self::Solver | Self::SimDriver | Self::Resolve | Self::Merge
+            Self::Solver | Self::SimDriver | Self::Resolve | Self::Merge | Self::PoolStateUpdater
         )
     }
 
@@ -158,10 +162,11 @@ impl WorkerRole {
             Self::SimDriver => "slot cap = 4 (today's SimSlots cap), duty-counted; fractional-quota remainder spendable here",
             Self::Resolve => "fixed v1 (1 slot, 12.4 ms/cycle measured)",
             Self::Merge => "exactly one sidecar",
-            Self::PoolStateUpdater
-            | Self::Registrar
-            | Self::Verifier
-            | Self::Submitter => "declared, unhosted in v1",
+            Self::PoolStateUpdater => {
+                "slot cap = fleet.pool_state_updater_slots (default 4), duty-counted; \
+                 fractional-quota remainder spendable here; Deferrable cordon class"
+            }
+            Self::Registrar | Self::Verifier | Self::Submitter => "declared, unhosted in v1",
         }
     }
 
@@ -230,15 +235,17 @@ mod tests {
     }
 
     #[test]
-    fn v1_active_is_exactly_the_first_four() {
+    fn v1_active_is_exactly_the_hosted_prefix() {
+        // ADR-042 Q2 hosted the first four; PRG-3 hosts PoolStateUpdater
+        // (the registration intake station) as the fifth.
         for (i, role) in ALL_ROLES.iter().enumerate() {
             assert_eq!(
                 role.v1_active(),
-                i < 4,
+                i < V1_ACTIVE_ROLES.len(),
                 "v1-active must be exactly {V1_ACTIVE_ROLES:?}"
             );
         }
-        assert_eq!(V1_ACTIVE_ROLES, ALL_ROLES[..4]);
+        assert_eq!(V1_ACTIVE_ROLES, ALL_ROLES[..V1_ACTIVE_ROLES.len()]);
     }
 
     #[test]

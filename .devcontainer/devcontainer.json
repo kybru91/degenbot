@@ -271,6 +271,7 @@
         "ms-python.vscode-pylance",
         "pkief.material-icon-theme",
         "rust-lang.rust-analyzer",
+        "sandover.ergo-backlog",
         "tintinweb.vscode-vyper"
       ],
       "settings": {

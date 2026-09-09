@@ -237,6 +237,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Bot — Rust-owned state (feature = "bot")
     #[cfg(feature = "bot")]
     m.add_class::<crate::bot::PyBot>()?;
+    m.add_class::<crate::bot::intake::PyIntakeReceipt>()?;
     #[cfg(feature = "bot")]
     m.add_class::<crate::bot::pool::PyLiquidityPool>()?;
     #[cfg(feature = "bot")]

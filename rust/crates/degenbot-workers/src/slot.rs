@@ -222,7 +222,7 @@ pub fn transition(
         // in-flight unit finishes — nothing taken, slot returns to Idle.
         (
             SlotState::Running {
-                role: WorkerRole::SimDriver | WorkerRole::Resolve,
+                role: WorkerRole::SimDriver | WorkerRole::Resolve | WorkerRole::PoolStateUpdater,
                 ..
             },
             Transition::CompleteToIdle,
@@ -272,7 +272,11 @@ mod tests {
 
     #[test]
     fn t1_idle_leases_a_pooled_role() {
-        for role in [WorkerRole::SimDriver, WorkerRole::Resolve] {
+        for role in [
+            WorkerRole::SimDriver,
+            WorkerRole::Resolve,
+            WorkerRole::PoolStateUpdater,
+        ] {
             let to = transition(
                 SlotState::Idle,
                 Transition::Lease { role, key: None },
@@ -507,7 +511,11 @@ mod tests {
 
     #[test]
     fn t5_pooled_roles_return_to_idle() {
-        for role in [WorkerRole::SimDriver, WorkerRole::Resolve] {
+        for role in [
+            WorkerRole::SimDriver,
+            WorkerRole::Resolve,
+            WorkerRole::PoolStateUpdater,
+        ] {
             let idle = transition(
                 SlotState::Running { role, key: None },
                 Transition::CompleteToIdle,

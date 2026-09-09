@@ -8,6 +8,7 @@ pub mod build_flights;
 pub mod deployments;
 pub mod dex_identity;
 pub mod engine;
+pub mod intake;
 pub mod pool;
 pub mod pump;
 pub mod py_bot_io;
@@ -492,6 +493,28 @@ impl PyBot {
             db: parking_lot::Mutex::new(None),
             flights: build_flights::BuildFlights::default(),
         }
+    }
+
+    /// PRG-3: whether the fleet hosts the registration intake (the
+    /// `fleet.stance=fleet` migration stance installed this process's
+    /// intake boot descriptor at engine construction). The Python driver
+    /// reads this ONCE at pipeline construction (stance like the executor
+    /// field — never re-read on the hot path).
+    pub fn registration_fleet_hosted(&self) -> bool {
+        degenbot_bot::arb_engine::fleet_registration_executor::boot_installed()
+    }
+
+    /// PRG-3: submit one intake unit (a pool-build callable) to the fleet
+    /// intake executor. Returns a receipt whose `.wait()` joins the unit.
+    /// Refuses loudly under the legacy stance — the driver must keep the
+    /// incumbent worker pool there.
+    fn submit_registration_unit(&self, fn_work: Py<PyAny>) -> PyResult<intake::PyIntakeReceipt> {
+        if !self.registration_fleet_hosted() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "registration intake is not fleet-hosted (fleet.stance != fleet)",
+            ));
+        }
+        Ok(intake::submit(fn_work))
     }
 
     /// Return a fresh async iterator over `newHeads` block notifications —

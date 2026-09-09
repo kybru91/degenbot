@@ -628,6 +628,19 @@ class Bot:
         coordinator-owned, so this lives on Bot (the pump-lifecycle handle),
         not on ArbitrageEngine. Once-only; a second call raises RuntimeError.
         """
+    def registration_fleet_hosted(self) -> bool:
+        """Whether the fleet hosts the registration intake (PRG-3).
+
+        Reads the fleet-stance boot gate installed at engine construction.
+        The driver reads this ONCE at pipeline construction.
+        """
+
+    def submit_registration_unit(self, fn: object) -> PyIntakeReceipt:
+        """Submit one pool-build callable to the fleet intake (PRG-3).
+
+        The callable runs on a pooled `work-fleet-poolupd-{n}` seat; the
+        receipt joins it. Refuses under the legacy stance.
+        """
     def load_snapshot_from_db(self, db_path: str, chain_id: int) -> None:
         """Load `S` from the DB into the core `BotState` at construction time.
 
@@ -1182,6 +1195,19 @@ class BlockStream:
 
     def __aiter__(self) -> BlockStream: ...
     def __anext__(self) -> Coroutine[Any, Any, dict[str, Any]]: ...
+
+class IntakeReceipt:
+    """Join handle for one fleet-intake registration unit (PRG-3).
+
+    Returned by :meth:`Bot.submit_registration_unit`; `done()` polls for
+    completion, `result()` delivers the callable's return value or raises
+    its exception, and `wait()` is the blocking (GIL-detached) join.
+    """
+
+    def done(self) -> bool: ...
+    def result(self) -> object: ...
+    def wait(self, timeout: float | None = None) -> object: ...
+    def wait_async(self) -> Coroutine[Any, Any, None]: ...
 
 class VerificationMismatchError(RuntimeError):
     """On-chain verification mismatch: engine tick data != on-chain state.

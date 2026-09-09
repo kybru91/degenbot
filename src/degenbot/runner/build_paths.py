@@ -401,6 +401,15 @@ class PathRegistrationPipeline:
         self.retry_policy_obj = retry_policy or VerificationRetryPolicy()
 
         # Bounded thread pool for the blocking pool-build RPC (35NMBX).
+        # PRG-3: under the fleet stance (`fleet.stance=fleet`) this pool
+        # retires — the fleet hosts the pool-build units on the duty-counted
+        # `PoolStateUpdater` intake seats (census row
+        # fleet_pool_state_updater_slots; Deferrable cordon class). The
+        # stance is read ONCE here (construction-time, like the executor
+        # field — never re-read on the hot path).
+        self._fleet_intake = bool(
+            getattr(self.constr_bot, "registration_fleet_hosted", lambda: False)()
+        )
         self._build_pool_executor: ThreadPoolExecutor | None = None
 
         # Configured discovery inputs (set by the driver before discovery runs).
@@ -447,7 +456,25 @@ class PathRegistrationPipeline:
         return self._build_pool_executor
 
     async def _run_build_offloaded(self, fn: Callable[[], object]) -> object:
-        """Run a blocking pool-build callable on the bounded worker pool."""
+        """Run a blocking pool-build callable on its execution home.
+
+        PRG-3: under the fleet stance the callable rides the fleet's
+        ``PoolStateUpdater`` intake seats as a bounded per-role unit
+        (``submit_registration_unit`` + receipt join); the legacy stance
+        keeps the incumbent ``ThreadPoolExecutor`` byte-for-byte. The seat
+        executes the SAME callable (identical wrap/lifecycle behavior —
+        the parity gate), only the execution home and its declared sizing
+        change.
+        """
+        if self._fleet_intake:
+            # The asyncio-native join: the receipt awaits on the shared
+            # tokio runtime and resolves when the fleet seat completes —
+            # no parked waiter thread, no poll loop. The seat re-raises the
+            # callable's exception through result(), so the skip-tagging
+            # below is byte-identical.
+            receipt = self.constr_bot.submit_registration_unit(fn)
+            await receipt.wait_async()
+            return receipt.result()
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._bounded_build_executor(), fn)
 
