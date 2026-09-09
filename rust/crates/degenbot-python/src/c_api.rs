@@ -155,6 +155,11 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Uniswap mixed V2/V3/V4 engine (feature = "bot")
     #[cfg(feature = "bot")]
     m.add_class::<crate::bot::engine::PyArbitrageEngine>()?;
+    // Claim-based single-flight pool builds (CXKACI): Rust-side claim
+    // coordination for the Python registration pipeline's concurrent
+    // consumers — one leader per (family, key) builds, others await.
+    #[cfg(feature = "bot")]
+    m.add_class::<crate::bot::pool_build_claims::PyPoolBuildClaims>()?;
     // Block-stream async iterator (epic 6W35AI) — the authoritative
     // `newHeads`-derived block clock, consumed by Python in parallel with
     // the result-batch iterator. See `engine::result_channel::BlockStream`.

@@ -1167,6 +1167,22 @@ class ArbitrageEngine:
     # unknown path id.
     def payload_path_info(self, path_id: int) -> dict[str, Any] | None: ...
 
+class PoolBuildClaims:
+    """Claim-based single-flight pool builds (CXKACI) — Rust-side coordination.
+
+    The first consumer of a `(family, key)` claim leads the build; concurrent
+    consumers await the in-flight claim and share the built pool. `complete` /
+    `fail` publish the leader's outcome (strictly after its registry
+    insertion) and release the claim; waiters whose claim window closed
+    re-run their build against the registry pre-check.
+    """
+
+    def __init__(self) -> None: ...
+    def try_claim(self, family: str, key: str) -> bool: ...
+    def complete(self, family: str, key: str, pool: object) -> None: ...
+    def fail(self, family: str, key: str, error: BaseException) -> None: ...
+    def wait(self, family: str, key: str) -> Coroutine[object, object, object | None]: ...
+
 class BlockStream:
     """Async iterator over `newHeads` block notifications from the pump.
 

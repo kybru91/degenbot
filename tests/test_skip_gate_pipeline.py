@@ -7,6 +7,7 @@ seen live or replayed from the memo.
 """
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -62,39 +63,48 @@ def test_memo_replay_plain_failure_is_not_admission() -> None:
 # instead of losing the path AND fatally memoizing the pool.
 
 
-def test_concurrent_duplicate_build_race_retries_to_registry_hit() -> None:
-    async def scenario() -> object:
-        p = make_pipeline()
-        sentinel = object()
+def test_concurrent_candidates_share_the_claims_leader_build() -> None:
+    """CXKACI: one leader builds; concurrent candidates await the claim."""
+
+    async def scenario(p: PathRegistrationPipeline) -> object:
         attempts: list[int] = []
 
         def build() -> object:
             attempts.append(1)
-            if len(attempts) < 3:
-                # Simulate the race loser: the concurrent winner's Rust
-                # registration is visible before its Python registry insert.
-                raise PoolAlreadyRegisteredError("V4 pool already registered")
-            return sentinel
+            # RPC-slow build (runs on the bounded executor thread): the
+            # concurrent candidate must park on the in-flight claim rather
+            # than close its claim window and rebuild.
+            time.sleep(0.05)
+            return "the-one-built-pool"
 
-        result = await p._build_offloaded_with_race_retry(build)
-        return result
+        a, b = await asyncio.gather(
+            p._build_pool_claimed("v4", "hash-1", build),
+            p._build_pool_claimed("v4", "hash-1", build),
+        )
+        return a, b, len(attempts)
 
-    assert asyncio.run(scenario()) is not None
+    p = make_pipeline()
+    a, b, builds = asyncio.run(scenario(p))
+    assert builds == 1, "the first consumer builds; the second waits on the claim"
+    assert a == b == "the-one-built-pool"
 
 
-def test_concurrent_duplicate_build_race_raises_after_exhaustion() -> None:
-    async def scenario() -> None:
-        p = make_pipeline()
-        calls: list[int] = []
-
+def test_claimed_build_failure_propagates_and_releases() -> None:
+    async def scenario(p: PathRegistrationPipeline) -> None:
         def build() -> object:
-            calls.append(1)
-            raise PoolAlreadyRegisteredError("V4 pool already registered")
+            raise PoolAlreadyRegisteredError("should not matter — leader failure")
 
-        await p._build_offloaded_with_race_retry(build)
+        await p._build_pool_claimed("v4", "hash-2", build)
 
+    p = make_pipeline()
     with pytest.raises(PoolAlreadyRegisteredError):
-        asyncio.run(scenario())
+        asyncio.run(scenario(p))
+    # The claim is released after the failure: a fresh build claims anew.
+
+    def rebuild() -> object:
+        return "fresh"
+
+    assert asyncio.run(p._build_pool_claimed("v4", "hash-2", rebuild)) == "fresh"
 
 
 def test_exhausted_race_skip_does_not_memoize_fatal() -> None:

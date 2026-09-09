@@ -4,8 +4,8 @@
 skip reasons are immutable pool facts — hook/dynamic-fee/encoder-fee admission
 rejections, discovery pool-id mismatches, duplicate registrations. Retrying
 can never change the verdict — EXCEPT raced duplicate registrations, which are
-transient concurrency artifacts, not pool facts (CXKACI; the pipeline retries
-them via ``_build_offloaded_with_race_retry`` and never fatal-memoizes them) —
+transient concurrency artifacts, not pool facts (CXKACI; see the Rust claim table
+in ``pool_build_claims.rs`` / ``_build_pool_claimed``) —
 and re-logging floods the GIL-bridged log path
 (~20k skip lines/block at mainnet scale; the missed-WS-pong investigation
 measured ~1M lines/16 min, driving RSS toward the cgroup ceiling).

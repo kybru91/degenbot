@@ -8,6 +8,7 @@ pub mod deployments;
 pub mod dex_identity;
 pub mod engine;
 pub mod pool;
+pub mod pool_build_claims;
 pub mod pump;
 pub mod py_bot_io;
 pub mod subscriber;

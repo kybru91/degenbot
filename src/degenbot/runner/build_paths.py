@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from degenbot import Bot, UniswapV2Pool, UniswapV3Pool, UniswapV4Pool, get_checksum_address
+from degenbot._ffi import PoolBuildClaims
 from degenbot.arbitrage.engine_registry import EngineRegistry
 from degenbot.arbitrage.verification_retry import (
     VerificationRetryPolicy,
@@ -40,7 +41,6 @@ from degenbot.exceptions import (
     DynamicFeePoolRejectedError,
     HighFeePoolRejectedError,
     HookedPoolRejectedError,
-    PoolAlreadyRegisteredError,
     VerificationMismatchError,
     VerificationRpcError,
 )
@@ -156,13 +156,6 @@ def _pool_types_from_filter(perms: set[str] | None) -> list[type]:
 #: a bounded path universe so solve performance is observable without ongoing
 #: registration load. Override with DEGENBOT_MAX_PATHS (0 = uncapped).
 MAX_REGISTERED_PATHS = int(os.environ.get("DEGENBOT_MAX_PATHS", "100000"))
-
-#: CXKACI — bounded retry for the concurrent duplicate-build race (see
-#: PathRegistrationPipeline._build_offloaded_with_race_retry). A raced loser
-#: waits out the winner's registry insertion instead of losing its path; 8
-#: attempts doubling from 25ms covers even a slow winner's Python-side wrap-up.
-_RACE_RETRY_ATTEMPTS = int(os.environ.get("DEGENBOT_REG_RACE_RETRIES", "8"))
-_RACE_RETRY_BACKOFF_S = float(os.environ.get("DEGENBOT_REG_RACE_BACKOFF_MS", "25")) / 1000.0
 
 
 class DiscoveryCrawlComplete(Exception):
@@ -413,6 +406,11 @@ class PathRegistrationPipeline:
         # Bounded thread pool for the blocking pool-build RPC (35NMBX).
         self._build_pool_executor: ThreadPoolExecutor | None = None
 
+        # CXKACI: Rust-side claim table for single-flight pool builds — the
+        # first consumer of a (family, key) leads the build; concurrent
+        # consumers await the in-flight claim. See pool_build_claims.rs.
+        self._pool_claims = PoolBuildClaims()
+
         # Configured discovery inputs (set by the driver before discovery runs).
         self.pool_types: list[type] = []
         self.pool_type_per_depth: list[set[type] | None] | None = None
@@ -460,33 +458,50 @@ class PathRegistrationPipeline:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._bounded_build_executor(), fn)
 
-    async def _build_offloaded_with_race_retry(self, fn: Callable[[], object]) -> object:
-        """Offloaded pool build with bounded retry across the registration race.
+    async def _build_pool_claimed(
+        self, family: str, key: str, build: Callable[[], object]
+    ) -> object:
+        """Build a pool under a Rust-side claim (CXKACI).
 
-        CXKACI: REG_WORKERS concurrent consumers mean two candidates containing
-        the same not-yet-built pool can race between the Bot registry
-        pre-check and the Rust registration — the loser raises
-        `PoolAlreadyRegisteredError` even though the pool becomes usable (via
-        the registry pre-check) milliseconds later, once the winner finishes
-        its Python-side registry insertion. Retrying the whole build lets the
-        retry hit the pre-check and return the existing pool. Without the
-        retry, the loser's path was skipped AND the pool fatally memoized,
-        making the registered-path total a function of the race outcome
-        (observed 545,511-645,329 paths across otherwise identical launches;
-        2026-09-09: 7,973,943 PoolAlreadyRegistered skips vs 566,125
-        registered from a static DB).
+        The Rust core (degenbot._ffi.bot.PoolBuildClaims) owns the
+        coordination: the first consumer of a (family, key) claim leads the
+        build (the Rust PoolBuilder does the work under one registry
+        insertion); concurrent consumers await the in-flight claim and share
+        the built pool. A waiter whose claim window closed before it
+        subscribed re-runs the build - the Bot registry pre-check answers.
         """
-        backoff_s = _RACE_RETRY_BACKOFF_S
-        attempt = 0
-        while True:
+        claims = self._pool_claims
+        if claims.try_claim(family, key):
             try:
-                return await self._run_build_offloaded(fn)
-            except PoolAlreadyRegisteredError:
-                attempt += 1
-                if attempt >= _RACE_RETRY_ATTEMPTS:
-                    raise
-                await asyncio.sleep(backoff_s)
-                backoff_s *= 2.0
+                pool = await self._run_build_offloaded(build)
+            except BaseException as exc:
+                claims.fail(family, key, exc)
+                raise
+            claims.complete(family, key, pool)
+            return pool
+        claimed = await claims.wait(family, key)
+        if claimed is not None:
+            return claimed
+        return await self._run_build_offloaded(build)
+
+    def _build_v3_fallback_chain(self, address: str) -> object:
+        """The V3 build chain: Uniswap, Sushi, Pancake trackers, generic Bot.
+
+        Runs inside ONE offloaded call under a single (family="v3",
+        key=address) claim (CXKACI): pool-identity fallbacks cannot race the
+        Rust registration across consumers, and the whole chain occupies one
+        bounded-executor slot instead of re-queueing per rung.
+        """
+        try:
+            return self.uniswap_v3_tracker.get_pool(pool_address=address, silent=True)
+        except Exception:
+            try:
+                return self.sushiswap_v3_tracker.get_pool(pool_address=address, silent=True)
+            except Exception:
+                try:
+                    return self.pancakeswap_v3_tracker.get_pool(pool_address=address, silent=True)
+                except Exception:
+                    return self.constr_bot.build_pool(address, silent=True)
 
     def _reject_v4_from_memo(self, tag: str) -> bool:
         """Replay the counter effect of a memoized fatal V4 skip.
@@ -670,7 +685,7 @@ class PathRegistrationPipeline:
         pools: list[UniswapV2Pool | UniswapV3Pool | UniswapV4Pool] = []
         skip = False
         v4_admission_rejected = False
-        for step, pt in zip(steps, pool_type_strs, strict=True):  # ruff:ignore[too-many-nested-blocks]
+        for step, pt in zip(steps, pool_type_strs, strict=True):
             if pt == "V2":
                 memo_tag = self.skip_gate.fatal_tag("v2", step.address)
                 if memo_tag is not None:
@@ -678,8 +693,10 @@ class PathRegistrationPipeline:
                     skip = True
                     break
                 try:
-                    pool = await self._build_offloaded_with_race_retry(
-                        lambda: self.constr_bot.build_pool(step.address, silent=True)
+                    pool = await self._build_pool_claimed(
+                        "v2",
+                        step.address,
+                        lambda: self.constr_bot.build_pool(step.address, silent=True),
                     )
                 except Exception as exc:
                     tag = f"build-v2:{type(exc).__name__}"
@@ -697,30 +714,11 @@ class PathRegistrationPipeline:
                     skip = True
                     break
                 try:
-                    try:
-                        pool = await self._build_offloaded_with_race_retry(
-                            lambda: self.uniswap_v3_tracker.get_pool(
-                                pool_address=step.address, silent=True
-                            )
-                        )
-                    except Exception:
-                        try:
-                            pool = await self._build_offloaded_with_race_retry(
-                                lambda: self.sushiswap_v3_tracker.get_pool(
-                                    pool_address=step.address, silent=True
-                                )
-                            )
-                        except Exception:
-                            try:
-                                pool = await self._build_offloaded_with_race_retry(
-                                    lambda: self.pancakeswap_v3_tracker.get_pool(
-                                        pool_address=step.address, silent=True
-                                    )
-                                )
-                            except Exception:
-                                pool = await self._build_offloaded_with_race_retry(
-                                    lambda: self.constr_bot.build_pool(step.address, silent=True)
-                                )
+                    pool = await self._build_pool_claimed(
+                        "v3",
+                        step.address,
+                        lambda: self._build_v3_fallback_chain(step.address),
+                    )
                 except Exception as exc:
                     tag = f"build-v3:{type(exc).__name__}"
                     # CXKACI: raced duplicate builds are transient, not immutable facts
@@ -742,12 +740,14 @@ class PathRegistrationPipeline:
                     skip = True
                     break
                 try:
-                    pool = await self._build_offloaded_with_race_retry(
+                    pool = await self._build_pool_claimed(
+                        "v4",
+                        step.hash,
                         lambda: self.constr_bot.build_managed_pool(
                             address=UNISWAP_V4_POOL_MANAGER_ADDRESS,
                             pool_id=step.hash,
                             silent=True,
-                        )
+                        ),
                     )
                 except HookedPoolRejectedError:
                     self.skip_gate.note("v4", step.hash, "v4-hook-rejected", fatal=True)
