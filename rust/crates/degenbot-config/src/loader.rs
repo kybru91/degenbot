@@ -255,6 +255,33 @@ impl BotConfigLoader {
                      (env DEGENBOT_IO_WORKERS) or let it derive from the cgroup CPU budget"
                 ));
             }
+
+            // P6YXA6 hard cutover: solve.executor was retired with the Rayon
+            // dispatch arms — the role-switching worker fleet (and its
+            // private-runtime tokio fallback) is the ONLY solve executor. A
+            // surviving DEGENBOT_SOLVE_EXECUTOR setting fails the load
+            // loudly and points at the replacement: silent fail-open here
+            // would resurrect the stance-gated dispatch this cutover removes
+            // (the deprecation-style hard error is kept for one release).
+            if let Some(raw) = env.get("DEGENBOT_SOLVE_EXECUTOR") {
+                problems.push(format!(
+                    "retired env var DEGENBOT_SOLVE_EXECUTOR={raw:?} is no longer supported; \
+                     the worker fleet is the only solve executor since the hard cutover \
+                     (ADR-042 / ergo P6YXA6) — remove the variable; per-bin fleet hosting \
+                     needs no executor stance selection"
+                ));
+            }
+
+            // P6YXA6: solve bins are ALWAYS LPT-pre-balanced now (the rayon
+            // fallback this flag disabled is retired) — a surviving variable
+            // fails the load loudly for one release.
+            if let Some(raw) = env.get("DEGENBOT_LPT_PARTITION") {
+                problems.push(format!(
+                    "retired env var DEGENBOT_LPT_PARTITION={raw:?} is no longer supported; \
+                     solve bins are always LPT-pre-balanced since the hard cutover \
+                     (ADR-042 / ergo P6YXA6) — remove the variable"
+                ));
+            }
         }
 
         // Layer 4 (highest): CLI / explicit argument overrides.

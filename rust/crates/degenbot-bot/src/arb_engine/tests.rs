@@ -3562,7 +3562,7 @@ mod tests {
 
     // --- ADR-005 slice 15b-1: Rust parallel solve fan-out -----------------
     //
-    // `solve_dirty`'s affected-path solve loop is parallelized via rayon
+    // `solve_dirty`'s affected-path solve loop is parallelized via executor bins
     // `par_iter`. The tracer bullet below pins the invariant the parallel
     // fan-out must preserve: equivalence with the serial baseline. This test
     // runs green against the current serial `solve_all()`; after the parallel
@@ -3572,7 +3572,7 @@ mod tests {
     // many paths (drives the par_iter loop across non-trivial batch sizes).
 
     /// Pin the parallel-fan-out equivalence invariant: the batch re-solver
-    /// (`solve_all_paths` → `solve_all` → rayon `par_iter` of `solve_path`)
+    /// (`solve_all_paths` → `solve_all` → executor bins of `solve_path`)
     /// must produce results identical to the per-path eager baseline captured
     /// at `register_and_solve_path` time. Any drift between the two means the
     //  fan-out is dropping paths, double-counting, or producing a different
@@ -3623,7 +3623,7 @@ mod tests {
 
         // Full batch re-solve via solve_all_paths — this is the call path
         // whose solve loop gets parallelized. Equivalent eager results must
-        // survive the batch re-solve (today serial; after the refactor, rayon
+        // survive the batch re-solve (today in the resolve fan-out; a batch
         // `par_iter`).
         engine.solve_all_paths(1);
         let (results, block) = engine.latest_results();
@@ -3646,7 +3646,7 @@ mod tests {
 
     /// ADR-006 slice 10 acceptance for the parallel solve fan-out
     /// (ADR-005 slice 15b-1): characterize the engine-then-core lock ordering
-    /// when the engine's `solve_dirty` solve loop runs under rayon `par_iter`.
+    /// when the engine's `solve_dirty` solve loop runs under executor bins.
     /// The `par_iter` workers operate only on owned/Cloned data (`ResolvedMixedPath`
     /// clones + collected `(pid, SolvePathResult)` pairs); they acquire NO
     /// engine `Mutex` and NO core lock — so the engine-then-core lock order
@@ -3655,7 +3655,7 @@ mod tests {
     /// This test drives the contention with N=8 paths registered (so the
     /// `par_iter` batch is non-trivial — at least 8 work items per `solve_dirty`)
     /// under one writer (`solve_dirty`) + four readers (core.read companions).
-    /// Bounded join; a real deadlock (rayon re-entering the engine `Mutex`, or
+    /// Bounded join; a real deadlock (bins re-entering the engine `Mutex`, or
     /// a re-entrant core guard) surfaces as a panic on the writer thread.
     #[test]
     fn solve_dirty_parallel_fanout_survives_concurrent_readers_and_writer() {
@@ -3707,7 +3707,7 @@ mod tests {
         // Writer: `solve_dirty` invokes `solve_all_paths` semantically via
         // `rebuild_and_solve_affected` → `par_iter` of `Self::solve_path`. The
         // writer holds the engine `Mutex` then (inside) `core.read()` (path
-        // resolution) and briefly `core.write()` (V3/V4 buffer expiry). Rayon's
+        // resolution) and briefly `core.write()` (V3/V4 buffer expiry). The bins'
         // internal workers touch no engine/core state.
         let writer_engine = Arc::clone(&engine);
         let writer_done = Arc::clone(&done);
@@ -3742,7 +3742,7 @@ mod tests {
             handle.join().expect("reader panicked");
         }
         writer_result.expect(
-            "writer deadlocked — rayon `par_iter` in `solve_dirty` reintroduced a \
+            "writer deadlocked — engine-lock re-entry in `solve_dirty` bins reintroduced a \
              core/engine lock nesting or re-entrant guard (ADR-006 D2 violated)",
         );
     }
@@ -5980,7 +5980,6 @@ mod tests {
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         let mut engine = ArbitrageEngine::new();
-        engine.set_solve_executor(crate::arb_engine::SolveExecutorKind::Tokio);
 
         // Seven independent mispriced V2->V2 pairs -> seven profitable paths
         // (>=2 cores: LPT puts the slow path FIRST in its bin, so at least
@@ -6217,7 +6216,6 @@ mod tests {
         let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         let mut engine = ArbitrageEngine::new();
-        engine.set_solve_executor(crate::arb_engine::SolveExecutorKind::Tokio);
         engine.set_streaming_delivery(true);
         let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
         engine.set_result_channel(result_tx);

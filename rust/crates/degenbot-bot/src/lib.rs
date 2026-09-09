@@ -15,7 +15,7 @@
 //! This fusion is **tracked debt** (ADR-018): the solve surface is not
 //! reachable standalone (a `cargo add degenbot` consumer wanting only the
 //! V2/V3/V4 solve math must take this crate + `degenbot-rpc` +
-//! `degenbot-db` + `tokio` + `rayon` + `dashmap`). The extraction trigger
+//! `degenbot-db` + `tokio` + `dashmap`). The extraction trigger
 //! is a **second engine family** joining (e.g. an `AaveLiquidationEngine`
 //! or a split `SolidlyEngine`); until then, the cross-references are the
 //! cost of one engine family and one state owner co-evolving.
@@ -207,46 +207,10 @@ pub mod otel;
 pub mod profiling;
 pub mod telemetry;
 
-/// Configure the process-global rayon pool used by the engine's
-/// `par_iter` solve fan-out ([`crate::arb_engine`]).
-///
-/// GOQWCL (incident 2026-08-21): the pool was previously implicit — rayon
-/// spawns its global pool lazily on first `par_iter` with **unnamed**
-/// threads, which masquerade as unrelated workers in thread dumps (during
-/// the incident forensics they showed up as anonymous futex waiters and
-/// were nearly misattributed to tokio). Naming them makes any future
-/// dump immediately attributable.
-///
-/// Idempotent-ish: if a global pool already exists (another component or
-/// test built it first), the request is ignored with a debug log — rayon's
-/// global pool can only be configured once per process.
-/// Two-runtime contract (ADR: the tokio CPU/I-O split): the ambient I/O
-/// runtime (pump, websocket, dispatch, delivery) keeps the headroom cores
-/// (`DEFAULT_SOLVE_HEADROOM`), so the CPU-side pools — this rayon global
-/// pool, the solve-executor bins, and the sim drivers behind the
-/// `sim_slots` cap — are all sized from `solve_worker_count()` and its
-/// leftover, never from raw `available_parallelism`.
-pub fn configure_rayon_solver_pool() {
-    let workers = degenbot_core::cpu_budget::solve_worker_count();
-    // PE4FPM: self-register the global rayon pool in the worker census
-    // BEFORE the build call: `build_global` fails when another thread won
-    // the once-race or a pool already exists — the census row still
-    // describes the pool the process actually runs (same sizing rule).
-    degenbot_core::worker_census::register(degenbot_core::worker_census::WorkerCensusEntry {
-        resource: "rayon_global_pool",
-        kind: "rayon global pool (path resolve — RAYPAR partitions run here too)",
-        count: workers,
-        thread_name: "degenbot-solve-{i}",
-        sizing: "cpu_budget::solve_worker_count (cgroup budget minus headroom, DEGENBOT_SOLVE_CPUS override); an already-configured global pool wins and is kept",
-    });
-    let result = rayon::ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .thread_name(|i| format!("degenbot-solve-{i}"))
-        .build_global();
-    if let Err(err) = result {
-        tracing::debug!(
-            %err,
-            "[rayon] global pool already configured - keeping existing pool"
-        );
-    }
-}
+// P6YXA6 hard cutover: the process-global rayon pool (`configure_rayon_
+// solver_pool`) is retired with the rayon dispatch arms it served — every
+// solve bin rides the fleet-hosted executor or the dedicated private tokio
+// runtime, and the resolve fan-out runs on scoped std threads. The
+// two-runtime contract stands: the ambient I/O runtime keeps the headroom
+// cores; the solve-executor bins are sized from `solve_worker_count()` and
+// its leftover, never from raw `available_parallelism`.

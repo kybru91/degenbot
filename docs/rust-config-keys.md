@@ -80,7 +80,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | --- | --- | --- | --- | --- |
 | `DEGENBOT_SOLVE_CPUS` | `solve.solve_cpus` | `Option<usize>` | `(unset)` | Override the detected solve CPU budget (worker bin count). |
 | `DEGENBOT_SOLVE_HEADROOM` | `solve.solve_headroom` | `Option<usize>` | `(unset)` | Override the I/O headroom carved out of the CPU budget before solve bins. |
-| `DEGENBOT_SOLVE_EXECUTOR` | `solve.executor` | `SolveExecutor(Tokio|Rayon)` | `tokio` | Solve fan-out executor: tokio (low-priority dedicated runtime, production default) or rayon. |
 | `DEGENBOT_SOLVE_INLINE_SIM` | `solve.solve_inline_sim` | `bool` | `true` | Inline-sim stance (T2 worker-side clamp path); `0`/`false` disables. |
 | `DEGENBOT_SOLVE_RESOLVE_PAR` | `solve.solve_resolve_par` | `bool` | `true` | Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables. |
 | `DEGENBOT_SOLVE_SIM_INFLIGHT` | `solve.solve_sim_inflight` | `Option<usize>` | `(unset; derived from CPU budget)` | Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation. |
@@ -95,7 +94,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `DEGENBOT_SOLVER_WALK_MEMO` | `solve.solver_walk_memo` | `bool` | `false` | CL-solver walk memo (result caching) (`1` enables). |
 | `DEGENBOT_SOLVER_WALK_MEMO_STATS` | `solve.solver_walk_memo_stats` | `bool` | `false` | Walk-memo recomposition census (`1` enables). |
 | `DEGENBOT_CL_PROJECTION_CACHE` | `solve.cl_projection_cache` | `bool` | `true` | CL projection memo cache; `0`/`off`/`false`/`disabled` disables. |
-| `DEGENBOT_LPT_PARTITION` | `solve.lpt_partition` | `bool` | `true` | K-slowest-path LPT partitioning of solve bins; `0`/`false`/`off` disables. |
 ## `fleet`
 
 | Env var | TOML key | Type | Default | Description |

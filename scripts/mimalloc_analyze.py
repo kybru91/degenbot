@@ -29,7 +29,7 @@ PROBES = [
     "EngineHandle::solve_dirty",
     "mixed.solve_path_inner",
     "cl_solve.active_set",
-    "arb_solve.rayon_solve",
+    "arb_solve.tokio_solve",
 ]
 
 

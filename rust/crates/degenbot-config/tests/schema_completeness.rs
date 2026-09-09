@@ -41,6 +41,12 @@ const BUILD_ARTIFACT_KEYS: &[&str] = &[
 /// schema key.
 const BOOTSTRAP_KEYS: &[&str] = &["DEGENBOT_CONFIG"];
 
+/// RETIRED keys the loader guards for one release (P6YXA6 hard cutover):
+/// they fail the load loudly and point at the replacement rather than
+/// silently falling back — the deprecation-style hard error. They are not
+/// schema keys anymore; the guard lives in the env layer of `loader.rs`.
+const RETIRED_KEYS: &[&str] = &["DEGENBOT_LPT_PARTITION", "DEGENBOT_SOLVE_EXECUTOR"];
+
 /// Real static keys the artifact regex cannot capture (digit-terminated
 /// matches expand to these full names).
 const SWEEP_EXPANSIONS: &[&str] = &[
@@ -101,6 +107,7 @@ fn schema_covers_the_full_key_inventory() {
             !SWEEP_ARTIFACTS.contains(&k.as_str())
                 && !BOOTSTRAP_KEYS.contains(&k.as_str())
                 && !BUILD_ARTIFACT_KEYS.contains(&k.as_str())
+                && !RETIRED_KEYS.contains(&k.as_str())
         })
         .cloned()
         .collect();
@@ -137,6 +144,7 @@ fn snapshot_fallback_agrees_with_schema() {
             !SWEEP_ARTIFACTS.contains(&k.as_str())
                 && !BOOTSTRAP_KEYS.contains(&k.as_str())
                 && !BUILD_ARTIFACT_KEYS.contains(&k.as_str())
+                && !RETIRED_KEYS.contains(&k.as_str())
         })
         .cloned()
         .collect();

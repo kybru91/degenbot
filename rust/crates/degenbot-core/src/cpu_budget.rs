@@ -201,7 +201,7 @@ pub(crate) fn solve_worker_count_from(
     budget.saturating_sub(headroom).max(1)
 }
 
-pub(crate) const DEFAULT_SOLVE_HEADROOM: usize = 2;
+pub const DEFAULT_SOLVE_HEADROOM: usize = 2;
 
 /// Process-wide CPU budget: reads the real `/proc/self/{cgroup,mounts}` and
 /// affinity once.

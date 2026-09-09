@@ -501,11 +501,6 @@ mod fleet_stance_tests {
             observed, "fleet",
             "fleet.stance=fleet must reach the engine"
         );
-        // The executor kind is an INDEPENDENT axis (solve.executor stays
-        // tokio/rayon); the fleet stance routes through the fleet
-        // regardless of it.
-        assert_eq!(legacy.solve_executor_probe(), legacy.solve_executor_probe());
-
         // Restore the process-wide construction static so concurrently
         // running engine tests keep the legacy default posture (the fleet
         // boot descriptor stays installed — installing twice is a no-op).

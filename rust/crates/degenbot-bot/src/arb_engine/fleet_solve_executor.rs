@@ -69,8 +69,8 @@ enum HostMsg {
 pub(crate) struct FleetSolveExecutor {
     tx: mpsc::Sender<HostMsg>,
     unit_seq: AtomicU64,
-    /// Test-facing seat count (read via [`FleetSolveExecutor::solver_pin_count`]).
-    #[cfg(test)]
+    /// Seat count (read via [`FleetSolveExecutor::bin_count`] — the
+    /// dispatch arms bin at exactly this count so every bin has a home).
     solver_seats: usize,
 }
 
@@ -127,16 +127,15 @@ impl FleetSolveExecutor {
         Ok(Self {
             tx,
             unit_seq: AtomicU64::new(0),
-            #[cfg(test)]
             solver_seats,
         })
     }
 
-    /// Solver seats (Solver pins = the budget's pin count). Test-facing
-    /// (the dispatch sites submit bins without asking the seat count).
-    #[cfg(test)]
+    /// Solver seats = the budget's structural LPT bin count. The dispatch
+    /// arms bin at THIS count (P6YXA6 reconciliation): pins and bins are
+    /// the same number, so every bin owns a warm keyed seat across cycles.
     #[must_use]
-    pub(crate) fn solver_pin_count(&self) -> usize {
+    pub(crate) fn bin_count(&self) -> usize {
         self.solver_seats
     }
 
@@ -428,10 +427,22 @@ mod tests {
     /// Pinning fixture (BCA77G): per-bin worker pinning — every bin's
     /// units ride the same seat across cycles (T3/T6), matching the
     /// RAYPAR T3 one-persistent-worker-per-bin contract.
+    ///
+    /// P6YXA6 sizing reconciliation: the fleet seats are the
+    /// STRUCTURAL LPT bin count — at a hermetic Q = 8 boot,
+    /// floor(8) − the default solve headroom (2) = 6 seats — not the
+    /// retired sharesx2 multiple (8). The dispatch arms bin at this same
+    /// count, so every bin owns a warm keyed seat across cycles (T6).
+    #[test]
+    fn solver_seats_equal_the_structural_lpt_bin_count() {
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        assert_eq!(executor.bin_count(), 6);
+    }
+
     #[test]
     fn bins_stay_pinned_to_one_seat_across_cycles() {
         let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
-        let bins = executor.solver_pin_count().clamp(2, 4);
+        let bins = executor.bin_count().clamp(2, 4);
         let observed: Arc<parking_lot::Mutex<Vec<(u64, std::thread::ThreadId)>>> = Arc::default();
         for _cycle in 0..3 {
             for bin in 0..bins {

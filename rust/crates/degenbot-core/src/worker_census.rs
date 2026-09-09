@@ -1,7 +1,7 @@
 //! Worker census registry (ergo PE4FPM; observability surface of the
 //! ADR-042 role-switching fleet, section 7).
 //!
-//! Every execution resource — a tokio runtime, a rayon pool, a semaphore
+//! Every execution resource — a tokio runtime, a worker seat pool, a semaphore
 //! capacity, a sidecar/drainer thread — SELF-REGISTERS one census entry
 //! (id, kind, worker count, OS thread-name pattern, sizing rule) into one
 //! process-wide table:
@@ -27,13 +27,13 @@
 //! # REGISTRATION IS DOCUMENTATION-ENFORCED
 //!
 //! **If you add a new spawn site — any `thread::Builder::new`,
-//! `tokio::runtime::Builder`, `rayon::ThreadPoolBuilder`, or capacity
+//! `tokio::runtime::Builder` (a solve executor), or capacity
 //! constant that bounds concurrent execution — you MUST register it here**
 //! via `worker_census::register`. The census survives unknown-future spawns
 //! only by this documentation; an unregistered thread is invisible to the
 //! gauge, the boot dump, and the /proc comm cross-check. Registered ids
 //! today: `io_runtime_workers`, `inline_sim_runtime_workers`,
-//! `solve_executor_fleet`, `solve_probe_executor`, `rayon_global_pool`,
+//! `solve_executor_fleet`, `solve_probe_executor`, `fleet_solver_slots`,
 //! `sim_slots`, `arb_sim_workers`, `detached_merge_sidecar`,
 //! `detached_solve_bins`, `subscriber_drainer`, `metrics_scrape`,
 //! `rust_log_drainer`, `gil_probe`.

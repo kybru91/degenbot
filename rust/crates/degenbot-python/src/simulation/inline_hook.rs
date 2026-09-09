@@ -21,7 +21,7 @@
 //! Runtime caveat (the T4 body note): `WrapDatabaseAsync::new` captures
 //! `Handle::try_current()` at build time, and its DB calls escalate to
 //! `block_in_place` on a multi-threaded worker. The solve workers are
-//! rayon/`std` threads — NO ambient runtime — so the sim body spawns onto
+//! `std` threads — NO ambient runtime — so the sim body spawns onto
 //! this hook's DEDICATED multi-thread runtime (task-spawn, not
 //! `block_in_place`): the spawned task runs on a runtime worker (where
 //! `block_in_place` is legal AND the handle capture succeeds), and the
@@ -239,7 +239,7 @@ where
 /// Join a sim-task future from ANY thread context (the soak's runtime
 /// caveat: `block_in_place` is only legal on runtime workers, so an ambient
 /// multi-thread runtime blocks in place; otherwise the dedicated sim runtime
-/// is driven directly): the solve arms' workers may be plain threads (rayon/`std`), OR
+/// is driven directly): the solve arms' workers settle on persistent executor
 /// tokio tasks on the solve-executor runtime (`DEGENBOT_SOLVE_EXECUTOR=tokio`
 /// spawns the per-bin jobs as tasks). `Runtime::block_on` from inside a
 /// runtime context panics ("Cannot start a runtime from within a runtime" —

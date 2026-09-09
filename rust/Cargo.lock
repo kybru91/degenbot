@@ -2233,7 +2233,6 @@ dependencies = [
  "prometheus",
  "proptest",
  "rand 0.10.2",
- "rayon",
  "reqwest",
  "serde",
  "serde_json",

@@ -33,7 +33,7 @@ span start
   ├─[solve-phase] resolved hop snapshots         {paths.resolved, invalid.reasons}
   │  (resolve→LPT staging sits in its own child span — MQUKB6-T2 follow)
   ├─ degenbot.arb.stage                          {paths.staged}
-  ├─[solve-phase] rayon solve complete           {paths.solved, paths.invalid,
+  ├─[solve-phase] streaming solve complete       {paths.solved, paths.invalid,
   │                                               solve.cpu_us, profitable,
   │                                               slowest.paths}
   ├─[solve-phase] cycle complete (clamp done)    {clamp.twins, clamp.phase_us,
@@ -107,8 +107,8 @@ Derived quantities (compute these on every investigation):
 |---|---|---|
 | Activation-scan wall | `fanout.phase_us` | < 100ms; scales with affected set |
 | Resolve wall | next-event − fanout timestamp | ~10µs/path |
-| Rayon wall | rayon-event − resolve-event | ≈ `solve.cpu_us / 7.8` (8 cores) |
-| **Achieved parallelism** | **`solve.cpu_us / rayon_wall`** | **≈ 7.8 (8 cores)** |
+| Solve wall | solve-event − resolve-event | ≈ `solve.cpu_us / 7.8` (8 cores) |
+| **Achieved parallelism** | **`solve.cpu_us / solve_wall`** | **≈ 7.8 (8 cores)** |
 | Per-path solve CPU | `solve.cpu_us / paths.solved` | ~1.4–2.6ms |
 | Invalidity rate | `paths.invalid / paths.resolved` | trending down |
 
@@ -128,7 +128,7 @@ Diagnose by reading the phase split before touching code:
    depth/tick counts. Flat ⇒ volume problem; look at activation fan-out width.
 2. **Rayon wall dominates + parallelism well under 7** → contention or pool
    starvation. Hypotheses: (a) worker threads blocked on a mutex inside
-   `solve_path` (none known today — workers touch no engine state), (b) rayon
+   `solve_path` (none known today — workers touch no engine state), (b) bins
    pool shared with another subsystem, (c) CPU steal from co-located processes.
 3. **Activation scan dominates** (fanout.phase_us > several hundred ms at
    modest affected counts) → registry walk regressed; suspect `pool_to_paths`
@@ -142,7 +142,7 @@ the closure (`t0`/`micros`, feeds `slowest.paths`).
 
 ### S2. Achieved parallelism low (< 6×)
 
-`solve.cpu_us` high relative to rayon wall means workers idle or blocked.
+`solve.cpu_us` high relative to solve wall means workers idle or blocked.
 Hypotheses ranked:
 
 1. Affected set too small to saturate 8 workers — benign; ignore unless cycles

@@ -2,7 +2,7 @@
 //!
 //! Two-runtime contract (the tokio CPU/I-O split): the ambient I/O runtime
 //! (pump, websocket, dispatch, delivery) always keeps workers available,
-//! and the CPU-bound runtimes - solve bins, rayon resolve, and the eager
+//! and the CPU-bound runtimes - solve bins, the resolve chunks, and the eager
 //! sim drivers - must share the REMAINDER of the effective CPU budget
 //! without oversubscribing it. The cap makes that share explicit and
 //! environment-adaptive.

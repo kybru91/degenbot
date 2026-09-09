@@ -87,14 +87,14 @@ impl CachedProjection {
 /// microseconds, adding risk without a measured win.
 /// Sharded concurrency-ready form of the former flat
 /// `HashMap<(HopType, pool_key, zero_for_one), (CachedProjection, u64)>`
-/// (7LV6VN T2): the per-path resolve loop runs across rayon chunks, so the
+/// (7LV6VN T2): the per-path resolve loop runs across parallel chunks, so the
 /// memo must be shared by reference - chunk-local caches would multiply the
 /// expensive CL tick-walk per shared pool (the cache exists so one walk
 /// serves N paths). Shard locks guard only map access; the projection walk
 /// happens OUTSIDE the lock (misses are the CPU-heavy case), so cross-path
 /// hit reuse survives without serializing the loop.
 ///
-/// SINGLE-FLIGHT dedup: the walk runs outside the lock, so two rayon chunks
+/// SINGLE-FLIGHT dedup: the walk runs outside the lock, so two chunks
 /// missing the same (dirty) key concurrently would EACH walk it and EACH
 /// store, inflating the projection count above the serial arm's (the
 /// `resolve_chunk_parity` test's cache-reuse invariant). `in_flight` guards
