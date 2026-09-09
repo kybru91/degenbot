@@ -1289,6 +1289,24 @@ impl BotState {
         self.v4_state_views.get(&pool_manager).copied()
     }
 
+    /// The immutable admission verdict recorded for a pool, if any (PRG-2).
+    /// The `PyO3` `build_v4_pool` pre-check consults this BEFORE any RPC
+    /// work on the registration path.
+    #[must_use]
+    pub fn admission_verdict(
+        &self,
+        pool_manager: Address,
+        pool_id: &degenbot_decoders::v4_swap_decoder::V4PoolId,
+    ) -> Option<crate::bot_core::registration_gate::AdmissionVerdict> {
+        self.registration_gate.verdict(pool_manager, *pool_id)
+    }
+
+    /// The registration-gate census (recorded immutable verdicts).
+    #[must_use]
+    pub fn registration_gate_len(&self) -> usize {
+        self.registration_gate.len()
+    }
+
     /// Register a V4 pool by `(pool_manager, pool_id)`.
     ///
     /// ADR-037/X4EU3J: pools with amount-modifying hooks are ADMITTED (their
@@ -1323,6 +1341,13 @@ impl BotState {
             .map_err(RegisterV4PoolError::SpecViolation)?;
 
         if params.pool_key.fee == V4_DYNAMIC_FEE_FLAG {
+            self.registration_gate.record(
+                params.pool_manager,
+                params.pool_id,
+                crate::bot_core::registration_gate::AdmissionVerdict::DynamicFee {
+                    fee: params.pool_key.fee,
+                },
+            );
             return Err(RegisterV4PoolError::DynamicFee {
                 fee: params.pool_key.fee,
             });
@@ -1333,6 +1358,13 @@ impl BotState {
         // so these pools never reach the composer's `u16::try_from` guard and
         // waste a solve cycle.
         if params.pool_key.fee >= degenbot_executor::encoders::V4_FEE_ENCODER_MAX {
+            self.registration_gate.record(
+                params.pool_manager,
+                params.pool_id,
+                crate::bot_core::registration_gate::AdmissionVerdict::FeeExceedsEncoderLimit {
+                    fee: params.pool_key.fee,
+                },
+            );
             return Err(RegisterV4PoolError::FeeExceedsEncoderLimit {
                 fee: params.pool_key.fee,
             });

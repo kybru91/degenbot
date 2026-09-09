@@ -585,12 +585,50 @@ where
         .with(env_filter)
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(tracing_subscriber::fmt::writer::BoxMakeWriter::new(
-                    std::io::stderr,
-                ))
+                .with_writer(fmt_writer())
                 .with_ansi(true),
         )
         .with(python_layer)
+}
+
+/// DEGENBOT_LOG_FMT: the stderr `fmt` layer copy of every record.
+///
+/// Default ON (the stderr mirror is handy for hand-runs that only capture
+/// stderr). Set `DEGENBOT_LOG_FMT=0` to route the fmt layer to `io::sink()`:
+/// a driver that tees BOTH stdout (Python logging) and stderr (fmt layer)
+/// into one file then records every degenbot line exactly once, halving the
+/// run-log volume and dropping the ANSI-escaped blocker lines from the file.
+/// The writer (not the layer) is swapped so the builder types — and every
+/// caller/test against them — stay unchanged; the layer keeps formatting
+/// (costs are CPU-trivial at INFO levels).
+#[cfg(feature = "otel")]
+pub(crate) fn fmt_enabled() -> bool {
+    !matches!(
+        std::env::var("DEGENBOT_LOG_FMT")
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no" | "")
+    )
+}
+
+#[cfg(not(feature = "otel"))]
+fn fmt_enabled() -> bool {
+    !matches!(
+        std::env::var("DEGENBOT_LOG_FMT")
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "off" | "no" | "")
+    )
+}
+
+/// The writer for the stderr `fmt` layer: stderr, or a sink when
+/// `DEGENBOT_LOG_FMT` is falsey (see [`fmt_enabled`]).
+fn fmt_writer() -> tracing_subscriber::fmt::writer::BoxMakeWriter {
+    if fmt_enabled() {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::sink)
+    }
 }
 
 #[cfg(feature = "otel")]
@@ -646,9 +684,7 @@ where
         .with(otel_layer.with_filter(record_filter))
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(tracing_subscriber::fmt::writer::BoxMakeWriter::new(
-                    std::io::stderr,
-                ))
+                .with_writer(fmt_writer())
                 .with_ansi(true)
                 .with_filter(console_filter.clone()),
         )

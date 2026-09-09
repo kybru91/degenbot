@@ -161,6 +161,11 @@ pub struct PipelineInstruments {
     submit_latency: Histogram<f64>,
     /// Cumulative confirmed net profit (wei).
     profit_realized: Counter<f64>,
+    /// PRG-2 / IRUMXD: registration skips by reason (closed set; the
+    /// Python-side per-pool `SkipGate` memo retired in favor of the Rust
+    /// registration gate + this family). Error-class detail stays in log
+    /// spans and the `[build_paths] Progress` breakdown.
+    registration_skips: Counter<u64>,
     /// Cumulative un-submitted profitable-candidate net profit (wei).
     profit_missed: Counter<f64>,
     /// Monitor outcomes, labeled (`confirmed`, `expired`).
@@ -473,6 +478,10 @@ impl PipelineInstruments {
                 .u64_counter("degenbot.monitor.outcomes")
                 .with_description("Monitor outcomes (confirmed/expired)")
                 .build(),
+            registration_skips: meter
+                .u64_counter("degenbot.registration.skips")
+                .with_description("Registration-candidate skips by closed-set reason (PRG-2)")
+                .build(),
             detached_in_flight: meter
                 .f64_gauge("degenbot.detached.in_flight")
                 .with_description(
@@ -781,6 +790,17 @@ impl PipelineInstruments {
     pub fn count_submit_outcome(&self, outcome: &str) {
         self.submit_outcomes
             .add(1, &[KeyValue::new("outcome", outcome.to_owned())]);
+    }
+
+    /// PRG-2 / IRUMXD: one registration-candidate skip; `reason` is a small
+    /// closed set (`v4-admission`, `path-cap`, `dup`, `pool-build-error`,
+    /// `engine-reject`, `register-fail`, ...). The live registration-gate
+    /// table refuses immutable V4 admission facts pre-RPC, so this family
+    /// carries the residual (transient/config) skips. Per-error-class
+    /// detail belongs in log spans, not label cardinality.
+    pub fn count_registration_skip(&self, reason: &str) {
+        self.registration_skips
+            .add(1, &[KeyValue::new("reason", reason.to_owned())]);
     }
 
     /// Candidate loop start → broadcast latency.

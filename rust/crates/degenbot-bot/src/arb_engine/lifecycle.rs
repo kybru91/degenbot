@@ -174,7 +174,13 @@ impl ArbitrageEngine {
             .set_resolved(&deficits);
         self.path_signatures.insert(sig, path_id);
 
-        tracing::info!(
+        // DEBUG-gated (log-volume cut OPBD7L): one line per path registration
+        // was ~48% of a 10G run log (new pools/hop-combos register constantly
+        // on a live run). The registration itself stays fully observable via
+        // the `degenbot.path.register` OTel span (record filter uncapped) and
+        // the `path_pools` count metric; re-enable with
+        // `RUST_LOG=degenbot_bot=debug` for desync investigations.
+        tracing::debug!(
             target: "degenbot::path",
             path_id = path_id,
             hops.count = hop_descs.len(),

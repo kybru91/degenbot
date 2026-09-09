@@ -29,6 +29,9 @@ pub mod liquidity_verifier;
 pub mod log_dispatcher;
 pub mod pool_builder;
 pub mod pump_telemetry;
+/// PRG-2 / IRUMXD: the keyed registration-gate table for immutable V4
+/// admission verdicts (see [registration_gate] docs).
+pub mod registration_gate;
 pub mod registration_lifecycle;
 pub mod reorg_coordinator;
 pub mod reserve_pair_orchestration;
@@ -190,6 +193,11 @@ pub struct BotState {
     /// `pool_managers` DB row); the solver-state verifier reads it via
     /// [`BotState::state_view_for`].
     v4_state_views: HashMap<Address, Address>,
+    /// PRG-2 / IRUMXD: the keyed registration-gate — immutable V4
+    /// admission verdicts (dynamic fee / fee-exceeds-encoder-limit) recorded
+    /// by [`Self::register_v4_pool`] refusals and consulted pre-RPC by the
+    /// `PyO3` build path. Bounded by refused pools, not candidates.
+    registration_gate: registration_gate::RegistrationGate,
     /// The snapshot seed block `S = min(fetch_newest_update_block(V3), V4)`.
     /// Set by `Bot::load_snapshot_from_db` (or `load_snapshot_from_py`) when a
     /// snapshot is loaded; consumed by the auto-backfill (B1/J3FMDO) that
@@ -735,6 +743,7 @@ impl BotState {
             v4_buffer: ::degenbot_pools::liquidity_event_buffer::LiquidityEventBuffer::new(),
             v4_pool_ids: HashMap::new(),
             v4_state_views: HashMap::new(),
+            registration_gate: registration_gate::RegistrationGate::default(),
             snapshot_seed_block: None,
             pump_complete_cutoff: 0,
             v3_event_horizons: HashMap::new(),
@@ -4506,6 +4515,79 @@ mod tests {
     // registered handle instead of replaying the builder into an
     // `AlreadyRegistered` refusal.
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn admission_refusal_records_a_consultable_gate_verdict() {
+        use crate::arb_engine::PoolTickCoverage;
+        use crate::bot_core::{
+            registration_gate::AdmissionVerdict, RegisterV4PoolError, RegisterV4PoolParams,
+            V4PoolKey,
+        };
+        use hashbrown::HashMap;
+
+        let pm = Address::from([0x44u8; 20]);
+        let pid: degenbot_decoders::v4_swap_decoder::V4PoolId = [0xeeu8; 32];
+        let mut core = BotState::new();
+        let base = |fee: u32| RegisterV4PoolParams {
+            pool_manager: pm,
+            pool_id: pid,
+            pool_key: V4PoolKey {
+                currency0: Address::ZERO,
+                currency1: Address::from([1u8; 20]),
+                fee,
+                tick_spacing: 10,
+                hooks: Address::ZERO,
+            },
+            hook_flags: 0,
+            protocol_fee: 0,
+            sqrt_price_x96: U256::from(1u128) << 96,
+            liquidity: 1_000_000,
+            tick: 0,
+            tick_data: HashMap::new(),
+            update_block: 0,
+            tick_data_block: None,
+            coverage: PoolTickCoverage::Sparse,
+            fetcher: None,
+        };
+
+        // Dynamic-fee refusal records a consultable verdict.
+        assert!(matches! {
+            core.register_v4_pool(&base(0x100_000)),
+            Err(RegisterV4PoolError::DynamicFee { .. }),
+        });
+        assert_eq!(
+            core.admission_verdict(pm, &pid),
+            Some(AdmissionVerdict::DynamicFee { fee: 0x100_000 })
+        );
+
+        // Fee-encoder-limit refusal records its verdict on a fresh pool.
+        let pid2: degenbot_decoders::v4_swap_decoder::V4PoolId = [0x33u8; 32];
+        let mut p2 = base(320_000);
+        p2.pool_id = pid2;
+        assert!(matches! {
+            core.register_v4_pool(&p2),
+            Err(RegisterV4PoolError::FeeExceedsEncoderLimit { fee: 320_000 }),
+        });
+        assert_eq!(
+            core.admission_verdict(pm, &pid2),
+            Some(AdmissionVerdict::FeeExceedsEncoderLimit { fee: 320_000 })
+        );
+        assert_eq!(core.registration_gate_len(), 2);
+
+        // An admitted pool registers normally and answers via the registry
+        // of record — the REGISTRATION refusals gate-record, admissions do
+        // not, and the two readers never mix.
+        let pid3: degenbot_decoders::v4_swap_decoder::V4PoolId = [0x77u8; 32];
+        let mut ok = base(500);
+        ok.pool_id = pid3;
+        let admitted = core.register_v4_pool(&ok).expect("in-spec registration");
+        assert!(
+            core.admission_verdict(pm, &pid3).is_none(),
+            "admitted pools gate-record nothing"
+        );
+        assert!(core.try_registered_v4(pm, &pid3).is_some());
+        let _: u64 = admitted;
+    }
 
     #[test]
     fn registered_pool_by_address_answers_registered_families() {

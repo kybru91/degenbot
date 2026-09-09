@@ -50,35 +50,42 @@ mkdir -p "$LOGDIR"
 # --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
-# Debug-visible instrumented runs (default ON here).
+# INFO-visible runs (default; log-volume cut OPBD7L).
 #
-# The Rust core's granular diagnostics ([solver-dbg],
-# [solver-st], [v2-calc-trace], ...) are gated behind the `debug` tracing
-# level AND the Python-side DEBUG logger (see docs/logging.md). Set BOTH below
-# so those lines reach logs/bot_run.log in these instrumented runs:
+# The default posture prints INFO status lines ([sim], [bundle]-summaries,
+# pump/block lifecycle) and WARN/ERROR only — no debug/trace diagnostics.
+# The Rust core's granular diagnostics ([solver-dbg], [solver-st],
+# [v2-calc-trace], [path] registered, [bundle] inline payload settle) stay in
+# the code but are gated behind the `debug` tracing level AND the Python-side
+# DEBUG logger (see docs/logging.md). To run an instrumented run, set BOTH:
 #
-#   * RUST_LOG        is the Rust `tracing` EnvFilter gate. Raising the
-#                     degenbot_* crates to `debug` makes the fine-grained
-#                     diagnostics visible while `info` keeps routine status
-#                     lines; the alloy/tungstenite targets are held at `warn`
-#                     to mirror the code's built-in default and stop their
-#                     lifecycle INFO noise from flooding the log.
-#   * DEGENBOT_DEBUG=1 is the Python `logging` gate. Without it the crate-root
-#                     Python loggers stay at INFO and drop the debug records
-#                     before they reach the log/bot_run.log tee.
+#   * RUST_LOG         is the Rust `tracing` EnvFilter gate; raise degenbot_*
+#                      crates to `debug` (docs/logging.md has the recipes).
+#   * DEGENBOT_DEBUG=1 is the Python `logging` gate for forwarded records.
 #
-# Both respect a pre-set value: set RUST_LOG / DEGENBOT_DEBUG yourself to opt
-# out (e.g. RUST_LOG=warn ./run_bot.sh) or tighten the scope.
+# Duplication control:
+#   * DEGENBOT_LOG_FMT=0  routes the Rust stderr `fmt` layer (the
+#     ANSI-escaped copy) to a sink. RUST records still reach the log exactly
+#     once via the Python-forwarding tunnel; without this every degenbot
+#     line is written twice into bot_run.log.
+#   * DEGENBOT_WS_TRACE=0 silences the per-WS-log `[trace] ws-log` probe
+#     (it fires for EVERY relevant-topic log at info when =1).
+#
+# All values respect a pre-set environment: RUST_LOG=warn ./run_bot.sh opts
+# out; DEGENBOT_LOG_FMT=1 restores the stderr mirror.
 # --------------------------------------------------------------------------
-DEFAULT_RUST_LOG="info,degenbot_bot=debug,degenbot_arbitrage=debug,degenbot_simulation=debug,degenbot_solvers=debug,alloy_pubsub=warn,alloy_transport=warn,alloy_transport_ws=warn,alloy_transport_ipc=warn,alloy_transport_http=warn,alloy_provider=warn,alloy_rpc=warn,alloy_network=warn,alloy_contract=warn,tungstenite=warn"
+DEFAULT_RUST_LOG="info,alloy_pubsub=warn,alloy_transport=warn,alloy_transport_ws=warn,alloy_transport_ipc=warn,alloy_transport_http=warn,alloy_provider=warn,alloy_rpc=warn,alloy_network=warn,alloy_contract=warn,tungstenite=warn"
 export RUST_LOG="${RUST_LOG:-$DEFAULT_RUST_LOG}"
-export DEGENBOT_DEBUG="${DEGENBOT_DEBUG:-1}"
+export DEGENBOT_DEBUG="${DEGENBOT_DEBUG:-0}"
+export DEGENBOT_LOG_FMT="${DEGENBOT_LOG_FMT:-0}"
 export DEGENBOT_OTEL="${DEGENBOT_OTEL:-1}"
 # SIMPIPE2 T4 soak arm: the ENGINE-side inline sim (worker seam). Default 0
 # (legacy option-A FFI pipeline); the soak flips 0/1 across equal windows.
 export DEGENBOT_SOLVE_INLINE_SIM="${DEGENBOT_SOLVE_INLINE_SIM:-1}"
 export DEGENBOT_SIM_EXIT_ON_FAIL="${DEGENBOT_SIM_EXIT_ON_FAIL:-0}"
-export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-1}"
+# [trace] ws-log is a per-WS-log probe (one info line per relevant log);
+# OFF by default so the log is not flooded — desync investigations set =1.
+export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-0}"
 # Publish-debounce window (ms), last dirty log -> settle decision. A/B'd on
 # 2026-09-04 (telemetry-latency-playbook S7): bursts complete in 1.3-27.5 ms
 # while the 50 ms code default settled full-length on ~every block — a fixed

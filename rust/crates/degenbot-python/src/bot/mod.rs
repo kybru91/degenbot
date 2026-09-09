@@ -242,6 +242,32 @@ impl PyBot {
         pyo3::PyErr::from_value(exc.into_bound(py).into_any())
     }
 
+    /// PRG-2 / IRUMXD: record one registration-candidate skip into the
+    /// `degenbot.registration.skips` metric family (Rust meter). `reason`
+    /// is collapsed onto a small closed label set (instruments cardinality
+    /// discipline) — per-error-class detail stays in the greppable
+    /// `[build_paths] Progress` breakdown, not label cardinality.
+    fn registration_skip_kind(reason: &str) -> &'static str {
+        match reason {
+            "v4-hook-rejected" | "v4-dynamic-fee-rejected" | "v4-high-fee-rejected" => {
+                "v4-admission"
+            }
+            "path-cap" => "path-cap",
+            "dup" => "dup",
+            "direction-mismatch" | "v4-no-hash" | "unknown-pool-type" => "candidate-invalid",
+            "engine-reject" => Self::engine_reject_kind(),
+            other if other.starts_with("register-fail") => "register-fail",
+            other if other.starts_with("build-v2:") => "pool-build-error",
+            other if other.starts_with("build-v3:") => "pool-build-error",
+            other if other.starts_with("build-v4:") => "pool-build-error",
+            _ => "other",
+        }
+    }
+
+    const fn engine_reject_kind() -> &'static str {
+        "engine-reject"
+    }
+
     /// Run one pool build under the engine-internal single flight (PRG-1):
     /// `precheck` answers from the `BotState` registry of record, `lead` runs
     /// the full build choreography (fetch → register) exactly once under the
@@ -258,12 +284,12 @@ impl PyBot {
         &self,
         py: Python<'_>,
         key: &build_flights::FlightKey,
-        mut precheck: impl FnMut() -> Option<T>,
+        mut precheck: impl FnMut() -> PyResult<Option<T>>,
         lead: impl FnOnce() -> PyResult<(u64, T)>,
     ) -> PyResult<T> {
         let mut iterations: u32 = 0;
         loop {
-            if let Some(payload) = precheck() {
+            if let Some(payload) = precheck()? {
                 return Ok(payload);
             }
             match self.flights.enter(key) {
@@ -369,20 +395,39 @@ impl PyBot {
         py: Python<'_>,
         pm: Address,
         pid: &[u8; 32],
-    ) -> Option<(
-        u64,
-        String,
-        String,
-        String,
-        String,
-        u32,
-        i32,
-        u16,
-        String,
-        u32,
-        u32,
-    )> {
-        let existing = self.with_state(py, |s| s.try_registered_v4(pm, pid))?;
+    ) -> PyResult<
+        Option<(
+            u64,
+            String,
+            String,
+            String,
+            String,
+            u32,
+            i32,
+            u16,
+            String,
+            u32,
+            u32,
+        )>,
+    > {
+        // PRG-2: the keyed registration gate refuses an immutable-admission
+        // pool (dynamic fee / fee-exceeds-encoder-limit) BEFORE any RPC work
+        // on the registration path, with the exact exception class the live
+        // registration refusal would have raised (map_register_v4_err).
+        if let Some(verdict) = self.with_state(py, |s| s.admission_verdict(pm, pid)) {
+            let core_err = match verdict {
+                degenbot_bot::bot_core::registration_gate::AdmissionVerdict::DynamicFee { fee } => {
+                    degenbot_bot::bot_core::RegisterV4PoolError::DynamicFee { fee }
+                }
+                degenbot_bot::bot_core::registration_gate::AdmissionVerdict::FeeExceedsEncoderLimit {
+                    fee,
+                } => degenbot_bot::bot_core::RegisterV4PoolError::FeeExceedsEncoderLimit { fee },
+            };
+            return Err(map_register_v4_err(core_err));
+        }
+        let Some(existing) = self.with_state(py, |s| s.try_registered_v4(pm, pid)) else {
+            return Ok(None);
+        };
         let coverage_str = match existing.coverage {
             degenbot_bot::bot_core::PoolTickCoverage::Tracked => "tracked",
             degenbot_bot::bot_core::PoolTickCoverage::Sparse => "sparse",
@@ -391,7 +436,7 @@ impl PyBot {
         // `lp_fee` = the static pool-key fee: dynamic-fee pools are
         // admission-rejected and never registered, so they never reach this
         // branch.
-        Some((
+        Ok(Some((
             existing.pool_id,
             coverage_str.to_string(),
             key.currency0.to_checksum(None),
@@ -406,7 +451,7 @@ impl PyBot {
             format!("0x{}", alloy::hex::encode(pid)),
             existing.protocol_fee,
             key.fee,
-        ))
+        )))
     }
 
     /// ADR-006 D4 (T3): attach the pump lifecycle state owned by a
@@ -662,6 +707,19 @@ impl PyBot {
         Ok(())
     }
 
+    /// PRG-2 / IRUMXD: the Python driver records registration skips into
+    /// the Rust `degenbot.registration.skips` meter family; the former
+    /// Python `SkipGate` memo is retired — immutable V4 admission verdicts
+    /// are refused pre-RPC by the core registration gate. No `self` state —
+    /// observation only.
+    #[pyo3(signature = (reason))]
+    #[expect(clippy::unused_self)]
+    fn record_registration_skip(&self, reason: &str) {
+        if let Some(p) = degenbot_bot::instruments::pipeline() {
+            p.count_registration_skip(Self::registration_skip_kind(reason));
+        }
+    }
+
     /// The snapshot seed block `S` (or `None` when no DB snapshot was loaded —
     /// the cold-start path). Python reads this in `engine_registry.start()`
     /// to stash `_verify_snapshot_block` for the per-pool two-step verify.
@@ -888,7 +946,7 @@ impl PyBot {
         self.run_flight(
             py,
             &key,
-            || self.registered_v2_payload(py, &addr),
+            || Ok(self.registered_v2_payload(py, &addr)),
             || {
                 use degenbot_bot::bot_core::pool_builder::builder;
                 use degenbot_core::runtime::get_runtime;
@@ -965,7 +1023,11 @@ impl PyBot {
         self.run_flight(
             py,
             &key,
-            || self.registered_family_pool_id(py, &addr, RegisteredPoolFamily::AerodromeV2),
+            || {
+                Ok(
+                    self.registered_family_pool_id(py, &addr, RegisteredPoolFamily::AerodromeV2),
+                )
+            },
             || {
                 use degenbot_bot::bot_core::pool_builder::builder;
                 use degenbot_core::runtime::get_runtime;
@@ -1015,7 +1077,10 @@ impl PyBot {
         self.run_flight(
             py,
             &key,
-            || self.registered_family_pool_id(py, &addr, RegisteredPoolFamily::BalancerWeighted),
+            || {
+                Ok(self
+                    .registered_family_pool_id(py, &addr, RegisteredPoolFamily::BalancerWeighted))
+            },
             || {
                 use degenbot_bot::bot_core::pool_builder::builder;
                 use degenbot_core::runtime::get_runtime;
@@ -1070,7 +1135,9 @@ impl PyBot {
         self.run_flight(
             py,
             &key,
-            || self.registered_family_pool_id(py, &addr, RegisteredPoolFamily::BalancerStable),
+            || {
+                Ok(self.registered_family_pool_id(py, &addr, RegisteredPoolFamily::BalancerStable))
+            },
             || {
                 use degenbot_bot::bot_core::pool_builder::builder;
                 use degenbot_core::runtime::get_runtime;
@@ -1132,7 +1199,7 @@ impl PyBot {
         self.run_flight(
             py,
             &key,
-            || self.registered_v3_payload(py, &addr, chain_id),
+            || Ok(self.registered_v3_payload(py, &addr, chain_id)),
             || {
                 use degenbot_bot::bot_core::pool_builder::builder;
                 use degenbot_core::runtime::get_runtime;
@@ -1381,6 +1448,8 @@ impl PyBot {
             py,
             &key,
             || self.registered_v4_payload(py, pm, &pool_id),
+            // registered_v4_payload is now PyResult-returning (PRG-2 gate
+            // consult); no further wrapping needed.
             || {
                 use degenbot_bot::bot_core::pool_builder::builder;
                 use degenbot_core::runtime::get_runtime;

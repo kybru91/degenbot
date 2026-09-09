@@ -160,6 +160,8 @@ pub mod instruments {
         pub fn observe_dispatch_gas(&self, _gas: u64) {}
         /// no-op
         pub fn count_submit_outcome(&self, _outcome: &str) {}
+        /// no-op (PRG-2 / IRUMXD registration-skip family)
+        pub fn count_registration_skip(&self, _reason: &str) {}
         /// no-op
         pub fn observe_submit_latency(&self, _secs: f64) {}
         /// no-op

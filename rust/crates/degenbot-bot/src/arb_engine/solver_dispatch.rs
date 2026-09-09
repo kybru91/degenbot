@@ -1076,7 +1076,12 @@ impl ArbitrageEngine {
             } else {
                 "profitable"
             };
-            tracing::info!(
+            // DEBUG-gated (log-volume cut OPBD7L): this event duplicates the
+            // `[path] profitable solve` event above (same path.id/profit) and
+            // the Python-side `[sim]` summary; the settle verdict is also
+            // observable as an event on the enclosing `degenbot.arb.merge`
+            // OTel span. Re-enable with `RUST_LOG=degenbot_bot=debug`.
+            tracing::debug!(
                 target: "degenbot::solver",
                 { path.id = pid, verdict, expected_profit = %result.profit, sim.seam = "inline_payload_store" },
                 "[bundle] inline payload settle"
