@@ -89,6 +89,9 @@ shared instruments.
 
 - Import `docs/grafana/degenbot-overview.json` for the companion dashboard;
   point it at the Prometheus data source scraping the bot endpoint.
+- Function-level profiler metrics (hotpath) are a separate scrape job + the
+  `docs/grafana/hotpath-profiling.json` dashboard — the enablement and scrape
+  recipe is [`HOTPATH.md`](HOTPATH.md).
 - Traces: Jaeger UI, service `degenbot-bot`. Per-block traces root at
   `degenbot.epoch` (attrs `epoch.block` / `epoch.seq` plus the pre-solve gap
   fields); the ADR-041 stage spans (`degenbot.stage.streaming` / `quiesced` /

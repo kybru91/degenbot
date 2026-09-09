@@ -100,9 +100,19 @@ otel = ["dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk", 
 # Forwards degenbot-solvers/hotpath so the solver-internal probes (cl_solve.*,
 # mixed.solve_path_inner) instrument too — the crate-level hotpath dep unifies
 # at package level, but the explicit forward keeps the intent durable.
-hotpath = ["hotpath/hotpath", "hotpath/threads", "degenbot-solvers/hotpath"]
+# `tokio` backend: the tokio_runtime! monitor (hotpath_tokio_* families; the
+# interesting RuntimeMetrics getters additionally need --cfg tokio_unstable,
+# which the repo-root .cargo/config.toml applies workspace-wide).
+hotpath = ["hotpath/hotpath", "hotpath/threads", "hotpath/tokio", "degenbot-solvers/hotpath"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+# Prometheus exporter for the profiler itself (GET /metrics, default
+# 127.0.0.1:6772; env knobs HOTPATH_PROMETHEUS_{PORT,HOST,AUTH_TOKEN}).
+# hotpath starts the exporter automatically with the guard
+# (start_prometheus_server_once), so this feature adds no call sites — the
+# DEGENBOT_HOTPATH=1 runtime gate keeps default runs export-free. Operator
+# scrape recipe + dashboard live in docs/grafana/ (hotpath profiling notes).
+hotpath-prometheus = ["hotpath", "hotpath/hotpath-prometheus"]
 opentelemetry-prometheus = ["dep:opentelemetry-prometheus"]
 prometheus = ["dep:prometheus"]
 tokio-util = ["dep:tokio-util"]

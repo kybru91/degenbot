@@ -450,6 +450,13 @@ impl BlockPump {
         // build_with_shutdown thread, whose process::exit aborted tokio
         // workers mid-TLS-teardown).
         let _hotpath_guard = crate::profiling::hotpath_guard("block_pump");
+        // hotpath tokio-runtime monitor (hotpath_tokio_* families): must run
+        // inside the ambient I/O runtime, which this is. The interesting
+        // getters need --cfg tokio_unstable (root .cargo/config.toml); without
+        // it the monitor emits only the unstable-free subset. No-op when the
+        // hotpath feature is off.
+        #[cfg(feature = "hotpath")]
+        hotpath::tokio_runtime!(&tokio::runtime::Handle::current());
         // AZZDBI/XXJR3A: apply any fixed DEGENBOT_MIMALLOC_PURGE_DELAY_MS and
         // arm the block-cadence discovery for the purge-delay control.
         crate::allocator_ctrl::init_from_env_at_pump_start();
@@ -2013,6 +2020,10 @@ impl BlockPump {
     /// Panics if `eth_getLogs` reveals a relevant-topic log for `block` that
     /// the live websocket did not deliver — a catastrophic WS delivery drop
     /// that must fail loudly rather than silently stale the engine state.
+    // future=true: poll-level attribution for the per-block getLogs
+    // completeness call (WS-gap verification) — poll time here is network
+    // wait, useful against the header->published latency race.
+    #[hotpath::measure(future = true)]
     pub async fn assert_ws_block_complete(
         &self,
         block: u64,

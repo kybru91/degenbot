@@ -1,0 +1,1776 @@
+{
+ "kind": "Dashboard",
+ "apiVersion": "dashboard.grafana.app/v2alpha1",
+ "metadata": {
+  "name": "hotpath-profiling"
+ },
+ "spec": {
+  "cursorSync": "Off",
+  "editable": true,
+  "links": [],
+  "liveNow": false,
+  "preload": false,
+  "tags": [
+   "degenbot",
+   "hotpath",
+   "profiling"
+  ],
+  "title": "hotpath profiling (Rust core)",
+  "timeSettings": {
+   "from": "now-30m",
+   "to": "now",
+   "autoRefresh": "5s",
+   "autoRefreshIntervals": [
+    "5s",
+    "10s",
+    "30s",
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h",
+    "2h",
+    "1d"
+   ],
+   "hideTimepicker": false,
+   "fiscalYearStartMonth": 0
+  },
+  "variables": [
+   {
+    "kind": "DatasourceVariable",
+    "spec": {
+     "name": "DS_PROMETHEUS",
+     "pluginId": "prometheus",
+     "refresh": "never",
+     "regex": "",
+     "current": {
+      "text": "prometheus",
+      "value": "prometheus"
+     },
+     "options": [],
+     "multi": false,
+     "includeAll": false,
+     "label": "Prometheus",
+     "hide": "dontHide",
+     "skipUrlSync": false,
+     "allowCustomValue": true
+    }
+   }
+  ],
+  "elements": {
+   "panel-1": {
+    "kind": "Panel",
+    "spec": {
+     "id": 1,
+     "title": "Build (hotpath / profile / rustc)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_build_info",
+            "legendFormat": "{{hotpath_version}} {{profile}} {{rustc_version}}",
+            "instant": true,
+            "range": false
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "stat",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ],
+         "fields": "",
+         "values": false
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-2": {
+    "kind": "Panel",
+    "spec": {
+     "id": 2,
+     "title": "Profiler uptime",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_uptime_seconds",
+            "legendFormat": "uptime",
+            "instant": true,
+            "range": false
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "stat",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ],
+         "fields": "",
+         "values": false
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-3": {
+    "kind": "Panel",
+    "spec": {
+     "id": 3,
+     "title": "Resident set size",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_rss_bytes",
+            "legendFormat": "rss",
+            "instant": true,
+            "range": false
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "stat",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": {
+         "calcs": [
+          "lastNotNull"
+         ],
+         "fields": "",
+         "values": false
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "bytes",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-4": {
+    "kind": "Panel",
+    "spec": {
+     "id": 4,
+     "title": "Threads",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_threads",
+            "legendFormat": "threads",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-5": {
+    "kind": "Panel",
+    "spec": {
+     "id": 5,
+     "title": "Per-thread CPU (top 8, last monitor window)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "topk(8, hotpath_thread_cpu_percent)",
+            "legendFormat": "{{name}} (tid {{tid}})",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "percent",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-6": {
+    "kind": "Panel",
+    "spec": {
+     "id": 6,
+     "title": "Per-thread peak CPU (since start)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_thread_cpu_percent_max",
+            "legendFormat": "{{name}} (tid {{tid}})",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "percent",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-10": {
+    "kind": "Panel",
+    "spec": {
+     "id": 10,
+     "title": "Live tasks / workers / blocking threads",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_tokio_alive_tasks",
+            "legendFormat": "alive tasks",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        },
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_tokio_workers",
+            "legendFormat": "workers",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "B",
+          "hidden": false
+         }
+        },
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_tokio_blocking_threads",
+            "legendFormat": "blocking threads",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "C",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-11": {
+    "kind": "Panel",
+    "spec": {
+     "id": 11,
+     "title": "Queue depths (global / blocking / worker-local max)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_tokio_global_queue_depth",
+            "legendFormat": "global queue",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        },
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_tokio_blocking_queue_depth",
+            "legendFormat": "blocking queue",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "B",
+          "hidden": false
+         }
+        },
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "max by (worker) (hotpath_tokio_worker_local_queue_depth)",
+            "legendFormat": "worker {{worker}} local",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "C",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-12": {
+    "kind": "Panel",
+    "spec": {
+     "id": 12,
+     "title": "Worker steal events (rate/s)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "rate(hotpath_tokio_worker_steals_total[$__rate_interval])",
+            "legendFormat": "{{worker}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-13": {
+    "kind": "Panel",
+    "spec": {
+     "id": 13,
+     "title": "Worker busy time (rate)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "sum by (worker) (rate(hotpath_tokio_worker_busy_seconds_total[$__rate_interval]))",
+            "legendFormat": "{{worker}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-14": {
+    "kind": "Panel",
+    "spec": {
+     "id": 14,
+     "title": "Spawn / remote-schedule rates",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "rate(hotpath_tokio_spawned_tasks_total[$__rate_interval])",
+            "legendFormat": "spawned",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        },
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "rate(hotpath_tokio_remote_schedules_total[$__rate_interval])",
+            "legendFormat": "remote scheduled",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "B",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-20": {
+    "kind": "Panel",
+    "spec": {
+     "id": 20,
+     "title": "Function duration p99 (top 8)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "topk(8, histogram_quantile(0.99, sum by (function) (rate(hotpath_function_duration_seconds[$__rate_interval]))))",
+            "legendFormat": "{{function}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-21": {
+    "kind": "Panel",
+    "spec": {
+     "id": 21,
+     "title": "Function duration avg (top 8)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "topk(8, histogram_sum(rate(hotpath_function_duration_seconds[$__rate_interval])) / histogram_count(rate(hotpath_function_duration_seconds[$__rate_interval])))",
+            "legendFormat": "{{function}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-22": {
+    "kind": "Panel",
+    "spec": {
+     "id": 22,
+     "title": "Function calls/s (top 8)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "topk(8, rate(hotpath_function_calls_total[$__rate_interval]))",
+            "legendFormat": "{{function}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "reqps",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-23": {
+    "kind": "Panel",
+    "spec": {
+     "id": 23,
+     "title": "Allocation bytes/s per function (top 8)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "topk(8, rate(hotpath_function_alloc_bytes_total[$__rate_interval]))",
+            "legendFormat": "{{function}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "Bps",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-24": {
+    "kind": "Panel",
+    "spec": {
+     "id": 24,
+     "title": "Allocation count/s per function",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "topk(8, rate(hotpath_function_alloc_count_total[$__rate_interval]))",
+            "legendFormat": "{{function}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "reqps",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-25": {
+    "kind": "Panel",
+    "spec": {
+     "id": 25,
+     "title": "Mutex contention: wait vs hold (avg, by label)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "sum by (label) (histogram_sum(rate(hotpath_mutex_wait_seconds[$__rate_interval])))",
+            "legendFormat": "wait {{label}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        },
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "sum by (label) (histogram_sum(rate(hotpath_mutex_acquire_seconds[$__rate_interval])))",
+            "legendFormat": "held {{label}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "B",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-26": {
+    "kind": "Panel",
+    "spec": {
+     "id": 26,
+     "title": "Channel queue depth (max by label/type)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "max by (label, type) (hotpath_channel_queue_size)",
+            "legendFormat": "{{label}} {{type}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-27": {
+    "kind": "Panel",
+    "spec": {
+     "id": 27,
+     "title": "Future avg poll duration",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "rate(hotpath_future_poll_seconds_total[$__rate_interval]) / rate(hotpath_future_sampled_polls_total[$__rate_interval])",
+            "legendFormat": "{{source}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "s",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-28": {
+    "kind": "Panel",
+    "spec": {
+     "id": 28,
+     "title": "Custom gauges (gauge!)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "hotpath_gauge",
+            "legendFormat": "{{key}}",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   },
+   "panel-29": {
+    "kind": "Panel",
+    "spec": {
+     "id": 29,
+     "title": "I/O throughput and errors (by op)",
+     "links": [],
+     "data": {
+      "kind": "QueryGroup",
+      "spec": {
+       "queries": [
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "sum by (op) (rate(hotpath_io_bytes_total[$__rate_interval]))",
+            "legendFormat": "{{op}} bytes/s",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "A",
+          "hidden": false
+         }
+        },
+        {
+         "kind": "PanelQuery",
+         "spec": {
+          "query": {
+           "kind": "prometheus",
+           "spec": {
+            "expr": "sum by (op) (rate(hotpath_io_errors_total[$__rate_interval]))",
+            "legendFormat": "{{op}} errors/s",
+            "instant": false,
+            "range": true
+           }
+          },
+          "datasource": {
+           "type": "prometheus",
+           "uid": "prometheus"
+          },
+          "refId": "B",
+          "hidden": false
+         }
+        }
+       ],
+       "transformations": [],
+       "queryOptions": {}
+      }
+     },
+     "vizConfig": {
+      "kind": "timeseries",
+      "spec": {
+       "pluginVersion": "",
+       "options": {
+        "legend": {
+         "displayMode": "list",
+         "placement": "bottom",
+         "showLegend": true
+        },
+        "tooltip": {
+         "mode": "multi",
+         "sort": "desc"
+        }
+       },
+       "fieldConfig": {
+        "defaults": {
+         "unit": "short",
+         "color": {
+          "mode": "palette-classic"
+         }
+        },
+        "overrides": []
+       }
+      }
+     }
+    }
+   }
+  },
+  "layout": {
+   "kind": "RowsLayout",
+   "spec": {
+    "rows": [
+     {
+      "kind": "RowsLayoutRow",
+      "spec": {
+       "title": "Process & runtime",
+       "collapse": false,
+       "layout": {
+        "kind": "AutoGridLayout",
+        "spec": {
+         "maxColumnCount": 6,
+         "columnWidthMode": "narrow",
+         "rowHeightMode": "short",
+         "items": [
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-1"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-2"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-3"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-4"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-5"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-6"
+            }
+           }
+          }
+         ]
+        }
+       }
+      }
+     },
+     {
+      "kind": "RowsLayoutRow",
+      "spec": {
+       "title": "Tokio runtime",
+       "collapse": false,
+       "layout": {
+        "kind": "AutoGridLayout",
+        "spec": {
+         "maxColumnCount": 6,
+         "columnWidthMode": "standard",
+         "rowHeightMode": "standard",
+         "items": [
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-10"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-11"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-12"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-13"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-14"
+            }
+           }
+          }
+         ]
+        }
+       }
+      }
+     },
+     {
+      "kind": "RowsLayoutRow",
+      "spec": {
+       "title": "Function & concurrency profiling",
+       "collapse": false,
+       "layout": {
+        "kind": "AutoGridLayout",
+        "spec": {
+         "maxColumnCount": 4,
+         "columnWidthMode": "standard",
+         "rowHeightMode": "standard",
+         "items": [
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-20"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-21"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-22"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-23"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-24"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-25"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-26"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-27"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-28"
+            }
+           }
+          },
+          {
+           "kind": "AutoGridLayoutItem",
+           "spec": {
+            "element": {
+             "kind": "ElementReference",
+             "name": "panel-29"
+            }
+           }
+          }
+         ]
+        }
+       }
+      }
+     }
+    ]
+   }
+  }
+ }
+}

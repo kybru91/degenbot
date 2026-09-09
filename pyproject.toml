@@ -293,11 +293,13 @@ bindings = "pyo3"
 # rust/PERF_RESULTS.md "dev-vs-release profile" lever.
 profile = "dev"
 # Dev builds compile hotpath in (toggle at runtime via DEGENBOT_HOTPATH=1 —
-# see rust/crates/degenbot-bot/src/profiling.rs). Release wheels override this
+# see rust/crates/degenbot-bot/src/profiling.rs), plus its Prometheus exporter
+# (guard-enabled runs serve profiler /metrics on :6772, see
+# docs/grafana/ALERTS.md). Release wheels override this
 # list with `--features pyo3/extension-module` (see
 # .github/workflows/release.yml) so the shipped artifact excludes
 # hotpath — macros are no-op `lib_off`, zero runtime penalty.
-features = ["pyo3/extension-module", "degenbot-bot/hotpath", "degenbot-solvers/hotpath", "degenbot-bot/allocator-ctrl", "otel", "mimalloc"]
+features = ["pyo3/extension-module", "degenbot-bot/hotpath", "degenbot-bot/hotpath-prometheus", "degenbot-solvers/hotpath", "degenbot-bot/allocator-ctrl", "otel", "mimalloc"]
 python-packages = ["degenbot"]
 
 [tool.alembic]

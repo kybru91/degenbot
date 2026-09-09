@@ -1135,6 +1135,9 @@ impl ArbitrageEngine {
         if let Some(p) = crate::instruments::pipeline() {
             p.set_detached_in_flight(outstanding_now);
         }
+        hotpath::gauge!("detached_solve_in_flight").set(f64::from(
+            u32::try_from(outstanding_now).unwrap_or(u32::MAX),
+        ));
         let DetachedMergeItem::Solved {
             cycle_seq,
             solve_block,
@@ -1681,7 +1684,9 @@ impl ArbitrageEngine {
         // same deficits, same memo validation).
 
         hotpath::measure_block!("arb_solve.resolve", {
-            let core = self.core.read();
+            // Violated only while a writer is queued (parking_lot read acquire):
+            // nonzero = core-lock congestion, not compute.
+            let core = hotpath::measure_block!("resolve.core_read_acquire", self.core.read());
             let resolve_chunk = |path_ids: &[u64]| -> ResolveChunkOut {
                 let mut out = ResolveChunkOut {
                     resolved: Vec::new(),
@@ -1773,7 +1778,8 @@ impl ArbitrageEngine {
             // debug-log ordering) identical across runs for ~microsecond cost.
             let mut affected_vec: Vec<u64> = affected_path_ids.iter().copied().collect();
             affected_vec.sort_unstable();
-            let chunk_outs: Vec<ResolveChunkOut> =
+            let chunk_outs: Vec<ResolveChunkOut> = hotpath::measure_block!(
+                "resolve.chunks",
                 if resolve_parallel_enabled() && affected_vec.len() >= RESOLVE_PAR_MIN {
                     affected_vec
                         .par_chunks(RESOLVE_CHUNK)
@@ -1781,45 +1787,64 @@ impl ArbitrageEngine {
                         .collect()
                 } else {
                     vec![resolve_chunk(&affected_vec)]
-                };
+                }
+            );
 
             // Serial, deterministic merge (the engine mutex is held by this
             // cycle, so no other task can race these stores).
             let mut same_state_total = 0u64;
             let mut projections_total = 0u64;
-            for ResolveChunkOut {
-                resolved,
-                status,
-                snapshots,
-                same_state,
-                projections,
-                invalid_reasons: chunk_invalid,
-                deferred,
-            } in chunk_outs
-            {
-                same_state_total += same_state;
-                projections_total += projections;
-                deferred_paths.extend(deferred);
-                for (path_id, snapshot) in snapshots {
-                    self.resolved_update_snapshot.insert(path_id, snapshot);
+            hotpath::measure_block!("resolve.merge", {
+                for ResolveChunkOut {
+                    resolved,
+                    status,
+                    snapshots,
+                    same_state,
+                    projections,
+                    invalid_reasons: chunk_invalid,
+                    deferred,
+                } in chunk_outs
+                {
+                    same_state_total += same_state;
+                    projections_total += projections;
+                    deferred_paths.extend(deferred);
+                    for (path_id, snapshot) in snapshots {
+                        self.resolved_update_snapshot.insert(path_id, snapshot);
+                    }
+                    for (path_id, arc) in resolved {
+                        self.path_resolved.insert(path_id, arc);
+                    }
+                    for (path_id, deficits) in status {
+                        self.path_status
+                            .entry(path_id)
+                            .or_default()
+                            .set_resolved(&deficits);
+                    }
+                    for (reason, count) in chunk_invalid {
+                        *invalid_reasons.entry(reason).or_insert(0u64) += count;
+                    }
                 }
-                for (path_id, arc) in resolved {
-                    self.path_resolved.insert(path_id, arc);
-                }
-                for (path_id, deficits) in status {
-                    self.path_status
-                        .entry(path_id)
-                        .or_default()
-                        .set_resolved(&deficits);
-                }
-                for (reason, count) in chunk_invalid {
-                    *invalid_reasons.entry(reason).or_insert(0u64) += count;
-                }
-            }
-            self.paths_same_state_this_cycle = same_state_total;
-            // Lifetime counter (the serial loop accumulated in place).
-            self.hop_projection_count += projections_total;
+                self.paths_same_state_this_cycle = same_state_total;
+                // Lifetime counter (the serial loop accumulated in place).
+                self.hop_projection_count += projections_total;
+            });
         });
+        // Per-cycle resolve funnel (hotpath_gauge{key=...}). Reason keys come
+        // from the closed HopDeficit-reason set, so the series family stays
+        // bounded.
+        hotpath::gauge!("resolve_paths_affected").set(f64::from(
+            u32::try_from(affected_path_ids.len()).unwrap_or(u32::MAX),
+        ));
+        hotpath::gauge!("resolve_paths_same_state").set(f64::from(
+            u32::try_from(self.paths_same_state_this_cycle).unwrap_or(u32::MAX),
+        ));
+        hotpath::gauge!("resolve_paths_deferred").set(f64::from(
+            u32::try_from(deferred_paths.len()).unwrap_or(u32::MAX),
+        ));
+        for (reason, count) in &invalid_reasons {
+            hotpath::gauge!(format!("resolve_invalid_{reason}"))
+                .set(f64::from(u32::try_from(*count).unwrap_or(u32::MAX)));
+        }
         tracing::info!(
             target: "degenbot::solver",
             block_number = solve_block,
@@ -2118,84 +2143,58 @@ impl ArbitrageEngine {
                     let outstanding_bin = std::sync::Arc::clone(&outstanding_in_bins);
                     let tx = merge_tx.clone();
                     let solve_span_bin = solve_span.clone();
-                    if let Err(err) = std::thread::Builder::new()
-                        .name(format!("arb-detach-bin-{bin_idx}"))
-                        .spawn(move || {
-                            // 7LV6VN T5 (pipelined arm): results park until
-                            // their sim lands; the walk never waits on a
-                            // sim. Sims pace on the budget-derived global
-                            // slot pool (sim_slots), so walk + sim demand
-                            // never exceeds the CPU quota by construction.
-                            let mut held: Vec<DetachedMergeItem> = Vec::new();
-                            let mut pending = PipelinedSims::default();
-                            for &idx in &bin {
-                                let (pid, resolved) = &to_solve_bin[idx];
-                                // SIMPIPE2 T2: clamp in the bin thread
-                                // (stance-gated; BEFORE the profitless filter
-                                // — the profit-clamp recompute can zero a
-                                // candidate) so the committed inputs are
-                                // merge-ready with no sidecar round-trip.
-                                let Some((pid, result, worker_clamp_twins)) =
-                                    solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved)
-                                        .map(|(pid, mut r)| {
-                                            let twins = clamp_result_in_worker(
-                                                &shared_bin,
-                                                idx,
-                                                pid,
-                                                &mut r,
-                                            );
-                                            (pid, r, twins)
-                                        })
-                                else {
+                    // ergo INYMDG: bin jobs ride the dedicated tokio solve
+                    // executor (persistent warm workers, BXUSGL T1) when the
+                    // solve.executor stance is tokio — per-cycle named
+                    // std-threads remain the rayon-stance fallback. The body
+                    // is unchanged; same 'static + Send move semantics, and
+                    // concurrent detached cycles now share the persistent
+                    // worker set instead of forking one thread per bin.
+                    let run_bin = move || {
+                        // 7LV6VN T5 (pipelined arm): results park until
+                        // their sim lands; the walk never waits on a
+                        // sim. Sims pace on the budget-derived global
+                        // slot pool (sim_slots), so walk + sim demand
+                        // never exceeds the CPU quota by construction.
+                        let mut held: Vec<DetachedMergeItem> = Vec::new();
+                        let mut pending = PipelinedSims::default();
+                        for &idx in &bin {
+                            let (pid, resolved) = &to_solve_bin[idx];
+                            // SIMPIPE2 T2: clamp in the bin thread
+                            // (stance-gated; BEFORE the profitless filter
+                            // — the profit-clamp recompute can zero a
+                            // candidate) so the committed inputs are
+                            // merge-ready with no sidecar round-trip.
+                            let Some((pid, result, worker_clamp_twins)) =
+                                solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved).map(
+                                    |(pid, mut r)| {
+                                        let twins =
+                                            clamp_result_in_worker(&shared_bin, idx, pid, &mut r);
+                                        (pid, r, twins)
+                                    },
+                                )
+                            else {
+                                continue;
+                            };
+                            {
+                                // The profitless filter runs BEFORE the
+                                // sim is scheduled - a clamp-zeroed
+                                // candidate never needs its payload.
+                                // the sim is scheduled — a clamp-zeroed
+                                // candidate never needs its payload (the
+                                // legacy path simmed first, then filtered).
+                                if result.optimal_input.is_zero() || result.profit.is_zero() {
                                     continue;
-                                };
-                                {
-                                    // The profitless filter runs BEFORE the
-                                    // sim is scheduled - a clamp-zeroed
-                                    // candidate never needs its payload.
-                                    // the sim is scheduled — a clamp-zeroed
-                                    // candidate never needs its payload (the
-                                    // legacy path simmed first, then filtered).
-                                    if result.optimal_input.is_zero() || result.profit.is_zero() {
-                                        continue;
-                                    }
-                                    if !pending.schedule_one(
-                                        &shared_bin,
-                                        idx,
-                                        pid,
-                                        &result,
-                                        &solve_span_bin,
-                                    ) {
-                                        // No sim rides this item (no hook /
-                                        // clamp off) — flush immediately.
-                                        let update_stamp =
-                                            stamps_bin.get(&pid).cloned().unwrap_or_default();
-                                        held.push(DetachedMergeItem::Solved {
-                                            cycle_seq,
-                                            solve_block,
-                                            metadata: cycle_metadata,
-                                            pid,
-                                            update_stamp,
-                                            result,
-                                            worker_clamp_twins,
-                                            payload: None,
-                                            solve_span: solve_span_bin.clone(),
-                                        });
-                                        flush_detached_item(
-                                            &mut held,
-                                            &tx,
-                                            &outstanding_bin,
-                                            pid,
-                                            None,
-                                        );
-                                        continue;
-                                    }
-                                    if !result.solver_pool_states.is_empty() {
-                                        tracing::debug!(
-                                            "[solver-st] path_id={pid} hops=[{}]",
-                                            result.solver_pool_states.join(";")
-                                        );
-                                    }
+                                }
+                                if !pending.schedule_one(
+                                    &shared_bin,
+                                    idx,
+                                    pid,
+                                    &result,
+                                    &solve_span_bin,
+                                ) {
+                                    // No sim rides this item (no hook /
+                                    // clamp off) — flush immediately.
                                     let update_stamp =
                                         stamps_bin.get(&pid).cloned().unwrap_or_default();
                                     held.push(DetachedMergeItem::Solved {
@@ -2209,22 +2208,37 @@ impl ArbitrageEngine {
                                         payload: None,
                                         solve_span: solve_span_bin.clone(),
                                     });
-                                    // Fan while walking: send every sim that
-                                    // landed during this iteration's solve.
-                                    for (done_pid, payload) in pending.drain_ready() {
-                                        flush_detached_item(
-                                            &mut held,
-                                            &tx,
-                                            &outstanding_bin,
-                                            done_pid,
-                                            payload,
-                                        );
-                                    }
+                                    flush_detached_item(
+                                        &mut held,
+                                        &tx,
+                                        &outstanding_bin,
+                                        pid,
+                                        None,
+                                    );
+                                    continue;
                                 }
-                            }
-                            // Tail: join every outstanding sim and send.
-                            if !pending.is_empty() {
-                                for (done_pid, payload) in pending.join_all() {
+                                if !result.solver_pool_states.is_empty() {
+                                    tracing::debug!(
+                                        "[solver-st] path_id={pid} hops=[{}]",
+                                        result.solver_pool_states.join(";")
+                                    );
+                                }
+                                let update_stamp =
+                                    stamps_bin.get(&pid).cloned().unwrap_or_default();
+                                held.push(DetachedMergeItem::Solved {
+                                    cycle_seq,
+                                    solve_block,
+                                    metadata: cycle_metadata,
+                                    pid,
+                                    update_stamp,
+                                    result,
+                                    worker_clamp_twins,
+                                    payload: None,
+                                    solve_span: solve_span_bin.clone(),
+                                });
+                                // Fan while walking: send every sim that
+                                // landed during this iteration's solve.
+                                for (done_pid, payload) in pending.drain_ready() {
                                     flush_detached_item(
                                         &mut held,
                                         &tx,
@@ -2234,7 +2248,28 @@ impl ArbitrageEngine {
                                     );
                                 }
                             }
-                        })
+                        }
+                        // Tail: join every outstanding sim and send.
+                        if !pending.is_empty() {
+                            for (done_pid, payload) in pending.join_all() {
+                                flush_detached_item(
+                                    &mut held,
+                                    &tx,
+                                    &outstanding_bin,
+                                    done_pid,
+                                    payload,
+                                );
+                            }
+                        }
+                    };
+                    if matches!(
+                        self.solve_executor,
+                        crate::arb_engine::SolveExecutorKind::Tokio
+                    ) {
+                        crate::arb_engine::solve_executor::global_solve_executor().spawn(run_bin);
+                    } else if let Err(err) = std::thread::Builder::new()
+                        .name(format!("arb-detach-bin-{bin_idx}"))
+                        .spawn(run_bin)
                     {
                         // LOUD (loud-failure discipline): a lost bin would
                         // strand its affected paths' results forever.
@@ -2252,6 +2287,13 @@ impl ArbitrageEngine {
                             .load(std::sync::atomic::Ordering::Relaxed),
                     );
                 }
+                hotpath::gauge!("detached_solve_in_flight").set(f64::from(
+                    u32::try_from(
+                        self.detached_outstanding
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                    .unwrap_or(u32::MAX),
+                ));
                 tracing::info!(
                     target: "degenbot::solver",
                     block_number = solve_block,

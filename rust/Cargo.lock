@@ -3230,12 +3230,14 @@ dependencies = [
  "libc",
  "object",
  "pin-project-lite",
+ "prost",
  "quanta",
  "regex-lite",
  "rustc-demangle",
  "serde",
  "serde_json",
  "tiny_http",
+ "tokio",
 ]
 
 [[package]]

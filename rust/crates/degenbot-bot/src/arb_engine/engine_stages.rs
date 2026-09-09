@@ -189,6 +189,9 @@ impl EngineStages {
             if let Some(p) = crate::instruments::pipeline() {
                 p.set_registered_paths(u64::try_from(engine.path_count()).unwrap_or(u64::MAX));
             }
+            hotpath::gauge!("engine_registered_paths").set(f64::from(
+                u32::try_from(engine.path_count()).unwrap_or(u32::MAX),
+            ));
             // T3 (epic BXZBWY): the solve cycle must not pin a shared
             // pump-runtime worker while it runs. 2UVG3E seam #4: under the
             // detached stance the engine Mutex hold collapses to enqueue end

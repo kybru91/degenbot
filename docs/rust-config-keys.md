@@ -69,7 +69,7 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | --- | --- | --- | --- | --- |
 | `DEGENBOT_SOLVE_CPUS` | `solve.solve_cpus` | `Option<usize>` | `(unset)` | Override the detected solve CPU budget (worker bin count). |
 | `DEGENBOT_SOLVE_HEADROOM` | `solve.solve_headroom` | `Option<usize>` | `(unset)` | Override the I/O headroom carved out of the CPU budget before solve bins. |
-| `DEGENBOT_SOLVE_EXECUTOR` | `solve.executor` | `SolveExecutor(Tokio|Rayon)` | `tokio` | Solve fan-out executor: tokio (low-priority dedicated runtime, production default) or rayon. |
+| `DEGENBOT_SOLVE_EXECUTOR` | `solve.executor` | `SolveExecutor(Tokio|Rayon)` | `tokio` | Solve fan-out executor: `tokio` = dedicated runtime with persistent per-bin workers; since INYMDG it also routes the DETACHED posture's solve bins (previously detached always used per-cycle std-threads, making this key a no-op there). `rayon` = global pool (`degenbot-solve-*`, always carries the resolve phase) + per-cycle detached bin threads (driven arm only). |
 | `DEGENBOT_SOLVE_INLINE_SIM` | `solve.solve_inline_sim` | `bool` | `true` | Inline-sim stance (T2 worker-side clamp path); `0`/`false` disables. |
 | `DEGENBOT_SOLVE_RESOLVE_PAR` | `solve.solve_resolve_par` | `bool` | `true` | Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables. |
 | `DEGENBOT_SOLVE_SIM_INFLIGHT` | `solve.solve_sim_inflight` | `Option<usize>` | `(unset; derived from CPU budget)` | Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation. |

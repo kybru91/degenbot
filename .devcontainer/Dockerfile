@@ -76,10 +76,16 @@ RUN printf '\neval "$(direnv hook bash)"\n' >> /etc/bashrc
 # Whitelist the bind-mounted repo so a container rebuild (which wipes the dev
 # user's home, including direnv's allow records) does not re-prompt: the .envrc
 # is a no-op in-container (guarded on /run/.containerenv) and first-party.
+#
+# chowns the WHOLE ~/.config (not just direnv/): this step created it as root
+# and it must be dev-owned before the USER switch below — otherwise the dev
+# user cannot write sibling dotfile dirs under ~/.config. It also pre-empts
+# podman auto-creating the devcontainer.json bind-mount parent
+# (~/.config/degenbot) as root:root at container-create time.
 RUN mkdir -p /home/dev/.config/direnv && \
     printf 'hide_env_diff = true\nlog_filter = "error"\n\n[whitelist]\nprefix = [ "/workspaces/degenbot" ]\n' \
         > /home/dev/.config/direnv/direnv.toml && \
-    chown -R dev:dev /home/dev/.config/direnv
+    chown -R dev:dev /home/dev/.config
 
 USER ${USERNAME}
 ENV HOME=/home/${USERNAME}
@@ -93,13 +99,10 @@ ENV PATH="/home/${USERNAME}/go/bin:/home/${USERNAME}/.foundry/bin:/home/${USERNA
 
 # Configure npm's global prefix to a user-writable dir so `npm i -g` needs no
 # sudo, and the bins land in ~/.local/bin (already on PATH via ENV above).
-# Pre-create ~/.config as dev-owned so the devcontainer.json bind mount of
-# ~/.config/degenbot finds its parent already present. Otherwise podman
-# auto-creates missing bind-target parents as root:root, which then blocks
-# the dev user from writing sibling dotfile dirs under ~/.config (and leaves
-# the dir as root-owned with a sticky bit).
+# NOTE: ~/.config is pre-created dev-owned in the root step above (a chown
+# here as the dev user would fail with EPERM against the root-owned dir that
+# step created). This step only needs the user-local dirs + npm prefix.
 RUN mkdir -p "${HOME}/.config" "${HOME}/.local/bin" \
-    && chown ${USERNAME}:${USERNAME} "${HOME}/.config" "${HOME}/.local/bin" \
     && npm config set prefix "${HOME}/.local"
 
 # Foundry (forge/cast/anvil/chisel). No dnf package, so curl-install foundryup

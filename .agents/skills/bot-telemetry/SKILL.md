@@ -51,7 +51,7 @@ Grafana dashboards + alert rules live in `docs/grafana/` (`degenbot-overview.jso
 
 Done when you can state, with numbers, which phase owns the time: drain/decode, state apply, solve, simulate, or submit. A histogram p99 plus a ranked trace sample is enough evidence to proceed.
 
-For function-level attribution below the span granularity, use hotpath profiling instead of adding ad-hoc timers — the recipe (env vars, report formats, TUI console) is in `AGENTS.md` under **Profiling**.
+For function-level attribution below the span granularity, use hotpath profiling instead of adding ad-hoc timers. Enable with the `DEGENBOT_HOTPATH=1` runtime gate (dev builds already compile `degenbot-bot/hotpath-prometheus`); besides the end-of-run report and `hotpath console` TUI, the profiler exports Prometheus metrics on `127.0.0.1:6772` — scrape recipe, classic-vs-native query guidance, and the `docs/grafana/hotpath-profiling.json` dashboard live in [`docs/grafana/HOTPATH.md`](../../../docs/grafana/HOTPATH.md).
 
 ## Step 3: Drill into the owning phase
 
