@@ -90,6 +90,8 @@ pub mod instruments {
         pub fn count_reorg_recovery_dropped(&self) {}
         /// no-op (HJ5HWF benign late-admit family)
         pub fn count_late_log_admitted(&self) {}
+        /// no-op (BM35LK adaptive quiesce window)
+        pub fn observe_quiesce_window(&self, _ms: u64) {}
         /// no-op
         pub fn count_ws_log_seen(&self) {}
         /// no-op

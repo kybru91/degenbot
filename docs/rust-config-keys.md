@@ -53,6 +53,12 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `DEGENBOT_EARLY_SLICE_MS` | `pump.early_slice_ms` | `duration-ms (u64)` | `25` | Early-slice window in ms; `0` valid and disables the slice (settle-only parity). |
 | `DEGENBOT_STREAMING_DELIVERY` | `pump.streaming_delivery` | `bool` | `true` | Stream solved arms immediately (T3 default); `0` opts out to the debounce sweep. |
 | `DEGENBOT_WS_COMPLETENESS` | `pump.ws_completeness` | `bool` | `true` | WS completeness gating (newHeads + logs double-delivery check); `0` disables. |
+| `DEGENBOT_PUMP_QUIESCE_MODE` | `pump.quiesce_mode` | `QuiesceMode(Fixed|Adaptive)` | `fixed` | Settle-window mode: `fixed` = constant pump.pump_debounce_ms debounce; `adaptive` = EWMA trailing-quiesce estimator (never below quiesce_floor_ms, never above quiesce_ceil_ms; late-admit budget overruns hold at the ceiling). |
+| `DEGENBOT_PUMP_QUIESCE_FLOOR_MS` | `pump.quiesce_floor_ms` | `duration-ms (u64)` | `2` | Adaptive mode: lower bound (ms) of the trailing settle window (clamped >= 1; a 0/garbage value never collapses the window to zero). |
+| `DEGENBOT_PUMP_QUIESCE_CEIL_MS` | `pump.quiesce_ceil_ms` | `duration-ms (u64)` | `20` | Adaptive mode: upper bound (ms) of the trailing settle window; the estimator never grows beyond it (inherits the debounce parse contract: unset/zero/invalid falls back, never 0). |
+| `DEGENBOT_PUMP_QUIESCE_MARGIN_MS` | `pump.quiesce_margin_ms` | `f64` | `3.0` | Adaptive mode: safety multiplier over the silence-gap EWMA (W = EWMA × margin, then floor/ceiling clamp). |
+| `DEGENBOT_PUMP_QUIESCE_EWMA_ALPHA` | `pump.quiesce_ewma_alpha` | `f64` | `0.1` | Adaptive mode: EWMA smoothing constant over per-block max silence gaps (≈10-block memory); clamped to (0, 1]. |
+| `DEGENBOT_PUMP_QUIESCE_LATE_BUDGET` | `pump.quiesce_late_budget` | `u64` | `120` | Adaptive-mode runtime backstop (HJ5HWF contract): more than this many benign late-admit events in a sliding hour holds the window at quiesce_ceil_ms until the ledger drains. |
 ## `trace`
 
 | Env var | TOML key | Type | Default | Description |

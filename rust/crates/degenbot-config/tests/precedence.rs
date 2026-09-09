@@ -67,6 +67,32 @@ fn defaults_feed_every_representative_type() {
         SolveExecutor::Tokio,
         "enum default"
     );
+    // BM35LK quiesce-estimator keys: f64 + enum + ms defaults.
+    assert_eq!(
+        cfg.config.pump.quiesce_mode,
+        degenbot_config::QuiesceMode::Fixed,
+        "quiesce mode default (fixed = historical debounce)"
+    );
+    assert_eq!(
+        (
+            cfg.config.pump.quiesce_floor_ms,
+            cfg.config.pump.quiesce_ceil_ms
+        ),
+        (2, 20),
+        "quiesce floor/ceil defaults"
+    );
+    assert!(
+        (cfg.config.pump.quiesce_margin_ms - 3.0).abs() < f64::EPSILON,
+        "quiesce margin default"
+    );
+    assert!(
+        (cfg.config.pump.quiesce_ewma_alpha - 0.1).abs() < f64::EPSILON,
+        "quiesce alpha default"
+    );
+    assert_eq!(
+        cfg.config.pump.quiesce_late_budget, 120,
+        "quiesce late budget default"
+    );
     assert_eq!(
         cfg.source_of("DEGENBOT_MIMALLOC_AUTO_PURGE"),
         Some(Source::Default)
@@ -161,7 +187,47 @@ fn cli_layer_overrides_env_and_file() {
 }
 
 #[test]
+fn quiesce_keys_precedence_chain_env_beats_file_beats_default() {
+    // BM35LK: the pump.quiesce_* keys follow the same precedence law.
+    let path = temp_toml(
+        "quiesce",
+        "[pump]\nquiesce_mode = \"adaptive\"\nquiesce_floor_ms = 3\nquiesce_margin_ms = 2.5\n",
+    );
+    let default = must_ok(&BotConfigLoader::new().without_env());
+    assert_eq!(
+        default.config.pump.quiesce_mode,
+        degenbot_config::QuiesceMode::Fixed,
+        "default mode is fixed"
+    );
+    let from_file = must_ok(&BotConfigLoader::new().without_env().with_config_path(&path));
+    assert_eq!(
+        from_file.config.pump.quiesce_mode,
+        degenbot_config::QuiesceMode::Adaptive,
+        "file layer drives quiesce_mode"
+    );
+    assert_eq!(from_file.config.pump.quiesce_floor_ms, 3);
+    assert!((from_file.config.pump.quiesce_margin_ms - 2.5).abs() < f64::EPSILON);
+    let from_env = must_ok(
+        &BotConfigLoader::new()
+            .with_env(map_env(&[("DEGENBOT_PUMP_QUIESCE_MODE", "fixed")]))
+            .with_config_path(&path),
+    );
+    assert_eq!(
+        from_env.config.pump.quiesce_mode,
+        degenbot_config::QuiesceMode::Fixed,
+        "env layer beats the file layer"
+    );
+    assert_eq!(
+        from_env.config.pump.quiesce_floor_ms, 3,
+        "env-unset keys keep their file value"
+    );
+    cleanup(&path);
+}
+
+#[test]
 fn every_layer_for_every_type_in_sequence() {
+    // (BM35LK: the quiesce keys ride the same loader machinery — asserted
+    // for env+file precedence below in `quiesce_keys_precedence_chain`.)
     // One full precedence chain per representative type.
     let path = temp_toml(
         "chain",
