@@ -65,6 +65,7 @@ mod diagnostic;
 // hard cutover, Q6.
 pub mod engine_stages;
 mod event_routing;
+mod fleet_solve_executor;
 pub mod inline_sim;
 mod lifecycle;
 pub mod path_info;
@@ -438,6 +439,11 @@ pub struct ArbitrageEngine {
     /// Which dispatch drives the solve fan-out (epic BXUSGL T1); see
     /// [`SolveExecutorKind`].
     solve_executor: SolveExecutorKind,
+    /// ADR-042 Q6 migration stance (`fleet.stance`, construction-time):
+    /// when true the fleet-hosted executor is the SOLE executor of solve
+    /// bins (detached + in-cycle arms) and the merge sidecar runs as the
+    /// fleet `Merge` role; when false the per-era mechanisms stand.
+    fleet_hosted: bool,
     /// T3 (epic BXUSGL): emit each clamp-passed above-threshold result as
     /// an IMMEDIATE single-entry [`ResultBatch`] during the drain instead of
     /// waiting for the pump debounce. Construction-time stance; **streaming
@@ -565,6 +571,17 @@ impl ArbitrageEngine {
         }
     }
 
+    /// Probe the packed fleet-stance (ADR-042 Q6; smoke-boot observability;
+    /// no environment read): `fleet` = the fleet hosts all solve bins.
+    #[must_use]
+    pub fn fleet_stance_probe(&self) -> &'static str {
+        if self.fleet_hosted {
+            "fleet"
+        } else {
+            "legacy"
+        }
+    }
+
     #[must_use]
     pub fn with_core(core: Arc<StateLock<BotState>>) -> Self {
         Self::with_core_cfg(
@@ -614,6 +631,8 @@ impl ArbitrageEngine {
             } else {
                 SolveExecutorKind::Rayon
             },
+            fleet_hosted: solver_dispatch::SOLVE_FLEET_HOSTED
+                .load(std::sync::atomic::Ordering::Relaxed),
             streaming_delivery: solver_dispatch::STREAMING_DELIVERY_ENABLED
                 .load(std::sync::atomic::Ordering::Relaxed),
             #[cfg(test)]

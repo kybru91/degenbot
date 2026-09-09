@@ -2217,6 +2217,7 @@ dependencies = [
  "degenbot-rpc",
  "degenbot-solvers",
  "degenbot-uniswap",
+ "degenbot-workers",
  "futures-util",
  "hashbrown 0.17.1",
  "hotpath",
