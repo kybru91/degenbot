@@ -91,10 +91,10 @@ impl BudgetOverrides {
             solver_cpus: cfg.fleet.solver_cpus.and_then(|v| u64::try_from(v).ok()),
             sim_slot_cap: cfg.fleet.sim_slot_cap,
             pool_state_updater_slots: cfg.fleet.pool_state_updater_slots,
-            // The typed config key for solve_headroom lands at the T8 surface
-            // (JI275C — noted by TZ2ACJ); until then the documented constant
-            // rules.
-            solve_headroom: None,
+            // The typed T8 follow-through (W6EMBF): the headroom override
+            // reaches the budget derive; unset stays None and the documented
+            // constant rules below.
+            solve_headroom: cfg.solve.solve_headroom,
         }
     }
 }
@@ -699,6 +699,31 @@ mod tests {
         let b = FleetBudget::derive(8.0, &o).expect("hostable");
         assert_eq!(b.solver_cpus, 3);
         assert_eq!(b.sim_slot_cap, 6);
+    }
+
+    /// W6EMBF: the `solve.solve_headroom` typed key reaches the budget
+    /// derive end-to-end — through the LOADER route (not just a hand-built
+    /// struct) — while the default stays `None` (the documented constant
+    /// rules below).
+    #[test]
+    fn the_solve_headroom_override_projects_from_the_typed_config() {
+        let loaded = degenbot_config::BotConfigLoader::new()
+            .without_env()
+            .with_cli("solve.solve_headroom", "2")
+            .load()
+            .expect("the headroom override must load from the explicit CLI layer");
+        assert_eq!(loaded.config.solve.solve_headroom, Some(2));
+        let o = BudgetOverrides::from_config(&loaded.config);
+        assert_eq!(o.solve_headroom, Some(2));
+        let b = FleetBudget::derive(8.0, &o).expect("hostable");
+        // The documented formula: pins = floor(Q) - H_s (8 - 2 = 6).
+        assert_eq!(b.solver_pin_count, 6);
+        assert_eq!(b.declared_sum(), b.quota_floor);
+        // The default config projects None — the documented constant rules.
+        assert_eq!(
+            BudgetOverrides::from_config(&degenbot_config::BotConfig::default()).solve_headroom,
+            None
+        );
     }
 
     mod cross_authority {
