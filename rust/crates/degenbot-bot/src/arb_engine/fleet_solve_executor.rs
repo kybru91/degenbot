@@ -856,6 +856,21 @@ mod tests {
             fleet, legacy,
             "fleet-hosted solve results must be byte-equal with the legacy executor"
         );
+
+        // LW-T7 (Seam F) promotion gate: the parity harness compares the
+        // stances' OUTCOME TOTALS (sold outcomes never diverge between the
+        // arms) and never exceeds the submissions; the EXACT
+        // solved+suppressed+failed == submitted equation is asserted in the
+        // production drain itself (the same seam, LW-T1's fuse).
+        assert!(
+            fleet.len() <= items.len(),
+            "outcomes can never exceed submissions"
+        );
+        assert_eq!(
+            fleet.len(),
+            legacy.len(),
+            "parity gate: the arms' outcome totals must never diverge"
+        );
     }
 
     /// Solver bin keys never collide with the merge pin key (the FSM's
@@ -1010,6 +1025,82 @@ mod tests {
         assert_eq!(
             observed[0].arena, observed[1].arena,
             "the SAME ArenaToken across cycles (warm)"
+        );
+    }
+
+    // ---- LW-T6 (Seam G2): seat naming + census atoms -------------------------
+
+    /// LW-T6: the boot census carries the seat fleet's rows — per-index
+    /// `{n}` patterns matching the roles, the Solver budget matching the
+    /// STRUCTURAL seat count, and no two rows sharing a thread-name pattern
+    /// (the GOQWCL collision lock, fleet-wide).
+    #[test]
+    fn boot_census_rows_are_per_index_patterned_with_the_solver_budget() {
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let snap = degenbot_core::worker_census::snapshot();
+        let solver_row = snap
+            .iter()
+            .find(|e| e.thread_name == WorkerRole::Solver.thread_name())
+            .expect("the Solver fleet census row exists");
+        assert_eq!(
+            solver_row.count,
+            executor.bin_count(),
+            "the census Solver count must equal the structural seat count"
+        );
+        // The collision lock: no two rows fleet-wide share a thread-name
+        // pattern (the GOQWCL lesson: shared patterns made dumps
+        // unattributable).
+        let mut patterns: Vec<&str> = snap.iter().map(|e| e.thread_name).collect();
+        let n = patterns.len();
+        patterns.sort_unstable();
+        patterns.dedup();
+        assert_eq!(
+            patterns.len(),
+            n,
+            "census thread-name patterns must be unique"
+        );
+    }
+
+    /// LW-T6: the runtime registration is not a lie — the OS thread names of
+    /// RUNNING seats match the census rows (per-index under the pattern).
+    #[test]
+    fn running_seat_thread_names_match_their_census_rows() {
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let seats = executor.bin_count();
+        let names: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        for bin in 0..seats {
+            let names = Arc::clone(&names);
+            executor
+                .submit_solve_bin(bin, move |ctx| {
+                    let _ = ctx;
+                    names.lock().push(
+                        std::thread::current()
+                            .name()
+                            .unwrap_or("<unnamed>")
+                            .to_owned(),
+                    );
+                })
+                .expect("the naming probe submit is accepted");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while names.lock().len() < seats {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seats did not report thread names in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let names_set: std::collections::HashSet<_> = names.lock().iter().cloned().collect();
+        for name in &names_set {
+            assert!(
+                name.starts_with("work-fleet-solver-"),
+                "seat thread names must be per-index census-named: {name}"
+            );
+        }
+        assert_eq!(
+            names_set.len(),
+            seats,
+            "every structural seat has its own distinct census-NAMED thread"
         );
     }
 

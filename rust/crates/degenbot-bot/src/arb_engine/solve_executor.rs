@@ -102,6 +102,39 @@ impl SolveExecutor {
     }
 }
 
+/// LW-T6 (Seam G2): the LEGACY tokio-stance fleet exists while the cutover
+/// runs (LW-T9 deletes it). Its census row must be HONEST: same-name-for-all
+/// workers is stated in the row itself, never hidden behind an `{n}` pattern
+/// the runtime does not honor (GOQWCL: honesty > elegance, dumps stay
+/// explainable).
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod census_honesty_tests {
+    #[test]
+    fn legacy_tokio_census_row_names_its_same_name_multiplicity_honestly() {
+        // First use registers the legacy row (the row exists even if the
+        // runtime build aborts loudly — see global_solve_executor).
+        let _executor = super::global_solve_executor();
+        let snap = degenbot_core::worker_census::snapshot();
+        let row = snap
+            .iter()
+            .find(|e| e.resource == "solve_executor_fleet")
+            .expect("the legacy tokio census row exists");
+        // HONESTY PIN: the row says the workers share one name, and does NOT
+        // claim an `{n}` per-index pattern the legacy runtime never honors.
+        assert!(
+            row.thread_name.contains("SAME name"),
+            "the legacy row must state its same-name-for-all multiplicity: {}",
+            row.thread_name
+        );
+        assert!(
+            !row.thread_name.contains("{n}"),
+            "a non-per-index runtime must not claim the {{n}} pattern: {}",
+            row.thread_name
+        );
+    }
+}
+
 static SOLVE_EXECUTOR: std::sync::OnceLock<SolveExecutor> = std::sync::OnceLock::new();
 
 /// The process-wide solve executor, built lazily on the first tokio-stance
@@ -116,7 +149,7 @@ pub(crate) fn global_solve_executor() -> &'static SolveExecutor {
         resource: "solve_executor_fleet",
         kind: "tokio multi-thread runtime (solve bins — the LPT-pin fleet host)",
         count: degenbot_core::cpu_budget::solve_worker_count(),
-        thread_name: "degenbot-solve-tokio (+ -host dispatcher)",
+        thread_name: "degenbot-solve-tokio (SAME name for all workers + the -host dispatcher; per-index naming lands at the fleet cutover — LW-T9)",
         sizing: "one persistent worker per cpu_budget::solve_worker_count (cgroup budget minus headroom); DEGENBOT_SOLVE_CPUS override (VPD5ZH)",
     });
     SOLVE_EXECUTOR.get_or_init(|| {
