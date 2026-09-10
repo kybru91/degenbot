@@ -30,22 +30,6 @@ pub(crate) fn sim_intake() -> &'static dyn FleetIntake {
     crate::arb_engine::fleet_sim_executor::global_fleet_sim_executor()
 }
 
-/// The crate-INTERNAL hand-out of the registration executor (T1's identity
-/// probe; in-crate symmetry with the sim side; NOT exportable - it names
-/// the crate-internal concrete executor, so it could never survive the
-/// module going private). In-crate only.
-#[must_use]
-/// The trait object flows in-crate only - the identity probe stays inert
-/// while no in-crate caller exists.
-#[expect(
-    dead_code,
-    reason = "T1's identity probe: the crate-INTERNAL hand-out for in-crate consumers only; the pub closure is `registration_intake`"
-)]
-pub(crate) fn registration_executor(
-) -> &'static crate::arb_engine::fleet_registration_executor::FleetRegistrationExecutor {
-    crate::arb_engine::fleet_registration_executor::global_fleet_registration_executor()
-}
-
 /// The ONLY surface `degenbot-python` names: the pooled registration intake.
 /// The PRG-3 station ratchet + the `DivergenceTable` note from sim (one seam,
 /// two shapes) + the `ADR-013`/pyo3-free boundary: units carry `InnerWork`;

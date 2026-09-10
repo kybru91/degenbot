@@ -43,11 +43,12 @@ pub(crate) trait Executor: Send + Sync {
 
 /// The solve-arm global token (LW-T8): every SOLVE call site submits
 /// through here. LNQDOA: it is the solve arm of a token FAMILY — the
-/// pooled intake arms submit through `global_sim_executor` /
-/// `global_pooled_registration_executor` (which delegate to `fleet_intake`'s
-/// `FleetIntake` port), not through this fn — the fleet-hosted executors
-/// remain the only executors since the LW-T9 cutover (the tokio stance is
-/// deleted; there is no stance parameter).
+/// pooled intake arms submit through `global_sim_executor` here (which
+/// delegates to `fleet_intake`'s `FleetIntake` port) and
+/// `fleet_intake::registration_intake` (the pyo3-leaf registration arm),
+/// not through this fn — the fleet-hosted executors remain the only
+/// executors since the LW-T9 cutover (the tokio stance is deleted; there
+/// is no stance parameter).
 pub(crate) fn global_executor() -> &'static dyn Executor {
     crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
 }
