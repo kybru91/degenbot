@@ -16,7 +16,6 @@
 //! remaining records. The Python driver should call this before interpreter
 //! finalization (e.g. in `__aexit__` or via Python `atexit`).
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -185,18 +184,13 @@ where
 /// has `target = "log"` and the original log target is stored in the
 /// `log.target` field. This function visits the event fields and returns
 /// the original target if found.
-/// The user config file (`~/.config/degenbot/config.toml`). Separate helper
-/// so tests can point it at a fixture.
-pub(crate) fn user_config_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| Path::new(&home).join(".config/degenbot/config.toml"))
-}
-
 /// Resolve the OTLP endpoint for span export. Precedence (first wins):
 ///
 /// 1. `OTEL_EXPORTER_OTLP_ENDPOINT` env var (standard `OTel` signal env —
 ///    explicit, always wins),
-/// 2. `otel.endpoint` in the user config file
-///    (`~/.config/degenbot/config.toml`),
+/// 2. `telemetry.jaeger_endpoint` in the user config file (the modern
+///    OTLP-key home; the pre-0.6 `[otel]` table is retired and any file
+///    still carrying it is refused at boot — JLFE2F),
 /// 3. `None` — the exporter falls back to its built-in default
 ///    (`http://localhost:4318`).
 ///
@@ -206,7 +200,7 @@ pub(crate) fn user_config_path() -> Option<PathBuf> {
 #[must_use]
 pub(crate) fn resolve_otlp_endpoint(
     env_raw: Option<&str>,
-    config_file: Option<&Path>,
+    config_file: Option<&std::path::Path>,
 ) -> Option<String> {
     if let Some(url) = env_raw.filter(|s| !s.is_empty()) {
         return Some(url.to_owned());
@@ -217,8 +211,8 @@ pub(crate) fn resolve_otlp_endpoint(
     };
     match text.parse::<toml::Table>() {
         Ok(table) => table
-            .get("otel")
-            .and_then(|otel| otel.get("endpoint"))
+            .get("telemetry")
+            .and_then(|telemetry| telemetry.get("jaeger_endpoint"))
             .and_then(|v| v.as_str())
             .map(str::to_owned),
         Err(e) => {
@@ -737,11 +731,12 @@ pub fn init_logging_subscriber() {
             // T5/RMH23E dev default: ON whenever the `otel` feature is
             // compiled (dev builds only — release wheels carry zero OTel
             // code). Opt out with DEGENBOT_OTEL=0. Endpoint precedence:
-            // OTEL_EXPORTER_OTLP_ENDPOINT env > otel.endpoint in
-            // ~/.config/degenbot/config.toml > exporter default.
+            // OTEL_EXPORTER_OTLP_ENDPOINT env > telemetry.jaeger_endpoint
+            // in ~/.config/degenbot/config.toml (JLFE2F: the pre-0.6
+            // [otel] table is retired) > exporter default.
             let endpoint = resolve_otlp_endpoint(
                 std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().as_deref(),
-                user_config_path().as_deref(),
+                ::degenbot_config::standard_file_path().as_deref(),
             );
             let build_provider = || match &endpoint {
                 Some(url) => degenbot_bot::otel::provider_from_endpoint(url),
@@ -1031,7 +1026,10 @@ mod tests {
         let cfg = dir.join("config.toml");
 
         // 1. env wins over an existing config file
-        let contents = concat!("[otel]\n", "endpoint = \"http://from-config:4318\"\n");
+        let contents = concat!(
+            "[telemetry]\n",
+            "jaeger_endpoint = \"http://from-config:4318\"\n"
+        );
         std::fs::write(&cfg, contents).unwrap();
         assert_eq!(
             resolve_otlp_endpoint(Some("http://from-env:4318"), Some(&cfg)).as_deref(),

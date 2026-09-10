@@ -212,17 +212,23 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // subscriber/failure-policy/engine code reads the holder. The loader is
     // the ONLY env-reading site; without this install every production run
     // observed schema defaults (metrics bound 127.0.0.1, default debounce),
-    // silently ignoring DEGENBOT_* env. ENV LAYER ONLY for now: the file
-    // layer is DORMANT until the loader models the legacy operator file —
-    // its [rpc]/[ws]/[database]/[otel]/[failure_policy] sections are
-    // Python-domain surfaces the typed schema models as unknown keys, so
-    // wiring it in refuses every existing operator boot. Tracked as the
-    // legacy-file-mapping follow-up.
+    // silently ignoring DEGENBOT_* env.
+    // JLFE2F (Option B hard cutover): the standard file layer is LIVE —
+    // DEGENBOT_CONFIG (or ~/.config/degenbot/config.toml) feeds the typed
+    // BotConfig; the retired pre-0.6 vocabulary ([rpc]/[ws]/[database]/
+    // [otel]/default_chain_id) fails the load with pointed migration
+    // errors (docs/config-migration.md). [failure_policy] is a sanctioned
+    // free-form table the loader skips; the reader below consumes it from
+    // the SAME file via the single standard_file_path() contract.
     // ADR-040 D3: per-bucket failure-policy overrides, boot-validated. An
     // invalid bucket/action is a boot ERROR (process exits) — the operator
     // asked for a specific containment stance; silently ignoring it would
     // trade on a policy the process does not actually have.
-    match ::degenbot_config::BotConfigLoader::new().load() {
+    let config_file = ::degenbot_config::standard_file_path();
+    match ::degenbot_config::BotConfigLoader::new()
+        .with_standard_file_paths()
+        .load()
+    {
         Ok(loaded) => {
             // First-wins: a test harness or an embedding that installed
             // earlier keeps ITS config; this is the production boot path.
@@ -237,9 +243,7 @@ fn _ffi(m: &Bound<'_, PyModule>) -> PyResult<()> {
             std::process::exit(2);
         }
     }
-    match python_log_layer::read_failure_policy_overrides(
-        python_log_layer::user_config_path().as_deref(),
-    ) {
+    match python_log_layer::read_failure_policy_overrides(config_file.as_deref()) {
         Ok(overrides) if !overrides.is_empty() => {
             let refs: Vec<(&str, &str)> = overrides
                 .iter()
