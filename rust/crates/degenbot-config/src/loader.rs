@@ -101,9 +101,9 @@ pub(crate) const RETIRED_LAYOUT_ITEMS: &[(&str, &str)] = &[
 ];
 
 /// Sanctioned free-form file sections the loader SKIPS: not typed, not
-/// retired. Read as raw tables by \`file_path()\` consumers sharing the
+/// retired. Read as raw tables by `file_path()` consumers sharing the
 /// same file.
-///  - \`[failure_policy]\` (ADR-040 D3): per-bucket override table owned by
+///  - `[failure_policy]` (ADR-040 D3): per-bucket override table owned by
 ///    degenbot-python's failure-policy reader; freedom-of-policy outlives
 ///    the typed schema.
 pub(crate) const FREE_FORM_FILE_SECTIONS: &[&str] = &["failure_policy"];
@@ -167,10 +167,10 @@ impl std::fmt::Debug for BotConfigLoader {
 }
 
 /// The canonical STANDARD config file path (ergo JLFE2F): the
-/// \`DEGENBOT_CONFIG\` env override when set — even when missing, the
-/// operator asked for it — else \`$HOME/.config/degenbot/config.toml\` when
-/// it exists, else \`None\` (an absent user file is contractually defaults).
-/// \`BotConfigLoader::with_standard_file_paths\` selects exactly this value,
+/// `DEGENBOT_CONFIG` env override when set — even when missing, the
+/// operator asked for it — else `$HOME/.config/degenbot/config.toml` when
+/// it exists, else `None` (an absent user file is contractually defaults).
+/// `BotConfigLoader::with_standard_file_paths` selects exactly this value,
 /// and raw-table readers resolve the SAME file through this function so
 /// file discovery stays a single contract. The std env reads live in THIS
 /// crate so they stay confined to degenbot-config.

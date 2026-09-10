@@ -38,6 +38,14 @@ fn must_err_problems(loader: &BotConfigLoader) -> Vec<String> {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "test assertion helper: a missing problem entry is a hard test failure; loud panic beats a dummy value"
+)]
+fn must_find<'a>(problems: &'a [String], needle: &str, why: &str) -> &'a String {
+    problems.iter().find(|p| p.contains(needle)).expect(why)
+}
+
 /// (1) The original production boot refusal: all six legacy-layout items in
 /// one file. Every one of them must produce a pointed problem naming the
 /// migration doc — never a bare "unknown section".
@@ -63,10 +71,7 @@ fn legacy_layout_items_fail_with_pointed_errors() {
         "exactly one problem per retired item; got: {problems:#?}"
     );
     for name in retired {
-        let hit = problems
-            .iter()
-            .find(|p| p.contains(name))
-            .unwrap_or_else(|| panic!("no problem names {name}: {problems:#?}"));
+        let hit = must_find(&problems, name, &format!("no problem names {name}"));
         assert!(
             hit.contains("docs/config-migration.md"),
             "problem for {name} must point at the migration doc: {hit}"
@@ -95,23 +100,17 @@ fn pointed_errors_name_replacements() {
     let problems = must_err_problems(&BotConfigLoader::new().without_env().with_config_path(&path));
     cleanup(&path);
 
-    let rpc = problems.iter().find(|p| p.contains("[rpc]")).expect("rpc");
+    let rpc = must_find(&problems, "[rpc]", "rpc");
     assert!(
         rpc.contains("DEGENBOT_RPC_HTTP_CHAINID_"),
         "rpc problem must name the per-chain env replacement: {rpc}"
     );
-    let db = problems
-        .iter()
-        .find(|p| p.contains("[database]"))
-        .expect("db");
+    let db = must_find(&problems, "[database]", "db");
     assert!(
         db.contains("config.py") || db.contains("Python"),
         "database problem must name the Python-side replacement: {db}"
     );
-    let otel = problems
-        .iter()
-        .find(|p| p.contains("[otel]"))
-        .expect("otel");
+    let otel = must_find(&problems, "[otel]", "otel");
     assert!(
         otel.contains("telemetry"),
         "otel problem must name the modern telemetry section: {otel}"
@@ -157,10 +156,7 @@ fn genuinely_unknown_section_keeps_generic_error() {
     let problems = must_err_problems(&BotConfigLoader::new().without_env().with_config_path(&path));
     cleanup(&path);
 
-    let hit = problems
-        .iter()
-        .find(|p| p.contains("[totally_bogus]"))
-        .expect("unknown section reported");
+    let hit = must_find(&problems, "[totally_bogus]", "unknown section reported");
     assert!(
         hit.contains("unknown section"),
         "generic shape preserved: {hit}"
