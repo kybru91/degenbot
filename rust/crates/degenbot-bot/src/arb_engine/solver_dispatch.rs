@@ -767,7 +767,12 @@ impl PipelinedSims {
         // The seat pool is the budget's sim slot cap — the fleet-side bound
         // that replaced the SimSlots semaphore. Receipts ride the SAME
         // per-request channel, so the poll/join contract is untouched.
-        crate::arb_engine::fleet_sim_executor::global_fleet_sim_executor().spawn(run_sim_body);
+        // ADR-042 F4 (LW-T9): submit through the pooled-executor seam — arb_engine
+        // hosts TWO executor traits since LNQDOA: Executor (solve, bin-indexed)
+        // and FleetIntake (pooled sim/intake, fire-and-dispatch). Pooled SimDriver
+        // unit, lane-2 dispatch precedence; receipts stay on the caller's
+        // per-request channel (unchanged contract).
+        crate::arb_engine::executor::global_sim_executor().spawn(Box::new(run_sim_body));
         self.pending.push((pid, PendingSim::new(rx)));
         true
     }

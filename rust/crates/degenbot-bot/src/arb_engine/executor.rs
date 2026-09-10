@@ -1,8 +1,12 @@
 //! THE Executor seam (parking-lot decision, LW-T8 JI275C): the name is
-//! **`Executor`** — the LANEWARDEN vocabulary finalizes here. This module
-//! owns the ONE global executor token, and re-exports the shared seam
-//! types (mirroring the degenbot-workers placement of shared types — no
-//! pyo3 in any signature).
+//! **`Executor`** — the LANEWARDEN vocabulary finalizes here. Since LNQDOA
+//! (the pooled intake port) this module owns the GLOBAL EXECUTOR TOKEN
+//! FAMILY for `arb_engine` — `global_executor` (the solve-arm seam) plus
+//! the pooled-intake delegates `global_sim_executor` /
+//! `global_pooled_registration_executor`, which hand out `fleet_intake`'s
+//! `FleetIntake` port over the pooled executors — and re-exports the shared
+//! seam types (mirroring the degenbot-workers placement of shared types —
+//! no pyo3 in any signature).
 
 use degenbot_workers::dispatcher::SubmitError;
 use degenbot_workers::lane::LaneCtx;
@@ -22,7 +26,11 @@ pub(crate) trait Executor: Send + Sync {
     fn bin_count(&self) -> usize;
 
     /// Submit one LPT bin job; the unit body receives the seat's `LaneCtx`.
-    /// Never drops a unit (advisory receipt; ADR-042 §10).
+    /// Admission is posture-invariant (7OGY5V/024ef513d): a posture refusal
+    /// at the gate aborts LOUDLY (process exit) with the 'bin submission,
+    /// posture gate' context; accepted units are never silently dropped
+    /// (units ride one of the solved-arm lanes; receipts are tracked per
+    /// lane).
     fn submit(&self, bin: usize, work: SubmitWork) -> Result<SubmitReceipt, SubmitError>;
 
     /// Posture observation (the production poller feed). Absorbed by
@@ -32,11 +40,22 @@ pub(crate) trait Executor: Send + Sync {
     }
 }
 
-/// The ONE global token (LW-T8): every call site submits through here —
-/// the fleet-hosted executor is the SOLE executor since the LW-T9 cutover
-/// (the tokio stance is deleted; there is no stance parameter).
+/// The solve-arm global token (LW-T8): every SOLVE call site submits
+/// through here. LNQDOA: it is the solve arm of a token FAMILY — the
+/// pooled intake arms submit through `global_sim_executor` /
+/// `global_pooled_registration_executor` (which delegate to `fleet_intake`'s
+/// `FleetIntake` port), not through this fn — the fleet-hosted executors
+/// remain the only executors since the LW-T9 cutover (the tokio stance is
+/// deleted; there is no stance parameter).
 pub(crate) fn global_executor() -> &'static dyn Executor {
     crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
+}
+
+/// The pooled SIM intake delegate (LNQDOA): hands out `fleet_intake`'s
+/// `FleetIntake` port over the fleet sim executor, so the sim dispatch
+/// route reads through ONE module (the trait object flows in-crate only).
+pub(crate) fn global_sim_executor() -> &'static dyn crate::arb_engine::fleet_intake::FleetIntake {
+    crate::arb_engine::fleet_intake::sim_intake()
 }
 // ---------------------------------------------------------------------------
 // THE solve lane (QR3NUS 43E3H3): the one outcome-carrier module both solve

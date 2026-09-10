@@ -37,6 +37,8 @@ use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, GrantKind, U
 use degenbot_workers::lane::LaneCtx;
 use degenbot_workers::role::WorkerRole;
 
+use crate::arb_engine::fleet_intake::{FleetIntake, InnerWork};
+
 /// Loud, unrecoverable executor failure (mirror of the fleet sim/solve
 /// executors' abort discipline): a dead host would strand in-flight build
 /// receipts — the crawl worker awaiting one parks forever (stranded pipe,
@@ -153,6 +155,16 @@ impl FleetRegistrationExecutor {
     /// (executor died) is a LOUD abort — a lost build strands its awaiting
     /// crawl worker forever (stranded pipe, §10).
     pub fn spawn(&self, work: impl FnOnce() + Send + 'static) {
+        let _ = self.try_send(Box::new(work));
+    }
+
+    /// The port's unit body, factored for the `FleetIntake` impl (the
+    /// inherent `spawn` above delegates here): wraps the `InnerWork` unit
+    /// and enqueues it over the host channel, typed to the port's
+    /// `Result<(), ()>` close vocabulary. The channel-open arm returns
+    /// `Ok`; the CLOSE arm's abort lives in the trait impl. `pub(crate)`
+    /// fn, in-crate.
+    pub(crate) fn try_send(&self, work: InnerWork) -> Result<(), ()> {
         let unit = Unit::new(
             self.unit_seq.fetch_add(1, Ordering::Relaxed),
             WorkerRole::PoolStateUpdater,
@@ -162,7 +174,18 @@ impl FleetRegistrationExecutor {
             true,
             Box::new(move |_ctx| work()),
         );
-        if self.tx.send(HostMsg::Enqueue(unit)).is_err() {
+        // The close arm, typed to the port's unit vocabulary: the send
+        // value carries the close arm; the abort lives in the trait impl.
+        match self.tx.send(HostMsg::Enqueue(unit)) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(()),
+        }
+    }
+}
+
+impl FleetIntake for FleetRegistrationExecutor {
+    fn spawn(&self, work: InnerWork) {
+        if self.try_send(work).is_err() {
             abort_executor("intake submission", "fleet intake host channel closed");
         }
     }

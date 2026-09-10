@@ -42,6 +42,8 @@ use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, GrantKind, U
 use degenbot_workers::lane::LaneCtx;
 use degenbot_workers::role::WorkerRole;
 
+use crate::arb_engine::fleet_intake::{FleetIntake, InnerWork};
+
 /// Loud, unrecoverable executor failure (mirror of the fleet solve
 /// executor's abort discipline): a dead host would strand in-flight sim
 /// receipts — a scheduling bin waiting on a receipt parks forever (stranded
@@ -153,11 +155,14 @@ impl FleetSimExecutor {
         self.sim_seats
     }
 
-    /// Submit one pipelined sim unit. Never drops: the host-side backlog
-    /// preserves the legacy unbounded-receipt semantics; a closed host
-    /// channel (executor died) is a LOUD abort — a lost sim strands the
-    /// scheduling bin's receipt join forever (stranded pipe, §10).
-    pub(crate) fn spawn(&self, work: impl FnOnce() + Send + 'static) {
+    /// The pre-existing submit body, RENAMED (was the inherent `spawn`,
+    /// sim:158-174): wraps into `Unit::new(.., Box::new(move |_ctx| work()))`
+    /// (:166) and `tx.send(HostMsg::Enqueue(unit))` (:173, `map_err`-typed
+    /// to `Err(())` on a closed channel — the send VALUE carries the close
+    /// arm; the abort lives in the trait impl). The OLD close arm
+    /// (sim:171-173's `abort_executor`) MOVES to the trait impl below — same
+    /// process-exit semantics, one owner of the abort. Private fn, in-crate.
+    fn try_send(&self, work: InnerWork) -> Result<(), ()> {
         let unit = Unit::new(
             self.unit_seq.fetch_add(1, Ordering::Relaxed),
             WorkerRole::SimDriver,
@@ -167,7 +172,28 @@ impl FleetSimExecutor {
             true,
             Box::new(move |_ctx| work()),
         );
-        if self.tx.send(HostMsg::Enqueue(unit)).is_err() {
+        // The close arm, typed to the port's unit vocabulary: the send
+        // value carries the close arm; the abort lives in the trait impl.
+        match self.tx.send(HostMsg::Enqueue(unit)) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(()),
+        }
+    }
+
+    /// Test-venue shim: the OLD name `spawn`, `#[cfg(test)]`-only, so the
+    /// in-file fixtures (sim:415..:546) keep compiling VERBATIM. Outside test
+    /// builds the inherent fn does not EXIST — the inherent-priority shadow
+    /// (§6 risk 6) is confined to test code that calls no port path, and the
+    /// port is the only `spawn` production callers can name.
+    #[cfg(test)]
+    fn spawn(&self, work: impl FnOnce() + Send + 'static) {
+        let _ = self.try_send(Box::new(work));
+    }
+}
+
+impl FleetIntake for FleetSimExecutor {
+    fn spawn(&self, work: InnerWork) {
+        if self.try_send(work).is_err() {
             abort_executor("sim submission", "fleet sim host channel closed");
         }
     }

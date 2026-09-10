@@ -66,6 +66,7 @@ mod diagnostic;
 pub mod engine_stages;
 mod event_routing;
 pub(crate) mod executor;
+pub(crate) mod fleet_intake;
 pub mod fleet_registration_executor;
 mod fleet_sim_executor;
 pub(crate) mod fleet_solve_executor;
