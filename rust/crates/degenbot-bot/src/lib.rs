@@ -199,6 +199,9 @@ pub mod instruments {
 }
 pub mod allocator_ctrl;
 pub mod arb_engine;
+/// The PRG-3 intake surface (LNQDOA): the documented single re-export the
+/// pyo3 leaf depends on — no other `arb_engine` module is public surface.
+pub use arb_engine::fleet_intake;
 pub mod failure_policy;
 #[cfg(feature = "otel")]
 pub mod instruments;

@@ -87,6 +87,7 @@ pub struct FleetRegistrationExecutor {
     tx: mpsc::Sender<HostMsg>,
     unit_seq: AtomicU64,
     /// The budget's `PoolStateUpdater` slot cap (the pooled seat count).
+    #[cfg(test)]
     seats: usize,
 }
 
@@ -139,31 +140,30 @@ impl FleetRegistrationExecutor {
         Ok(Self {
             tx,
             unit_seq: AtomicU64::new(0),
+            #[cfg(test)]
             seats,
         })
     }
 
     /// The budget's `PoolStateUpdater` slot cap (the pooled seat count).
     /// Test-facing (the intake submits without asking the cap).
+    #[cfg(test)]
     #[must_use]
     pub fn seat_count(&self) -> usize {
         self.seats
     }
 
-    /// Submit one intake unit. Never drops: the host-side backlog preserves
-    /// the legacy unbounded-submission semantics; a closed host channel
-    /// (executor died) is a LOUD abort — a lost build strands its awaiting
-    /// crawl worker forever (stranded pipe, §10).
-    pub fn spawn(&self, work: impl FnOnce() + Send + 'static) {
-        let _ = self.try_send(Box::new(work));
-    }
-
-    /// The port's unit body, factored for the `FleetIntake` impl (the
-    /// inherent `spawn` above delegates here): wraps the `InnerWork` unit
-    /// and enqueues it over the host channel, typed to the port's
-    /// `Result<(), ()>` close vocabulary. The channel-open arm returns
-    /// `Ok`; the CLOSE arm's abort lives in the trait impl. `pub(crate)`
-    /// fn, in-crate.
+    /// The port's unit body (the pre-existing submit, renamed from the
+    /// inherent `spawn`, reg:155-174): wraps into `Unit::new(.., Box::new(
+    /// move |_ctx| work()))` and enqueues over `tx.send(HostMsg::Enqueue(
+    /// unit))`, typed to the port's `Result<(), ()>` close vocabulary - the
+    /// send VALUE carries the close arm; the abort lives in the trait impl
+    /// (reg:173-175's `abort_executor` - today's "intake submission" /
+    /// "fleet intake host channel closed" - moved there; same process-exit
+    /// semantics, one owner of the abort). `pub(crate)` fn, in-crate (T3's
+    /// cross-module pin in `fleet_intake`'s tests binds the `Result<(), ()>`
+    /// shape by calling it - the surface stays crate-internal, invisible to
+    /// the §4.3 pub-surface grep).
     pub(crate) fn try_send(&self, work: InnerWork) -> Result<(), ()> {
         let unit = Unit::new(
             self.unit_seq.fetch_add(1, Ordering::Relaxed),
@@ -180,6 +180,16 @@ impl FleetRegistrationExecutor {
             Ok(()) => Ok(()),
             Err(_) => Err(()),
         }
+    }
+
+    /// Test-venue shim: the OLD name `spawn`, `#[cfg(test)]`-only, so the
+    /// in-file fixtures keep compiling VERBATIM. Outside test builds the
+    /// inherent fn does not EXIST - the inherent-priority shadow (§6 risk 6)
+    /// is confined to test code that calls no port path, and the port is the
+    /// only `spawn` production callers can name.
+    #[cfg(test)]
+    fn spawn(&self, work: impl FnOnce() + Send + 'static) {
+        let _ = self.try_send(Box::new(work));
     }
 }
 
@@ -400,8 +410,10 @@ fn fallback_boot() -> FleetBoot {
 
 /// The process-wide fleet registration intake executor, built lazily on the
 /// first fleet-stance intake submission and persisting for the process
-/// lifetime.
-pub fn global_fleet_registration_executor() -> &'static FleetRegistrationExecutor {
+/// lifetime. Crate-internal (LNQDOA §4.2): its only callers are the
+/// `fleet_intake` facade hand-outs — the executor TYPE crosses a boundary
+/// exactly once, as an anonymous trait object.
+pub(crate) fn global_fleet_registration_executor() -> &'static FleetRegistrationExecutor {
     FLEET_REGISTRATION_EXECUTOR.get_or_init(|| {
         let boot = FLEET_REGISTRATION_BOOT
             .get()

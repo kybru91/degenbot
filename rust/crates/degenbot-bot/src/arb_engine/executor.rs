@@ -2,9 +2,10 @@
 //! **`Executor`** — the LANEWARDEN vocabulary finalizes here. Since LNQDOA
 //! (the pooled intake port) this module owns the GLOBAL EXECUTOR TOKEN
 //! FAMILY for `arb_engine` — `global_executor` (the solve-arm seam) plus
-//! the pooled-intake delegates `global_sim_executor` /
-//! `global_pooled_registration_executor`, which hand out `fleet_intake`'s
-//! `FleetIntake` port over the pooled executors — and re-exports the shared
+//! the pooled-intake delegate `global_sim_executor` (which hands out
+//! `fleet_intake`'s `FleetIntake` port over the pooled sim executor; the
+//! registration intake arm is served by the `fleet_intake` facade's
+//! `registration_intake`) — and re-exports the shared
 //! seam types (mirroring the degenbot-workers placement of shared types —
 //! no pyo3 in any signature).
 

@@ -501,7 +501,7 @@ impl PyBot {
     /// reads this ONCE at pipeline construction (stance like the executor
     /// field — never re-read on the hot path).
     pub fn registration_fleet_hosted(&self) -> bool {
-        degenbot_bot::arb_engine::fleet_registration_executor::boot_installed()
+        degenbot_bot::fleet_intake::registration_boot_installed()
     }
 
     /// PRG-3: submit one intake unit (a pool-build callable) to the fleet

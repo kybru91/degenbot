@@ -163,34 +163,33 @@ pub fn submit(fn_work: Py<PyAny>) -> PyIntakeReceipt {
     };
     let done = Arc::clone(&receipt.done);
     let outcome_slot = Arc::clone(&receipt.outcome);
-    degenbot_bot::arb_engine::fleet_registration_executor::global_fleet_registration_executor()
-        .spawn(move || {
-            let outcome = Python::attach(|py| {
-                // GOQWCL: propagate the seat's Rust thread name into Python —
-                // an anonymous C thread registers as `Dummy-N`, hiding which
-                // fleet seat executed the unit (py-spy/operator
-                // greppability). The per-call rename is idempotent.
-                let seat = std::thread::current();
-                if let Some(name) = seat.name() {
-                    let _ = py
-                        .import("threading")
-                        .and_then(|m| m.call_method0("current_thread"))
-                        .and_then(|t| t.call_method1("setName", (name,)));
-                }
-                fn_work.call0(py)
-            });
-            *outcome_slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
-            done.store(true, Ordering::Relaxed);
-            // A waiting driver may be gone (cancelled task): log it, never
-            // crash a warm seat.
-            if sig_tx.send(()).is_err() {
-                tracing::warn!(
-                    target: "degenbot::fleet",
-                    "[fleet-reg] intake unit completed with no waiting consumer"
-                );
+    degenbot_bot::fleet_intake::registration_intake().spawn(Box::new(move || {
+        let outcome = Python::attach(|py| {
+            // GOQWCL: propagate the seat's Rust thread name into Python —
+            // an anonymous C thread registers as `Dummy-N`, hiding which
+            // fleet seat executed the unit (py-spy/operator
+            // greppability). The per-call rename is idempotent.
+            let seat = std::thread::current();
+            if let Some(name) = seat.name() {
+                let _ = py
+                    .import("threading")
+                    .and_then(|m| m.call_method0("current_thread"))
+                    .and_then(|t| t.call_method1("setName", (name,)));
             }
+            fn_work.call0(py)
         });
+        *outcome_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+        done.store(true, Ordering::Relaxed);
+        // A waiting driver may be gone (cancelled task): log it, never
+        // crash a warm seat.
+        if sig_tx.send(()).is_err() {
+            tracing::warn!(
+                target: "degenbot::fleet",
+                "[fleet-reg] intake unit completed with no waiting consumer"
+            );
+        }
+    }));
     receipt
 }
