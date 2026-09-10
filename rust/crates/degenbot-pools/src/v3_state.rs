@@ -2123,7 +2123,7 @@ mod apply_inherent_tests {
     /// where liquidity recovers to `6_491_467_503_505_060_4`. Without the drain,
     /// the solver models range 0 as carrying the full `5.407e18` liquidity
     /// through the whole region → no-slippage over-prediction of ~2.7× (the
-    /// `no-profit` trap; see logs/fixtures/v2_v3_v3_solver_divergence_25641093.md,
+    /// `no-profit` trap; see `logs/fixtures/v2_v3_v3_solver_divergence_25641093.md`,
     /// a gitignored logs/ artifact since removed).
     #[test]
     fn build_int_v3_sequence_drains_current_tick_on_zfo_when_current_is_initialized() {

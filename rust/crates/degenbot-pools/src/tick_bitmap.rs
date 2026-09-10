@@ -340,7 +340,7 @@ pub fn gen_ticks_iter<S: std::hash::BuildHasher>(
 /// Runs of consecutive zero-`liquidity_net` word-boundary ticks are collapsed
 /// so the `max_ranges` budget is not starved by tick-sparse pools
 /// (`tick_spacing=1` with initialized ticks separated by many word boundaries
-/// — see mainnet fixture logs/fixtures/v2_v3_v3_solver_divergence_25641093.md,
+/// — see mainnet fixture `logs/fixtures/v2_v3_v3_solver_divergence_25641093.md`,
 /// a gitignored logs/ artifact since removed).
 /// The on-chain V3/V4 `PoolManager` floors `computeSwapStep` at EVERY word
 /// boundary; the `ON5QMD` per-step rounding parity is preserved TWO ways:
@@ -1350,7 +1350,7 @@ mod tests {
 
     /// Regression: `tick_spacing=1` pools with initialized ticks separated by
     /// many word boundaries (the mainnet fixture
-    /// logs/fixtures/v2_v3_v3_solver_divergence_25641093.md — a gitignored
+    /// `logs/fixtures/v2_v3_v3_solver_divergence_25641093.md` — a gitignored
     /// logs/ artifact since removed — DAI/WETH pool
     /// `0xD8dEC118e1215F02e10DB846DCbBfE27d477aC19`, fee=100, `tick_spacing=1`)
     /// starved `compute_tick_ranges`'s `max_ranges` budget: ~40 word-boundary
