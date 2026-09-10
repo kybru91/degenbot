@@ -181,8 +181,13 @@ pub(crate) fn effective_budget_from_with_roots(
 /// Solve-worker count from overrides: `override_cpu` (`DEGENBOT_SOLVE_CPUS`)
 /// wins outright (headroom ignored); otherwise budget minus the headroom
 /// (`override_headroom`, default [`DEFAULT_SOLVE_HEADROOM`]), floored at 1.
+///
+/// Public so the fleet budget authority can property-test the
+/// cross-authority sizing contract `TTANQJ` (epic 64ZQLA), and so a
+/// standalone (ADR-005) consumer can size solve bins from a budget it
+/// derived itself.
 #[must_use]
-pub(crate) fn solve_worker_count_from(
+pub fn solve_worker_count_from(
     override_cpu: Option<&str>,
     override_headroom: Option<&str>,
     budget: usize,
