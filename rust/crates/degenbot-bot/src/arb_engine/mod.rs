@@ -48,11 +48,15 @@ use ::degenbot_solvers::mixed::{HopType, MixedPath, ResolvedMixedPath, SolvePath
 use alloy::primitives::aliases::U112;
 use alloy::primitives::Address;
 
+use self::boot_stamp::BootStamp;
 use self::delivery_policy::DeliveryPolicy;
 use crate::bot_core::resolve::HopProjectionCache;
 use crate::bot_core::state_lock::StateLock;
 use crate::bot_core::BotState;
 
+// THE construction-stamped fleet boot carrier (YI5NGB): the engine's own
+// FleetBoot value + the ride ledger the per-role fleet statics consult.
+mod boot_stamp;
 // Sub-modules — each contains `impl ArbitrageEngine` or `impl PyArbitrageEngine` blocks.
 mod delivery_lifecycle;
 mod delivery_policy;
@@ -434,6 +438,18 @@ pub struct ArbitrageEngine {
     /// debounce sweep (A/B opt-out), which still owns expired/removed + the
     /// end-of-cycle metadata batch either way.
     streaming_delivery: bool,
+    /// THE construction-stamped fleet boot (YI5NGB): the engine's OWN
+    /// `FleetBoot`, derived from the CALLER's cfg at construction and
+    /// stamped with the engine id + a deterministic cfg hash. Packed in
+    /// `with_core_cfg` right beside `streaming_delivery` (the KAHU5W
+    /// construction-stance pattern); the per-role fleet statics courier it
+    /// to the ONE process fleet materialization per role, and any
+    /// divergent-cfg rider is ledgered (`boot_stamp::record_ride`). The
+    /// non-test build carries it write-only (the stamp's consumers are the
+    /// install-time ledger + the per-role statics); test builds read it
+    /// through the white-box probe accessor.
+    #[cfg_attr(not(test), expect(dead_code))]
+    fleet_boot_stamp: BootStamp,
     /// Test-only: hook invoked at the start of each path solve — lets the
     /// streaming test slowen one path deterministically.
     #[cfg(test)]
@@ -595,12 +611,18 @@ impl ArbitrageEngine {
         // own cfg — never from an install-then-read process static. A
         // parallel construction flips such a static between our install and
         // a global read (TOCTOU). The install call remains for its process
-        // projections (the fleet boots; the stance statics other consumers
-        // observe). LW-T9: there is no stance — the fleet installs
-        // unconditionally, it is the only behavior.
+        // projections — the construction-STAMPED fleet boots (YI5NGB); the
+        // stance statics other consumers observe). LW-T9: there is no
+        // stance — the fleet installs unconditionally, it is the only
+        // behavior.
         let streaming_delivery = cfg.pump.streaming_delivery;
         let detached_solving = !cfg!(test) && cfg.solve.detached_solves;
-        solver_dispatch::install_engine_stances(cfg);
+        // YI5NGB: the engine OWNS its fleet boot (KAHU5W) — the stamp is
+        // constructed from THIS cfg BEFORE the installer runs, so the
+        // construction hand-off carries the caller's value, identified.
+        let fleet_boot_stamp =
+            BootStamp::of(degenbot_workers::dispatcher::FleetBoot::from_config(cfg));
+        solver_dispatch::install_engine_stances(cfg, &fleet_boot_stamp);
         Self {
             cfg: std::sync::Arc::clone(cfg),
             runtime_cfg: solver_dispatch::solve_runtime_config_from_cfg(cfg),
@@ -628,6 +650,7 @@ impl ArbitrageEngine {
             last_walk_sims: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             last_gate_us: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             streaming_delivery,
+            fleet_boot_stamp,
             #[cfg(test)]
             test_solve_delay: None,
             #[cfg(test)]
@@ -834,6 +857,14 @@ impl ArbitrageEngine {
 
     pub(crate) fn set_streaming_delivery(&mut self, on: bool) {
         self.streaming_delivery = on;
+    }
+
+    /// YI5NGB (test-only F-suite probe): the engine's construction-stamped
+    /// boot — lets the white-box tests verify twin constructions share a
+    /// byte-identical boot value WITHOUT reaching into the fleet statics.
+    #[cfg(test)]
+    pub(crate) fn fleet_boot_stamp(&self) -> &BootStamp {
+        &self.fleet_boot_stamp
     }
 
     pub(crate) fn set_detached_solving(&mut self, on: bool) {

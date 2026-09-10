@@ -317,19 +317,30 @@ pub fn solve_runtime_config_from_cfg(
 /// The solver-runtime stance is NOT installed globally anymore — the engine
 /// holds an instance value built by [`solve_runtime_config_from_cfg`] and
 /// threads it down (KAHU5W: the solver `OnceLock` is retired).
-pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
+///
+/// YI5NGB: the boots installed here are the CONSTRUCTION-STAMPED values —
+/// the engine derived its own `FleetBoot` from THIS caller cfg and stamped it
+/// (`BootStamp`: engine id + deterministic cfg hash); the per-role fleet
+/// executors courier the identified stamp to the single fleet
+/// materialization, and a divergent-cfg rider is ledgered
+/// (`boot_stamp::record_ride`) instead of silently winning the fleet.
+pub fn install_engine_stances(
+    cfg: &::degenbot_config::BotConfig,
+    boot_stamp: &crate::arb_engine::boot_stamp::BootStamp,
+) {
     // LW-T9 (no stance, no migration flag): the solve bins ALWAYS ride the
     // fleet-hosted executor; the typed boot descriptor (quota + overrides +
     // posture) is parsed here once.
-    let boot = degenbot_workers::dispatcher::FleetBoot::from_config(cfg);
-    crate::arb_engine::fleet_solve_executor::install_boot(boot);
+    // YI5NGB: the engine's OWN construction boot, stamped — each role's
+    // install records the identified ride (first-fleet-wins per role).
+    crate::arb_engine::fleet_solve_executor::install_boot(boot_stamp.clone());
     // ADR-042 F4: the SimDriver seat pool shares the boot descriptor
     // (same quota + overrides + posture as the Solver-side host).
-    crate::arb_engine::fleet_sim_executor::install_boot(boot);
+    crate::arb_engine::fleet_sim_executor::install_boot(boot_stamp.clone());
     // PRG-3: the registration intake station shares the same boot
     // descriptor (duty-counted PoolStateUpdater slots, Deferrable
     // cordon class).
-    crate::arb_engine::fleet_registration_executor::install_boot(boot);
+    crate::arb_engine::fleet_registration_executor::install_boot(boot_stamp.clone());
     STREAMING_DELIVERY_ENABLED.store(
         cfg.pump.streaming_delivery,
         std::sync::atomic::Ordering::Relaxed,

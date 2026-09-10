@@ -25,6 +25,10 @@ pub trait FleetIntake: Send + Sync {
 /// by `executor.rs::global_sim_executor()` so the §3.1 re-route reads
 /// through ONE module; crate-internal because only the sim dispatch route
 /// needs it.
+/// YI5NGB construction precondition: the fleet materializes LAZILY on the
+/// first call — from the construction-STAMPED boot the first engine
+/// construction installed (`with_core_cfg`). No fallback exists: a caller
+/// that reaches this seam BEFORE any engine construction aborts LOUD.
 #[must_use]
 pub(crate) fn sim_intake() -> &'static dyn FleetIntake {
     crate::arb_engine::fleet_sim_executor::global_fleet_sim_executor()
@@ -34,6 +38,11 @@ pub(crate) fn sim_intake() -> &'static dyn FleetIntake {
 /// The PRG-3 station ratchet + the `DivergenceTable` note from sim (one seam,
 /// two shapes) + the `ADR-013`/pyo3-free boundary: units carry `InnerWork`;
 /// `Python::attach` stays in `degenbot-python`'s closure body.
+/// YI5NGB construction precondition (same as [`sim_intake`]): the fleet
+/// materializes LAZILY from the first construction's STAMPED boot — the
+/// PRG-5 probe's pre-engine `False` / post-engine `True` latch rides this
+/// exact install moment. No fallback exists: a caller that reaches this
+/// seam BEFORE any engine construction aborts LOUD.
 #[must_use]
 pub fn registration_intake() -> &'static dyn FleetIntake {
     crate::arb_engine::fleet_registration_executor::global_fleet_registration_executor()
@@ -174,8 +183,9 @@ mod tests {
 
     /// The never-drop flood, through the FACADE ADAPTER the pyo3 leaf holds
     /// (`&dyn FleetIntake`). Boots a PRIVATE hermetic executor - never the
-    /// process global: the global lazily boots `fallback_boot()` (a real
-    /// cgroup-quota probe - machine-variable cap) and UPSERTS the
+    /// process global: the global lazy materialization is CONSTRUCTION-keyed
+    /// (it consumes the with_core_cfg-stamped boot; the ambient-deriving
+    /// absence hatch is deleted since YI5NGB) and UPSERTS the
     /// `fleet_pool_state_updater_slots` census row (process-wide storage,
     /// `worker_census.rs` `CENSUS` table - an exactness hazard for the
     /// census-row tests under parallel test threads). The flood scale rides

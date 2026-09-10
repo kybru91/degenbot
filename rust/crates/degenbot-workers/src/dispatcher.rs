@@ -267,7 +267,7 @@ impl std::fmt::Debug for FleetHost {
 }
 
 /// Boot description for [`FleetHost::boot`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FleetBoot {
     /// Fractional cgroup quota (cores), from
     /// [`crate::quota::fractional_cpu_budget`].

@@ -23,6 +23,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 
+use crate::arb_engine::boot_stamp::{BootRole, BootStamp};
 use degenbot_workers::dispatcher::{
     BootError, FleetBoot, FleetHost, SubmitError, SubmitReceipt, Unit,
 };
@@ -433,36 +434,41 @@ fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, seats: &[mpsc::Sende
     }
 }
 
-static FLEET_SOLVE_BOOT: OnceLock<FleetBoot> = OnceLock::new();
+static FLEET_SOLVE_BOOT: OnceLock<BootStamp> = OnceLock::new();
 static FLEET_EXECUTOR: OnceLock<FleetSolveExecutor> = OnceLock::new();
 
-/// Install the typed boot descriptor (fleet quota + overrides + posture)
-/// parsed ONCE at engine construction from the config; the global executor
-/// lazily consumes it on first fleet-stance solve. Never overrides an
-/// installed value (first engine wins, like the other stance statics).
-pub(crate) fn install_boot(boot: FleetBoot) {
-    let _ = FLEET_SOLVE_BOOT.set(boot);
-}
-
-/// Hermetic fallback when no engine installed a boot descriptor: detect
-/// the fractional cgroup quota, no overrides, doc-default posture.
-fn fallback_boot() -> FleetBoot {
-    FleetBoot {
-        quota_cpus: degenbot_workers::quota::fractional_cpu_budget(),
-        overrides: degenbot_workers::budget::BudgetOverrides::default(),
-        posture: degenbot_workers::posture::PosturePolicy::doc_defaults(),
-    }
+/// Install the CONSTRUCTION-STAMPED boot (YI5NGB): the engine's own typed
+/// boot descriptor (fleet quota + overrides + posture) parsed at ITS
+/// construction from the CALLER cfg, stamped with the engine id + a
+/// deterministic cfg hash. Never overrides an installed value (first
+/// engine wins, like the other stance statics) — every construction after
+/// the first RIDES, and the ride is ledgered (a divergent-cfg rider is
+/// counted + warned in prod, ILLEGAL in tests).
+pub(crate) fn install_boot(stamp: BootStamp) {
+    crate::arb_engine::boot_stamp::record_ride(BootRole::Solve, &stamp);
+    let _ = FLEET_SOLVE_BOOT.set(stamp);
 }
 
 /// The process-wide fleet solve executor, built lazily on the first
 /// fleet-stance solve and persisting for the process lifetime.
 pub(crate) fn global_fleet_solve_executor() -> &'static FleetSolveExecutor {
     FLEET_EXECUTOR.get_or_init(|| {
-        let boot = FLEET_SOLVE_BOOT
+        // YI5NGB: the absence window is CLOSED BY CONSTRUCTION — every
+        // dispatch path builds on a constructed engine, and construction
+        // (with_core_cfg) installs the stamp BEFORE any dispatch can
+        // exist. A missing stamp means a caller skipped the construction
+        // contract: LOUD abort (never a silent fallback boot of a boot
+        // nobody chose).
+        #[expect(
+            clippy::expect_used,
+            reason = "the loud construction-contract abort IS the YI5NGB design: a stamp-less materialization must abort, never fall back silently"
+        )]
+        let stamp = FLEET_SOLVE_BOOT
             .get()
-            .copied()
-            .unwrap_or_else(fallback_boot);
-        match FleetSolveExecutor::boot(boot) {
+            .expect(
+                "fleet solve boot stamp missing: an engine must construct before the first fleet submit (YI5NGB)",
+            );
+        match FleetSolveExecutor::boot(stamp.boot()) {
             Ok(executor) => executor,
             Err(err) => abort_executor("fleet budget boot", &err.to_string()),
         }
@@ -623,6 +629,43 @@ mod tests {
     /// floor(8) − the default solve headroom (2) = 6 seats — not the
     /// retired sharesx2 multiple (8). The dispatch arms bin at this same
     /// count, so every bin owns a warm keyed seat across cycles (T6).
+    #[expect(
+        clippy::print_stderr,
+        reason = "the self-skip channel when a parallel test won the stamp race (the documented F1 skip semantics)"
+    )]
+    /// F1 white-box (YI5NGB): the materializer's init closure aborts LOUD
+    /// (the expect) when no construction ever installed a stamp — invoked
+    /// directly so the expect fires WITHOUT a real `FleetHost` boot.
+    #[test]
+    fn fleet_solve_materializer_without_a_stamp_is_loud() {
+        if super::FLEET_SOLVE_BOOT.get().is_some() {
+            eprintln!(
+                "skipping: another test already installed the solve boot stamp in this process"
+            );
+            return;
+        }
+        let closure = || {
+            let stamp = super::FLEET_SOLVE_BOOT.get().expect(
+                "fleet solve boot stamp missing: an engine must construct before the first fleet submit (YI5NGB)",
+            );
+            match FleetSolveExecutor::boot(stamp.boot()) {
+                Ok(_executor) => (),
+                Err(_err) => (),
+            }
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(closure));
+        let err = result.expect_err("a stamp-less materialization must abort loud");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .expect("panic payload is the expect message");
+        assert!(
+            msg.contains("(YI5NGB)"),
+            "the expect must name the task: {msg}"
+        );
+    }
+
     #[test]
     fn solver_seats_equal_the_structural_lpt_bin_count() {
         let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");

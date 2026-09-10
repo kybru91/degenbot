@@ -49,6 +49,11 @@ pub(crate) trait Executor: Send + Sync {
 /// not through this fn — the fleet-hosted executors remain the only
 /// executors since the LW-T9 cutover (the tokio stance is deleted; there
 /// is no stance parameter).
+/// YI5NGB construction precondition: the fleet materializes LAZILY on the
+/// first call — from the construction-STAMPED boot the first engine
+/// construction installed (`with_core_cfg`). There is NO fallback boot: a
+/// caller that reaches this seam BEFORE any engine construction is a
+/// contract violation and aborts LOUD (`expect` in the materializer).
 pub(crate) fn global_executor() -> &'static dyn Executor {
     crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
 }
