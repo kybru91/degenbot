@@ -73,7 +73,7 @@ struct SeatJob {
     /// The work payload (`Send + 'static` — the `c_api` closure carries the
     /// Python callable handle and its receipt channel). Takes the seat's
     /// `LaneCtx` (LW-T2); pooled seats hand the detached stub (LW-T8
-    /// unifies the pooled paths onto pin-bound ctx).
+    /// landed: the executors submit through ONE seam).
     work: Box<dyn FnOnce(&LaneCtx) + Send>,
 }
 

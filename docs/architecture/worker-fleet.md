@@ -49,8 +49,11 @@ Measured on the live dry-run bot, 8-core cgroup quota:
 5. **Python/FFI rule:** cross only for runtime/startup concerns and standalone-
    result delivery; **simulation never round-trips Python**; the inline-sim
    hook's runtime becomes fleet-hosted.
-6. **Migration:** `DEGENBOT_FLEET` stance flag, parallel implementations, hard
-   cutover at the end.
+6. **Migration:** `DEGENBOT_FLEET` stance flag and parallel implementations
+   shipped during 0.6; the hard cutover LANDED at LW-T9 (ergo CQLMM2): the
+   stance flag and the legacy tokio-stance mechanisms are deleted — **fleet
+   is the only stance since LW-T9**. A surviving `DEGENBOT_FLEET` env var or
+   `fleet.stance` TOML key fails the config load loudly for one release.
 
 ## 3. `WorkerRole` — the role/state/cycle table
 
@@ -259,8 +262,10 @@ capture succeeds and no per-call runtime is built (VJGZJ2's rule retained).
 
 ## 9. Migration plan
 
-Stance flag `DEGENBOT_FLEET` (`legacy` | `fleet`; typed-config alias), default
-`legacy` until cutover. Both stances pass the same pinned behavioral tests.
+Stance flag `DEGENBOT_FLEET` (`legacy` | `fleet`; typed-config alias) shipped
+during the migration; **RETIRED at LW-T9 (fleet is the only stance since
+LW-T9)** — the flag fails the config load loudly for one release, and the
+legacy mechanisms it selected are deleted (§11 for the cutover ops notes).
 
 | Task | Content | Gate |
 |---|---|---|
@@ -321,3 +326,25 @@ the table or the stub fails loudly.
   sim-closure install and result delivery that already exist.
 - **No migration mechanics beyond the flag:** no soft handoff of in-flight
   units between stances (a stance switch is a restart-boundary config choice).
+
+## 11. Ops note: fuse trips, loud stops, and mutex semantics (ergo CQLMM2)
+
+The solve-path exactness fuses (QR3NUS: one path outcome exactly once — the
+in-cycle drain's outcome ledger AND the detached merge sidecar's
+seen-(cycle_seq, pid) ledger, carried by LW-T9 note (a)) trip LOUD, never
+silent: a dup or an undercount logs a `tripping-the-fuse` error and aborts the
+process (ADR-021 loud-stop discipline).
+
+- **Tripped fuse = cycle panic.** Under the FFI it surfaces as the cycle
+  thread's panic; the bin/pipe that double-emitted is the bug. Do not retry the
+  same process region blindly.
+- **No poisoned-Mutex recovery exists** — and none is needed: the engine and
+  engine-stages mutexes are `parking_lot` (non-poisoning). There is no poisoned
+  guard to recover; the loud stop IS the recovery contract. Restart the process
+  (the supervisor's loud-stop restart path) after the dump is captured.
+- **Soak gate (65GTJG-mirrored, host-side):** the 5-minute live soak plus
+  capture-replay parity runs post-merge on the host machine (home-only caches;
+  not in the container). Expect equal probe expectations: capture-replay parity
+  green, no solve-tail regression, census rows sane (`arb_sim_workers` /
+  `detached_merge_sidecar` / `sim_slots` rows are retired with LW-T9 — their
+  presence in a post-T9 dump is itself a failure).

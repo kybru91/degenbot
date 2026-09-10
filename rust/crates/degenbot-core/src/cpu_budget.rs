@@ -22,8 +22,8 @@
 //!   with `DEGENBOT_IO_WORKERS`.
 //!
 //! Everything CPU-adjacent that is NOT a solve bin (inline-sim drivers
-//! behind the `sim_slots` cap, sim runtime sizing) derives from the same
-//! leftover budget.
+//! behind the fleet `SimDriver` seat cap, sim runtime sizing) derives from
+//! the same leftover budget.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;

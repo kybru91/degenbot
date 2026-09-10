@@ -76,7 +76,7 @@ struct SeatJob {
     /// The work payload (the 'static + Send sim closure — the fleet crate
     /// has no pyo3 and simulation never round-trips Python, design doc §8).
     /// Takes the seat's `LaneCtx` (LW-T2); pooled seats hand the detached
-    /// stub (LW-T8 unifies the pooled paths onto pin-bound ctx).
+    /// stub (LW-T8 landed: the executors submit through ONE seam).
     work: Box<dyn FnOnce(&LaneCtx) + Send>,
 }
 

@@ -1,8 +1,8 @@
 //! THE Executor seam (parking-lot decision, LW-T8 JI275C): the name is
 //! **`Executor`** — the LANEWARDEN vocabulary finalizes here. This module
-//! owns the ONE global token hiding BOTH stance globals, and re-exports the
-//! shared seam types (mirroring the degenbot-workers placement of shared
-//! types — no pyo3 in any signature).
+//! owns the ONE global executor token, and re-exports the shared seam
+//! types (mirroring the degenbot-workers placement of shared types — no
+//! pyo3 in any signature).
 
 use degenbot_workers::dispatcher::SubmitError;
 use degenbot_workers::lane::LaneCtx;
@@ -32,12 +32,9 @@ pub(crate) trait Executor: Send + Sync {
     }
 }
 
-/// The ONE global token (LW-T8): hides BOTH stance `OnceLock`s — call sites
-/// never see `global_fleet_solve_executor` / `global_solve_executor`.
-pub(crate) fn global_executor(fleet_hosted: bool) -> &'static dyn Executor {
-    if fleet_hosted {
-        crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
-    } else {
-        crate::arb_engine::solve_executor::global_solve_executor()
-    }
+/// The ONE global token (LW-T8): every call site submits through here —
+/// the fleet-hosted executor is the SOLE executor since the LW-T9 cutover
+/// (the tokio stance is deleted; there is no stance parameter).
+pub(crate) fn global_executor() -> &'static dyn Executor {
+    crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
 }

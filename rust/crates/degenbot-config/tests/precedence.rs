@@ -1,17 +1,19 @@
 //! Acceptance criterion: precedence is unit-tested per layer on
-//! representative keys of each type (bool, duration-ms, usize, enum).
+//! representative keys of each type (bool, duration-ms, usize).
 
 use std::path::PathBuf;
 
-use degenbot_config::{BotConfigLoader, FleetStance, MapEnv, Source};
+use degenbot_config::{BotConfigLoader, MapEnv, Source};
 
 // Representative keys, one per type:
 // - bool   : `allocator.mimalloc_auto_purge` / `DEGENBOT_MIMALLOC_AUTO_PURGE`
 // - ms     : `state_lock.warn_ms`            / `DEGENBOT_LOCK_WARN_MS`
 // - usize  : `solve.envelope_max_tangent_lines` / `DEGENBOT_ENVELOPE_MAX_TANGENT_LINES`
-// - enum   : `fleet.stance` / `DEGENBOT_FLEET`
-//          (the former enum representative `solve.executor` /
-//          `DEGENBOT_SOLVE_EXECUTOR` was retired at the P6YXA6 hard cutover
+// - enum   : (no standing representative — the enum-key slots retired with
+//          `solve.executor` / `DEGENBOT_SOLVE_EXECUTOR` at the P6YXA6 hard
+//          cutover and with `fleet.stance` / `DEGENBOT_FLEET` at the LW-T9
+//          hard cutover; the enum parse law is covered by the quiesce-mode
+//          chain below, BM35LK)
 
 // Test env provider.
 fn map_env(pairs: &[(&str, &str)]) -> Box<dyn degenbot_config::EnvVars> {
@@ -64,9 +66,6 @@ fn defaults_feed_every_representative_type() {
         cfg.config.solve.envelope_max_tangent_lines, 32,
         "usize default"
     );
-    // The enum representative retired with solve.executor (P6YXA6);
-    // fleet.stance is the standing enum key.
-    assert_eq!(cfg.config.fleet.stance, FleetStance::Legacy, "enum default");
     // BM35LK quiesce-estimator keys: f64 + enum + ms defaults.
     assert_eq!(
         cfg.config.pump.quiesce_mode,
@@ -121,10 +120,7 @@ fn file_layer_overrides_defaults() {
 
 #[test]
 fn env_layer_overrides_file_layer() {
-    let path = temp_toml(
-        "env",
-        "[state_lock]\nwarn_ms = 1500\n\n[fleet]\nstance = \"fleet\"\n",
-    );
+    let path = temp_toml("env", "[state_lock]\nwarn_ms = 1500\n");
     let loaded = must_ok(
         &BotConfigLoader::new()
             .with_env(map_env(&[("DEGENBOT_LOCK_WARN_MS", "2500")]))
@@ -132,9 +128,6 @@ fn env_layer_overrides_file_layer() {
     );
     assert_eq!(loaded.config.state_lock.warn_ms, 2500, "env beats file");
     assert_eq!(loaded.source_of("DEGENBOT_LOCK_WARN_MS"), Some(Source::Env));
-    // Env NOT set -> file value still applies.
-    assert_eq!(loaded.config.fleet.stance, FleetStance::Fleet);
-    assert_eq!(loaded.source_of("DEGENBOT_FLEET"), Some(Source::File));
     cleanup(&path);
 }
 
@@ -150,7 +143,6 @@ fn cli_layer_overrides_env_and_file() {
                 ("DEGENBOT_LOCK_WARN_MS", "2500"),
                 ("DEGENBOT_ENVELOPE_MAX_TANGENT_LINES", "96"),
                 ("DEGENBOT_MIMALLOC_AUTO_PURGE", "0"),
-                ("DEGENBOT_FLEET", "fleet"),
             ]))
             .with_config_path(&path)
             // A CLI override key accepts the env name OR the TOML dotted path.
@@ -170,13 +162,7 @@ fn cli_layer_overrides_env_and_file() {
         loaded.config.allocator.mimalloc_auto_purge,
         "cli beats env (bool)"
     );
-    assert_eq!(
-        loaded.config.fleet.stance,
-        FleetStance::Fleet,
-        "no cli override -> env wins (enum)"
-    );
     assert_eq!(loaded.source_of("DEGENBOT_LOCK_WARN_MS"), Some(Source::Cli));
-    assert_eq!(loaded.source_of("DEGENBOT_FLEET"), Some(Source::Env));
     cleanup(&path);
 }
 
@@ -240,6 +226,90 @@ fn retired_executor_env_fails_the_load_loudly() {
     );
 }
 
+/// LW-T9 hard cutover: `fleet.stance` is retired — the worker fleet is the
+/// ONLY behavior (ADR-042 Q6 ended; ergo CQLMM2). A surviving
+/// `DEGENBOT_FLEET` setting must FAIL the load loudly and name the
+/// retirement (mirror of the P6YXA6 `DEGENBOT_SOLVE_EXECUTOR` treatment;
+/// the deprecation-style hard error is kept for one release). RED before
+/// the key was removed: the loader parsed the enum happily.
+#[test]
+fn retired_fleet_stance_env_fails_the_load_loudly() {
+    let err = must_err(&BotConfigLoader::new().with_env(map_env(&[("DEGENBOT_FLEET", "fleet")])));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("DEGENBOT_FLEET"),
+        "the error names the retired variable: {msg}"
+    );
+    assert!(
+        msg.contains("fleet.stance"),
+        "the error names the retired typed key: {msg}"
+    );
+    assert!(
+        msg.contains("retired") || msg.contains("no longer supported"),
+        "the error states the retirement, not a parse failure: {msg}"
+    );
+}
+
+/// The TOML layer of the same retirement: a surviving `[fleet] stance = ...
+///` entry fails the load loudly, naming `fleet.stance` (beyond the generic
+/// unknown-key error, per the retired-[otel]-table treatment).
+#[test]
+fn retired_fleet_stance_toml_key_fails_the_load_loudly() {
+    let path = temp_toml("retired-stance", "[fleet]\nstance = \"fleet\"\n");
+    let err = must_err(&BotConfigLoader::new().without_env().with_config_path(&path));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("fleet.stance"),
+        "the error names the retired TOML key: {msg}"
+    );
+    assert!(
+        msg.contains("retired") || msg.contains("no longer supported"),
+        "the error states the retirement: {msg}"
+    );
+    cleanup(&path);
+}
+
+/// LW-T9 hard cutover (ruling `sim_slots` (a)): `solve.solve_sim_inflight` is
+/// retired with the `SimSlots` semaphore — its only production consumer. A
+/// surviving `DEGENBOT_SOLVE_SIM_INFLIGHT` setting fails the load loudly and
+/// names the successor keys (`fleet.sim_slot_cap` /
+/// `solve.inline_sim_workers`).
+/// RED before the key was removed: the loader typed the value happily.
+#[test]
+fn retired_sim_inflight_env_fails_the_load_loudly() {
+    let err = must_err(
+        &BotConfigLoader::new().with_env(map_env(&[("DEGENBOT_SOLVE_SIM_INFLIGHT", "8")])),
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("DEGENBOT_SOLVE_SIM_INFLIGHT"),
+        "the error names the retired variable: {msg}"
+    );
+    assert!(
+        msg.contains("fleet.sim_slot_cap") && msg.contains("solve.inline_sim_workers"),
+        "the error names the successor keys: {msg}"
+    );
+}
+
+/// The TOML layer of the same retirement: a surviving
+/// `[solve] solve_sim_inflight` entry fails the load loudly, naming the key
+/// and the successors.
+#[test]
+fn retired_sim_inflight_toml_key_fails_the_load_loudly() {
+    let path = temp_toml("retired-sim-inflight", "[solve]\nsolve_sim_inflight = 8\n");
+    let err = must_err(&BotConfigLoader::new().without_env().with_config_path(&path));
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("solve.solve_sim_inflight"),
+        "the error names the retired TOML key: {msg}"
+    );
+    assert!(
+        msg.contains("fleet.sim_slot_cap") && msg.contains("solve.inline_sim_workers"),
+        "the error names the successor keys: {msg}"
+    );
+    cleanup(&path);
+}
+
 #[test]
 fn every_layer_for_every_type_in_sequence() {
     // (BM35LK: the quiesce keys ride the same loader machinery — asserted
@@ -247,13 +317,12 @@ fn every_layer_for_every_type_in_sequence() {
     // One full precedence chain per representative type.
     let path = temp_toml(
         "chain",
-        "[fleet]\nstance = \"legacy\"\n\n[solve]\nenvelope_max_tangent_lines = 64\n\n[state_lock]\nwarn_ms = 1500\n\n[allocator]\nmimalloc_auto_purge = false\n",
+        "[solve]\nenvelope_max_tangent_lines = 64\n\n[state_lock]\nwarn_ms = 1500\n\n[allocator]\nmimalloc_auto_purge = false\n",
     );
     let loaded = must_ok(
         &BotConfigLoader::new()
             .with_env(map_env(&[
                 ("DEGENBOT_ENVELOPE_MAX_TANGENT_LINES", "96"),
-                ("DEGENBOT_FLEET", "fleet"),
                 ("DEGENBOT_LOCK_WARN_MS", "2500"),
                 ("DEGENBOT_MIMALLOC_AUTO_PURGE", "0"),
             ]))
@@ -263,7 +332,6 @@ fn every_layer_for_every_type_in_sequence() {
                     "DEGENBOT_ENVELOPE_MAX_TANGENT_LINES".to_string(),
                     "7".to_string(),
                 ),
-                ("DEGENBOT_FLEET".to_string(), "legacy".to_string()),
                 ("DEGENBOT_LOCK_WARN_MS".to_string(), "42".to_string()),
                 (
                     "DEGENBOT_MIMALLOC_AUTO_PURGE".to_string(),
@@ -283,25 +351,23 @@ fn every_layer_for_every_type_in_sequence() {
         loaded.config.allocator.mimalloc_auto_purge,
         "cli top (bool)"
     );
-    assert_eq!(
-        loaded.config.fleet.stance,
-        FleetStance::Legacy,
-        "cli top (enum)"
-    );
     cleanup(&path);
 }
 
 #[test]
 fn loader_fails_closed_on_bad_values_and_unknown_keys() {
-    // Bad enum value -> aggregated error naming the key type; no silent fallback.
+    // LW-T9: the RETIRED stance key is not a schema key anymore — a CLI
+    // override naming it is rejected as unknown (the env-layer path fails
+    // loudly with the actionable retirement message; see
+    // retired_fleet_stance_env_fails_the_load_loudly), no silent fallback.
     let err = must_err(
         &BotConfigLoader::new()
             .without_env()
             .with_cli("DEGENBOT_FLEET", "ninja"),
     );
     assert!(
-        format!("{err}").contains("FleetStance"),
-        "error names the key"
+        format!("{err}").contains("DEGENBOT_FLEET"),
+        "the retired key is rejected: {err}"
     );
 
     // P6YXA6: the RETIRED executor key is not a schema key anymore — a CLI

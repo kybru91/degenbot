@@ -270,8 +270,8 @@ impl std::fmt::Debug for LaneCtx {
 impl LaneCtx {
     /// The stub context for pooled seats (no warm arena, no pin, no
     /// escalation capability): the pinned solve lanes hand the real
-    /// pin-bound ctx at the T2 grant seam (LW-T8 unifies the pooled paths
-    /// onto it).
+    /// pin-bound ctx at the T2 grant seam (LW-T8 landed: the executors
+    /// submit through the ONE Executor seam).
     #[must_use]
     pub fn detached() -> Self {
         Self {

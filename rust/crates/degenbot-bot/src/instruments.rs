@@ -1166,14 +1166,14 @@ mod kind_tests {
             crate::metrics::build_prometheus_provider().expect("prometheus provider build");
         let instruments = PipelineInstruments::new(&provider.meter("test"));
         instruments.set_worker_census("io_runtime_workers", 2.0);
-        instruments.set_worker_census("solve_executor_fleet", 6.0);
+        instruments.set_worker_census("fleet_solver_slots", 6.0);
         let text = crate::metrics::render(&registry);
         assert!(
             text.contains("degenbot_worker_census"),
             "worker-census family missing from exposition: {text}"
         );
         assert!(text.contains("resource=\"io_runtime_workers\""));
-        assert!(text.contains("resource=\"solve_executor_fleet\""));
+        assert!(text.contains("resource=\"fleet_solver_slots\""));
         drop(provider);
     }
 

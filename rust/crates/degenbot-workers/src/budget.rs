@@ -459,6 +459,16 @@ mod tests {
                     solve_headroom: Some(headroom),
                     ..overrides()
                 };
+                // Test-quotas are positive reals (1.0..24.0): floor() is exact
+                // and the cast cannot lose sign or magnitude here.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "quota floors are exact for the injected positive reals"
+                )]
+                #[expect(
+                    clippy::cast_sign_loss,
+                    reason = "the injected quotas are all strictly positive"
+                )]
                 let q_floor = quota.max(1.0).floor() as u64;
                 // Boot OR refuse, never a silent mis-size: the pinned-role
                 // floor (H+A+R+M+2) and the headroom+1 floor both refuse
@@ -479,11 +489,19 @@ mod tests {
                         continue;
                     }
                     Err(other) => {
-                        panic!("unexpected typed refusal at quota {quota}: {other}")
+                        // Test-fixture tripwire: an unexpected refusal here is
+                        // the failure — panic IS the assertion.
+                        #[expect(
+                            clippy::panic,
+                            reason = "an unexpected typed refusal is the fixture's failure mode"
+                        )]
+                        {
+                            panic!("unexpected typed refusal at quota {quota}: {other}")
+                        }
                     }
                 };
                 assert!(
-                    q_floor >= u64::try_from(headroom).unwrap_or(0) + 1,
+                    q_floor > u64::try_from(headroom).unwrap_or(0),
                     "a quota below headroom+1 must have taken the typed floor arm above"
                 );
                 assert_eq!(
@@ -498,11 +516,20 @@ mod tests {
                     q_floor,
                     "the integer share sum must be exactly floor(Q)"
                 );
-                assert_eq!(
-                    b.fractional_remainder,
-                    quota - q_floor as f64,
-                    "the fractional remainder is Q − floor(Q), spendable only by I/O"
-                );
+                // Exact-by-construction: the injected quotas are binary-exact
+                // (1.0/1.5/4.0/8.0/24.0) and floor(Q) is an integer, so the
+                // subtraction loses nothing — a strict comparison is exact.
+                {
+                    // The fills are an exact small integer; q_floor < 2^24 for
+                    // every injected quota, so the u32 conversion cannot lose.
+                    let q = u32::try_from(q_floor).expect("injected quotas are < 2^24");
+                    let quoted = quota - f64::from(q);
+                    assert!(
+                        (b.fractional_remainder - quoted).abs() < 1e-12,
+                        "the fractional remainder is Q − floor(Q), spendable only by I/O:                          {} vs {quoted}",
+                        b.fractional_remainder
+                    );
+                }
             }
         }
     }
@@ -548,11 +575,11 @@ mod tests {
         assert!(matches!(err, BudgetError::Oversubscribed { .. }));
         let msg = err.to_string();
         assert!(
-            msg.contains("9"),
+            msg.contains('9'),
             "the message must name the declared sum: {msg}"
         );
         assert!(
-            msg.contains("8"),
+            msg.contains('8'),
             "the message must name the quota floor: {msg}"
         );
     }

@@ -124,22 +124,17 @@ pub(crate) struct FleetSolveExecutor {
     solver_seats: usize,
 }
 
-/// The production throttle poller's feed point (LW-T5, Seam E):
-/// STANCE-GATED — a header sample must NEVER boot the fleet executor
-/// under the legacy tokio stance (the common default): gate-off means
-/// the feed returns without touching the global static. Returns
-/// whether the sample was fed.
+/// The production throttle poller's feed point (LW-T5, Seam E). LW-T9:
+/// always fed — the fleet executor is the sole executor, so a header
+/// sample may boot it (the stance gate is deleted with the stance).
 pub(crate) fn feed_fleet_posture_sample(now_ms: u64, events: u64, throttled_usec: u64) -> bool {
-    if !super::solver_dispatch::fleet_stance_enabled(degenbot_config::holder::config()) {
-        return false;
-    }
     let last_ms = LAST_HEADER_SAMPLE_MS.swap(now_ms, Ordering::Relaxed);
     let elapsed_usec = if last_ms == 0 {
         0
     } else {
         now_ms.saturating_sub(last_ms).saturating_mul(1_000)
     };
-    crate::arb_engine::executor::global_executor(true).observe_throttle(
+    crate::arb_engine::executor::global_executor().observe_throttle(
         now_ms,
         ThrottleSample {
             events,
@@ -148,16 +143,6 @@ pub(crate) fn feed_fleet_posture_sample(now_ms: u64, events: u64, throttled_usec
         },
     );
     true
-}
-
-/// Probe: whether the GLOBAL fleet executor has booted (stance-gate
-/// evidence + observability: the legacy stance must never boot it from
-/// a header sample). Only meaningful in a test build (the lib never
-/// queries it; the gate-off test pins "gate-off ⇒ no boot").
-#[must_use]
-#[cfg(test)]
-pub(crate) fn global_executor_booted() -> bool {
-    FLEET_EXECUTOR.get().is_some()
 }
 
 impl crate::arb_engine::executor::Executor for FleetSolveExecutor {
@@ -802,13 +787,15 @@ mod tests {
         results
     }
 
-    /// Parity fixture (BCA77G): the fleet-hosted solve executor is
-    /// byte-equal with the legacy private-runtime executor on the committed
-    /// heavy-CL capture fixture. Both arms drive the SAME `solve_one_path`
-    /// per path over the SAME LPT bins; the only difference is the
-    /// dispatch machinery (the port).
+    /// FLEET FIXTURE (BCA77G, LW-T9 single-arm): the fleet-hosted solve
+    /// executor produces exact, honest outcomes on the committed heavy-CL
+    /// capture fixture — outcomes can never exceed submissions, every
+    /// submitted path yields exactly one outcome (`solve_one_path` verdict
+    /// or failure), and the pinned-seat parity semantics carry (P6YXA6:
+    /// pins == bins). The former legacy-executor parity arm is deleted
+    /// with the stance (LW-T9; there is no other executor to diff against).
     #[test]
-    fn fleet_executor_is_result_parity_with_legacy_executor_on_capture_fixture() {
+    fn fleet_executor_yields_exact_outcomes_on_capture_fixture() {
         let items = load_corpus_fixture();
         let ctx = probe_ctx();
         // P6YXA6 regression: the bins bind at the fleet's STRUCTURAL seat
@@ -824,60 +811,21 @@ mod tests {
             "solver bins must equal the structural Solver seat count (pins == bins, P6YXA6)"
         );
 
-        // Legacy arm: the incumbent private-runtime executor (BXUSGL T1).
-        let legacy = {
-            let (tx, rx) = std::sync::mpsc::channel::<(u64, SolvePathResult)>();
-            let exec = crate::arb_engine::solve_executor::SolveExecutor::new(
-                "parity-legacy-exec",
-                bins.len(),
-            );
-            for bin in &bins {
-                let tx = tx.clone();
-                let ctx = Arc::clone(&ctx);
-                let items: Vec<_> = bin.iter().map(|&i| Arc::clone(&items[i])).collect();
-                let keys: Vec<u64> = bin
-                    .iter()
-                    .map(|&i| u64::try_from(i).unwrap_or(u64::MAX))
-                    .collect();
-                exec.spawn(move |_ctx| {
-                    for (key, item) in keys.into_iter().zip(items) {
-                        if let Some((pid, r)) =
-                            solve_one_path(&ctx, &tracing::Span::none(), key, &item)
-                        {
-                            let _ = tx.send((pid, r));
-                        }
-                    }
-                });
-            }
-            drop(tx);
-            let mut results: Vec<(u64, SolvePathResult)> = rx.into_iter().collect();
-            results.sort_unstable_by_key(|(pid, _)| *pid);
-            results
-        };
-        assert!(!legacy.is_empty(), "fixture must produce results");
-
-        // Fleet arm: same bins, same jobs, fleet-hosted Solver pins.
         let fleet = submit_bins(&executor, &bins, &items, &ctx);
+        assert!(!fleet.is_empty(), "fixture must produce results");
 
+        // Outcome honesty: the outcomes land exactly once per submitted
+        // path (in-bin solvers merge; failures arrive typed — never twice).
+        let mut pids: Vec<u64> = fleet.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable();
+        let n = pids.len();
+        pids.dedup();
         assert_eq!(
-            fleet, legacy,
-            "fleet-hosted solve results must be byte-equal with the legacy executor"
+            pids.len(),
+            n,
+            "a path may never surface two outcomes (one outcome per submission)"
         );
-
-        // LW-T7 (Seam F) promotion gate: the parity harness compares the
-        // stances' OUTCOME TOTALS (sold outcomes never diverge between the
-        // arms) and never exceeds the submissions; the EXACT
-        // solved+suppressed+failed == submitted equation is asserted in the
-        // production drain itself (the same seam, LW-T1's fuse).
-        assert!(
-            fleet.len() <= items.len(),
-            "outcomes can never exceed submissions"
-        );
-        assert_eq!(
-            fleet.len(),
-            legacy.len(),
-            "parity gate: the arms' outcome totals must never diverge"
-        );
+        assert!(n <= items.len(), "outcomes can never exceed submissions");
     }
 
     /// Solver bin keys never collide with the merge pin key (the FSM's
@@ -995,9 +943,9 @@ mod tests {
         );
     }
 
-    /// The LaneCtx submit seam (LW-T2): `submit_solve_bin` hands the unit a
+    /// The `LaneCtx` submit seam (LW-T2): `submit_solve_bin` hands the unit a
     /// ctx carrying the bin's pin key AND the warm arena identity — the
-    /// SAME ArenaToken across cycles (warm), never the detached stub.
+    /// SAME `ArenaToken` across cycles (warm), never the detached stub.
     #[test]
     fn submit_solve_bin_hands_a_lane_ctx_with_the_bins_key_and_warm_arena_identity() {
         let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
@@ -1127,26 +1075,6 @@ mod tests {
     }
 
     // ---- LW-T5 (Seam E): posture & precedence at the submit seam ------------
-
-    /// LW-T5 (Seam E): the throttle feed is STANCE-GATED — a gate-off
-    /// (legacy stance) sample NEVER boots the global fleet executor (no
-    /// seats, no host thread, no census rows from a mere header sample).
-    #[test]
-    fn gate_off_throttle_feed_never_boots_the_fleet_executor() {
-        // The default stance is LEGACY (the common default today): gate OFF,
-        // and the probe must show the global executor never booted.
-        let cfg = degenbot_config::BotConfig::default();
-        assert!(
-            !super::super::solver_dispatch::fleet_stance_enabled(&cfg),
-            "the default config must be gate-off (legacy stance)"
-        );
-        let fed = super::feed_fleet_posture_sample(5_000, 3, 9);
-        assert!(!fed, "gate-off must not feed");
-        assert!(
-            !super::global_executor_booted(),
-            "gate-off (legacy stance) must NOT boot the fleet executor"
-        );
-    }
 
     /// LW-T5 (Seam E): in Cordoned posture the submit seam refuses a NEW
     /// solver unit IMMEDIATELY with a typed `PostureHeld` — admission-side
@@ -1363,8 +1291,7 @@ mod tests {
                                 }
                                 let name = std::thread::current()
                                     .name()
-                                    .map(str::to_owned)
-                                    .unwrap_or_else(|| "<unnamed>".to_owned());
+                                    .map_or_else(|| "<unnamed>".to_owned(), str::to_owned);
                                 lane_threads.lock().push(name);
                                 completed.fetch_add(1, Ordering::Relaxed);
                             }))
@@ -1411,7 +1338,7 @@ mod tests {
     }
 
     /// Test verdict double (decision A): records every (unit, seat)
-    /// consultation and prescribes RecordAndContinue — never a real abort.
+    /// consultation and prescribes `RecordAndContinue` — never a real abort.
     struct VerdictRecorder {
         consulted: parking_lot::Mutex<Vec<(u64, u64)>>,
     }
@@ -1424,7 +1351,7 @@ mod tests {
     }
 
     /// Deliberate panic inside a harness bin body: the adapter's
-    /// catch_unwind (with the seat's backstop) must convert it to data.
+    /// `catch_unwind` (with the seat's backstop) must convert it to data.
     #[expect(clippy::panic)]
     fn red_panic(message: &str) -> ! {
         panic!("{message}")
@@ -1542,7 +1469,7 @@ mod tests {
                         });
                         drop(lane); // close the pipe so the per-cycle drain completes
                         let mut stash = lane_outcomes.lock();
-                        for outcome in rx.into_iter() {
+                        for outcome in rx {
                             stash.push(outcome);
                         }
                     }),

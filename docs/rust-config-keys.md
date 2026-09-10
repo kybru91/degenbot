@@ -83,7 +83,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 | `DEGENBOT_SOLVE_HEADROOM` | `solve.solve_headroom` | `Option<usize>` | `(unset)` | Override the I/O headroom carved out of the CPU budget before solve bins. |
 | `DEGENBOT_SOLVE_INLINE_SIM` | `solve.solve_inline_sim` | `bool` | `true` | Inline-sim stance (T2 worker-side clamp path); `0`/`false` disables. |
 | `DEGENBOT_SOLVE_RESOLVE_PAR` | `solve.solve_resolve_par` | `bool` | `true` | Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables. |
-| `DEGENBOT_SOLVE_SIM_INFLIGHT` | `solve.solve_sim_inflight` | `Option<usize>` | `(unset; derived from CPU budget)` | Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation. |
 | `DEGENBOT_INLINE_SIM_WORKERS` | `solve.inline_sim_workers` | `Option<usize>` | `(unset; derived from CPU budget)` | Inline-sim worker count (clamped 1..=32; unparsable falls back to derived default at the site). |
 | `DEGENBOT_DETACHED_SOLVES` | `solve.detached_solves` | `bool` | `true` | Route solve arms through detached (out-of-cycle) workers; `0`/`false` opts back into the in-cycle engine-Mutex hold. Default ON: the solve path takes no engine-level Mutex (epic MROOY7 task 2UVG3E, seam #4). |
 | `DEGENBOT_MIN_PROFIT_WEI` | `solve.min_profit_wei` | `u128 (decimal text)` | `0` | Minimum path profit floor in wei (decimal text; TOML: quoted string). |
@@ -99,7 +98,6 @@ The loader is fail-closed: unparsable values and unknown file keys are reported,
 
 | Env var | TOML key | Type | Default | Description |
 | --- | --- | --- | --- | --- |
-| `DEGENBOT_FLEET` | `fleet.stance` | `FleetStance(Legacy|Fleet)` | `legacy` | Worker-fleet stance (ADR-042 Q6): `legacy` keeps the per-era mechanisms; `fleet` hosts Solver/SimDriver/Resolve/Merge on the role-switching fleet. Deleted at the hard cutover. |
 | `DEGENBOT_FLEET_QUOTA_CPUS` | `fleet.quota_cpus` | `Option<f64>` | `(unset; detected from the cgroup)` | Terminal override of the fractional cgroup CPU quota (cores) feeding the fleet budget sum check; unset detects from the cgroup (ADR-042 §5). |
 | `DEGENBOT_FLEET_RESERVE_CPUS` | `fleet.reserve_cpus` | `Option<usize>` | `(unset; default 1)` | Fleet-budget reserve share H (Python bridge, pump, OTel, async GC) in cores; overrides the fixed default 1 (design doc §5). |
 | `DEGENBOT_FLEET_SOLVER_CPUS` | `fleet.solver_cpus` | `Option<usize>` | `(unset; derived floor(Q)-H-A-R-M)` | Fleet Solver CPU share S in cores; terminal when set and it participates in the same startup sum check (default: floor(quota) − H − A − R − M; S < 2 fails the boot). |

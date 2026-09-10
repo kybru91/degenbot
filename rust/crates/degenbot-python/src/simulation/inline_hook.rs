@@ -18,14 +18,19 @@
 //!   formula without the percentile clamp. The soak compares LATENCY
 //!   primarily; the formula (target/decay) dominates the clamp on mainnet.
 //!
-//! Runtime caveat (the T4 body note): `WrapDatabaseAsync::new` captures
-//! `Handle::try_current()` at build time, and its DB calls escalate to
-//! `block_in_place` on a multi-threaded worker. The solve workers are
-//! `std` threads — NO ambient runtime — so the sim body spawns onto
-//! this hook's DEDICATED multi-thread runtime (task-spawn, not
+//! Runtime caveat (the T4 body note, updated by LW-T9):
+//! `WrapDatabaseAsync::new` captures `Handle::try_current()` at build time,
+//! and its DB calls escalate to `block_in_place` on a multi-threaded
+//! worker. The fleet worker seats are `std` threads — NO ambient runtime
+//! (the LW-T2 wedge test pins this structurally; the old
+//! sync-inside-async BY DESIGN comment was that invariant's only
+//! enforcement before the cutover) — so the sim body spawns onto this
+//! hook's DEDICATED multi-thread runtime (task-spawn, never
 //! `block_in_place`): the spawned task runs on a runtime worker (where
 //! `block_in_place` is legal AND the handle capture succeeds), and the
-//! worker blocks on the `JoinHandle` from the plain thread.
+//! worker blocks on the join from the plain thread. Out-of-band work
+//! (affect-cache misses, escalations) rides the injected `EscalationPort`
+//! — never an ambient `Handle`.
 
 use std::sync::Arc;
 
@@ -307,29 +312,23 @@ impl degenbot_workers::lane::EscalationPort for SimRuntimeEscalationPort {
     }
 }
 
-/// Join a sim-task future from ANY thread context (the soak's runtime
-/// caveat: `block_in_place` is only legal on runtime workers, so an ambient
-/// multi-thread runtime blocks in place; otherwise the dedicated sim runtime
-/// is driven directly): the solve arms' workers settle on persistent executor
-/// tokio tasks on the solve-executor runtime (`DEGENBOT_SOLVE_EXECUTOR=tokio`
-/// spawns the per-bin jobs as tasks). `Runtime::block_on` from inside a
-/// runtime context panics ("Cannot start a runtime from within a runtime" —
-/// the 2026-09-05 soak freeze #2), so:
-/// - inside a multi-thread runtime: `block_in_place` + join on THAT runtime's
-///   handle (legal on a worker; the handle drive keeps the task-local context
-///   the DB wrap needs);
-/// - otherwise (plain threads): block on the dedicated sim runtime.
+/// Join a sim-task future from a worker seat: the dedicated sim runtime is
+/// driven directly. The ambient-runtime arm the old treatment carried
+/// (`block_in_place` + ambient-handle drive) is DELETED with the tokio
+/// solve stance (LW-T9): every caller is a fleet worker seat — plain OS
+/// thread, NO ambient runtime, pinned structurally by the LW-T2 wedge test
+/// in `degenbot_bot::arb_engine::fleet_solve_executor` — and sim
+/// escalations drive on the injected `EscalationPort`, never an ambient
+/// `Handle`. A future caller that DOES hold an ambient runtime now fails
+/// loudly (`block_on` inside a runtime panics — the 2026-09-05 soak freeze
+/// #2 anti-pattern the old arm re-purchased) instead of silently
+/// `block_in_place`-driving on a CPU seat.
 fn join_sim_task<F>(sim_runtime: &tokio::runtime::Runtime, fut: F) -> F::Output
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread => {
-            tokio::task::block_in_place(|| handle.block_on(fut))
-        }
-        _ => sim_runtime.block_on(fut),
-    }
+    sim_runtime.block_on(fut)
 }
 
 /// GOQWCL: the inline-sim runtime previously kept the default thread name
@@ -763,7 +762,15 @@ mod tests {
         let port =
             super::SimRuntimeEscalationPort::new(Arc::new(super::build_inline_sim_runtime()));
         port.escalate(Box::pin(async {
-            panic!("cold-miss escalation panics mid-work (LW-T3)");
+            // The panic IS the fixture's signal (the slot must reclaim on
+            // panic exactly as on completion).
+            #[expect(
+                clippy::panic,
+                reason = "panicking escalated work is the reclaimed-slot contract under test"
+            )]
+            {
+                panic!("cold-miss escalation panics mid-work (LW-T3)");
+            }
         }))
         .expect("escalation admitted");
         // The admission must be RECLAIMED whether the work panicked,

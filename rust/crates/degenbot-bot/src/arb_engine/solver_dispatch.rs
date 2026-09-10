@@ -63,8 +63,8 @@ pub(crate) type SolveArmOutcome = (u64, SolvePathResult, u64, Option<SimulatedPa
 /// worker count. One funnel so the arms can never re-derive the count and
 /// drift apart (a hermetic fleet under machine-derived bins aborts at the
 /// T2 grant — the host-only `just test-rust` failure).
-pub(crate) fn solve_bin_count(fleet_hosted: bool) -> usize {
-    crate::arb_engine::executor::global_executor(fleet_hosted).bin_count()
+pub(crate) fn solve_bin_count() -> usize {
+    crate::arb_engine::executor::global_executor().bin_count()
 }
 
 #[expect(clippy::doc_markdown)]
@@ -228,11 +228,6 @@ fn min_profit_floor() -> U256 {
     MIN_PROFIT_FLOOR_WEI.get().copied().unwrap_or(U256::ZERO)
 }
 
-/// PE4FPM: first-spawn latch for the `arb_sim_workers` census row — keeps
-/// the per-sim hot path off the census mutex (the registration itself is
-/// upsert-idempotent, so a lost race only rewrites the same row).
-static ARB_SIM_CENSUS_SEEDED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
 static MIN_PROFIT_FLOOR_WEI: std::sync::OnceLock<U256> = std::sync::OnceLock::new();
 
 /// T3 (epic BXUSGL): `DEGENBOT_STREAMING_DELIVERY` — emit each clamp-passed
@@ -250,21 +245,6 @@ static MIN_PROFIT_FLOOR_WEI: std::sync::OnceLock<U256> = std::sync::OnceLock::ne
 /// (A/B); any other value (or unset) streams.
 pub(crate) static STREAMING_DELIVERY_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
-
-/// ADR-042 Q6 migration stance: `fleet.stance=fleet` routes the solve fan-
-/// out (detached AND in-cycle arms) through the degenbot-workers fleet —
-/// the fleet becomes the sole executor of solve bins. Construction reads
-/// the CALLER's OWN cfg (`fleet_stance_enabled`, J4HN66) — never a
-/// process-wide install-window static: a parallel construction could flip
-/// such a static between the engine's install and read (TOCTOU).
-///
-/// `fleet.stance` → hosting decision (ADR-042 Q6: `legacy` keeps the
-/// per-era mechanisms; `fleet` hosts Solver (and the Merge sidecar role)
-/// on the role-switching fleet). Typed enum, so both stances are explicit.
-#[must_use]
-pub(crate) fn fleet_stance_enabled(cfg: &::degenbot_config::BotConfig) -> bool {
-    matches!(cfg.fleet.stance, ::degenbot_config::FleetStance::Fleet)
-}
 
 /// `DEGENBOT_DETACHED_SOLVES` — the detached solve cycle (enqueue-and-return
 /// with sidecar merge). Default ON since task 2UVG3E (epic MROOY7, stage-table
@@ -344,21 +324,18 @@ pub fn solve_runtime_config_from_cfg(
 /// holds an instance value built by [`solve_runtime_config_from_cfg`] and
 /// threads it down (KAHU5W: the solver `OnceLock` is retired).
 pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
-    // ADR-042 Q6: the fleet.stance migration flag. Under `fleet` the solve
-    // bins ride the fleet-hosted executor; the typed boot descriptor
-    // (quota + overrides + posture) is parsed here once.
-    let fleet_hosted = fleet_stance_enabled(cfg);
-    if fleet_hosted {
-        let boot = degenbot_workers::dispatcher::FleetBoot::from_config(cfg);
-        crate::arb_engine::fleet_solve_executor::install_boot(boot);
-        // ADR-042 F4: the SimDriver seat pool shares the boot descriptor
-        // (same quota + overrides + posture as the Solver-side host).
-        crate::arb_engine::fleet_sim_executor::install_boot(boot);
-        // PRG-3: the registration intake station shares the same boot
-        // descriptor (duty-counted PoolStateUpdater slots, Deferrable
-        // cordon class).
-        crate::arb_engine::fleet_registration_executor::install_boot(boot);
-    }
+    // LW-T9 (no stance, no migration flag): the solve bins ALWAYS ride the
+    // fleet-hosted executor; the typed boot descriptor (quota + overrides +
+    // posture) is parsed here once.
+    let boot = degenbot_workers::dispatcher::FleetBoot::from_config(cfg);
+    crate::arb_engine::fleet_solve_executor::install_boot(boot);
+    // ADR-042 F4: the SimDriver seat pool shares the boot descriptor
+    // (same quota + overrides + posture as the Solver-side host).
+    crate::arb_engine::fleet_sim_executor::install_boot(boot);
+    // PRG-3: the registration intake station shares the same boot
+    // descriptor (duty-counted PoolStateUpdater slots, Deferrable
+    // cordon class).
+    crate::arb_engine::fleet_registration_executor::install_boot(boot);
     STREAMING_DELIVERY_ENABLED.store(
         cfg.pump.streaming_delivery,
         std::sync::atomic::Ordering::Relaxed,
@@ -782,56 +759,14 @@ impl PipelinedSims {
             );
             let _ = tx.send(payload);
         };
-        if ctx.sim_fleet_hosted {
-            // ADR-042 F4: the fleet is the sole executor of inline sims —
-            // the request rides a pooled SimDriver unit (dispatch lane 2:
-            // queued sims drain before new Solver intake; cordon floors the
-            // sim intake and never cancels in-flight sims). The seat pool
-            // is the budget's sim slot cap — the fleet-side bound that
-            // replaces the SimSlots semaphore. Receipts ride the SAME
-            // per-request channel, so the poll/join contract is untouched.
-            crate::arb_engine::fleet_sim_executor::global_fleet_sim_executor().spawn(run_sim_body);
-        } else {
-            // Two-runtime pacing (7LV6VN T5): the slot is acquired INSIDE the
-            // detached sim thread, so a saturated sim pipeline parks queued
-            // sims at zero CPU cost instead of stalling the bins mid-walk
-            // (T5 window: schedule-time blocking starved the walks).
-            // Concurrent EXECUTING sims stay bounded by the budget-derived
-            // cap. The guard releases exactly when the sim finishes.
-            let slots = crate::arb_engine::sim_slots::sim_slots_global();
-            // PE4FPM: the per-path detached sim threads are a burst resource; the
-            // census row declares the pacing bound (the sim-slot cap) as the
-            // sustained count and documents the burst in `sizing`. One short
-            // registration at first spawn (hot path stays off the census lock).
-            if ARB_SIM_CENSUS_SEEDED.get().is_none() {
-                // First detached-sim spawn of the process: register the burst
-                // resource. The OnceLock short-circuit keeps the hot path off
-                // the census mutex; a lost race just upserts the same row.
-                ARB_SIM_CENSUS_SEEDED.set(()).ok();
-                degenbot_core::worker_census::register(
-                    degenbot_core::worker_census::WorkerCensusEntry {
-                        resource: "arb_sim_workers",
-                        kind: "detached per-path sim threads (burst; one per scheduled sim, joined per cycle)",
-                        count: crate::arb_engine::sim_slots::sim_slot_capacity(),
-                        thread_name: "arb-sim-{pid}",
-                        sizing: "burst paced by the sim_slots semaphore; sustained concurrent cap = the slot cap (leftover x 2, DEGENBOT_SOLVE_SIM_INFLIGHT override)",
-                    },
-                );
-            }
-            let spawned = std::thread::Builder::new()
-                .name(format!("arb-sim-{pid}"))
-                .spawn(move || {
-                    slots.acquire();
-                    let _slot = crate::arb_engine::sim_slots::SlotGuard::acquired(slots);
-                    run_sim_body();
-                });
-            if spawned.is_err() {
-                // Liveness: a failed spawn must not strand the receipt (the
-                // poll/join would block forever on an empty channel). The
-                // payload slot empties — the merge treats it as sim-failed.
-                return false;
-            }
-        }
+        // ADR-042 F4 (LW-T9, sole posture): the fleet is the sole executor
+        // of inline sims — the request rides a pooled SimDriver unit
+        // (dispatch lane 2: queued sims drain before new Solver intake;
+        // cordon floors the sim intake and never cancels in-flight sims).
+        // The seat pool is the budget's sim slot cap — the fleet-side bound
+        // that replaced the SimSlots semaphore. Receipts ride the SAME
+        // per-request channel, so the poll/join contract is untouched.
+        crate::arb_engine::fleet_sim_executor::global_fleet_sim_executor().spawn(run_sim_body);
         self.pending.push((pid, PendingSim::new(rx)));
         true
     }
@@ -960,16 +895,12 @@ pub(crate) struct SolveCycleShared {
     /// The cycle's block metadata (Copy) — the inline-sim request's block env
     /// (solve block from `solve_block`; timestamp/base-fee from here).
     metadata: BlockMetadata,
-    /// The stance copy (construction-time static read at cycle build).
+    /// SIMPIPE2 T2 worker-side clamp gate (construction-time pack).
     worker_clamp: bool,
     /// SIMPIPE2 T3: the engine's inline-sim hook snapshot. `Some` + stance ON
     /// → the worker resolves the per-path payload right after the clamp (no
     /// engine lock — the same off-lock seam the worker clamp opened).
     inline_sim: Option<std::sync::Arc<dyn crate::arb_engine::inline_sim::InlineSimulator>>,
-    /// ADR-042 F4 stance copy: `fleet.stance=fleet` routes the pipelined
-    /// sims through the fleet-hosted `SimDriver` executor (the fleet is the
-    /// sole executor of sim units — the arb-sim detached threads retire).
-    sim_fleet_hosted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +929,12 @@ pub(crate) struct SolveCycleShared {
 /// draining inside the merge makespan, so the cap is a safety valve, not the
 /// steady-state controller.
 pub(crate) const DETACHED_INFLIGHT_CAP: u64 = 8;
+
+/// Lead THE SIDECAR's exactness-ledger age (LW-T9 note (a) carry): how many
+/// recent `cycle_seq`s the seen-(cycle_seq, pid) ledger spans before pruning
+/// (well past the in-flight cap: a duplicate must never be re-admitted by
+/// pruning, so the ledger outlives any legitimately outstanding straggler).
+const DETACHED_LEDGER_AGE: u64 = 64;
 
 /// One unit of detached-merge work: a solved result that passed the same
 /// profitless filter the in-cycle arms apply. `update_stamp` is the
@@ -1218,6 +1155,30 @@ impl ArbitrageEngine {
             payload,
             solve_span,
         } = item;
+        // QR3NUS exactness fuse carried to the DETACHED sidecar (LW-T9 note
+        // (a)): the in-cycle drain asserts one path outcome EXACTLY once per
+        // cycle over its local outcome ledger — this sidecar holds the same
+        // ledger per (cycle_seq, pid). A duplicate delivery is a bin/pipe
+        // bug (an outcome emitted twice): merge-twice would double-apply the
+        // Q1a policy and double-emit, so the fuse trips loudly and the item
+        // is refused. The ledger keeps recent cycles only (the in-flight cap
+        // bounds meaningful straggler age); older cycle keys are pruned.
+        {
+            let mut seen = self.detached_seen_outcomes.lock();
+            seen.retain(|(seq, _)| *seq >= cycle_seq.saturating_sub(DETACHED_LEDGER_AGE));
+            if seen.contains(&(cycle_seq, pid)) {
+                self.detached_duplicate_outcomes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    target: crate::telemetry::DIAGNOSTIC_TARGET,
+                    path_id = pid,
+                    detached_seq = cycle_seq,
+                    "[detached] duplicate merge delivery for path — exactness fuse tripped (QR3NUS carried by LW-T9)"
+                );
+                return;
+            }
+            seen.insert((cycle_seq, pid));
+        }
         // MQUKB6-T2: re-enter the enqueue-time cycle span for the whole
         // merge (Q1a drop/apply events + any profit emit parent there).
         // Inert without a subscriber or for `Span::none()` test items.
@@ -2136,7 +2097,6 @@ impl ArbitrageEngine {
             pool_refs,
             worker_clamp: INLINE_SIM_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
             inline_sim: self.inline_sim.clone(),
-            sim_fleet_hosted: self.fleet_hosted,
         });
         // The LPT bins are Arc-shared for every arm; the
         // arms index through the same deref (byte-identical semantics).
@@ -2161,7 +2121,7 @@ impl ArbitrageEngine {
             // P6YXA6 sizing reconciliation: fleet-hosted cycles bin at the
             // fleet's STRUCTURAL seat count — pins and bins are the same
             // number, so every bin owns a warm keyed seat across cycles.
-            let n_threads = solve_bin_count(self.fleet_hosted);
+            let n_threads = solve_bin_count();
             // LW-T7 (Seam F): the bin fan-out goes through the typed runtime
             // fallback decision — a capability narrower than the intended
             // width is a NAMED-AND-LOGGED plan, never a silent narrower bin.
@@ -2273,9 +2233,9 @@ impl ArbitrageEngine {
                     let run_bin = move || {
                         // 7LV6VN T5 (pipelined arm): results park until
                         // their sim lands; the walk never waits on a
-                        // sim. Sims pace on the budget-derived global
-                        // slot pool (sim_slots), so walk + sim demand
-                        // never exceeds the CPU quota by construction.
+                        // sim. Sims pace on the fleet SimDriver seat pool
+                        // (the budget's sim slot cap), so walk + sim
+                        // demand never exceeds the CPU quota by construction.
                         let mut held: Vec<DetachedMergeItem> = Vec::new();
                         let mut pending = PipelinedSims::default();
                         for &idx in &bin {
@@ -2382,13 +2342,11 @@ impl ArbitrageEngine {
                             }
                         }
                     };
-                    // LW-T8: both stances submit through the ONE Executor
-                    // token (the legacy tokio stance is the mini-seat
-                    // adapter; the fleet is the sole executor under
-                    // fleet.stance=fleet).
-                    if let Err(err) =
-                        crate::arb_engine::executor::global_executor(self.fleet_hosted)
-                            .submit(bin_idx, Box::new(move |_ctx| run_bin()))
+                    // LW-T8: both arms submit through the ONE Executor
+                    // token (the fleet has been the sole executor since the
+                    // LW-T9 cutover).
+                    if let Err(err) = crate::arb_engine::executor::global_executor()
+                        .submit(bin_idx, Box::new(move |_ctx| run_bin()))
                     {
                         crate::arb_engine::fleet_solve_executor::abort_loud(
                             "bin submission, posture gate",
@@ -2559,8 +2517,8 @@ impl ArbitrageEngine {
                     let mut lane = SolveLane::new(lane_key, lane_key, lane_pids, res_tx.clone());
                     run_solve_lane(&mut lane, &SeatSurvivesPolicy, run_bin);
                 };
-                // LW-T8: the ONE Executor token submits on both stances.
-                if let Err(err) = crate::arb_engine::executor::global_executor(self.fleet_hosted)
+                // LW-T8: the ONE Executor token submits on both arms.
+                if let Err(err) = crate::arb_engine::executor::global_executor()
                     .submit(bin_idx, Box::new(spawn_job))
                 {
                     crate::arb_engine::fleet_solve_executor::abort_loud(
@@ -2799,7 +2757,7 @@ impl ArbitrageEngine {
         // same cost skew as the hot path, so it bins over the structural
         // bin count too — the fleet's Solver seats when fleet-hosted
         // (pins == bins), else solve_worker_count's dedicated-runtime bins.
-        let n_bins = solve_bin_count(self.fleet_hosted);
+        let n_bins = solve_bin_count();
         // Cold start has no previous-block sims/gate yet: structural proxy only.
         let costs: Vec<usize> = to_solve
             .iter()
@@ -2865,7 +2823,7 @@ impl ArbitrageEngine {
                 }
             };
             // LW-T8: the ONE Executor token submits on both stances.
-            if let Err(err) = crate::arb_engine::executor::global_executor(self.fleet_hosted)
+            if let Err(err) = crate::arb_engine::executor::global_executor()
                 .submit(bin_idx, Box::new(move |_ctx| run_bin()))
             {
                 crate::arb_engine::fleet_solve_executor::abort_loud(
@@ -3380,7 +3338,6 @@ mod profit_clamp_recompute_tests {
             pool_refs,
             worker_clamp: true,
             inline_sim: None,
-            sim_fleet_hosted: false,
             solve_block: 0,
             epoch: 0,
             metadata: BlockMetadata::default(),
@@ -3785,13 +3742,18 @@ mod lpt_partition_tests {
         // ascending original index; min-load bin tie by lowest bin index).
         let mut idx: Vec<usize> = (0..n).collect();
         idx.sort_by_key(|&i| (std::cmp::Reverse(costs[i]), i));
-        let mut loads = vec![0usize; 3];
+        let mut loads = [0usize; 3];
         let expected: Vec<Vec<usize>> = {
             let mut bins: Vec<Vec<usize>> = vec![Vec::new(); 3];
             for i in idx {
+                // Closed 3-bin range: the Option is statically Some.
+                #[expect(
+                    clippy::expect_used,
+                    reason = "the 3-bin range is statically non-empty"
+                )]
                 let mi = (0..3)
                     .min_by_key(|&bi| (loads[bi], bi))
-                    .expect("bing shape is non-empty");
+                    .expect("closed 3-bin range is non-empty");
                 bins[mi].push(i);
                 loads[mi] += costs[i];
             }
@@ -3979,48 +3941,19 @@ mod solve_path_span_tests {
     }
 }
 
-// ----------------- OFFLINE A/B PROBE (epic BXUSGL T4) -----------------
-// env-driven, #[ignore]d - see the module docs below; run manually:
-//   cargo test --release -p degenbot-bot --lib executor_ab_probe -- --ignored --nocapture
+// Payload-sim fixture support (epic BXUSGL T4 lineage, slimmed by LW-T9:
+// the env-driven #[ignore]d offline A/B probe arms are deleted with the
+// stance).
 #[cfg(test)]
-#[expect(
-    clippy::print_stderr,
-    clippy::print_stdout,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-// Offline probe: panics/prints ARE the measurement contract (loud failure on
-// misload; CSV is the output). Outer allow/expects at module level are the
-// documented-permitted form for cross-lint bulk suppression.
 pub(super) mod executor_ab_probe {
-    // Offline A/B probe (epic BXUSGL T4): emit-granularity A/B on the
-    // dedicated tokio solve executor, over the heavy-CL capture corpus.
-    // Since the P6YXA6 hard cutover the executor is unambiguous — the rayon
-    // arms are gone — so the probe measures the STREAMING property: per-PATH
-    // sends (production) vs per-BIN sends (the pre-streaming granularity).
-    // NOT part of the normal suite: `#[ignore]`d, env-driven, run
-    // manually with `cargo test --release -p degenbot-bot --lib executor_ab --
-    // --ignored --nocapture`. Uses the crate-internal production components
-    // (`solve_one_path`, `SolveCycleShared`, `SolveExecutor`, `lpt_partition`,
-    // `path_cost_proxy`) so the arms differ ONLY in emit granularity. Fixture
-    // parse replicates rust/crates/degenbot-solvers/examples/rayon_scale_probe.rs.
-    //
-    // Env:
-    //   DEGENBOT_PROBE_FIXTURE  fixture jsonl path (default: the committed
-    //                           heavy_cl_solve_captures.jsonl)
-    //   DEGENBOT_PROBE_NS       comma thread counts (default 1,2,4,8,16)
-    //   DEGENBOT_PROBE_PASSES   measurement passes per config (default 3)
-    //
-    // CSV columns (stdout):
-    //   arm,threads,items,wall_ms,first_emit_ms,p50_emit_ms,p95_emit_ms
-    // `emit` = wall offset when a path's result is AVAILABLE to the merge - the
-    // streaming property. For the `tokio-perbin` control every emit lands at
-    // cycle end by construction (per-BIN sends); `tokio` (production) sends
-    // per PATH.
+    // Fixture + harness support for the fleet probe surface (LW-T9: the
+    // legacy-stance A/B probe arms are DELETED with the stance — the fleet
+    // is one executor, so there is nothing to A/B). What remains: the heavy-CL
+    // capture-corpus loader, the production cost proxy's bin packer and the
+    // shared-cycle fixture used by the fleet parity/identity fixtures.
+    // Fixture parse replicates rust/crates/degenbot-solvers/examples/rayon_scale_probe.rs.
 
     use std::sync::Arc;
-    use std::time::Instant;
 
     use crate::arb_engine::BlockMetadata;
     use alloy::primitives::U256;
@@ -4028,20 +3961,8 @@ pub(super) mod executor_ab_probe {
     use degenbot_solvers::mobius_v3_int::{build_cl_crossing_table, build_cl_word_profiles};
     use serde_json::Value;
 
-    use super::{
-        lpt_partition, path_cost_proxy, solve_one_path, BotState, PathTimesHeap, SolveCycleShared,
-    };
-    use crate::arb_engine::solve_executor::SolveExecutor;
+    use super::{lpt_partition, path_cost_proxy, BotState, PathTimesHeap, SolveCycleShared};
     use hashbrown::HashMap;
-
-    pub(super) fn pct(values: &[f64], q: f64) -> f64 {
-        if values.is_empty() {
-            return 0.0;
-        }
-        let mut v = values.to_vec();
-        v.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        v[((v.len() as f64) * q).floor() as usize % v.len()]
-    }
 
     fn fixture_path() -> std::path::PathBuf {
         if let Ok(p) = std::env::var("DEGENBOT_PROBE_FIXTURE") {
@@ -4178,7 +4099,6 @@ pub(super) mod executor_ab_probe {
             pool_refs: Vec::new(),
             worker_clamp: false,
             inline_sim: None,
-            sim_fleet_hosted: false,
             #[cfg(test)]
             test_solve_delay: None,
         })
@@ -4192,144 +4112,18 @@ pub(super) mod executor_ab_probe {
     ) -> Vec<Vec<usize>> {
         lpt_partition(items.len(), threads, |i| path_cost_proxy(&items[i]))
     }
-
-    /// One full cycle over the corpus, `emit` timestamps (offsets from
-    /// cycle start) relative to when the result is AVAILABLE to the merge:
-    ///  - tokio         : dedicated executor, per-PATH send (production)
-    ///  - tokio-perbin  : per-BIN send (granularity control)
-    fn run_cycle(
-        items: &[Arc<::degenbot_solvers::mixed::ResolvedMixedPath>],
-        threads: usize,
-        arm: &str,
-        ctx: &Arc<SolveCycleShared>,
-    ) -> (f64, Vec<f64>) {
-        let bins = prod_lpt_bins(items, threads);
-        let (tx, rx) = std::sync::mpsc::channel::<f64>();
-        let t0 = Instant::now();
-        match arm {
-            "tokio" => {
-                // PE4FPM: the verification probe builds its own ephemeral
-                // fleet; it census-registers under its own id so it can never
-                // be confused with the production solve_executor_fleet.
-                degenbot_core::worker_census::register(
-                    degenbot_core::worker_census::WorkerCensusEntry {
-                        resource: "solve_probe_executor",
-                        kind: "ephemeral probe executor (solve-verify diagnostics)",
-                        count: threads,
-                        thread_name: "probe-solve-tokio",
-                        sizing: "probe parameter (thread count passed to the verify run; torn down with the probe)",
-                    },
-                );
-                let executor = SolveExecutor::new("probe-solve-tokio", threads);
-                for bin in &bins {
-                    let bin = bin.clone();
-                    let tx = tx.clone();
-                    let ctx = Arc::clone(ctx);
-                    let items = items.to_vec();
-                    executor.spawn(move |_ctx| {
-                        for &i in &bin {
-                            let _ =
-                                solve_one_path(&ctx, &tracing::Span::none(), i as u64, &items[i]);
-                            let _ = tx.send(t0.elapsed().as_secs_f64() * 1000.0);
-                        }
-                        // Bin-complete sentinel (NaN): without it, the collector
-                        // sees the channel close as soon as the last bin closure
-                        // ends, and the runtime drop can cancel still-running bins
-                        // mid-solve — an artificially short wall. Production is
-                        // immune (process-lifetime executor singleton).
-                        let _ = tx.send(f64::NAN);
-                    });
-                }
-            }
-            "tokio-perbin" => {
-                // Granularity control: identical executor + bins, but the
-                // whole BIN is visible to the merge only at bin completion
-                // (the pre-streaming emit shape the rayon arm embodied).
-                let executor = SolveExecutor::new("probe-solve-tokio", threads);
-                for bin in &bins {
-                    let bin = bin.clone();
-                    let tx = tx.clone();
-                    let ctx = Arc::clone(ctx);
-                    let items = items.to_vec();
-                    executor.spawn(move |_ctx| {
-                        for &i in &bin {
-                            let _ =
-                                solve_one_path(&ctx, &tracing::Span::none(), i as u64, &items[i]);
-                        }
-                        let _ = tx.send(t0.elapsed().as_secs_f64() * 1000.0);
-                        // Bin-complete sentinel (NaN): see the "tokio" arm.
-                        let _ = tx.send(f64::NAN);
-                    });
-                }
-            }
-            other => unreachable!("unknown arm {other}"),
-        }
-        drop(tx);
-        let mut emits: Vec<f64> = Vec::new();
-        let mut completed_bins = 0usize;
-        for v in rx {
-            if v.is_nan() {
-                completed_bins += 1;
-                if completed_bins == bins.len() {
-                    break;
-                }
-            } else {
-                emits.push(v);
-            }
-        }
-        (t0.elapsed().as_secs_f64() * 1000.0, emits)
-    }
-
-    pub(super) fn raise_nice_for_lane_courtesy() {
-        #[cfg(unix)]
-        {
-            // T4 courtesy: keep this offline probe off the live soak's cores.
-            let _ = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 15) };
-        }
-    }
-
-    #[test]
-    #[ignore = "offline A/B probe; run with --ignored (T4); env: DEGENBOT_PROBE_FIXTURE/NS/PASSES"]
-    fn executor_ab_probe_runs_and_prints_csv() {
-        raise_nice_for_lane_courtesy();
-        let items = load_corpus();
-        eprintln!("corpus paths = {}", items.len());
-        let threads: Vec<usize> = match std::env::var("DEGENBOT_PROBE_NS") {
-            Ok(s) => s.split(',').filter_map(|t| t.trim().parse().ok()).collect(),
-            Err(_) => vec![1, 2, 4, 8, 16],
-        };
-        let passes: usize = std::env::var("DEGENBOT_PROBE_PASSES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(3);
-        println!("arm,threads,items,wall_ms,first_emit_ms,p50_emit_ms,p95_emit_ms");
-        let ctx = probe_ctx();
-        for &n in &threads {
-            for arm in ["tokio", "tokio-perbin"] {
-                for _ in 0..passes {
-                    let (wall, emits) = run_cycle(&items, n, arm, &ctx);
-                    println!(
-                        "{arm},{n},{},{wall:.1},{first:.1},{p50:.1},{p95:.1}",
-                        items.len(),
-                        first = emits.iter().copied().fold(f64::INFINITY, f64::min),
-                        p50 = pct(&emits, 0.5),
-                        p95 = pct(&emits, 0.95),
-                    );
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod fleet_sim_stance_tests {
-    //! ADR-042 F4 (task LTUE7I) fixtures: the inline-sim runtime port onto
-    //! the fleet. Parity — fleet-seat sims return byte/field-equal results
-    //! to the legacy detached-sim threads over requests derived from the
-    //! committed heavy-CL capture corpus. Identity — the stance flips the
-    //! hosting thread family: legacy `arb-sim-{pid}` detached threads vs
-    //! fleet `work-fleet-sim-{n}` `SimDriver` seats (census row included).
+    //! ADR-042 F4 (task LTUE7I) fixtures: the inline-sim runtime on the
+    //! fleet (LW-T9: the legacy-arm half of the parity/identity matrix is
+    //! deleted with the stance — every sim rides the `SimDriver` seats).
+    //! Parity — `SimDriver` seats execute requests derived from the committed
+    //! heavy-CL capture corpus honestly (success AND failure payloads).
+    //! Identity — the hosting family is the fleet `work-fleet-sim-{n}`
+    //! `SimDriver` seats (census row included).
 
     use alloy::primitives::{I256, U256};
     use degenbot_solvers::mixed::{HopType, MixedPath, MixedPoolRef, SolvePathResult};
@@ -4463,11 +4257,7 @@ mod fleet_sim_stance_tests {
             .collect()
     }
 
-    fn make_ctx(
-        sim: Arc<CorpusSim>,
-        pool_refs: Vec<Arc<MixedPath>>,
-        sim_fleet_hosted: bool,
-    ) -> Arc<SolveCycleShared> {
+    fn make_ctx(sim: Arc<CorpusSim>, pool_refs: Vec<Arc<MixedPath>>) -> Arc<SolveCycleShared> {
         Arc::new(SolveCycleShared {
             solve_block: 42,
             epoch: 0,
@@ -4501,7 +4291,6 @@ mod fleet_sim_stance_tests {
             pool_refs,
             worker_clamp: true,
             inline_sim: Some(sim),
-            sim_fleet_hosted,
             #[cfg(test)]
             test_solve_delay: None,
         })
@@ -4558,18 +4347,18 @@ mod fleet_sim_stance_tests {
             })
     }
 
-    /// PARITY FIXTURE (LTUE7I): fleet-stance inline sims return BYTE-EQUAL
-    /// payloads to the legacy detached-sim threads over the committed
-    /// capture corpus — same requests, same deterministic sim, only the
-    /// dispatch machinery differs (the port).
+    /// FLEET FIXTURE (LTUE7I, LW-T9 single-arm): fleet `SimDriver` inline sims
+    /// honor the full request contract over the committed capture corpus —
+    /// every request schedules, successes carry field-equal payloads, and
+    /// the failure-payload contract is exercised end to end.
     #[test]
-    fn fleet_stance_inline_sims_are_parity_with_legacy_threads_on_capture_corpus() {
+    fn fleet_sims_honor_the_request_contract_on_capture_corpus() {
         let items = strided_corpus(PARITY_REQUESTS);
         let pool_refs = pool_refs_for(&items);
         let sim = CorpusSim::new();
 
-        let run_arm = |sim_fleet_hosted: bool| {
-            let ctx = make_ctx(Arc::clone(&sim), pool_refs.clone(), sim_fleet_hosted);
+        let run_arm = || {
+            let ctx = make_ctx(Arc::clone(&sim), pool_refs.clone());
             // Deterministic reverse order so receipts interleave like a
             // real multi-bin fan-out (per-receipt channels, not the arm,
             // carry order).
@@ -4585,33 +4374,27 @@ mod fleet_sim_stance_tests {
             joined
         };
 
-        let legacy = run_arm(false);
-        let fleet = run_arm(true);
-        assert!(!legacy.is_empty(), "fixture must schedule sims");
-        assert_eq!(
-            fleet, legacy,
-            "fleet-hosted inline sims must be result parity with the legacy detached-sim threads"
-        );
+        let joined: Vec<(u64, Option<SimulatedPathResult>)> = run_arm();
+        assert!(!joined.is_empty(), "fixture must schedule sims");
         assert!(
-            legacy.iter().any(|(pid, _)| pid % 11 == 5),
+            joined.iter().any(|(pid, _)| pid % 11 == 5),
             "the fixture must exercise the failure-payload contract too"
         );
     }
 
-    /// IDENTITY FIXTURE (LTUE7I): the stance flips the runtime identity —
-    /// legacy keeps the `arb-sim-{pid}` detached threads byte-for-byte;
-    /// the fleet stance runs the SAME requests on fleet `SimDriver` seats
-    /// (`work-fleet-sim-{n}`) and the executor's census row is registered
-    /// (the `fleet_merge_slots` pattern from the BCA77G work).
+    /// IDENTITY FIXTURE (LTUE7I, LW-T9 single-arm): the ONLY sim hosting
+    /// family is the fleet `SimDriver` seats (`work-fleet-sim-{n}`) and the
+    /// executor's census row is registered (the `fleet_merge_slots` pattern
+    /// from the BCA77G work).
     #[test]
-    fn fleet_stance_flips_the_sim_runtime_identity_legacy_threads_vs_fleet_seats() {
+    fn fleet_sims_run_on_simdriver_seats_with_the_census_row() {
         let items = strided_corpus(4);
         let pool_refs = pool_refs_for(&items);
         let sim = CorpusSim::new();
 
-        let run_arm = |sim_fleet_hosted: bool| {
+        let run_arm = || {
             sim.thread_names.lock().clear();
-            let ctx = make_ctx(Arc::clone(&sim), pool_refs.clone(), sim_fleet_hosted);
+            let ctx = make_ctx(Arc::clone(&sim), pool_refs.clone());
             for (idx, item) in items.iter().enumerate() {
                 let pid = u64::try_from(idx).unwrap_or(u64::MAX);
                 let hops = item.hops.len().clamp(1, 4);
@@ -4621,13 +4404,7 @@ mod fleet_sim_stance_tests {
             sim.thread_names.lock().clone()
         };
 
-        let legacy_names = run_arm(false);
-        assert!(
-            !legacy_names.is_empty() && legacy_names.iter().all(|n| n.starts_with("arb-sim-")),
-            "legacy sims must run on arb-sim detached threads, got {legacy_names:?}"
-        );
-
-        let fleet_names = run_arm(true);
+        let fleet_names = run_arm();
         assert!(
             !fleet_names.is_empty() && fleet_names.iter().all(|n| n.starts_with("work-fleet-sim-")),
             "fleet sims must run on fleet SimDriver seats, got {fleet_names:?}"

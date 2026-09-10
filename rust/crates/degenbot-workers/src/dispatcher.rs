@@ -588,7 +588,7 @@ impl FleetHost {
             target: "degenbot::fleet",
             quota = new_quota_cpus,
             solver_pins = self.budget.solver_pin_count,
-            sim_slots = self.budget.sim_slot_cap,
+            sim_driver_slots = self.budget.sim_slot_cap,
             "[fleet-budget] quota re-detected — shares re-declared, sum re-checked"
         );
         Ok(())

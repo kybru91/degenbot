@@ -18,6 +18,18 @@ The pre-0.6 file vocabulary (`[rpc]`, `[ws]`, `[database]`, `[otel]`, top-level 
 | `[otel]` `endpoint` / `enabled` | the modern `telemetry` section: `telemetry.otel` (toggle) and `telemetry.jaeger_endpoint` (OTLP endpoint) |
 | top-level `default_chain_id` | Python config cascade (`src/degenbot/config.py`) |
 
+## In-schema key retirements (typed migrations)
+
+Later hard cutovers retired SCHEMA keys the same way: a surviving env var
+or TOML key fails the load loudly with a pointed message, for one release.
+
+| Retired key | Cutover | Replacement |
+|---|---|---|
+| `solve.executor` / `DEGENBOT_SOLVE_EXECUTOR` | P6YXA6 | the worker fleet (per-bin hosting needs no executor selection) |
+| `solve.lpt_partition` / `DEGENBOT_LPT_PARTITION` | P6YXA6 | bins are always LPT-pre-balanced |
+| `fleet.stance` / `DEGENBOT_FLEET` | LW-T9 (ergo CQLMM2) | fleet is the only stance since LW-T9 — the worker fleet is the only behavior |
+| `solve.solve_sim_inflight` / `DEGENBOT_SOLVE_SIM_INFLIGHT` | LW-T9 (ergo CQLMM2) | SimDriver capacity: `fleet.sim_slot_cap`; inline-sim sizing: `solve.inline_sim_workers` |
+
 ## What is NOT retired
 
 `[failure_policy]` is deliberately **not** typed and **not** rejected: it is the ADR-040 D3 free-form per-bucket override table, read as a raw TOML table from the same file the loader selected (`BotConfigLoader::file_path()`). Files may keep it unchanged.

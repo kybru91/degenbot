@@ -73,9 +73,7 @@ pub mod inline_sim;
 pub mod lifecycle;
 pub mod path_info;
 mod path_lifecycle;
-pub mod sim_slots;
 mod snapshot_verify;
-mod solve_executor;
 mod solver_dispatch;
 #[cfg(test)]
 mod tests;
@@ -427,11 +425,6 @@ pub struct ArbitrageEngine {
     /// (dense-CL envelope compose, sims≈0) were invisible to the LPT cost —
     /// bin-packed as cheap while dominating wall time.
     last_gate_us: std::sync::Arc<parking_lot::Mutex<HashMap<u64, u64>>>,
-    /// ADR-042 Q6 migration stance (`fleet.stance`, construction-time):
-    /// when true the fleet-hosted executor is the SOLE executor of solve
-    /// bins (detached + in-cycle arms) and the merge sidecar runs as the
-    /// fleet `Merge` role; when false the per-era mechanisms stand.
-    fleet_hosted: bool,
     /// T3 (epic BXUSGL): emit each clamp-passed above-threshold result as
     /// an IMMEDIATE single-entry [`ResultBatch`] during the drain instead of
     /// waiting for the pump debounce. Construction-time stance; **streaming
@@ -502,6 +495,16 @@ pub struct ArbitrageEngine {
     /// guard is touched exactly once, by the spawner thread).
     detached_merge_rx:
         parking_lot::Mutex<Option<std::sync::mpsc::Receiver<solver_dispatch::DetachedMergeItem>>>,
+    /// LW-T9 note-(a) carry: the detached sidecar's duplicate-outcome fuse
+    /// counter (the QR3NUS exactness assert the in-cycle drain enforces
+    /// via its per-cycle outcome ledger; the sidecar keeps it
+    /// process-cumulative).
+    detached_duplicate_outcomes: std::sync::atomic::AtomicU64,
+    /// The sidecar's seen-(cycle_seq, pid) exactness ledger (LW-T9 note (a)
+    /// carry): the QR3NUS one-outcome-per-cycle assert, sidecar side. Held on
+    /// the ENGINE (`parking_lot` Mutex) — the fuse is stateful across sidecar
+    /// restarts (the pipe outlives any one sidecar thread).
+    detached_seen_outcomes: parking_lot::Mutex<std::collections::HashSet<(u64, u64)>>,
     /// In-flight gauge: detached results SENT but not yet dispositioned.
     /// `Arc` because the enqueue half's bin threads bump it at send time and
     /// the sidecar decrements it per terminal disposition. At cycle start a
@@ -557,17 +560,6 @@ impl ArbitrageEngine {
         self.streaming_delivery
     }
 
-    /// Probe the packed fleet-stance (ADR-042 Q6; smoke-boot observability;
-    /// no environment read): `fleet` = the fleet hosts all solve bins.
-    #[must_use]
-    pub fn fleet_stance_probe(&self) -> &'static str {
-        if self.fleet_hosted {
-            "fleet"
-        } else {
-            "legacy"
-        }
-    }
-
     #[must_use]
     pub fn with_core(core: Arc<StateLock<BotState>>) -> Self {
         // KAHU5W/P6YXA6 production-boot fix: pack from the INSTALLED loader
@@ -592,11 +584,10 @@ impl ArbitrageEngine {
         // J4HN66 (epic 64ZQLA): construction stances come from the CALLER's
         // own cfg — never from an install-then-read process static. A
         // parallel construction flips such a static between our install and
-        // a global read (TOCTOU): fleet-stance tests had to retry on a
-        // 5 s loop, and every construction raced its engine-external state.
-        // The install call below remains for its process projections (fleet
-        // boots; the stance statics other consumers observe).
-        let fleet_hosted = solver_dispatch::fleet_stance_enabled(cfg);
+        // a global read (TOCTOU). The install call remains for its process
+        // projections (the fleet boots; the stance statics other consumers
+        // observe). LW-T9: there is no stance — the fleet installs
+        // unconditionally, it is the only behavior.
         let streaming_delivery = cfg.pump.streaming_delivery;
         let detached_solving = !cfg!(test) && cfg.solve.detached_solves;
         solver_dispatch::install_engine_stances(cfg);
@@ -626,7 +617,6 @@ impl ArbitrageEngine {
             resolved_update_snapshot: HashMap::new(),
             last_walk_sims: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             last_gate_us: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            fleet_hosted,
             streaming_delivery,
             #[cfg(test)]
             test_solve_delay: None,
@@ -644,6 +634,8 @@ impl ArbitrageEngine {
             detached_issued_seq: 0,
             event_buffer_expiry_enabled: false,
             detached_merge_tx: None,
+            detached_duplicate_outcomes: std::sync::atomic::AtomicU64::new(0),
+            detached_seen_outcomes: parking_lot::Mutex::new(std::collections::HashSet::new()),
             detached_merge_rx: parking_lot::Mutex::new(None),
             detached_outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             detached_applied: std::sync::atomic::AtomicU64::new(0),

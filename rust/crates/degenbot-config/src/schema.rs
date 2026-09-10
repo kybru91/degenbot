@@ -233,8 +233,6 @@ crate::config_schema! {
             doc = "Inline-sim stance (T2 worker-side clamp path); `0`/`false` disables.";
         solve_resolve_par [bool] = true, env = "DEGENBOT_SOLVE_RESOLVE_PAR", def = "true",
             doc = "Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables.";
-        solve_sim_inflight [opt usize] = None, env = "DEGENBOT_SOLVE_SIM_INFLIGHT", def = "(unset; derived from CPU budget)",
-            doc = "Terminal concurrent sim-slot cap (clamped 1..=64); overrides the leftover-budget derivation.";
         inline_sim_workers [opt usize] = None, env = "DEGENBOT_INLINE_SIM_WORKERS", def = "(unset; derived from CPU budget)",
             doc = "Inline-sim worker count (clamped 1..=32; unparsable falls back to derived default at the site).";
         detached_solves [bool] = true, env = "DEGENBOT_DETACHED_SOLVES", def = "true",
@@ -260,8 +258,6 @@ crate::config_schema! {
     }
 
     fleet FleetConfig {
-        stance [enum FleetStance Legacy Fleet] = FleetStance::Legacy, env = "DEGENBOT_FLEET", def = "legacy",
-            doc = "Worker-fleet stance (ADR-042 Q6): `legacy` keeps the per-era mechanisms; `fleet` hosts Solver/SimDriver/Resolve/Merge on the role-switching fleet. Deleted at the hard cutover.";
         quota_cpus [opt f64] = None, env = "DEGENBOT_FLEET_QUOTA_CPUS", def = "(unset; detected from the cgroup)",
             doc = "Terminal override of the fractional cgroup CPU quota (cores) feeding the fleet budget sum check; unset detects from the cgroup (ADR-042 §5).";
         reserve_cpus [opt usize] = None, env = "DEGENBOT_FLEET_RESERVE_CPUS", def = "(unset; default 1)",
@@ -410,7 +406,6 @@ mod tests {
     fn fleet_section_declares_the_adr_042_keys() {
         let want = [
             ("fleet.quota_cpus", "DEGENBOT_FLEET_QUOTA_CPUS"),
-            ("fleet.stance", "DEGENBOT_FLEET"),
             ("fleet.reserve_cpus", "DEGENBOT_FLEET_RESERVE_CPUS"),
             ("fleet.solver_cpus", "DEGENBOT_FLEET_SOLVER_CPUS"),
             ("fleet.sim_slot_cap", "DEGENBOT_FLEET_SIM_SLOT_CAP"),
@@ -447,14 +442,16 @@ mod tests {
             );
             assert_eq!(key.map(|k| k.env), Some(env), "{toml_path} env drift");
         }
-        // Stance default: legacy until cutover (ADR-042 Q6); the enum has
-        // exactly the two variants.
-        let stance = SCHEMA.iter().find(|k| k.toml_path == "fleet.stance");
-        assert!(stance.is_some(), "fleet.stance must be declared");
-        assert_eq!(stance.map(|k| k.default_repr), Some("legacy"));
-        assert_eq!(
-            stance.map(|k| k.kind.base),
-            Some(BaseKind::Enum("FleetStance", &["Legacy", "Fleet"]))
+        // LW-T9 hard cutover: the stance key is RETIRED — it must not be
+        // declared (mirror of the P6YXA6 solve.executor removal; the env
+        // var + TOML key fail the load loudly at the loader).
+        assert!(
+            !SCHEMA.iter().any(|k| k.toml_path == "fleet.stance"),
+            "fleet.stance must be retired from the schema"
+        );
+        assert!(
+            !SCHEMA.iter().any(|k| k.env == "DEGENBOT_FLEET"),
+            "DEGENBOT_FLEET must be retired from the schema"
         );
     }
 }

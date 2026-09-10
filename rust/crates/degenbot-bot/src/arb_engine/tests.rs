@@ -6605,8 +6605,11 @@ mod tests {
 
     /// Q1a stale policy (red/green): a straggler whose resolved-update stamp
     /// is stale (a pool ticked during the solve → its `update_block` moved)
-    /// is DROPPED, not applied. The fresh-stamp twin applies (apply-if-
-    /// unchanged) through the same merge seam.
+    /// is DROPPED, not applied. A fresh-stamp straggler applies
+    /// (apply-if-unchanged) through the same merge seam. LW-T9: the two
+    /// dispositions ride DIFFERENT pids — the QR3NUS exactness fuse (carried
+    /// to the sidecar) owns per-(cycle_seq, pid) delivery uniqueness, so the
+    /// stale→fresh stamp flip on ONE pid is fused by construction now.
     #[test]
     fn detached_straggler_with_stale_update_stamp_is_dropped() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
@@ -6615,17 +6618,22 @@ mod tests {
             .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
             .collect();
         engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
-        let pid = path_ids[0];
+        let stale_pid = path_ids[0];
+        let fresh_pid = path_ids[1];
         assert!(
-            engine.results.contains_key(&pid),
-            "precondition: a fresh result merged in-cycle"
+            engine.results.contains_key(&stale_pid) && engine.results.contains_key(&fresh_pid),
+            "precondition: fresh results merged in-cycle"
         );
-        let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
-        let fresh_result = engine.results.get(&pid).unwrap().clone();
+        let stale_stamp: Vec<u64> = engine.resolved_update_snapshot[&stale_pid]
+            .clone()
+            .iter()
+            .map(|b| b + 1)
+            .collect();
+        let stale_result = engine.results.get(&stale_pid).unwrap().clone();
+        let fresh_stamp = engine.resolved_update_snapshot[&fresh_pid].clone();
+        let fresh_result = engine.results.get(&fresh_pid).unwrap().clone();
 
-        // A straggler whose pools ALL ticked during the solve.
-        let stale_stamp: Vec<u64> = fresh_stamp.iter().map(|b| b + 1).collect();
-        engine.merge_detached_item(
+        let item = |result: SolvePathResult, stamp: Vec<u64>, pid: u64| {
             crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
                 payload: None,
                 worker_clamp_twins: 0,
@@ -6633,11 +6641,14 @@ mod tests {
                 solve_block: 100,
                 metadata: BlockMetadata::default(),
                 pid,
-                update_stamp: stale_stamp,
-                result: fresh_result.clone(),
+                update_stamp: stamp,
+                result,
                 solve_span: tracing::Span::none(),
-            },
-        );
+            }
+        };
+
+        // A straggler whose pools ALL ticked during the solve.
+        engine.merge_detached_item(item(stale_result, stale_stamp, stale_pid));
         assert_eq!(
             engine
                 .detached_dropped_stale
@@ -6653,19 +6664,7 @@ mod tests {
         );
 
         // The unchanged-intake twin APPLIES (apply-if-unchanged).
-        engine.merge_detached_item(
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-                payload: None,
-                worker_clamp_twins: 0,
-                cycle_seq: 1,
-                solve_block: 100,
-                metadata: BlockMetadata::default(),
-                pid,
-                update_stamp: fresh_stamp,
-                result: fresh_result,
-                solve_span: tracing::Span::none(),
-            },
-        );
+        engine.merge_detached_item(item(fresh_result, fresh_stamp, fresh_pid));
         assert_eq!(
             engine
                 .detached_applied
@@ -6678,6 +6677,56 @@ mod tests {
                 .detached_dropped_stale
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
+        );
+    }
+
+    /// LW-T9 note-(a) carry (red): the DETACHED sidecar merge must carry the
+    /// SAME exactness assert as the in-cycle drain (QR3NUS): one path outcome
+    /// exactly once — a duplicate (`cycle_seq`, `pid`) delivery trips the loud
+    /// exactness fuse and is NOT applied a second time. RED before the
+    /// cutover: the sidecar had no duplicate guard, so the twin merge
+    /// counted applied == 2.
+    #[test]
+    fn detached_duplicate_straggler_trips_the_exactness_fuse() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        let pid = path_ids[0];
+        let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
+        let fresh_result = engine.results.get(&pid).unwrap().clone();
+
+        let item = |result: SolvePathResult| {
+            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                payload: None,
+                worker_clamp_twins: 0,
+                cycle_seq: 1,
+                solve_block: 100,
+                metadata: BlockMetadata::default(),
+                pid,
+                update_stamp: fresh_stamp.clone(),
+                result,
+                solve_span: tracing::Span::none(),
+            }
+        };
+        engine.merge_detached_item(item(fresh_result.clone()));
+        engine.merge_detached_item(item(fresh_result));
+
+        assert_eq!(
+            engine
+                .detached_applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the duplicate delivery must not apply a second time"
+        );
+        assert_eq!(
+            engine
+                .detached_duplicate_outcomes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the duplicate delivery must trip the loud exactness fuse once"
         );
     }
 

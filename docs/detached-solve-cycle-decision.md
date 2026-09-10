@@ -65,7 +65,9 @@ and each result flows through an unbounded mpsc to the merge sidecar, a plain
 |---|---|---|---|
 | DEGENBOT_DETACHED_SOLVES | 1 / unset | enqueue-and-return sidecar cycle / in-cycle single-hold cycle | epic SRQEK5; default flips with the soaked readout |
 | DEGENBOT_STREAMING_DELIVERY | unset / 0 | streaming (per-path micro-batches) / debounce sweep | T3 default flip; A/B opt-out keeps the debounce sweep; the sweep still owns expired/removed + end-of-cycle metadata either way |
-| DEGENBOT_SOLVE_EXECUTOR | — (retired) | fleet-or-tokio | RETIRED at the P6YXA6 hard cutover: the fleet (fleet.stance=fleet) or the dedicated tokio runtime hosts every bin, detached included; the env var fails the config load loudly for one release |
+| DEGENBOT_SOLVE_EXECUTOR | — (retired) | fleet | RETIRED at the P6YXA6 hard cutover; the tokio-stance fallback itself retired at LW-T9 (ergo CQLMM2): the fleet is the ONLY solve executor (fleet is the only stance since LW-T9), and the env var fails the config load loudly for one release |
+| DEGENBOT_FLEET / fleet.stance | — (retired) | fleet | RETIRED at the LW-T9 hard cutover: the stance flag is gone with the legacy tokio-stance code path (solve_executor.rs deleted); a surviving env var or TOML key fails the config load loudly for one release |
+| DEGENBOT_SOLVE_SIM_INFLIGHT / solve.solve_sim_inflight | — (retired) | fleet | RETIRED at the LW-T9 hard cutover with the SimSlots semaphore (legacy arb-sim detached threads): SimDriver capacity is `fleet.sim_slot_cap`, inline-sim sizing `solve.inline_sim_workers`; a surviving env var fails the config load loudly for one release |
 | in-flight gauge | 0..8 | >= cap at cycle start degrades that cycle to in-cycle | backpressure thesis |
 | Q1a oracle | stamp vs live clocks | mismatch or deregistered => drop | stale policy thesis |
 
