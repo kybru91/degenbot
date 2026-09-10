@@ -4436,3 +4436,100 @@ mod fleet_sim_stance_tests {
         assert_eq!(row.thread_name, "work-fleet-sim-{n}");
     }
 }
+
+#[cfg(test)]
+mod dispatch_binning_properties {
+    //! JXCAR4 (epic 64ZQLA): solver dispatch binning properties over
+    //! ARBITRARY item counts, cost shapes and seat shapes. The spawn-seam
+    //! invariant (`FleetSolveExecutor::spawn` aborts on a bin >= the
+    //! structural seat count, commit `ccc148275`) must never be the
+    //! discovery mechanism again: a future binning regression shows up here
+    //! as a shrunk counterexample, not a host-only SIGABRT.
+    use super::executor_ab_probe::prod_lpt_bins;
+    use super::lpt_partition;
+    use degenbot_solvers::mixed::ResolvedMixedPath;
+    use proptest::prelude::*;
+    use std::sync::Arc;
+
+    /// Synthesized fixture paths (empty hops = zero structural cost; the
+    /// properties exercise the BINDER, not the solver).
+    fn synth_items(n: usize) -> Vec<Arc<ResolvedMixedPath>> {
+        (0..n)
+            .map(|_| {
+                Arc::new(ResolvedMixedPath {
+                    hops: Vec::new(),
+                    valid: true,
+                    state_nonces: Vec::new(),
+                    max_update_block: 0,
+                })
+            })
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+        #[test]
+        fn lpt_partition_preserves_items_and_stays_enclosed(
+            n_items in 0usize..=2048usize,
+            n_bins in 1usize..=64usize,
+            costs in proptest::collection::vec(0usize..=97usize, 0..=2048),
+        ) {
+            let cost = |i: usize| costs.get(i).copied().unwrap_or(0);
+            let bins = lpt_partition(n_items, n_bins, cost);
+            // Enclosure: exactly the requested bin shape, indices inside.
+            prop_assert_eq!(bins.len(), n_bins);
+            for bin in &bins {
+                for &i in bin {
+                    prop_assert!(i < n_items);
+                }
+            }
+            // Preservation: every item index appears exactly once.
+            let mut seen: Vec<usize> = bins.iter().flatten().copied().collect();
+            seen.sort_unstable();
+            prop_assert_eq!(seen.len(), n_items);
+            for (want, got) in seen.iter().enumerate() {
+                prop_assert_eq!(*got, want);
+            }
+        }
+
+        #[test]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "quota units (1e6 scale, <= 6.4e7) are exact in f64"
+        )]
+        fn prod_bins_never_exceed_the_structural_seats(
+            quota_units in 6_000_000u64..=64_000_000u64,
+            n_items in 0usize..=1024usize,
+        ) {
+            // Hostable quotas only (floor >= the pinned-role floor of 6);
+            // the seat count comes from the REAL budget table keyed to the
+            // quota property, never from this machine's shape.
+            let q = (quota_units as f64) / 1_000_000.0;
+            let seats = match degenbot_workers::budget::FleetBudget::derive(
+                q,
+                &degenbot_workers::budget::BudgetOverrides::default(),
+            ) {
+                Ok(b) => b.solver_pin_count,
+                Err(err) => {
+                    return Err(TestCaseError::fail(format!(
+                        "hostable quota refused: {err:?}"
+                    )));
+                }
+            };
+            let items = synth_items(n_items);
+            let bins = prod_lpt_bins(&items, seats);
+            // Binding at the fleet's own seat count: the spawn normalize
+            // (validate_bin_index) can never fire.
+            prop_assert_eq!(bins.len(), seats);
+            for (bin_idx, bin) in bins.iter().enumerate() {
+                prop_assert!(bin_idx < seats);
+                for &i in bin {
+                    prop_assert!(i < n_items);
+                }
+            }
+            // Item preservation across the seats.
+            let total: usize = bins.iter().map(Vec::len).sum();
+            prop_assert_eq!(total, n_items);
+        }
+    }
+}
