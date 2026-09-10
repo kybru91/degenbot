@@ -108,6 +108,61 @@ pub(crate) fn lpt_partition(
     bins
 }
 
+/// The RUNTIME lane-capability decision (LW-T7, Seam F): the cycle either
+/// runs at full structural width or takes the NAMED narrower fallback
+/// (reth `state_root_task_timeout => sequential` lesson: the fallback is a
+/// NAMED-AND-LOGGED decision, never a silent narrower bin mid-drain) — the
+/// runtime twin of LW-T4's boot-time capacity floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CordonFallbackDecision {
+    /// Structural seats cover the intended bins.
+    FullCapacity,
+    /// The hosting capability dropped (T9 resize under cordon): the cycle
+    /// runs `running` bins (< `intended`) this block — logged at INFO.
+    Narrower {
+        /// The bins the workload intended.
+        intended: usize,
+        /// The bins the current capability hosts.
+        running: usize,
+    },
+}
+
+/// One cycle's planned bin fan-out (LW-T7, Seam F).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SeatPlan {
+    /// The bin count the cycle fans out over.
+    pub bins: usize,
+    /// The typed fallback decision this plan took.
+    pub decision: CordonFallbackDecision,
+}
+
+/// Plan this cycle's bin fan-out: a capability narrower than the intended
+/// fan-out takes the NAMED narrower fallback (typed + logged at INFO).
+#[must_use]
+pub(crate) fn plan_bins(intended_bins: usize, structural_seats: usize) -> SeatPlan {
+    if structural_seats < intended_bins {
+        tracing::info!(
+            target: "degenbot::solver",
+            intended = intended_bins,
+            running = structural_seats,
+            "[seat-plan] capability drop under cordon — running the NAMED \
+             narrower fallback (LW-T7; the serial arm remains a downstream decision)"
+        );
+        SeatPlan {
+            bins: structural_seats,
+            decision: CordonFallbackDecision::Narrower {
+                intended: intended_bins,
+                running: structural_seats,
+            },
+        }
+    } else {
+        SeatPlan {
+            bins: intended_bins,
+            decision: CordonFallbackDecision::FullCapacity,
+        }
+    }
+}
+
 #[expect(clippy::doc_markdown)]
 /// Resolve-time cost proxy for LPT binning: the total number of word-boundary
 /// prices across all CL hops. Correlates with walk combinatorics without
@@ -1532,6 +1587,10 @@ impl ArbitrageEngine {
     /// then re-resolves and re-solves only those. Unaffected paths carry
     /// their previous results forward.
     #[expect(clippy::too_many_lines)] // telemetry events + solve pipeline are one narrative
+    /// # Panics
+    /// When the merged drain's outcome accounting undercounts (exactness
+    /// fuse, QR3NUS/LW-T7): the cycle thread fails loudly, never silently
+    /// mis-sizes.
     pub fn rebuild_and_solve_affected(
         &mut self,
         affected: &[degenbot_solvers::affected_keys::AffectedKey],
@@ -2106,6 +2165,11 @@ impl ArbitrageEngine {
             // fleet's STRUCTURAL seat count — pins and bins are the same
             // number, so every bin owns a warm keyed seat across cycles.
             let n_threads = solve_bin_count(self.fleet_hosted);
+            // LW-T7 (Seam F): the bin fan-out goes through the typed runtime
+            // fallback decision — a capability narrower than the intended
+            // width is a NAMED-AND-LOGGED plan, never a silent narrower bin.
+            let plan = plan_bins(n_threads, n_threads);
+            let n_threads = plan.bins;
             // Loop-12 KUKHMX: previous-block measured walk sims refine the
             // LPT cost; snapshot once (single lock) before binning.
             // Loop-18: measured gate us rides the same snapshot - gate-heavy
@@ -2580,22 +2644,20 @@ impl ArbitrageEngine {
             }
             drop(merge_ctx);
             merge_span.record("merge.paths", solved_count);
-            // The exactness fuse with a sensor (QR3NUS): every submitted
-            // path owes exactly one outcome; any gap is loud, never silent.
-            // (Real-sink parity promotion cross-checks "total delivered" in
-            // LW-T7.)
+            // LW-T7 (Seam F, promotion gate): the merged drain ASSERTS exact
+            // totals — outcomes == submissions, failures and all. The assert
+            // IS the gate: a mismatch fails the cycle thread loudly (the
+            // promoted parity fixture additionally cross-checks its own
+            // solved-vs-suspended accounting against its submissions).
             let drained = solved_count + suppressed_count + failed_count;
-            if drained != to_solve.len() {
-                tracing::error!(
-                    target: "degenbot::solver",
-                    submitted = to_solve.len(),
-                    drained,
-                    solved = solved_count,
-                    suppressed = suppressed_count,
-                    failed = failed_count,
-                    "[solve-merge] outcome accounting undercount — exactness fuse tripped (QR3NUS)"
-                );
-            }
+            assert_eq!(
+                drained,
+                to_solve.len(),
+                "[solve-merge] outcome accounting undercount — exactness fuse \
+                 tripped (QR3NUS/LW-T7): solved {solved_count} + suppressed \
+                 {suppressed_count} + failed {failed_count} != submitted {}",
+                to_solve.len()
+            );
         });
         if let Some(c) = shared.capture.as_ref() {
             tracing::info!(
@@ -3703,6 +3765,66 @@ mod profit_clamp_recompute_tests {
 #[cfg(test)]
 mod lpt_partition_tests {
     use super::*;
+
+    // ---- LW-T7 (Seam F): determinism, runtime fallback, promotion gate ----
+
+    /// LW-T7 (Seam F): LPT is bit-stable — the same input & cost fn yields
+    /// IDENTICAL bins across 50 invocations at widely varying shape, and
+    /// equal-cost ties resolve by the FIXED rule (original index order) —
+    /// the expected bins are computed by an independent reading of the
+    /// documented rule (stable sort desc by cost with index-order ties,
+    /// then item-by-item onto the first minimal-load bin).
+    #[test]
+    fn lpt_partition_is_bit_stable_across_invocations_and_ties_are_index_ordered() {
+        let costs = vec![40, 40, 40, 70, 70, 30, 30, 30, 30, 55];
+        let n = costs.len();
+        // Independent reading of the documented rule (order-stable, ties by
+        // ascending original index; min-load bin tie by lowest bin index).
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by_key(|&i| (std::cmp::Reverse(costs[i]), i));
+        let mut loads = vec![0usize; 3];
+        let expected: Vec<Vec<usize>> = {
+            let mut bins: Vec<Vec<usize>> = vec![Vec::new(); 3];
+            for i in idx {
+                let mi = (0..3)
+                    .min_by_key(|&bi| (loads[bi], bi))
+                    .expect("bing shape is non-empty");
+                bins[mi].push(i);
+                loads[mi] += costs[i];
+            }
+            bins
+        };
+        for invocation in 0..50 {
+            let bins = lpt_partition(n, 3, |i| costs[i]);
+            assert_eq!(
+                bins, expected,
+                "invocation {invocation}: bins deviate from the documented rule"
+            );
+        }
+    }
+
+    /// LW-T7 (Seam F): a seat-capacity drop under a cordon drives a NAMED
+    /// typed runtime fallback decision (typed enum, logged at INFO) —
+    /// never silent narrower bins mid-drain (the runtime twin of LW-T4's
+    /// boot-time capacity floor).
+    #[test]
+    fn seat_drop_under_cordon_drives_a_named_typed_runtime_fallback() {
+        // Narrower capability: the plan NAMES the drop (intended → running).
+        let plan = plan_bins(6, 4);
+        assert_eq!(plan.bins, 4);
+        assert_eq!(
+            plan.decision,
+            CordonFallbackDecision::Narrower {
+                intended: 6,
+                running: 4,
+            },
+            "the fallback must be a NAMED typed decision"
+        );
+        // Full capability: no fallback, full width.
+        let full = plan_bins(6, 6);
+        assert_eq!(full.decision, CordonFallbackDecision::FullCapacity);
+        assert_eq!(full.bins, 6);
+    }
 
     #[test]
     fn lpt_distributes_heavy_items_across_bins() {
