@@ -391,7 +391,7 @@ fn the_stranded_pipe_trips_the_loud_abort_path() {
     let sim_slot = first_idle_of(&host, WorkerRole::SimDriver);
     host.lease_claim(sim_slot, WorkerRole::SimDriver, None)
         .expect("T1");
-    let unit = Unit::new(1, WorkerRole::SimDriver, None, true, Box::new(|| {}));
+    let unit = Unit::new(1, WorkerRole::SimDriver, None, true, Box::new(|_ctx| {}));
     host.start(sim_slot, &unit).expect("T2");
     // Abandoning a result-pipe unit mid-flight trips the loud abort path...
     assert!(host.strand_unit(sim_slot).is_err());

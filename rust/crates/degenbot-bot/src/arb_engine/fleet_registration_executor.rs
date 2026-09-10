@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 
 use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, GrantKind, Unit};
+use degenbot_workers::lane::LaneCtx;
 use degenbot_workers::role::WorkerRole;
 
 /// Loud, unrecoverable executor failure (mirror of the fleet sim/solve
@@ -70,8 +71,10 @@ struct SeatJob {
     /// back so T5 applies to the right slot).
     slot: u64,
     /// The work payload (`Send + 'static` — the `c_api` closure carries the
-    /// Python callable handle and its receipt channel).
-    work: Box<dyn FnOnce() + Send>,
+    /// Python callable handle and its receipt channel). Takes the seat's
+    /// `LaneCtx` (LW-T2); pooled seats hand the detached stub (LW-T8
+    /// unifies the pooled paths onto pin-bound ctx).
+    work: Box<dyn FnOnce(&LaneCtx) + Send>,
 }
 
 /// The fleet-hosted registration intake executor. Shared by the whole
@@ -157,7 +160,7 @@ impl FleetRegistrationExecutor {
             // The unit's receipt feeds the awaiting crawl worker — a
             // stranded pipe if abandoned.
             true,
-            Box::new(work),
+            Box::new(move |_ctx| work()),
         );
         if self.tx.send(HostMsg::Enqueue(unit)).is_err() {
             abort_executor("intake submission", "fleet intake host channel closed");
@@ -222,7 +225,8 @@ fn seat_loop(work: &WorkQueue, done: &mpsc::Sender<HostMsg>) {
     while let Some(job) = work.take() {
         // A panicking build closure must not kill the seat (its pool would
         // strand receipts): keep the seat alive, log loudly, report done.
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| (job.work)()));
+        let ctx = LaneCtx::detached();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| (job.work)(&ctx)));
         if outcome.is_err() {
             tracing::error!(
                 target: "degenbot::fleet",

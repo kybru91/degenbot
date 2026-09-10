@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 
 use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, GrantKind, Unit};
+use degenbot_workers::lane::LaneCtx;
 use degenbot_workers::role::WorkerRole;
 
 /// Loud, unrecoverable executor failure (mirror of the fleet solve
@@ -74,7 +75,9 @@ struct SeatJob {
     slot: u64,
     /// The work payload (the 'static + Send sim closure — the fleet crate
     /// has no pyo3 and simulation never round-trips Python, design doc §8).
-    work: Box<dyn FnOnce() + Send>,
+    /// Takes the seat's `LaneCtx` (LW-T2); pooled seats hand the detached
+    /// stub (LW-T8 unifies the pooled paths onto pin-bound ctx).
+    work: Box<dyn FnOnce(&LaneCtx) + Send>,
 }
 
 /// The fleet-hosted inline-sim executor. Shared by all engine cycles (the
@@ -162,7 +165,7 @@ impl FleetSimExecutor {
             // The unit's receipt feeds the scheduling bin's join — a
             // stranded pipe if abandoned.
             true,
-            Box::new(work),
+            Box::new(move |_ctx| work()),
         );
         if self.tx.send(HostMsg::Enqueue(unit)).is_err() {
             abort_executor("sim submission", "fleet sim host channel closed");
@@ -227,7 +230,8 @@ fn seat_loop(work: &WorkQueue, done: &mpsc::Sender<HostMsg>) {
     while let Some(job) = work.take() {
         // A panicking sim closure must not kill the seat (its pool would
         // strand receipts): keep the seat alive, log loudly, report done.
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| (job.work)()));
+        let ctx = LaneCtx::detached();
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| (job.work)(&ctx)));
         if outcome.is_err() {
             tracing::error!(
                 target: "degenbot::fleet",

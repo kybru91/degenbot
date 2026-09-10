@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::budget::{BudgetError, BudgetOverrides, FleetBudget};
 use crate::gauges::{self as gauges_mod, RoleGaugeSample};
+use crate::lane::LaneCtx;
 use crate::posture::{
     FleetPosture, PostureChange, PosturePolicy, PostureStateMachine, ThrottleSample,
 };
@@ -40,6 +41,13 @@ pub type SlotId = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArenaToken(u64);
 
+impl ArenaToken {
+    /// The stub token for pooled (non-pinned) seats: `0` is never minted by
+    /// the host (`next_arena` starts at 1), so it can never collide with a
+    /// warm identity.
+    pub const DETACHED: Self = Self(0);
+}
+
 /// A unit of role work. The payload is a `'static + Send` RUST closure — the
 /// fleet crate has no pyo3 in it and simulation never round-trips Python
 /// (design doc §8), so no worker ever holds a GIL across role work by
@@ -55,7 +63,7 @@ pub struct Unit {
     /// discipline: abandoning it mid-flight is a STRANDED PIPE).
     pub result_pipe: bool,
     /// The work payload.
-    pub work: Box<dyn FnOnce() + Send>,
+    pub work: Box<dyn FnOnce(&LaneCtx) + Send>,
 }
 
 impl std::fmt::Debug for Unit {
@@ -77,7 +85,7 @@ impl Unit {
         role: WorkerRole,
         key: Option<PinKey>,
         result_pipe: bool,
-        work: Box<dyn FnOnce() + Send>,
+        work: Box<dyn FnOnce(&LaneCtx) + Send>,
     ) -> Self {
         Self {
             id,
@@ -91,7 +99,7 @@ impl Unit {
     /// An inert `work = || {}` unit for pool/dispatch tests.
     #[must_use]
     pub fn noop(id: UnitId, role: WorkerRole, key: Option<PinKey>) -> Self {
-        Self::new(id, role, key, false, Box::new(|| {}))
+        Self::new(id, role, key, false, Box::new(|_ctx: &LaneCtx| {}))
     }
 }
 
@@ -402,6 +410,25 @@ impl FleetHost {
     pub fn arena(&self, slot: SlotId) -> Option<ArenaToken> {
         let idx = usize::try_from(slot).ok()?;
         self.slots.get(idx).and_then(|c| c.arena)
+    }
+
+    /// Mint (idempotently) the slot's warm arena at the T2 grant seam
+    /// (LW-T2): a lane ctx handed to a unit at grant time must ALWAYS
+    /// carry the warm identity — minted on the first pin claim, stable
+    /// across cycles, released at T9 (never live across a role switch).
+    /// `None` for unknown slots.
+    #[must_use]
+    pub fn ensure_arena(&mut self, slot: SlotId) -> Option<ArenaToken> {
+        let idx = usize::try_from(slot).ok()?;
+        let cell = self.slots.get_mut(idx)?;
+        if cell.arena.is_none() {
+            // First pin claim: mint on the spot — NOT deferred to the first
+            // completion — so a lane ctx handed at grant time always carries
+            // the warm identity (still released at T9).
+            cell.arena = Some(ArenaToken(self.next_arena));
+            self.next_arena += 1;
+        }
+        cell.arena
     }
 
     /// Slot id of the (unique) merge pin.

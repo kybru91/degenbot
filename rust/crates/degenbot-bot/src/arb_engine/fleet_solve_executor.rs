@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 
 use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, Unit};
+use degenbot_workers::lane::{EscalationPort, LaneCtx, QuitSig};
 use degenbot_workers::role::WorkerRole;
 use degenbot_workers::slot::PinKey;
 
@@ -71,8 +72,11 @@ struct SeatJob {
     unit: u64,
     /// The work payload (the 'static + Send `run_bin` closure — the fleet
     /// crate has no pyo3 and simulation never round-trips Python, design
-    /// doc §8).
-    work: Box<dyn FnOnce() + Send>,
+    /// doc §8). The seat hands the unit its `LaneCtx` (LW-T2 Seam B).
+    work: Box<dyn FnOnce(&LaneCtx) + Send>,
+    /// The seat ctx minted at the T2 grant seam: the bin's pin + the
+    /// slot's warm arena identity (warm across cycles, fresh after T9).
+    ctx: LaneCtx,
 }
 
 /// Host-bound message: a submitted bin unit, or a seat reporting its unit
@@ -159,11 +163,24 @@ impl FleetSolveExecutor {
         self.solver_seats
     }
 
-    /// Submit one LPT bin job keyed to its bin. Never drops: the host-side
-    /// backlog preserves the legacy unbounded-mpsc semantics; a closed host
-    /// channel (executor died) is a LOUD abort — a lost bin would strand
-    /// its paths' per-path result sends forever (stranded pipe, §10).
+    /// Submit one LPT bin job keyed to its bin — the ctx-less wrapper over
+    /// [`FleetSolveExecutor::submit_solve_bin`] (the per-path result
+    /// closures don't need the seat ctx).
     pub(crate) fn spawn(&self, bin: usize, job: impl FnOnce() + Send + 'static) {
+        self.submit_solve_bin(bin, move |_ctx| job());
+    }
+
+    /// Submit one LPT bin job keyed to its bin; the seat hands the unit body
+    /// a [`LaneCtx`] carrying the bin's pin key and warm arena identity
+    /// (LW-T2 Seam B). Never drops: the host-side backlog preserves the
+    /// legacy unbounded-mpsc semantics; a closed host channel (executor
+    /// died) is a LOUD abort — a lost bin would strand its paths' per-path
+    /// result sends forever (stranded pipe, §10).
+    pub(crate) fn submit_solve_bin(
+        &self,
+        bin: usize,
+        work: impl FnOnce(&LaneCtx) + Send + 'static,
+    ) {
         // The pins == bins invariant (P6YXA6), held at the submit seam: a
         // bin without a structural seat must abort HERE — with both numbers
         // in the message — instead of decaying into an FSM transition
@@ -178,7 +195,7 @@ impl FleetSolveExecutor {
             Some(key),
             // The bin's per-path result sends feed the merge pipe.
             true,
-            Box::new(job),
+            Box::new(work),
         );
         if self.tx.send(HostMsg::Enqueue(unit)).is_err() {
             abort_executor("bin submission", "fleet host channel closed");
@@ -197,7 +214,7 @@ fn seat_loop(seat: u64, rx: mpsc::Receiver<SeatJob>, done: &mpsc::Sender<HostMsg
     while let Ok(job) = rx.recv() {
         // A panicking bin closure must not kill the seat (its pinned bins
         // would strand): keep the seat alive, log loudly, report done.
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| (job.work)()));
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| (job.work)(&job.ctx)));
         if outcome.is_err() {
             tracing::error!(
                 target: "degenbot::fleet",
@@ -286,9 +303,32 @@ fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, seats: &[mpsc::Sende
             let Some(seat_tx) = seats.get(usize::try_from(grant.slot).unwrap_or(usize::MAX)) else {
                 abort_executor("dispatch grant", "unknown seat");
             };
+            // LW-T2 (Seam B): mint the warm arena at the grant seam — the
+            // ctx handed to the unit at dispatch time ALWAYS carries the
+            // warm identity (stable across cycles; released at T9). An
+            // unknown slot here is structurally unreachable (the grant came
+            // from THIS host) — a silent default would violate the loud
+            // posture, so it aborts with BOTH numbers, P6YXA6-style.
+            let arena = host.ensure_arena(grant.slot).unwrap_or_else(|| {
+                abort_executor(
+                    "arena mint at grant",
+                    &format!(
+                        "slot {} hosts no arena for bin key {}",
+                        grant.slot,
+                        unit.key.unwrap_or(0)
+                    ),
+                );
+            });
+            let ctx = LaneCtx {
+                pin: unit.key.unwrap_or(0),
+                arena,
+                escalation: EscalationPort,
+                quit: QuitSig,
+            };
             let job = SeatJob {
                 unit: grant.unit,
                 work: unit.work,
+                ctx,
             };
             if seat_tx.send(job).is_err() {
                 // A dead seat cannot drain its pinned bins' results —
@@ -528,8 +568,9 @@ mod tests {
     use degenbot_solvers::mixed::SolvePathResult;
     use degenbot_workers::budget::BudgetOverrides;
     use degenbot_workers::dispatcher::{
-        AbortingPolicy, FleetBoot, PanicAction, PanicVerdict, SeatSurvivesPolicy,
+        AbortingPolicy, ArenaToken, FleetBoot, PanicAction, PanicVerdict, SeatSurvivesPolicy,
     };
+    use degenbot_workers::lane::LaneCtx;
     use degenbot_workers::posture::PosturePolicy;
 
     use super::super::solver_dispatch::executor_ab_probe::{
@@ -717,6 +758,99 @@ mod tests {
                 "bin {bin} must pin to exactly one seat across cycles"
             );
         }
+    }
+
+    // ---- LW-T2 (Seam B): seat context — no ambient runtime, LaneCtx identity
+
+    /// The runtime wedge (LW-T2): fleet seats are OS threads with NO ambient
+    /// tokio runtime. The executor boots and submits from inside a LIVE
+    /// multi-thread runtime here, and every seated unit still observes
+    /// `Handle::try_current() == Err` — any future drift that puts a runtime
+    /// on the seat (the tokio-stance path) fails this test.
+    ///
+    /// INTENDED TRIPWIRE: this test passing today is correct (fleet seats
+    /// are plain `std::thread`s). It goes RED deliberately when the
+    /// tokio-stance path is ported, and again when LW-T8 consolidates the
+    /// executors behind a trait — that red is the T9 cutover gate, not a
+    /// regression.
+    #[test]
+    fn fleet_seats_run_units_with_no_ambient_tokio_runtime() {
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let runtime_free: Arc<parking_lot::Mutex<Vec<bool>>> = Arc::default();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        runtime.block_on(async {
+            for _ in 0..3 {
+                let runtime_free = Arc::clone(&runtime_free);
+                executor.spawn(0, move || {
+                    runtime_free
+                        .lock()
+                        .push(tokio::runtime::Handle::try_current().is_err());
+                });
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while runtime_free.lock().len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fleet seats did not drain the probe units in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            runtime_free.lock().iter().all(|free| *free),
+            "fleet seats must run units OUTSIDE any ambient tokio runtime"
+        );
+    }
+
+    /// The LaneCtx submit seam (LW-T2): `submit_solve_bin` hands the unit a
+    /// ctx carrying the bin's pin key AND the warm arena identity — the
+    /// SAME ArenaToken across cycles (warm), never the detached stub.
+    #[test]
+    fn submit_solve_bin_hands_a_lane_ctx_with_the_bins_key_and_warm_arena_identity() {
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let observed: Arc<parking_lot::Mutex<Vec<LaneCtx>>> = Arc::default();
+        for _cycle in 0..2 {
+            let observed = Arc::clone(&observed);
+            executor.submit_solve_bin(0, move |ctx| {
+                observed.lock().push(*ctx);
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while observed.lock().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the seat did not drain the ctx probe units in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let observed = observed.lock().clone();
+        let expected_key = SOLVE_BIN_KEY_BASE; // bin 0 → base + 0
+        for ctx in &observed {
+            assert_eq!(
+                ctx.pin, expected_key,
+                "the ctx must carry the bin's pin key"
+            );
+            // Solver seats are pinned lanes: the arena is minted at the T2
+            // grant seam, so a SOLVER unit must NEVER observe the detached
+            // stub (the DETACHED token is pooled seats only).
+            assert_ne!(
+                ctx.arena,
+                ArenaToken::DETACHED,
+                "a solver-seat unit must never observe the DETACHED arena stub"
+            );
+        }
+        assert_ne!(
+            observed[0].arena,
+            ArenaToken::DETACHED,
+            "the warm identity must be host-minted, not the detached stub"
+        );
+        assert_eq!(
+            observed[0].arena, observed[1].arena,
+            "the SAME ArenaToken across cycles (warm)"
+        );
     }
 
     // ---- QR3NUS (Seam D): exact per-unit outcome accounting -------------------

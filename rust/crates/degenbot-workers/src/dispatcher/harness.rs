@@ -408,7 +408,7 @@ fn the_stranded_pipe_tripwire_fires_on_host_death_mid_drain() {
             WorkerRole::Merge,
             Some(MERGE_PIN_KEY),
             true,
-            Box::new(|| {}),
+            Box::new(|_ctx| {}),
         ),
     )
     .expect("T6");
@@ -441,13 +441,13 @@ fn role_work_never_crosses_python_the_fleet_graph_is_pyo3_free() {
         WorkerRole::SimDriver,
         None,
         false,
-        Box::new(move || {
+        Box::new(move |_ctx| {
             observer.fetch_add(1, Ordering::SeqCst);
         }),
     );
     std::thread::scope(|s| {
         s.spawn(move || {
-            (unit.work)();
+            (unit.work)(&crate::lane::LaneCtx::detached());
         })
         .join()
         .expect("host-side unit work completes");
@@ -528,4 +528,52 @@ fn overly_small_quotas_never_boot() {
         err,
         BootError::Budget(BudgetError::QuotaTooSmallForPinnedRoles { .. })
     ));
+}
+
+/// LW-T2 (Seam B): the lane ctx's warm arena is minted at the GRANT seam —
+/// the FIRST cycle's ctx already carries the warm token; the identity
+/// survives cycles within a pin, and a T9 role switch yields a DIFFERENT
+/// token on re-claim (an arena never lives across a role switch, §3.4).
+#[test]
+fn lane_ctx_arena_is_minted_at_grant_time_warm_across_cycles_and_fresh_after_t9() {
+    let mut host = stub_host();
+    let slot = first_idle_home_slot(&host, WorkerRole::Solver);
+
+    // Cycle 1: the ctx at grant time carries an arena ALREADY (mint at T2,
+    // NOT silently deferred to the first completion).
+    host.lease_claim(slot, WorkerRole::Solver, Some(9))
+        .expect("T1");
+    host.start(slot, &Unit::noop(1, WorkerRole::Solver, Some(9)))
+        .expect("T2");
+    let first = host
+        .ensure_arena(slot)
+        .expect("ctx arena minted at grant time");
+    host.complete(slot).expect("T3");
+    assert_eq!(host.arena(slot), Some(first));
+
+    // Cycle 2: same pin — the SAME warm token.
+    host.start(slot, &Unit::noop(2, WorkerRole::Solver, Some(9)))
+        .expect("T6 same key");
+    assert_eq!(
+        host.ensure_arena(slot),
+        Some(first),
+        "warm identity across cycles"
+    );
+    host.complete(slot).expect("T3");
+
+    // T9 role switch: the arena drops; a fresh claim mints a NEW token.
+    host.begin_epoch();
+    host.release_pin(9).expect("T9");
+    assert_eq!(host.arena(slot), None, "arena never crosses a role switch");
+    host.lease_claim(slot, WorkerRole::Solver, Some(9))
+        .expect("re-claim (T1)");
+    host.start(slot, &Unit::noop(3, WorkerRole::Solver, Some(9)))
+        .expect("T2");
+    let fresh = host
+        .ensure_arena(slot)
+        .expect("fresh warm identity after the switch");
+    assert_ne!(
+        fresh, first,
+        "the re-pinned lane gets a DIFFERENT ArenaToken after the switch"
+    );
 }
