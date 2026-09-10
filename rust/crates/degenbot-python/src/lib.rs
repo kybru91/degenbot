@@ -47,6 +47,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod aave_updater;
 #[cfg(feature = "abi")]
 pub mod abi;
+/// Ambient-runtime driver seam (VJGZJ2): enter the shared degenbot-core
+/// runtime around a Python callable. Unconditional — degenbot-core is.
+pub mod ambient_runtime;
 #[cfg(feature = "balancer-math")]
 pub mod balancer_math;
 #[cfg(feature = "bot")]

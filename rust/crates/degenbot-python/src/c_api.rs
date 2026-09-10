@@ -42,6 +42,14 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::build_info::build_number, m)?)?;
     m.add_function(wrap_pyfunction!(crate::build_info::build_fingerprint, m)?)?;
 
+    // Ambient-runtime driver seam (VJGZJ2): lets a Python driver satisfy the
+    // ambient-runtime-only policy on the verify seams. Unconditional —
+    // degenbot-core (the runtime singleton) is.
+    m.add_function(wrap_pyfunction!(
+        crate::ambient_runtime::call_on_ambient_runtime,
+        m
+    )?)?;
+
     // Keccak256 + event topic (always a dependency; ergo 5JKNQH)
     m.add_function(wrap_pyfunction!(crate::crypto::keccak256, m)?)?;
     m.add_function(wrap_pyfunction!(crate::crypto::event_topic, m)?)?;

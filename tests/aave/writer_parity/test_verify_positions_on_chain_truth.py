@@ -27,6 +27,7 @@ canonical on-chain truth = the Rust writer's scaled-balance output.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import pytest
@@ -37,6 +38,7 @@ from degenbot._ffi.aave import (
     run_aave_update,
     verify_touched_positions_on_chain,
 )
+from degenbot._ffi import call_on_ambient_runtime
 from degenbot._ffi.cancel import CancelHandle
 from tests.aave.writer_parity.harness import (
     FIXTURE_BLOCK,
@@ -184,6 +186,28 @@ def _drive_rust(rust_path: str, rpc_url: str) -> dict[str, object]:
     )
 
 
+def _verify_all(database_path: str, rpc_url: str) -> list[dict[str, object]]:
+    """Run the standalone verify seam in verify-all mode (`touched_users=None`).
+
+    The seam is an ambient-runtime-only consumer (VJGZJ2: a missing ambient
+    tokio runtime is a typed ValueError, never a per-call runtime spawn), so
+    the direct call goes through the Rust ambient-runtime driver seam, which
+    enters the shared degenbot-core runtime around the callable — the same
+    policy a live Python driver shell must follow.
+    """
+    return call_on_ambient_runtime(
+        partial(
+            verify_touched_positions_on_chain,
+            database_path=database_path,
+            rpc_url=rpc_url,
+            market_id=1,
+            chain_id=1,
+            block_number=FIXTURE_BLOCK,
+            touched_users=None,
+        )
+    )
+
+
 def _corrupt_balance(rust_path: str, user_address: str, new_balance: int) -> None:
     """Mutate the SENDER's collateral position balance to `new_balance` in
     the DB. Used by the RED case to simulate a regression that left the DB
@@ -267,14 +291,7 @@ def test_verify_touched_positions_on_chain_catches_corrupted_balance(
         # introduced in EARLIER chunks surface before their
         # crash-cycle chunk commits). The touched-filter would miss p534
         # here (it wasn't touched in THIS chunk).
-        divergences = verify_touched_positions_on_chain(
-            database_path=str(rust_path),
-            rpc_url=rpc_url,
-            market_id=1,
-            chain_id=1,
-            block_number=FIXTURE_BLOCK,
-            touched_users=None,
-        )
+        divergences = _verify_all(str(rust_path), rpc_url)
 
         if corrupt_db:
             # RED — the gate surfaces the SENDER's collateral balance
@@ -507,14 +524,7 @@ def test_liquidation_burn_side_pair_single_debit(
         )
 
         # The verify gate fires for ALL nonzero positions (verify-all mode).
-        divergences = verify_touched_positions_on_chain(
-            database_path=str(rust_path),
-            rpc_url=rpc_url,
-            market_id=1,
-            chain_id=1,
-            block_number=FIXTURE_BLOCK,
-            touched_users=None,
-        )
+        divergences = _verify_all(str(rust_path), rpc_url)
 
         # GREEN: zero divergences (DB balance == on-chain truth).
         bal_divs = [d for d in divergences if d["field"] == "balance"]

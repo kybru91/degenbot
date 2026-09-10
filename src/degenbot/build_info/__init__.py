@@ -90,7 +90,9 @@ def read_receipt() -> Receipt | None:
         The `Receipt`, or None when unavailable.
 
     """
-    receipt_path = Path(__file__).resolve().parents[2] / _COUNTER_NAME
+    # src/degenbot/build_info/__init__.py -> parents[3] = the repo root (the
+    # receipt lives next to the Rust sources it fingerprints).
+    receipt_path = Path(__file__).resolve().parents[3] / _COUNTER_NAME
     try:
         tokens = receipt_path.read_text().split()
         count = int(tokens[0])

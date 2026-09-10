@@ -62,7 +62,7 @@ from degenbot.version import __version__
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from degenbot._ffi import BlockStream
+    from degenbot._ffi import BlockStream, IntakeReceipt
     from degenbot.builders.protocol import PoolBuilder
     from degenbot.erc20.erc20 import Erc20Token
     from degenbot.types.abstract.liquidity_pool import AbstractLiquidityPool
@@ -334,7 +334,7 @@ class Bot:
         """
         return self._py_bot.registration_fleet_hosted()
 
-    def submit_registration_unit(self, fn: object) -> object:
+    def submit_registration_unit(self, fn: object) -> IntakeReceipt:
         """Submit ONE registration-intake unit for fleet-seat execution.
 
         The receipt exposes ``done()`` / ``result()`` / ``wait()`` /

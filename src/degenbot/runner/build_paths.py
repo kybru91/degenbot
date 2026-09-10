@@ -220,7 +220,7 @@ class _SeatVerifyClaims:
         self._lock = threading.Lock()
         self._claims: dict[str, _SeatVerifyClaims._Claim] = {}
 
-    def run_exclusive(self, key: str, run: Callable[[], None]) -> None:
+    def run_exclusive(self, key: str, run: Callable[[], object]) -> None:
         """Run ``run()`` at most once per live claim window; peers wait it."""
         with self._lock:
             claim = self._claims.get(key)
@@ -592,11 +592,12 @@ class PathRegistrationPipeline:
                     # V2 needs no lifecycle; mirror the retired
                     # register_v2_pool diagnostic (asymmetric-fee warning) —
                     # the key cache itself is the OPERATOR surface's state.
-                    if pool._fee_token0 != pool._fee_token1:  # ruff:ignore[private-member-access]
+                    v2_pool = cast("UniswapV2Pool", pool)
+                    if v2_pool._fee_token0 != v2_pool._fee_token1:  # ruff:ignore[private-member-access]
                         bot_logger.warning(
-                            f"Asymmetric V2 fees detected for {pool.address} "
-                            f"(fee_token0={pool._fee_token0}, "  # ruff:ignore[private-member-access]
-                            f"fee_token1={pool._fee_token1}).",  # ruff:ignore[private-member-access]
+                            f"Asymmetric V2 fees detected for {v2_pool.address} "
+                            f"(fee_token0={v2_pool._fee_token0}, "  # ruff:ignore[private-member-access]
+                            f"fee_token1={v2_pool._fee_token1}).",  # ruff:ignore[private-member-access]
                         )
                 elif pt == "V3":
                     # DMZ3DD seat twin: at-most-once verify per pool address.
@@ -605,14 +606,15 @@ class PathRegistrationPipeline:
                         lambda pool=pool, reg=reg: reg.run_v3_verify_lifecycle_sync(pool.address),
                     )
                 elif pt == "V4":
+                    v4_pool = cast("UniswapV4Pool", pool)
                     self._verify_claims.run_exclusive(
-                        f"v4:{to_0x_hex(pool.pool_id)}",
-                        lambda pool=pool, reg=reg, policy=self.retry_policy_obj: (
+                        f"v4:{to_0x_hex(v4_pool.pool_id)}",
+                        lambda v4_pool=v4_pool, reg=reg, policy=self.retry_policy_obj: (
                             retry_verification_call(
                                 policy,
                                 reg.run_v4_verify_lifecycle_sync,
                                 UNISWAP_V4_POOL_MANAGER_ADDRESS,
-                                to_0x_hex(pool.pool_id),
+                                to_0x_hex(v4_pool.pool_id),
                             )
                         ),
                     )
@@ -913,7 +915,7 @@ class PathRegistrationPipeline:
 
         receipt = self.constr_bot.submit_registration_unit(_unit)
         await receipt.wait_async()
-        self._absorb_outcome(receipt.result())
+        self._absorb_outcome(cast("RegistrationUnitOutcome", receipt.result()))
 
     def _absorb_outcome(self, outcome: RegistrationUnitOutcome) -> None:
         """Fold one unit outcome into the summary counters (driver-side).
@@ -939,7 +941,7 @@ class PathRegistrationPipeline:
             return
         if outcome.kind == "register-fail":
             self.register_fail_count += 1
-            self._record_skip(outcome.tag, detail=outcome.detail)
+            self._record_skip(outcome.tag or "register-fail", detail=outcome.detail)
             if self.register_fail_count <= 5:
                 bot_logger.warning(f"Path registration failed: {outcome.detail}")
             return

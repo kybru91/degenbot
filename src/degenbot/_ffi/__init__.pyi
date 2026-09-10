@@ -109,6 +109,24 @@ from .submission import (
 # optional `0x` prefix), `bytes`, `bytearray`, or `str` (hex); return `bytes`.
 # Truncated/invalid back-references surface as `ValueError`. The Python
 # companion `degenbot.utils.solady.libzip` delegates here (sub-step C routing).
+def call_on_ambient_runtime(fn: object) -> object:
+    """Call ``fn()`` on the calling thread, sharing the core runtime.
+
+    The verify seams read the caller's ambient tokio runtime and refuse to
+    build a per-call runtime; Rust consumers run on it natively, so a
+    Python driver wraps its verify-seam call in this helper to supply the
+    ambient runtime. The shared runtime singleton is created on first use
+    and the enter guard is held for the duration of the call.
+
+    Args:
+        fn: A zero-argument callable; its return value (or exception) is
+            passed through unchanged.
+
+    Returns:
+        Whatever ``fn`` returns.
+
+    """
+
 def build_fingerprint() -> str: ...
 def build_number() -> int: ...
 def build_path_graph(
@@ -635,7 +653,7 @@ class Bot:
         The driver reads this ONCE at pipeline construction.
         """
 
-    def submit_registration_unit(self, fn: object) -> PyIntakeReceipt:
+    def submit_registration_unit(self, fn: object) -> IntakeReceipt:
         """Submit one pool-build callable to the fleet intake (PRG-3).
 
         The callable runs on a pooled `work-fleet-poolupd-{n}` seat; the
