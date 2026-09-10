@@ -459,16 +459,12 @@ mod fleet_stance_tests {
     }
 
     /// The typed config flips the engine's construction-time stance field.
-    /// The construction static is process-global and other engine tests
-    /// construct with the legacy default concurrently, so the harness
-    /// retries the install→construct→observe triple until it observes a
-    /// consistent read (any interleaving where the static survives the
-    /// window proves the wiring).
+    /// Construction reads the CALLER's own cfg (J4HN66): no retry loop, no
+    /// global restore — a parallel construction can never race us.
     #[test]
     fn fleet_stance_probe_flips_with_typed_config() {
         use crate::arb_engine::ArbitrageEngine;
         use std::sync::Arc;
-        use std::time::{Duration, Instant};
 
         // Default (legacy): the per-era mechanisms stand.
         let legacy = ArbitrageEngine::with_core_cfg(
@@ -479,32 +475,20 @@ mod fleet_stance_tests {
         );
         assert_eq!(legacy.fleet_stance_probe(), "legacy");
 
-        // Fleet: the typed enum, parsed once at construction.
+        // Fleet: the typed enum, packed at construction from the caller's
+        // own cfg.
         let mut cfg = degenbot_config::BotConfig::default();
         cfg.fleet.stance = degenbot_config::FleetStance::Fleet;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut observed = "legacy".to_string();
-        while Instant::now() < deadline {
-            let fleet = ArbitrageEngine::with_core_cfg(
-                Arc::new(crate::bot_core::state_lock::StateLock::new(
-                    crate::bot_core::BotState::new(),
-                )),
-                &Arc::new(cfg.clone()),
-            );
-            observed = fleet.fleet_stance_probe().to_string();
-            if observed == "fleet" {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let fleet = ArbitrageEngine::with_core_cfg(
+            Arc::new(crate::bot_core::state_lock::StateLock::new(
+                crate::bot_core::BotState::new(),
+            )),
+            &Arc::new(cfg),
+        );
         assert_eq!(
-            observed, "fleet",
+            fleet.fleet_stance_probe(),
+            "fleet",
             "fleet.stance=fleet must reach the engine"
         );
-        // Restore the process-wide construction static so concurrently
-        // running engine tests keep the legacy default posture (the fleet
-        // boot descriptor stays installed — installing twice is a no-op).
-        crate::arb_engine::solver_dispatch::SOLVE_FLEET_HOSTED
-            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }

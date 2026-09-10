@@ -588,6 +588,16 @@ impl ArbitrageEngine {
         core: Arc<StateLock<BotState>>,
         cfg: &std::sync::Arc<::degenbot_config::BotConfig>,
     ) -> Self {
+        // J4HN66 (epic 64ZQLA): construction stances come from the CALLER's
+        // own cfg — never from an install-then-read process static. A
+        // parallel construction flips such a static between our install and
+        // a global read (TOCTOU): fleet-stance tests had to retry on a
+        // 5 s loop, and every construction raced its engine-external state.
+        // The install call below remains for its process projections (fleet
+        // boots; the stance statics other consumers observe).
+        let fleet_hosted = solver_dispatch::fleet_stance_enabled(cfg);
+        let streaming_delivery = cfg.pump.streaming_delivery;
+        let detached_solving = !cfg!(test) && cfg.solve.detached_solves;
         solver_dispatch::install_engine_stances(cfg);
         Self {
             cfg: std::sync::Arc::clone(cfg),
@@ -615,10 +625,8 @@ impl ArbitrageEngine {
             resolved_update_snapshot: HashMap::new(),
             last_walk_sims: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             last_gate_us: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            fleet_hosted: solver_dispatch::SOLVE_FLEET_HOSTED
-                .load(std::sync::atomic::Ordering::Relaxed),
-            streaming_delivery: solver_dispatch::STREAMING_DELIVERY_ENABLED
-                .load(std::sync::atomic::Ordering::Relaxed),
+            fleet_hosted,
+            streaming_delivery,
             #[cfg(test)]
             test_solve_delay: None,
             #[cfg(test)]
@@ -630,8 +638,7 @@ impl ArbitrageEngine {
             paths_same_state_this_cycle: 0,
             delivery: DeliveryPolicy::default(),
             phase: std::sync::atomic::AtomicU8::new(EnginePhase::Created as u8),
-            detached_solving: solver_dispatch::DETACHED_SOLVES_ENABLED
-                .load(std::sync::atomic::Ordering::Relaxed),
+            detached_solving,
             detached_seq_ctr: 0,
             detached_issued_seq: 0,
             event_buffer_expiry_enabled: false,

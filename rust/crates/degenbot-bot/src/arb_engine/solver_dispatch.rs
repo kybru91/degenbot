@@ -197,12 +197,11 @@ pub(crate) static STREAMING_DELIVERY_ENABLED: std::sync::atomic::AtomicBool =
 
 /// ADR-042 Q6 migration stance: `fleet.stance=fleet` routes the solve fan-
 /// out (detached AND in-cycle arms) through the degenbot-workers fleet —
-/// the fleet becomes the sole executor of solve bins. Parsed ONCE at
-/// engine construction ([`install_engine_stances`]); the hot path reads
-/// the engine's construction-time field, never this static directly.
-pub(crate) static SOLVE_FLEET_HOSTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
+/// the fleet becomes the sole executor of solve bins. Construction reads
+/// the CALLER's OWN cfg (`fleet_stance_enabled`, J4HN66) — never a
+/// process-wide install-window static: a parallel construction could flip
+/// such a static between the engine's install and read (TOCTOU).
+///
 /// `fleet.stance` → hosting decision (ADR-042 Q6: `legacy` keeps the
 /// per-era mechanisms; `fleet` hosts Solver (and the Merge sidecar role)
 /// on the role-switching fleet). Typed enum, so both stances are explicit.
@@ -219,10 +218,9 @@ pub(crate) fn fleet_stance_enabled(cfg: &::degenbot_config::BotConfig) -> bool {
 /// policy makes that safe). Opt OUT with `DEGENBOT_DETACHED_SOLVES=0` (the
 /// in-cycle arm reappears, engine Mutex held through the fan-out). The
 /// in-flight cap remains the safety valve when the merge sidecar lags
-/// (construction-time stance like the executor field — never read at call time).
-pub(crate) static DETACHED_SOLVES_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
+/// (construction-time stance: every engine packs the caller's OWN cfg
+/// value at construction — never a process-wide static, J4HN66).
+///
 /// `DEGENBOT_DETACHED_SOLVES` parse (2UVG3E default flip): unset/empty/1/
 /// unknown values all route DETACHED (the shipped posture — the solve path
 /// takes no engine-level Mutex); only an explicit 0/false/off opts back into
@@ -294,7 +292,6 @@ pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
     // bins ride the fleet-hosted executor; the typed boot descriptor
     // (quota + overrides + posture) is parsed here once.
     let fleet_hosted = fleet_stance_enabled(cfg);
-    SOLVE_FLEET_HOSTED.store(fleet_hosted, std::sync::atomic::Ordering::Relaxed);
     if fleet_hosted {
         let boot = degenbot_workers::dispatcher::FleetBoot::from_config(cfg);
         crate::arb_engine::fleet_solve_executor::install_boot(boot);
@@ -310,14 +307,9 @@ pub fn install_engine_stances(cfg: &::degenbot_config::BotConfig) {
         cfg.pump.streaming_delivery,
         std::sync::atomic::Ordering::Relaxed,
     );
-    DETACHED_SOLVES_ENABLED.store(
-        // 2UVG3E production default: detached (schema default true). In test
-        // builds the engine suite was written for the synchronous in-cycle
-        // arm — deterministic IN-CYCLE default there; detached tests opt in
-        // per-test via `set_detached_solving(true)`.
-        !cfg!(test) && cfg.solve.detached_solves,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // J4HN66: streaming/detached stances are per-engine cfg values now
+    // (packed at construction); this install keeps only the statics that
+    // still have non-construction consumers (STREAMING; INLINE_SIM).
     INLINE_SIM_ENABLED.store(
         cfg.solve.solve_inline_sim,
         std::sync::atomic::Ordering::Relaxed,
