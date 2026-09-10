@@ -142,6 +142,16 @@ export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
 # source / Cargo.toml is newer than the installed build).
 BOT_CMD=(uv run python examples/eth_settlement_arbitrage_v2_v3_v4_rust.py)
 
+# Print the EFFECTIVE chain-1 RPC URIs — exactly what the bot's cascade
+# (degenbot.config.resolve_rpc_uris: CLI > OS env > config.toml) will resolve —
+# into console + log BEFORE the first provider call. A later-applied shell
+# export can shadow the devcontainer containerEnv (the resolver reads
+# os.environ), and this surfaces such a stomp immediately instead of as a
+# connection-refused chain-ID failure (2026-09-10 incident).
+log_resolved_rpcs() {
+    uv run python -c 'from degenbot.config import resolve_rpc_uris as _r; _h, _w = _r(1); print(f"[runner] resolved rpc http={_h} ws={_w}")' 2>/dev/null | tee -a "$LOG" >&2 || true
+}
+
 start() {
     if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
         echo "[runner] bot already running (pid $(cat "$PIDFILE"))" >&2
@@ -149,6 +159,7 @@ start() {
     fi
     : > "$LOG"
     : > "$PIDFILE"
+    log_resolved_rpcs
     # setsid: new session + no controlling terminal, so the launching shell
     # can exit without the pump dying (SIGHUP) and the tool shell's return
     # isn't entangled with the bot's life. exec is NOT used so `$!` is the
@@ -192,6 +203,7 @@ foreground() {
     : > "$LOG"
     : > "$PIDFILE"
     echo "[runner] starting bot $(date -Is)" | tee -a "$LOG" >&2
+    log_resolved_rpcs
     # Bot output goes to the log by direct fd redirection — authoritative and
     # immune to a closing console (no `tee` pipeline to SIGPIPE and drop the
     # tail). The console is only a live mirror fed by `tail -f`.

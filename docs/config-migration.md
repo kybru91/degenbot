@@ -65,7 +65,17 @@ jaeger_endpoint = "http://localhost:4318"
 [failure_policy]  # unchanged, still free-form
 ```
 
-with the Python-domain settings supplied through the environment (`DEGENBOT_RPC_HTTP_CHAINID_1=http://localhost:8545`) or the Python config cascade (`BotConfig(database=…, rpc={1: "http://localhost:8545"}, default_chain_id=1)`).
+with the Python-domain settings supplied through the environment (`DEGENBOT_RPC_HTTP_CHAINID_1=http://localhost:8545` — a HOST-machine example; in the devcontainer, see the CAUTION below) or the Python config cascade (`BotConfig(database=…, rpc={1: "http://localhost:8545"}, default_chain_id=1)`).
+
+CAUTION (2026-09-10 incident): inside the degenbot devcontainer, do NOT export these
+`DEGENBOT_RPC_*` names from a shell rc file (`.bashrc` etc.), and do not use
+`localhost:8545` there. `devcontainer.json` `containerEnv` already bakes the
+container-correct URIs — `http://host.containers.internal:8545` and
+`ws://host.containers.internal:8546` — into the container environment, and
+`resolve_rpc_uris` reads `os.environ`, so a later rc-file export silently wins and
+points the bot at the container's own loopback, where nothing listens (connection
+refused at the first `eth_chainId` call). Override endpoints in-container via the
+CLI (`--node-http` / `--node-ws`) or by editing `devcontainer.json` and rebuilding.
 
 Boot behavior: a surviving retired item fails the load and the process exits 2 with a message like
 
