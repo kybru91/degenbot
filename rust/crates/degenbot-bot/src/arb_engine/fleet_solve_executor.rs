@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 
 use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, Unit};
-use degenbot_workers::lane::{EscalationPort, LaneCtx, QuitSig};
+use degenbot_workers::lane::{LaneCtx, QuitSig};
 use degenbot_workers::role::WorkerRole;
 use degenbot_workers::slot::PinKey;
 
@@ -322,7 +322,11 @@ fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, seats: &[mpsc::Sende
             let ctx = LaneCtx {
                 pin: unit.key.unwrap_or(0),
                 arena,
-                escalation: EscalationPort,
+                // LW-T3 (Seam C): the injected default escalation port (the
+                // inline-sim runtime, registered at hook install) — lanes
+                // without one are refused TYPED at escalate, never dropped.
+                escalation: degenbot_workers::lane::default_escalation_port()
+                    .unwrap_or_else(degenbot_workers::lane::no_escalation_port),
                 quit: QuitSig,
             };
             let job = SeatJob {
@@ -563,6 +567,7 @@ pub(crate) use lane_scaffold::{run_solve_lane, LaneOutcome, SolveLane};
 #[expect(clippy::expect_used)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use degenbot_solvers::mixed::SolvePathResult;
@@ -570,7 +575,9 @@ mod tests {
     use degenbot_workers::dispatcher::{
         AbortingPolicy, ArenaToken, FleetBoot, PanicAction, PanicVerdict, SeatSurvivesPolicy,
     };
-    use degenbot_workers::lane::LaneCtx;
+    use degenbot_workers::lane::{
+        install_default_escalation_port, EscalationError, EscalationPort, EscalationWork, LaneCtx,
+    };
     use degenbot_workers::posture::PosturePolicy;
 
     use super::super::solver_dispatch::executor_ab_probe::{
@@ -815,7 +822,7 @@ mod tests {
         for _cycle in 0..2 {
             let observed = Arc::clone(&observed);
             executor.submit_solve_bin(0, move |ctx| {
-                observed.lock().push(*ctx);
+                observed.lock().push(ctx.clone());
             });
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -853,7 +860,136 @@ mod tests {
         );
     }
 
-    // ---- QR3NUS (Seam D): exact per-unit outcome accounting -------------------
+    // ---- LW-T3 (Seam C): escalation port — self-contained I/O lane ----------
+
+    /// A TEST escalation port: a dedicated single-thread tokio runtime owned
+    /// by its own pump thread (a self-contained capability lane, never the
+    /// caller's CPU seat) — the shape of the default impl (the inline-sim
+    /// runtime); the pyo3 default impl is feature-gated, so the lane
+    /// contract is pinned here at the seam.
+    struct ThreadLanePort {
+        tx: std::sync::mpsc::Sender<(EscalationWork, degenbot_workers::lane::FinishOnDrop)>,
+        gate: Arc<degenbot_workers::lane::EscalationGate>,
+    }
+
+    impl ThreadLanePort {
+        fn spawn(budget: usize) -> Self {
+            let (tx, rx) =
+                std::sync::mpsc::channel::<(EscalationWork, degenbot_workers::lane::FinishOnDrop)>(
+                );
+            let gate = degenbot_workers::lane::EscalationGate::new(budget);
+            std::thread::Builder::new()
+                .name("test-escalation-lane".to_owned())
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("escalation lane runtime");
+                    for (work, permit) in rx {
+                        runtime.block_on(work);
+                        drop(permit);
+                    }
+                })
+                .expect("escalation lane pump thread");
+            Self { tx, gate }
+        }
+    }
+
+    impl EscalationPort for ThreadLanePort {
+        fn escalate(&self, work: EscalationWork) -> Result<(), EscalationError> {
+            let permit = self.gate.begin()?;
+            if self.tx.send((work, permit)).is_err() {
+                return Err(EscalationError::PortClosed);
+            }
+            Ok(())
+        }
+
+        fn counters(&self) -> degenbot_workers::lane::EscalationCountersSnapshot {
+            self.gate.counters()
+        }
+    }
+
+    /// LW-T3 (Seam C, reth research §7): escalation is a SELF-CONTAINED I/O
+    /// lane — a bin escalates its cold-miss work through its `LaneCtx`
+    /// while EVERY solver seat is mid-unit, and the escalations complete on
+    /// the port lane (never on a solver seat: CPU cannot starve I/O).
+    #[test]
+    fn escalations_complete_while_all_solver_seats_are_mid_unit() {
+        install_default_escalation_port(Arc::new(ThreadLanePort::spawn(8)));
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let seats = executor.bin_count();
+        let completed: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+        let failures: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+        let after_drained: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+        let lane_threads: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let seats_done: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+        for bin in 0..seats {
+            let completed = Arc::clone(&completed);
+            let failures = Arc::clone(&failures);
+            let after_drained = Arc::clone(&after_drained);
+            let lane_threads = Arc::clone(&lane_threads);
+            let seats_done = Arc::clone(&seats_done);
+            executor.submit_solve_bin(bin, move |ctx| {
+                // The bin escalates its cold-miss work while MID-UNIT — the
+                // escalation must NOT run on this seat (CPU) but on the
+                // port's own lane.
+                let occupied_seats = Arc::clone(&seats_done);
+                if ctx
+                    .escalate(Box::pin(async move {
+                        // STARVATION CHECK: an escalation completing only
+                        // after all seats drained would be CPU starvation by
+                        // another name.
+                        if occupied_seats.load(Ordering::Relaxed)
+                            == u64::try_from(seats).unwrap_or(0)
+                        {
+                            after_drained.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let name = std::thread::current()
+                            .name()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| "<unnamed>".to_owned());
+                        lane_threads.lock().push(name);
+                        completed.fetch_add(1, Ordering::Relaxed);
+                    }))
+                    .is_err()
+                {
+                    failures.fetch_add(1, Ordering::Relaxed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                seats_done.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while seats_done.load(Ordering::Relaxed) < u64::try_from(seats).unwrap_or(0) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "seats did not drain the escalation probe units in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            failures.load(Ordering::Relaxed),
+            0,
+            "escalations through the LaneCtx port must succeed (typed errors are the only failure mode)"
+        );
+        assert_eq!(
+            completed.load(Ordering::Relaxed),
+            u64::try_from(seats).unwrap_or(0),
+            "every escalated cold-miss work item must COMPLETE while its seat is mid-unit"
+        );
+        assert_eq!(
+            after_drained.load(Ordering::Relaxed),
+            0,
+            "no escalation may complete only after the seats drained (CPU starvation)"
+        );
+        for lane in lane_threads.lock().iter() {
+            assert_ne!(
+                lane.strip_prefix("work-fleet-solver"),
+                Some(""),
+                "escalated work must NEVER run on a solver seat: {lane}"
+            );
+        }
+    }
 
     /// Test verdict double (decision A): records every (unit, seat)
     /// consultation and prescribes RecordAndContinue — never a real abort.

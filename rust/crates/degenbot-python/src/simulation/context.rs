@@ -202,9 +202,15 @@ impl crate::bot::engine::PyArbitrageEngine {
             bot_state,
             warm_cache,
         );
+        // LW-T3 (Seam C): the inline-sim runtime registers itself as the
+        // DEFAULT escalation port at hook install — escalated lane work
+        // drives on THIS runtime, never on CPU seats; the cold-miss budget
+        // ceiling is visible at the port's gauge surface.
+        let escalation_port = hook.escalation_port();
         self.with_engine_mut(py, |e| {
             e.set_inline_simulator(std::sync::Arc::new(hook));
         });
+        degenbot_workers::lane::install_default_escalation_port(escalation_port);
         // The soak's hook-wiring tell — one line at install, matching the
         // `[solve-phase] cycle complete` inline.* fields it pairs with.
         tracing::info!(

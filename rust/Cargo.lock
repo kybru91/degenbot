@@ -2565,6 +2565,7 @@ dependencies = [
  "degenbot-solvers",
  "degenbot-submission",
  "degenbot-uniswap",
+ "degenbot-workers",
  "futures-util",
  "hashbrown 0.17.1",
  "log",
