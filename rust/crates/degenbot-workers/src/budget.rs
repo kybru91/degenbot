@@ -74,6 +74,10 @@ pub struct BudgetOverrides {
     pub sim_slot_cap: Option<usize>,
     /// `fleet.pool_state_updater_slots` — `PoolStateUpdater` slot count.
     pub pool_state_updater_slots: Option<usize>,
+    /// Solve headroom `H_s` in the seat formula `floor(Q) − H_s` (the
+    /// documented floor-allocation constant; LW-T4 makes it an explicit
+    /// boot-authority input).
+    pub solve_headroom: Option<usize>,
 }
 
 impl BudgetOverrides {
@@ -87,6 +91,10 @@ impl BudgetOverrides {
             solver_cpus: cfg.fleet.solver_cpus.and_then(|v| u64::try_from(v).ok()),
             sim_slot_cap: cfg.fleet.sim_slot_cap,
             pool_state_updater_slots: cfg.fleet.pool_state_updater_slots,
+            // The typed config key for solve_headroom lands at the T8 surface
+            // (JI275C — noted by TZ2ACJ); until then the documented constant
+            // rules.
+            solve_headroom: None,
         }
     }
 }
@@ -111,7 +119,10 @@ pub enum BudgetError {
     #[error(
         "fractional quota {quota:.2} below the pinned-role floor of {required} cores \
          (reserve H + ambient A + resolve R + merge M + the 2-core Solver minimum); \
-         the fleet cannot host the pinned latency roles there"
+         the fleet cannot host the pinned latency roles there — the \
+         serial/sequential fallback DECISION POINT is here (reth \
+         has_enough_parallelism(): lane capability is explicit, never silently \
+         narrower); the fallback arm itself is a DOWNSTREAM decision (LW-T7)"
     )]
     QuotaTooSmallForPinnedRoles {
         /// The fractional quota (cores).
@@ -325,6 +336,9 @@ fn derive_table(quota_cpus: f64, overrides: &BudgetOverrides) -> Result<FleetBud
     }
 
     let sim_slot_cap = overrides.sim_slot_cap.unwrap_or(DEFAULT_SIM_SLOT_CAP);
+    let solve_headroom = overrides
+        .solve_headroom
+        .unwrap_or(degenbot_core::cpu_budget::DEFAULT_SOLVE_HEADROOM);
     let pool_state_updater_slots = overrides
         .pool_state_updater_slots
         .unwrap_or(DEFAULT_POOL_STATE_UPDATER_SLOTS);
@@ -346,7 +360,7 @@ fn derive_table(quota_cpus: f64, overrides: &BudgetOverrides) -> Result<FleetBud
         // Walk admission stays the share S — a gated bin parks (§5).
         solver_pin_count: usize::try_from(quota_floor)
             .unwrap_or(usize::MAX)
-            .saturating_sub(degenbot_core::cpu_budget::DEFAULT_SOLVE_HEADROOM)
+            .saturating_sub(solve_headroom)
             .max(1),
         sim_slot_cap,
         pool_state_updater_slots,
@@ -425,6 +439,141 @@ mod tests {
         assert!((b.fractional_remainder - 0.5).abs() < 1e-9);
         assert_eq!(b.solver_cpus, 2);
         assert_eq!(b.solver_pin_count, 4);
+    }
+
+    // ---- LW-T4 (Seam A+G1): boot authority — quota-derived sizing, no ambient fallback
+
+    /// The documented floor-allocation formula is the SOLE seat authority:
+    /// `pins == floor(Q) − solve_headroom` (floored at 1) with the shares
+    /// and the fractional remainder derived from the SAME quota — over the
+    /// matrix quota × headroom, under INJECTED quotas only (no detector may
+    /// run in tests): the test passes host-hardware-independently (cgroup-
+    /// limited CI and a bare host alike). A quota below the capacity floor
+    /// refuses TYPED, naming the floor and the serial/sequential fallback
+    /// decision point — never a silently narrower lane.
+    #[test]
+    fn seat_count_is_quota_headroom_derived_under_the_documented_formula_only() {
+        for quota in [1.0_f64, 1.5, 4.0, 8.0, 24.0] {
+            for headroom in [1_usize, 2] {
+                let overrides = BudgetOverrides {
+                    solve_headroom: Some(headroom),
+                    ..overrides()
+                };
+                let q_floor = quota.max(1.0).floor() as u64;
+                // Boot OR refuse, never a silent mis-size: the pinned-role
+                // floor (H+A+R+M+2) and the headroom+1 floor both refuse
+                // TYPED, naming the floor and the serial fallback point.
+                let b = match FleetBudget::derive(quota, &overrides) {
+                    Ok(b) => b,
+                    Err(err @ BudgetError::QuotaTooSmallForPinnedRoles { .. }) => {
+                        let msg = err.to_string();
+                        assert!(
+                            msg.contains(&format!("{q_floor} numerically"))
+                                || msg.contains("pinned-role floor"),
+                            "the capacity-floor error must name the floor: {msg}"
+                        );
+                        assert!(
+                            msg.contains("serial/sequential"),
+                            "the typed floor error must name the serial/sequential fallback decision point (reth has_enough_parallelism): {msg}"
+                        );
+                        continue;
+                    }
+                    Err(other) => {
+                        panic!("unexpected typed refusal at quota {quota}: {other}")
+                    }
+                };
+                assert!(
+                    q_floor >= u64::try_from(headroom).unwrap_or(0) + 1,
+                    "a quota below headroom+1 must have taken the typed floor arm above"
+                );
+                assert_eq!(
+                    b.solver_pin_count as u64,
+                    q_floor
+                        .saturating_sub(u64::try_from(headroom).unwrap_or(0))
+                        .max(1),
+                    "seat count must be f(quota, headroom): quota {quota}, headroom {headroom}"
+                );
+                assert_eq!(
+                    b.declared_sum(),
+                    q_floor,
+                    "the integer share sum must be exactly floor(Q)"
+                );
+                assert_eq!(
+                    b.fractional_remainder,
+                    quota - q_floor as f64,
+                    "the fractional remainder is Q − floor(Q), spendable only by I/O"
+                );
+            }
+        }
+    }
+
+    /// LW-T4 (reth research lesson-4): the boot authority never falls back to
+    /// ambient host state — `available_parallelism` must not appear in the
+    /// sizing paths (the DETECTION ceilings live in degenbot-core / quota.rs;
+    /// the seat authority floors purely from the injected quota). This is a
+    /// DELIBERATE regular-expression tripwire mirroring the pyo3-free
+    /// dependency assertion — replace it with a behavioral assertion if
+    /// budget.rs ever sizes off a parameterizable source instead of the
+    /// injected quota.
+    #[test]
+    fn seat_sizing_never_reads_ambient_parallelism() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/budget.rs"))
+            .expect("crate source readable");
+        // Scan ONLY the lib code: the tests module legitimately names the
+        // identifier (this assertion's own text).
+        let lib = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the lib segment always exists");
+        assert!(
+            !lib.contains("available_parallelism"),
+            "the boot authority must never size lanes off ambient parallelism (reth lesson-4)"
+        );
+    }
+
+    /// LW-T4: oversubscription is TYPED at boot (derive returns the error —
+    /// `abort_executor` is reserved for RUNTIME strand abandonment only)
+    /// and the message names BOTH numbers (declared sum AND quota floor).
+    #[test]
+    fn oversubscription_is_typed_at_boot_and_names_both_numbers() {
+        let err = FleetBudget::derive(
+            8.0,
+            &BudgetOverrides {
+                ambient_io_workers: Some(2),
+                solver_cpus: Some(4),
+                ..overrides()
+            },
+        )
+        .expect_err("H1+A2+R1+M1+S4 = 9 > 8");
+        assert!(matches!(err, BudgetError::Oversubscribed { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("9"),
+            "the message must name the declared sum: {msg}"
+        );
+        assert!(
+            msg.contains("8"),
+            "the message must name the quota floor: {msg}"
+        );
+    }
+
+    /// LW-T4: quota below the capacity floor is a TYPED refusal naming the
+    /// floor and pointing at the serial/sequential fallback decision point
+    /// (reth `has_enough_parallelism()` lesson: lane capability is explicit,
+    /// never silently narrower). The fallback arm itself is LW-T7's.
+    #[test]
+    fn quota_below_the_capacity_floor_refuses_typed_naming_the_fallback_point() {
+        let err = FleetBudget::derive(2.0, &overrides())
+            .expect_err("quota 2.0 < the pinned-role floor must refuse typed");
+        assert!(matches!(
+            err,
+            BudgetError::QuotaTooSmallForPinnedRoles { .. }
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("serial"),
+            "the typed floor error must name the serial/sequential fallback decision point: {msg}"
+        );
     }
 
     #[test]
@@ -642,6 +791,7 @@ mod tests {
                     solver_cpus: Some(s),
                     sim_slot_cap: Some(sim),
                     pool_state_updater_slots: Some(psu),
+                    solve_headroom: None,
                 })
         }
 
