@@ -178,6 +178,36 @@ fn queue_overflow_is_loud_and_counted_never_silent() {
     assert_eq!(host.overflow_count(), 1);
 }
 
+/// LW-T5 (Seam E): precedence VISIBLE at the submit surface — sims and
+/// solves submitted together (seats idle) grant ALL sims before ANY solve
+/// (dispatcher doc §4 rule 2; T6 continuations still pin to their seats).
+#[test]
+fn submitting_sims_and_solves_together_grants_all_sims_before_any_solve() {
+    let mut host = host();
+    for i in 0..3u64 {
+        host.enqueue(Unit::noop(i + 20, WorkerRole::SimDriver, None))
+            .expect("sim submitted");
+    }
+    for i in 0..3u64 {
+        host.enqueue(Unit::noop(i + 40, WorkerRole::Solver, Some(i + 50)))
+            .expect("solve submitted");
+    }
+    let grants = host.dispatch();
+    assert_eq!(grants.len(), 6, "both kinds grant on idle seats");
+    let last_sim = grants
+        .iter()
+        .rposition(|(g, _)| g.kind == GrantKind::Sim)
+        .expect("sims granted");
+    let first_solve = grants
+        .iter()
+        .position(|(g, _)| g.kind != GrantKind::Sim)
+        .expect("solver grants present");
+    assert!(
+        last_sim < first_solve,
+        "ALL sims must grant before ANY solve (§4 rule 2): {grants:?}"
+    );
+}
+
 #[test]
 fn sim_before_solve_at_lease_time_and_solver_pins_first_via_continuations() {
     let mut host = host();

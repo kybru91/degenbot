@@ -21,10 +21,11 @@
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 
-use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, Unit};
+use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, SubmitError, Unit};
 use degenbot_workers::lane::{LaneCtx, QuitSig};
+use degenbot_workers::posture::{FleetPosture, PostureChange, ThrottleSample};
 use degenbot_workers::role::WorkerRole;
 use degenbot_workers::slot::PinKey;
 
@@ -83,7 +84,29 @@ struct SeatJob {
 /// done (completion drives T3 — the seat re-pins warm for the next cycle).
 enum HostMsg {
     Enqueue(Unit),
-    SeatDone { seat: u64 },
+    SeatDone {
+        seat: u64,
+    },
+    /// Posture observation feed (LW-T5, Seam E): a cgroup throttle sample
+    /// — the host's FSM applies it; the submit-seam MIRROR updates from
+    /// the verdict (the FSM itself is never re-worked from the surface).
+    Throttle {
+        now_ms: u64,
+        sample: ThrottleSample,
+    },
+}
+
+/// The submit-seam receipt (LW-T5, Seam E): a unit is NEVER dropped — the
+/// unbounded host backlog absorbs overflow (§10 ledger); the receipt TELLS
+/// the caller which path its unit took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubmitReceipt {
+    /// `true` = the role queue was already at cap when admitted: the unit
+    /// rides the unbounded host backlog and drains FIRST on the next pump.
+    /// ADVISORY under mirror lag (the host publishes the length
+    /// asynchronously): the FSM remains authoritative and no unit is ever
+    /// dropped either way — the bit names the resource the unit rides.
+    accepted_with_backlog: bool,
 }
 
 /// The fleet-hosted solve executor. Shared by all engine cycles (the
@@ -93,9 +116,54 @@ enum HostMsg {
 pub(crate) struct FleetSolveExecutor {
     tx: mpsc::Sender<HostMsg>,
     unit_seq: AtomicU64,
+    /// The submit-seam posture MIRROR (LW-T5, Seam E): the host thread
+    /// writes the FSM posture after every throttle observation; submit
+    /// consults THIS (never a unit body, never ambient) — the FSM itself
+    /// stays untouched.
+    posture: Arc<parking_lot::Mutex<FleetPosture>>,
+    /// The host thread stamps TRUE when an enqueue spilled to the
+    /// unbounded host backlog; submit stamps the receipt with (and resets)
+    /// the flag — the unit is never dropped (§10 ledger).
+    solver_queue_len: Arc<std::sync::atomic::AtomicUsize>,
     /// Seat count (read via [`FleetSolveExecutor::bin_count`] — the
     /// dispatch arms bin at exactly this count so every bin has a home).
     solver_seats: usize,
+}
+
+/// The production throttle poller's feed point (LW-T5, Seam E):
+/// STANCE-GATED — a header sample must NEVER boot the fleet executor
+/// under the legacy tokio stance (the common default): gate-off means
+/// the feed returns without touching the global static. Returns
+/// whether the sample was fed.
+pub(crate) fn feed_fleet_posture_sample(now_ms: u64, events: u64, throttled_usec: u64) -> bool {
+    if !super::solver_dispatch::fleet_stance_enabled(degenbot_config::holder::config()) {
+        return false;
+    }
+    let last_ms = LAST_HEADER_SAMPLE_MS.swap(now_ms, Ordering::Relaxed);
+    let elapsed_usec = if last_ms == 0 {
+        0
+    } else {
+        now_ms.saturating_sub(last_ms).saturating_mul(1_000)
+    };
+    global_fleet_solve_executor().observe_throttle(
+        now_ms,
+        ThrottleSample {
+            events,
+            throttled_usec,
+            elapsed_usec,
+        },
+    );
+    true
+}
+
+/// Probe: whether the GLOBAL fleet executor has booted (stance-gate
+/// evidence + observability: the legacy stance must never boot it from
+/// a header sample). Only meaningful in a test build (the lib never
+/// queries it; the gate-off test pins "gate-off ⇒ no boot").
+#[must_use]
+#[cfg(test)]
+pub(crate) fn global_executor_booted() -> bool {
+    FLEET_EXECUTOR.get().is_some()
 }
 
 impl FleetSolveExecutor {
@@ -122,6 +190,10 @@ impl FleetSolveExecutor {
             seat_senders.push(stx);
             seat_mailboxes.push(srx);
         }
+        // The submit mirror (LW-T5, Seam E) lives with the host thread and
+        // every executor handle shares the same cells.
+        let posture = Arc::new(parking_lot::Mutex::new(FleetPosture::Nominal));
+        let solver_queue_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // Census: `FleetHost::boot` registered every v1 role row. The seats
         // are the runtime behind the solver pins, named per
         // `WorkerRole::Solver::thread_name()` (work-fleet-solver-{n}).
@@ -142,9 +214,13 @@ impl FleetSolveExecutor {
                 abort_executor("solver seat spawn", &format!("{err:?}"));
             }
         }
+        let host_posture = Arc::clone(&posture);
+        let host_queue_len = Arc::clone(&solver_queue_len);
         let spawned = std::thread::Builder::new()
             .name("work-fleet-solver-host".to_string())
-            .spawn(move || host_loop(rx, host, &seat_senders));
+            .spawn(move || {
+                host_loop(rx, host, &seat_senders, &host_posture, &host_queue_len);
+            });
         if let Err(err) = spawned {
             abort_executor("fleet host thread spawn", &format!("{err:?}"));
         }
@@ -152,6 +228,8 @@ impl FleetSolveExecutor {
             tx,
             unit_seq: AtomicU64::new(0),
             solver_seats,
+            posture,
+            solver_queue_len,
         })
     }
 
@@ -165,22 +243,32 @@ impl FleetSolveExecutor {
 
     /// Submit one LPT bin job keyed to its bin — the ctx-less wrapper over
     /// [`FleetSolveExecutor::submit_solve_bin`] (the per-path result
-    /// closures don't need the seat ctx).
+    /// closures don't need the seat ctx). The production arms never
+    /// silently shrink under a cordon: a typed posture refusal here is a
+    /// LOUD abort (ADR-021 classify-and-stop); the serial/sequential
+    /// fallback arm is a downstream decision (LW-T7).
     pub(crate) fn spawn(&self, bin: usize, job: impl FnOnce() + Send + 'static) {
-        self.submit_solve_bin(bin, move |_ctx| job());
+        if let Err(err) = self.submit_solve_bin(bin, move |_ctx| job()) {
+            abort_executor(
+                "bin submission under posture",
+                &format!("{err} — the serial/sequential fallback arm is an LW-T7 decision"),
+            );
+        }
     }
 
     /// Submit one LPT bin job keyed to its bin; the seat hands the unit body
     /// a [`LaneCtx`] carrying the bin's pin key and warm arena identity
-    /// (LW-T2 Seam B). Never drops: the host-side backlog preserves the
-    /// legacy unbounded-mpsc semantics; a closed host channel (executor
+    /// (LW-T2 Seam B). The typed submit receipt never drops a unit (the
+    /// host-side backlog preserves the legacy unbounded-mpsc semantics);
+    /// posture refusals are TYPED at this seam (admission-side only —
+    /// running units are never preempted); a closed host channel (executor
     /// died) is a LOUD abort — a lost bin would strand its paths' per-path
     /// result sends forever (stranded pipe, §10).
     pub(crate) fn submit_solve_bin(
         &self,
         bin: usize,
         work: impl FnOnce(&LaneCtx) + Send + 'static,
-    ) {
+    ) -> Result<SubmitReceipt, SubmitError> {
         // The pins == bins invariant (P6YXA6), held at the submit seam: a
         // bin without a structural seat must abort HERE — with both numbers
         // in the message — instead of decaying into an FSM transition
@@ -197,8 +285,36 @@ impl FleetSolveExecutor {
             true,
             Box::new(work),
         );
+        // LW-T5 (Seam E): the posture consult AT the submit seam — a cordon
+        // refuses a NEW solver submission immediately (admission-side only;
+        // the running units' timeline is untouched and the FSM is never
+        // re-worked from the surface).
+        let observed_posture = *self.posture.lock();
+        if observed_posture != FleetPosture::Nominal {
+            return Err(SubmitError::PostureHeld {
+                posture: observed_posture,
+                role: WorkerRole::Solver,
+            });
+        }
         if self.tx.send(HostMsg::Enqueue(unit)).is_err() {
-            abort_executor("bin submission", "fleet host channel closed");
+            return Err(SubmitError::PortClosed);
+        }
+        Ok(SubmitReceipt {
+            // The receipt's backlog bit reads the host's queue MIRROR: at or
+            // over the cap, this unit rides the unbounded host backlog and
+            // drains FIRST on the next pump (§10 ledger) — never dropped, never
+            // silent.
+            accepted_with_backlog: self.solver_queue_len.load(Ordering::Relaxed)
+                >= self.solver_seats.saturating_mul(2),
+        })
+    }
+
+    /// Feed a throttle sample to the host posture (LW-T5, Seam E): the
+    /// production throttle poller and tests drive the SAME seam — the
+    /// verdict lands in the submit mirror on the host thread.
+    pub(crate) fn observe_throttle(&self, now_ms: u64, sample: ThrottleSample) {
+        if self.tx.send(HostMsg::Throttle { now_ms, sample }).is_err() {
+            abort_executor("posture observation", "fleet host channel closed");
         }
     }
 }
@@ -239,26 +355,40 @@ fn seat_loop(seat: u64, rx: mpsc::Receiver<SeatJob>, done: &mpsc::Sender<HostMsg
 /// Receiver's ownership moves into the spawned host thread — a borrow
 /// cannot cross the thread boundary.
 #[expect(clippy::needless_pass_by_value)]
-fn host_loop(rx: mpsc::Receiver<HostMsg>, mut host: FleetHost, seats: &[mpsc::Sender<SeatJob>]) {
+fn host_loop(
+    rx: mpsc::Receiver<HostMsg>,
+    mut host: FleetHost,
+    seats: &[mpsc::Sender<SeatJob>],
+    posture: &Arc<parking_lot::Mutex<FleetPosture>>,
+    solver_queue_len: &std::sync::atomic::AtomicUsize,
+) {
     let mut backlog: VecDeque<Unit> = VecDeque::new();
     while let Ok(msg) = rx.recv() {
-        apply_host_msg(&mut host, &mut backlog, msg);
+        apply_host_msg(&mut host, &mut backlog, msg, posture, solver_queue_len);
         pump(&mut host, &mut backlog, seats);
     }
 }
 
 /// Apply one submission or completion (both arrive on the single host
 /// channel — completions can never starve behind a blocking recv).
-fn apply_host_msg(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, msg: HostMsg) {
+fn apply_host_msg(
+    host: &mut FleetHost,
+    backlog: &mut VecDeque<Unit>,
+    msg: HostMsg,
+    posture: &Arc<parking_lot::Mutex<FleetPosture>>,
+    solver_queue_len: &std::sync::atomic::AtomicUsize,
+) {
     match msg {
         HostMsg::Enqueue(unit) => {
             // Pre-check capacity INSTEAD of failing enqueue: the host
             // thread owns every queue mutation, so the check is exact.
             // Units that do not fit spill to the backlog (unbounded, like
             // the legacy mpsc) and drain FIRST on the next pump — never
-            // dropped (§10 ledger).
+            // dropped (§10 ledger). The spill STAMPS the backlog mirror so
+            // a submit receipt honestly reports accepted-with-backlog.
             if host.queue_len(WorkerRole::Solver) >= host.queue_cap(WorkerRole::Solver) {
                 backlog.push_back(unit);
+                solver_queue_len.store(host.queue_len(WorkerRole::Solver), Ordering::Relaxed);
             } else if let Err(err) = host.enqueue(unit) {
                 // v1-active Solver units cannot hit RoleNotActive /
                 // MergeNeverQueued / PostureHeld; any such error is a
@@ -269,6 +399,20 @@ fn apply_host_msg(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, msg: HostM
         HostMsg::SeatDone { seat } => {
             if let Err(err) = host.complete(seat) {
                 abort_executor("seat completion (T3)", &err.to_string());
+            }
+            solver_queue_len.store(host.queue_len(WorkerRole::Solver), Ordering::Relaxed);
+        }
+        HostMsg::Throttle { now_ms, sample } => {
+            // LW-T5 (Seam E): the FSM owns the posture (slot surface is
+            // untouched); this MIRRORS the verdict into the submit seam.
+            match host.observe_throttle(now_ms, sample) {
+                PostureChange::Entered(_) => {
+                    *posture.lock() = FleetPosture::Cordoned;
+                }
+                PostureChange::Exited => {
+                    *posture.lock() = FleetPosture::Nominal;
+                }
+                PostureChange::Held => {}
             }
         }
     }
@@ -342,6 +486,11 @@ fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, seats: &[mpsc::Sende
         }
     }
 }
+
+/// The wall-ms of the last per-header cgroup throttle sample: the FSM
+/// needs each sample's poll interval (elapsed) and the `block_pump` poller
+/// samples on header cadence (LW-T5, Seam E).
+static LAST_HEADER_SAMPLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static FLEET_SOLVE_BOOT: OnceLock<FleetBoot> = OnceLock::new();
 static FLEET_EXECUTOR: OnceLock<FleetSolveExecutor> = OnceLock::new();
@@ -579,13 +728,15 @@ mod tests {
         install_default_escalation_port, EscalationError, EscalationPort, EscalationWork, LaneCtx,
     };
     use degenbot_workers::posture::PosturePolicy;
+    use degenbot_workers::posture::{FleetPosture, ThrottleSample};
 
     use super::super::solver_dispatch::executor_ab_probe::{
         load_corpus_fixture, probe_ctx, prod_lpt_bins,
     };
     use super::super::solver_dispatch::{solve_one_path, SolveArmOutcome};
     use super::lane_scaffold::{run_solve_lane, LaneFailure, LaneOutcome, SolveLane};
-    use super::{validate_bin_index, FleetSolveExecutor, SOLVE_BIN_KEY_BASE};
+    use super::WorkerRole;
+    use super::{validate_bin_index, FleetSolveExecutor, SubmitError, SOLVE_BIN_KEY_BASE};
 
     fn hermetic_boot() -> FleetBoot {
         FleetBoot {
@@ -821,9 +972,11 @@ mod tests {
         let observed: Arc<parking_lot::Mutex<Vec<LaneCtx>>> = Arc::default();
         for _cycle in 0..2 {
             let observed = Arc::clone(&observed);
-            executor.submit_solve_bin(0, move |ctx| {
-                observed.lock().push(ctx.clone());
-            });
+            executor
+                .submit_solve_bin(0, move |ctx| {
+                    observed.lock().push(ctx.clone());
+                })
+                .expect("the nominal ctx submit is accepted");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while observed.lock().len() < 2 {
@@ -857,6 +1010,148 @@ mod tests {
         assert_eq!(
             observed[0].arena, observed[1].arena,
             "the SAME ArenaToken across cycles (warm)"
+        );
+    }
+
+    // ---- LW-T5 (Seam E): posture & precedence at the submit seam ------------
+
+    /// LW-T5 (Seam E): the throttle feed is STANCE-GATED — a gate-off
+    /// (legacy stance) sample NEVER boots the global fleet executor (no
+    /// seats, no host thread, no census rows from a mere header sample).
+    #[test]
+    fn gate_off_throttle_feed_never_boots_the_fleet_executor() {
+        // The default stance is LEGACY (the common default today): gate OFF,
+        // and the probe must show the global executor never booted.
+        let cfg = degenbot_config::BotConfig::default();
+        assert!(
+            !super::super::solver_dispatch::fleet_stance_enabled(&cfg),
+            "the default config must be gate-off (legacy stance)"
+        );
+        let fed = super::feed_fleet_posture_sample(5_000, 3, 9);
+        assert!(!fed, "gate-off must not feed");
+        assert!(
+            !super::global_executor_booted(),
+            "gate-off (legacy stance) must NOT boot the fleet executor"
+        );
+    }
+
+    /// LW-T5 (Seam E): in Cordoned posture the submit seam refuses a NEW
+    /// solver unit IMMEDIATELY with a typed `PostureHeld` — admission-side
+    /// only: the unit running when the posture flipped completes normally
+    /// (RAYPAR T3 never-yield mid-unit; the slot FSM itself is untouched).
+    #[test]
+    fn submit_in_cordoned_posture_fails_typed_at_the_submit_seam_and_running_units_complete() {
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let long_unit_done: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let done = Arc::clone(&long_unit_done);
+        executor
+            .submit_solve_bin(0, move |_ctx| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .expect("the nominal submit is accepted");
+        // Flip the posture to Cordoned through the executor's own seam.
+        executor.observe_throttle(
+            100,
+            ThrottleSample {
+                events: 3,
+                throttled_usec: 0,
+                elapsed_usec: 1_000,
+            },
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let refused = executor
+            .submit_solve_bin(1, |_ctx| {
+                red_panic("a posture-held submit must not run its body");
+            })
+            .expect_err("the CORDONED submit must refuse TYPED at the submit seam");
+        // RED scaffold marker: the posture consult is wired at green — the
+        // refusal must already carry the posture + role in its payload.
+        assert!(
+            matches!(
+                refused,
+                SubmitError::PostureHeld {
+                    posture: FleetPosture::Cordoned,
+                    role: WorkerRole::Solver,
+                }
+            ),
+            "the refusal must carry the posture + role: {refused:?}"
+        );
+        // The occupant was NEVER preempted: it completed on its own timeline
+        // while the posture was already Cordoned.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !long_unit_done.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the running unit never completed (preempted?)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// LW-T5 (Seam E): overflow past a role's queue cap lands in the
+    /// unbounded host backlog (§10 ledger) and NEVER drops — the receipts
+    /// report accepted-with-backlog, and every submitted unit completes.
+    #[test]
+    fn overflow_past_the_role_cap_lands_in_the_backlog_and_never_drops() {
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let seats = executor.bin_count();
+        let occupants_done: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+        for bin in 0..seats {
+            let done = Arc::clone(&occupants_done);
+            executor
+                .submit_solve_bin(bin, move |_ctx| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                })
+                .expect("occupant submit");
+        }
+        // Overflow (queue cap is solver_pin_count × 2): the cap and more
+        // arrive while every seat is mid-unit.
+        let extras = seats * 4;
+        let drained: Arc<std::sync::atomic::AtomicU64> = Arc::default();
+        for bin in 0..extras {
+            let drained = Arc::clone(&drained);
+            executor
+                .submit_solve_bin(bin % seats, move |_ctx| {
+                    drained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                })
+                .expect("overflow submits are ACCEPTED — backlog, never dropped");
+        }
+        // Let the host thread settle (the queue is at cap, seats mid-unit),
+        // then probe: the NEXT submit rides the unbounded backlog and its
+        // receipt must SAY so (accepted-with-backlog, never queued-lost).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let drained_probe = Arc::clone(&drained);
+        let probe = executor
+            .submit_solve_bin(0, move |_ctx| {
+                drained_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            })
+            .expect("backlog submits are ACCEPTED — never dropped");
+        // RED scaffold marker: the receipt never reports the backlog state
+        // until green wires the host's queue mirror.
+        assert!(
+            probe.accepted_with_backlog,
+            "the overflow submit must report accepted-with-backlog (the cap was exceeded)"
+        );
+        // NEVER dropped: occupants AND every backlog unit complete.
+        let total = u64::try_from(seats * 5 + 1).unwrap_or(u64::MAX);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while occupants_done.load(std::sync::atomic::Ordering::Relaxed)
+            + drained.load(std::sync::atomic::Ordering::Relaxed)
+            < total
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the seats did not drain all submitted units in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            occupants_done.load(std::sync::atomic::Ordering::Relaxed)
+                + drained.load(std::sync::atomic::Ordering::Relaxed),
+            total,
+            "every submitted unit must complete — never dropped"
         );
     }
 
@@ -929,35 +1224,37 @@ mod tests {
             let after_drained = Arc::clone(&after_drained);
             let lane_threads = Arc::clone(&lane_threads);
             let seats_done = Arc::clone(&seats_done);
-            executor.submit_solve_bin(bin, move |ctx| {
-                // The bin escalates its cold-miss work while MID-UNIT — the
-                // escalation must NOT run on this seat (CPU) but on the
-                // port's own lane.
-                let occupied_seats = Arc::clone(&seats_done);
-                if ctx
-                    .escalate(Box::pin(async move {
-                        // STARVATION CHECK: an escalation completing only
-                        // after all seats drained would be CPU starvation by
-                        // another name.
-                        if occupied_seats.load(Ordering::Relaxed)
-                            == u64::try_from(seats).unwrap_or(0)
-                        {
-                            after_drained.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let name = std::thread::current()
-                            .name()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| "<unnamed>".to_owned());
-                        lane_threads.lock().push(name);
-                        completed.fetch_add(1, Ordering::Relaxed);
-                    }))
-                    .is_err()
-                {
-                    failures.fetch_add(1, Ordering::Relaxed);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                seats_done.fetch_add(1, Ordering::Relaxed);
-            });
+            executor
+                .submit_solve_bin(bin, move |ctx| {
+                    // The bin escalates its cold-miss work while MID-UNIT — the
+                    // escalation must NOT run on this seat (CPU) but on the
+                    // port's own lane.
+                    let occupied_seats = Arc::clone(&seats_done);
+                    if ctx
+                        .escalate(Box::pin(async move {
+                            // STARVATION CHECK: an escalation completing only
+                            // after all seats drained would be CPU starvation by
+                            // another name.
+                            if occupied_seats.load(Ordering::Relaxed)
+                                == u64::try_from(seats).unwrap_or(0)
+                            {
+                                after_drained.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let name = std::thread::current()
+                                .name()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| "<unnamed>".to_owned());
+                            lane_threads.lock().push(name);
+                            completed.fetch_add(1, Ordering::Relaxed);
+                        }))
+                        .is_err()
+                    {
+                        failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    seats_done.fetch_add(1, Ordering::Relaxed);
+                })
+                .expect("the escalation occupancy submit is accepted");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while seats_done.load(Ordering::Relaxed) < u64::try_from(seats).unwrap_or(0) {

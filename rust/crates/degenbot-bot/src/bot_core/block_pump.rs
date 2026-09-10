@@ -1088,6 +1088,15 @@ impl BlockPump {
                                     stats.nr_throttled,
                                     stats.throttled_usec,
                                 );
+                                // LW-T5 (Seam E): the SAME per-block sample
+                                // feeds the fleet submit posture — the feed
+                                // is STANCE-GATED inside (a legacy-stance
+                                // header sample never boots the fleet).
+                                crate::arb_engine::fleet_solve_executor::feed_fleet_posture_sample(
+                                    wall_ms(),
+                                    stats.nr_throttled,
+                                    stats.throttled_usec,
+                                );
                             }
                         }
                         // ADR-041: the header→publish epoch-race anchor

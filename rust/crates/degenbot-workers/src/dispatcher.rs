@@ -140,6 +140,28 @@ pub enum EnqueueError {
     PostureHeld(WorkerRole),
 }
 
+/// The submit-seam refusal (LW-T5, Seam E): typed AT the submit surface —
+/// admission-side only (a cordon never preempts a running unit: RAYPAR T3
+/// never-yield mid-unit; the slot FSM itself stays untouched).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SubmitError {
+    /// The posture holds this role's intake. The payload is intact and the
+    /// caller owns the retry/fallback decision (the serial arm is LW-T7).
+    #[error(
+        "submit refused: posture {posture:?} holds intake for role {role:?} \
+         — admission-side only; running units never preempted (RAYPAR T3)"
+    )]
+    PostureHeld {
+        /// The posture observed at submit.
+        posture: FleetPosture,
+        /// The refused role.
+        role: WorkerRole,
+    },
+    /// The executor's host lane is closed (host gone) — loud, never a drop.
+    #[error("submit refused: host channel closed")]
+    PortClosed,
+}
+
 /// Why a host state operation was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HostError {
