@@ -437,6 +437,11 @@ pub struct ArbitrageEngine {
     /// streaming test slowen one path deterministically.
     #[cfg(test)]
     test_solve_delay: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// 43E3H3 red-first: test-only per-path PANIC hook (the breaker suite
+    /// needs a bin body that dies mid-walk to pin the detached arm's
+    /// witness/gauge behavior through the panic path).
+    #[cfg(test)]
+    test_solve_panic: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
     /// Test-only: the drain appends each merged path id here (with the tokio
     /// executor this happens per-path, before the slowest path completes).
     #[cfg(test)]
@@ -620,6 +625,8 @@ impl ArbitrageEngine {
             streaming_delivery,
             #[cfg(test)]
             test_solve_delay: None,
+            #[cfg(test)]
+            test_solve_panic: None,
             #[cfg(test)]
             merge_probe: None,
             walk_memo: std::sync::Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
@@ -808,6 +815,10 @@ impl ArbitrageEngine {
 impl ArbitrageEngine {
     pub(crate) fn set_solve_delay_hook(&mut self, hook: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
         self.test_solve_delay = Some(hook);
+    }
+
+    pub(crate) fn set_solve_panic_hook(&mut self, hook: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
+        self.test_solve_panic = Some(hook);
     }
 
     pub(crate) fn set_merge_probe(&mut self, probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>>) {

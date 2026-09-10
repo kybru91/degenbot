@@ -6940,6 +6940,395 @@ mod tests {
         assert!(path_ids.iter().all(|p| guard.results.contains_key(p)));
     }
 
+    // =================================================================
+    // 43E3H3 red-first breaker suite (design logs/lane-unify-design.md §5).
+    // Status at HEAD (commit 1): each test below is RED against current
+    // code — they pin the POST-merge contracts (one carrier, one ledger,
+    // the detached arm's lane witness). They GREEN in commit 2.
+    // =================================================================
+
+    /// N2 (cross-arm replay): an in-cycle result and a sidecar straggler
+    /// naming the SAME (cycle_seq, pid) must collide on the ONE merged
+    /// ledger — the fuse refuses the second arrival instead of merging
+    /// twice. Red at HEAD: no shared key space exists across the arms
+    /// today (the sidecar keeps its own (cycle_seq, pid) set; the
+    /// in-cycle drain has no seq at all).
+    // 43E3H3 red-first: pins the (solve_seq, pid) key half the merged
+    // ledger must share across BOTH arms (design §3.3).
+    #[test]
+    fn merged_ledger_rejects_cross_arm_pid_replay() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        // In-cycle solve of the same block: all 3 paths land in `results`.
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        let pid = path_ids[0];
+        assert!(
+            engine.results.contains_key(&pid),
+            "baseline: the in-cycle arm must merge pid {} first",
+            pid
+        );
+        let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
+        let fresh_result = engine.results.get(&pid).unwrap().clone();
+        let results_before = engine.results.len();
+
+        // The straggler claims the cycle_seq the in-cycle cycle consumed:
+        // under the merged ledger this is the SAME (solve_seq, pid) key and
+        // the fuse must refuse it.
+        let item = crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+            payload: None,
+            worker_clamp_twins: 0,
+            cycle_seq: 1, // the first cycle's seq (the in-cycle run consumed 1)
+            solve_block: 100,
+            metadata: BlockMetadata::default(),
+            pid,
+            update_stamp: fresh_stamp,
+            result: fresh_result,
+            solve_span: tracing::Span::none(),
+        };
+        engine.merge_detached_item(item);
+
+        assert_eq!(
+            engine
+                .detached_duplicate_outcomes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "merged ledger: the cross-arm replay must trip the fuse exactly once"
+        );
+        assert_eq!(
+            engine.results.len(),
+            results_before,
+            "merged ledger: the refused duplicate must not add a results entry"
+        );
+        assert_eq!(
+            engine
+                .detached_applied
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "merged ledger: the refused duplicate must not count as applied"
+        );
+    }
+
+    /// N3 (prune correctness): the merged ledger prunes keyed rows only
+    /// past LEDGER_AGE, driven by the DETACHED arm's cycle issuance —
+    /// and an in-cycle-only advance must NOT prune (the anchor is
+    /// detached-issued-seq). Red at HEAD: the in-cycle side has no
+    /// ledger/rows at all; the detach-keyed prune ages on any current
+    /// seq the claim sees.
+    // 43E3H3 red-first: pins LEDGER_AGE=64 exactly and the anchor choice
+    // (design §3.3 + §3.3.1 REV 2).
+    #[test]
+    fn merged_ledger_prunes_only_past_ledger_age() {
+        use std::sync::atomic::Ordering;
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        let results_before = engine.results.len();
+
+        // Seed directly into the sidecar ledger (pub(crate) state) with
+        // pids not otherwise involved, at seq boundaries chosen to straddle
+        // the LEDGER_AGE edge driven through the DETACHED key space.
+        let mut seed = |seq: u64, pid: u64| {
+            let fresh_stamp = engine.resolved_update_snapshot[&path_ids[0]].clone();
+            let result = engine.results.get(&path_ids[0]).unwrap().clone();
+            let item = crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+                payload: None,
+                worker_clamp_twins: 0,
+                cycle_seq: seq,
+                solve_block: 100,
+                metadata: BlockMetadata::default(),
+                pid,
+                update_stamp: fresh_stamp,
+                result,
+                solve_span: tracing::Span::none(),
+            };
+            engine.merge_detached_item(item);
+        };
+
+        // Drive the anchor forward by ONE detached merge at a high seq; the
+        // seeds at (current-65) and (current-63) straddle the age edge.
+        let current = 100u64;
+        seed(current - 65, 1111); // beyond LEDGER_AGE: must be PRUNED
+        seed(current - 63, 2222); // within LEDGER_AGE: must be RETAINED
+        seed(current, 3333); // the advancing merge itself
+
+        let seen = engine.detached_seen_outcomes.lock();
+        assert!(
+            !seen.contains(&(current - 65, 1111)),
+            "LEDGER_AGE=64: row (seq-65) must be pruned after the seq-{} claim",
+            current
+        );
+        assert!(
+            seen.contains(&(current - 63, 2222)),
+            "LEDGER_AGE=64: row (seq-63) must be retained after the seq-{} claim",
+            current
+        );
+        drop(seen);
+
+        // NEGATIVE half (design §3.3.1 REV 2): in-cycle-only advances of
+        // the shared counter must NOT prune detached-keyed rows. Run two
+        // in-cycle solves (the shared counter ticks), then re-assert the
+        // retained row survived them.
+        engine.solve_dirty(101, &BlockMetadata::default(), &affected_keys_v2);
+        engine.solve_dirty(102, &BlockMetadata::default(), &affected_keys_v2);
+        let seen = engine.detached_seen_outcomes.lock();
+        assert!(
+            seen.contains(&(current - 63, 2222)),
+            "in-cycle-only advances must not prune detached-keyed rows (anchor = detached_issued_seq)"
+        );
+        let _ = results_before;
+        let _ = Ordering::Relaxed;
+    }
+
+    /// N4 (detached undercount): a detached bin that panics mid-walk must
+    /// deliver a typed disposition for EVERY owed pid — no silent
+    /// undercount. Red at HEAD: the detached arm has NO lane witness
+    /// (sD:2350 submits a raw bin body), so a panicked bin simply never
+    /// delivers its undelivered pids.
+    // 43E3H3 red-first: pins the detached arm's witness adoption
+    // (design §5.2). GREEN requires Failed records on the detached pipe.
+    #[test]
+    fn detached_undercount_trips_the_fan_in_assert() {
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
+            eprintln!("skipping: detached panic test requires >=2 cores");
+            return;
+        }
+        // Drive a detached cycle with a panicking pid; then REQUIRE that
+        // every submitted pid got exactly one disposition (Solved,
+        // Suppressed, or Failed) — observed through the applied+dropped
+        // counters, which today stay short (the undelivered pids never
+        // arrive at all: SILENT UNDERCOUNT).
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        engine.set_detached_solving(true);
+        let kill = path_ids[1];
+        engine.set_solve_panic_hook(std::sync::Arc::new(move |pid: u64| {
+            if pid == kill {
+                panic!("path killed mid-bin (43E3H3 red harness)");
+            }
+        }));
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        // Drive through the production stage seam so the sidecar spawns.
+        let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
+        let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
+        for &p in &pool_ids {
+            delta.record_affected(HopType::V2, p);
+        }
+        let stages = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
+        stages.set_delta(delta);
+        stages.solve_dirty(&affected_keys_v2, 100, &BlockMetadata::default());
+
+        // Wait for the dispositions to land (the sidecar merges async).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        loop {
+            let guard = engine.lock();
+            let applied = guard
+                .detached_applied
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let stale = guard
+                .detached_dropped_stale
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dereg = guard
+                .detached_dropped_deregistered
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dup = guard
+                .detached_duplicate_outcomes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            drop(guard);
+            let disposed = applied + stale + dereg + dup;
+            if disposed >= path_ids.len() as u64 || std::time::Instant::now() > deadline {
+                // 43E3H3: THE assert — every submitted path must be
+                // dispositioned EXACTLY once. At HEAD the panicked bin's
+                // undelivered pids NEVER arrive, so disposed < submitted.
+                assert_eq!(
+                    disposed, path_ids.len() as u64,
+                    "[detached] outcome accounting undercount — exactness fuse \\\n                     (QR3NUS/43E3H3): a panicked bin must still disposition \\\n                     every owed pid as a typed Failed record"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// N5 (gauge pairing through a panic): the in-flight gauge must return
+    /// to its EXACT pre-cycle value after a panicking detached cycle AND
+    /// keep the cap gate engaging on true load. Red at HEAD: the panicked
+    /// bin's flushed Solved items bump at send but the panic kills the
+    /// remaining path solves, nothing decrements the orphaned bumps
+    // 43E3H3 red-first: pins constraint (b) THROUGH the panic path AND
+    // the variant-gated bump/decrement pairing (design §4.6.1 REV 2).
+    #[test]
+    fn detached_panic_does_not_leak_inflight_gauge() {
+        if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
+            eprintln!("skipping: detached panic test requires >=2 cores");
+            return;
+        }
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        engine.set_detached_solving(true);
+        let kill = path_ids[2];
+        engine.set_solve_panic_hook(std::sync::Arc::new(move |pid: u64| {
+            if pid == kill {
+                panic!("path killed mid-bin (43E3H3 red harness)");
+            }
+        }));
+        let g0 = engine
+            .detached_outstanding
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
+        let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
+        for &p in &pool_ids {
+            delta.record_affected(HopType::V2, p);
+        }
+        let stages = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
+        stages.set_delta(delta);
+        stages.solve_dirty(&affected_keys_v2, 100, &BlockMetadata::default());
+
+        // After all dispositions land, the gauge must be back at g0 EXACTLY
+        // (a leaked count OR a sagged count both move it off g0 — only the
+        // exact value pins BOTH directions of a broken pairing).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        loop {
+            let guard = engine.lock();
+            let applied = guard
+                .detached_applied
+                .load(std::sync::atomic::Ordering::Relaxed)
+                + guard
+                    .detached_dropped_stale
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                + guard
+                    .detached_dropped_deregistered
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                + guard
+                    .detached_duplicate_outcomes
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            let gauge = guard
+                .detached_outstanding
+                .load(std::sync::atomic::Ordering::Relaxed);
+            drop(guard);
+            if applied >= path_ids.len() as u64 || std::time::Instant::now() > deadline {
+                assert_eq!(
+                    gauge, g0,
+                    "[detached] in-flight gauge must return to its EXACT pre-cycle \\\n                     value g0={g0} through a panicking cycle (variant-gated pairing, \\\n                     design §4.6.1 REV 2) — got {gauge}"
+                );
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// N6+N7 (constraint (b), the cap conjunction): a cycle whose
+    /// un-dispositioned count sits AT the cap must degrade to the
+    /// in-cycle arm (results present AT RETURN), and one below the cap
+    /// must still detach (results ABSENT at return). Red at HEAD: no test
+    /// pins either half (verified by grep — DETACHED_INFLIGHT_CAP appears
+    // only at its definition and the gate).
+    // 43E3H3 red-first: pins the gate's exact conjunction (design §5.4).
+    #[test]
+    fn detached_inflight_cap_degrades_full_cycles_to_in_cycle() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
+        engine.set_detached_solving(true);
+        // Seed the gauge AT the cap: the gate must refuse detachment.
+        engine
+            .detached_outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed); // == DETACHED_INFLIGHT_CAP
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        // In-cycle path: solve_dirty runs synchronously through the drain.
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        assert!(
+            path_ids.iter().all(|p| engine.results.contains_key(p)),
+            "at-cap cycles must degrade to the in-cycle arm: results present AT return"
+        );
+    }
+
+    #[test]
+    fn detached_inflight_below_cap_still_detaches() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
+        engine.set_detached_solving(true);
+        engine
+            .detached_outstanding
+            .store(7, std::sync::atomic::Ordering::Relaxed); // == CAP-1
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        // Below-cap cycles detach: with a 400ms slow path the results land
+        // AFTER return (T2's read) — at least the slow pid is absent.
+        assert!(
+            !engine.results.contains_key(&path_ids[0]),
+            "below-cap cycles must take the detached arm: the slow pid is absent AT return"
+        );
+    }
+
+    /// N1 (in-cycle duplicate policy, tightened): a duplicate
+    /// (solve_seq, pid) arrival at the in-cycle drain must be REFUSED —
+    /// counted and logged, never merged twice. Red at HEAD against the
+    /// NEW policy (today the in-cycle drain logs-and-merges anyway —
+    /// sD:2550 — because its local set is dropped with the cycle).
+    // 43E3H3 red-first: pins the tightened refuse-the-merge policy
+    // (design §4.4 REV 2 decision, Risk 5 option 1).
+    #[test]
+    fn in_cycle_duplicate_lane_outcome_does_not_double_apply() {
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        let pid = path_ids[0];
+        let results_before = engine.results.len();
+        let applied_before = engine
+            .detached_applied
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // A second Solved arrival for the SAME (seq, pid) through the merged
+        // disposition must be refused: no second results write, no applied
+        // count for the duplicate.
+        let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
+        let fresh_result = engine.results.get(&pid).unwrap().clone();
+        let item = crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+            payload: None,
+            worker_clamp_twins: 0,
+            cycle_seq: 1, // the in-cycle run's seq under the shared counter
+            solve_block: 100,
+            metadata: BlockMetadata::default(),
+            pid,
+            update_stamp: fresh_stamp,
+            result: fresh_result,
+            solve_span: tracing::Span::none(),
+        };
+        engine.merge_detached_item(item);
+
+        assert_eq!(
+            engine
+                .detached_duplicate_outcomes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "in-cycle dup policy (tightened): the fuse must trip exactly once"
+        );
+        assert_eq!(
+            engine.results.len(),
+            results_before,
+            "in-cycle dup policy (tightened): the refused duplicate must not re-merge"
+        );
+        let _ = applied_before;
+    }
+
     #[test]
     #[expect(clippy::too_many_lines)] // A/B harness: two full engines, worth the length
     fn resolve_chunk_parity_parallel_matches_serial_and_reuses_cache_walks() {

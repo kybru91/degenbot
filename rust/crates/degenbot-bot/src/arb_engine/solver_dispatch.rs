@@ -388,6 +388,13 @@ pub(crate) fn solve_one_path(
     if let Some(delay) = ctx.test_solve_delay.as_ref() {
         delay(pid);
     }
+    // 43E3H3 red-first: test-only panic hook — deliberately kill this
+    // path's solve mid-walk (catch_unwind on the seat/lane decides the
+    // disposition; the breaker suite pins that disposition).
+    #[cfg(test)]
+    if let Some(panic_pid) = ctx.test_solve_panic.as_ref() {
+        panic_pid(pid);
+    }
     // Worker-local view of the cycle gate deps (BXUSGL T1): the Arc-d
     // memo + owned capture cfg land in the shared ctx per cycle; the
     // prefix cache is generationed by the block epoch - same semantics
@@ -883,6 +890,11 @@ pub(crate) struct SolveCycleShared {
     /// Test-only deterministic per-path delay hook (epic test knob).
     #[cfg(test)]
     test_solve_delay: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// 43E3H3 red-first: test-only per-path PANIC hook — a bin body that
+    /// dies mid-walk so the breaker suite can pin the detached arm's
+    /// witness (typed Failed records) and gauge pairing through a panic.
+    #[cfg(test)]
+    test_solve_panic: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
     /// SIMPIPE2 T2: the shared core (Arc-cloned from the engine at cycle
     /// build) — the WORKER-side clamp takes the same short core read the
     /// merge-site clamp took; no engine state is touched (MQUKB6-T3 intact:
@@ -2093,6 +2105,8 @@ impl ArbitrageEngine {
             gate_recorder: std::sync::Arc::clone(&self.last_gate_us),
             #[cfg(test)]
             test_solve_delay: self.test_solve_delay.clone(),
+            #[cfg(test)]
+            test_solve_panic: self.test_solve_panic.clone(),
             core: std::sync::Arc::clone(self.core()),
             pool_refs,
             worker_clamp: INLINE_SIM_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
@@ -3362,6 +3376,8 @@ mod profit_clamp_recompute_tests {
             sims_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             gate_recorder: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             test_solve_delay: None,
+            #[cfg(test)]
+            test_solve_panic: None,
         })
     }
 
@@ -4101,6 +4117,8 @@ pub(super) mod executor_ab_probe {
             inline_sim: None,
             #[cfg(test)]
             test_solve_delay: None,
+            #[cfg(test)]
+            test_solve_panic: None,
         })
     }
 
@@ -4293,6 +4311,8 @@ mod fleet_sim_stance_tests {
             inline_sim: Some(sim),
             #[cfg(test)]
             test_solve_delay: None,
+            #[cfg(test)]
+            test_solve_panic: None,
         })
     }
 
