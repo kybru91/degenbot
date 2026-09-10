@@ -77,13 +77,23 @@ class OtelSettings(BaseModel):
 class DegenbotConfig(BaseSettings):
     """DegenbotConfig class."""
 
-    model_config = SettingsConfigDict()
+    # JLFE2F: carry the modern layout's Rust-domain sections (telemetry,
+    # runtime, solve, ...). Only extra=forbid would refuse every file the
+    # typed Rust loader accepts.
+    model_config = SettingsConfigDict(extra="ignore")
 
-    database: DatabaseSettings
+    # JLFE2F (0.6 modern layout): the Python-domain sections [database]/
+    # [rpc]/[ws] LEFT the shared operator file (now the typed Rust BotConfig
+    # file layer — docs/config-migration.md). Fields default instead: the
+    # database to the standard DB_PATH, rpc/ws to empty (the cascade then
+    # resolves endpoints from env or the caller).
+    database: DatabaseSettings = DatabaseSettings(
+        path=DB_PATH,
+    )
     rpc: dict[
         ChainId,
         HttpUrl | WebsocketUrl | Path,
-    ]
+    ] = {}
     ws: dict[
         ChainId,
         WebsocketUrl,
