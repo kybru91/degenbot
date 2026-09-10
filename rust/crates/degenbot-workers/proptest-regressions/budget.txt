@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6ae2f72990f895694884eff47411db98aa74efc55ccf6dfec9680884246d27f5 # shrinks to quota_units = 55000000, ov = BudgetOverrides { reserve_cpus: Some(1), ambient_io_workers: Some(0), solver_cpus: Some(2), sim_slot_cap: Some(0), pool_state_updater_slots: Some(0) }

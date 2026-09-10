@@ -335,20 +335,208 @@ pub(crate) fn global_fleet_solve_executor() -> &'static FleetSolveExecutor {
     })
 }
 
+// ---------------------------------------------------------------------------
+// QR3NUS GREEN (Seam D, decision A): typed per-path lane outcomes + the
+// solve-lane adapter. Every solve bin runs under the lane witness: a unit
+// panic stays loud AND typed — the `PanicVerdict` is consulted, every
+// undelivered pid is patched onto the pipe as `Failed(SeatPanic{unit,
+// seat, message})`, and the seat keeps serving its pin. The merge-side
+// accounting (`solved + suppressed + failed == submitted`) becomes exact;
+// real-sink parity promotion cross-checks it in LW-T7.
+// ---------------------------------------------------------------------------
+pub(crate) mod lane_scaffold {
+    //! Provisional module name (QR3NUS): this lane adapter folds into the
+    //! unified Executor module at LW-T8 (JI275C).
+
+    use std::collections::BTreeSet;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::mpsc;
+
+    use degenbot_workers::dispatcher::{PanicAction, PanicVerdict};
+
+    use crate::arb_engine::solver_dispatch::SolveArmOutcome;
+
+    /// Why one or more of a unit's paths never delivered an outcome to the
+    /// result pipe.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum LaneFailure {
+        /// The bin closure panicked mid-unit; the seat survives (QR3NUS
+        /// decision A) and every undelivered path becomes one of these.
+        SeatPanic {
+            /// The host-tracked unit id that panicked.
+            unit: u64,
+            /// The seat (slot) that was executing the unit.
+            seat: u64,
+            /// The panic payload when it is a string.
+            message: Option<String>,
+        },
+    }
+
+    /// One drained per-path outcome: EXACTLY one per submitted path. The
+    /// fuse the accounting asserts is `solved + suppressed + failed ==
+    /// submitted` with the delivered and failed pid sets exact and
+    /// disjoint — a worker `None` IS an outcome (counted even though it
+    /// never merges).
+    #[derive(Debug)]
+    #[expect(
+        clippy::large_enum_variant,
+        reason = "Solved IS the real pipe item (the full SolveArmOutcome tuple, QR3NUS review): boxing it would re-shape the type away from the channel item it must replace; Suppressed/Failed are small rare markers so the size gap is deliberate"
+    )]
+    pub(crate) enum LaneOutcome {
+        /// The real pipe item (the worker's `Some` arm).
+        Solved(SolveArmOutcome),
+        /// The worker's `None` arm (failed / filtered solve): never
+        /// merges, but is still an outcome the accounting must count.
+        Suppressed { pid: u64 },
+        /// A path whose outcome never landed because its unit panicked.
+        Failed {
+            /// The path the failed record covers.
+            pid: u64,
+            /// Why the path's outcome never landed.
+            failure: LaneFailure,
+        },
+    }
+
+    /// The solve-lane witness for one bin: the pid list the bin owed the
+    /// pipe plus the emitted-pid set (what actually landed).
+    pub(crate) struct SolveLane {
+        unit: u64,
+        seat: u64,
+        pids: Vec<u64>,
+        emitted: BTreeSet<u64>,
+        tx: mpsc::Sender<LaneOutcome>,
+    }
+
+    impl SolveLane {
+        /// Build a lane for one bin: `unit`/`seat` name the accounting
+        /// identity the panic records will carry; `pids` are the paths the
+        /// bin's work owed the pipe.
+        pub(crate) fn new(
+            unit: u64,
+            seat: u64,
+            pids: Vec<u64>,
+            tx: mpsc::Sender<LaneOutcome>,
+        ) -> Self {
+            Self {
+                unit,
+                seat,
+                pids,
+                emitted: BTreeSet::new(),
+                tx,
+            }
+        }
+
+        /// Deliver one real arm outcome (the worker's `Some` arm).
+        pub(crate) fn solved(&mut self, item: SolveArmOutcome) {
+            self.emitted.insert(item.0);
+            let _ = self.tx.send(LaneOutcome::Solved(item));
+        }
+
+        /// Deliver the worker's `None` arm — still an outcome (counted).
+        pub(crate) fn suppressed(&mut self, pid: u64) {
+            self.emitted.insert(pid);
+            let _ = self.tx.send(LaneOutcome::Suppressed { pid });
+        }
+
+        /// Patch one typed per-path failure onto the pipe (decision A):
+        /// exactly one outcome for `pid`, carrying unit + seat.
+        pub(crate) fn failed(&mut self, pid: u64, failure: LaneFailure) {
+            self.emitted.insert(pid);
+            let _ = self.tx.send(LaneOutcome::Failed { pid, failure });
+        }
+
+        /// The pids this bin still owed the pipe.
+        fn unemitted(&self) -> Vec<u64> {
+            self.pids
+                .iter()
+                .copied()
+                .filter(|pid| !self.emitted.contains(pid))
+                .collect()
+        }
+    }
+
+    /// Run one bin's work under the lane witness (QR3NUS, decision A):
+    /// a panicking work body is caught, the `PanicVerdict` is consulted
+    /// with the (unit, seat) identity, and on `RecordAndContinue` every
+    /// still-unemitted path is patched onto the pipe as exactly one typed
+    /// `Failed(LaneFailure::SeatPanic)` record — so the drain observes one
+    /// outcome per submitted path and the seat keeps serving its pin.
+    /// `Abort` is the strict ADR-021 posture: wired only outside tests —
+    /// a test never runs a real `std::process::abort`.
+    pub(crate) fn run_solve_lane(
+        lane: &mut SolveLane,
+        verdict: &dyn PanicVerdict,
+        work: impl FnOnce(&mut SolveLane),
+    ) {
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| work(lane)));
+        let Err(payload) = outcome else {
+            return;
+        };
+        let message = if let Some(text) = payload.downcast_ref::<&str>() {
+            Some((*text).to_owned())
+        } else {
+            payload.downcast_ref::<String>().cloned()
+        };
+        match verdict.on_unit_panic(lane.unit, lane.seat) {
+            PanicAction::RecordAndContinue => {
+                let unemitted = lane.unemitted();
+                let patched = unemitted.len();
+                for pid in unemitted {
+                    lane.failed(
+                        pid,
+                        LaneFailure::SeatPanic {
+                            unit: lane.unit,
+                            seat: lane.seat,
+                            message: message.clone(),
+                        },
+                    );
+                }
+                tracing::error!(
+                    target: "degenbot::fleet",
+                    unit = lane.unit,
+                    seat = lane.seat,
+                    message = ?message,
+                    patched,
+                    "[fleet-solve] bin job panicked — seat survives with typed failure records (QR3NUS decision A)"
+                );
+            }
+            PanicAction::Abort => {
+                super::abort_executor(
+                    "unit panic (strict ADR-021 posture)",
+                    &format!(
+                        "unit {} seat {}: {}",
+                        lane.unit,
+                        lane.seat,
+                        message.as_deref().unwrap_or("<non-string panic payload>")
+                    ),
+                );
+            }
+        }
+    }
+}
+
+// Re-exports: the solve-lane adapter is the production seam the
+// `solver_dispatch` merge wires every bin through (QR3NUS decision A).
+pub(crate) use lane_scaffold::{run_solve_lane, LaneOutcome, SolveLane};
+
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use degenbot_solvers::mixed::SolvePathResult;
     use degenbot_workers::budget::BudgetOverrides;
-    use degenbot_workers::dispatcher::FleetBoot;
+    use degenbot_workers::dispatcher::{
+        AbortingPolicy, FleetBoot, PanicAction, PanicVerdict, SeatSurvivesPolicy,
+    };
     use degenbot_workers::posture::PosturePolicy;
 
     use super::super::solver_dispatch::executor_ab_probe::{
         load_corpus_fixture, probe_ctx, prod_lpt_bins,
     };
-    use super::super::solver_dispatch::solve_one_path;
+    use super::super::solver_dispatch::{solve_one_path, SolveArmOutcome};
+    use super::lane_scaffold::{run_solve_lane, LaneFailure, LaneOutcome, SolveLane};
     use super::{validate_bin_index, FleetSolveExecutor, SOLVE_BIN_KEY_BASE};
 
     fn hermetic_boot() -> FleetBoot {
@@ -529,5 +717,232 @@ mod tests {
                 "bin {bin} must pin to exactly one seat across cycles"
             );
         }
+    }
+
+    // ---- QR3NUS (Seam D): exact per-unit outcome accounting -------------------
+
+    /// Test verdict double (decision A): records every (unit, seat)
+    /// consultation and prescribes RecordAndContinue — never a real abort.
+    struct VerdictRecorder {
+        consulted: parking_lot::Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl PanicVerdict for VerdictRecorder {
+        fn on_unit_panic(&self, unit: u64, seat: u64) -> PanicAction {
+            self.consulted.lock().push((unit, seat));
+            PanicAction::RecordAndContinue
+        }
+    }
+
+    /// Deliberate panic inside a harness bin body: the adapter's
+    /// catch_unwind (with the seat's backstop) must convert it to data.
+    #[expect(clippy::panic)]
+    fn red_panic(message: &str) -> ! {
+        panic!("{message}")
+    }
+
+    /// The exactness fuse (QR3NUS): a bin whose 3rd of N paths panics
+    /// still drains exactly one outcome per submitted path — survivors as
+    /// real outcomes (a worker `None` IS an outcome), every undelivered
+    /// path as a typed failure — so `solved + suppressed + failed ==
+    /// submitted` with the delivered and failed pid sets exact and
+    /// disjoint. Today the panic silently vanishes with sender-drop.
+    #[test]
+    fn drain_delivers_exactly_one_lane_outcome_per_submitted_path_when_third_path_panics() {
+        let submitted: BTreeSet<u64> = [10, 11, 12, 13, 14].into_iter().collect();
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+        let mut lane = SolveLane::new(1, 0, vec![10, 11, 12, 13, 14], tx);
+        run_solve_lane(&mut lane, &SeatSurvivesPolicy, |lane| {
+            // Trace of a real bin: two survivor arms land, then the 3rd
+            // path panics — 13 and 14 are still owed and must come back
+            // typed instead of silently vanishing with sender-drop.
+            let arm: SolveArmOutcome = (10, SolvePathResult::default(), 0, None);
+            lane.solved(arm);
+            lane.suppressed(11);
+            red_panic("path 12 panicked mid-bin (QR3NUS red harness)");
+            // 13/14 never run — the panic ends the bin body.
+        });
+        drop(lane); // close the pipe so the drain completes
+        let outcomes: Vec<LaneOutcome> = rx.into_iter().collect();
+
+        let mut solved_count = 0usize;
+        let mut suppressed_count = 0usize;
+        let mut failed_count = 0usize;
+        let mut delivered: BTreeSet<u64> = BTreeSet::new();
+        let mut failed: BTreeSet<u64> = BTreeSet::new();
+        for outcome in outcomes {
+            match outcome {
+                LaneOutcome::Solved(item) => {
+                    solved_count += 1;
+                    delivered.insert(item.0);
+                }
+                LaneOutcome::Suppressed { pid } => {
+                    suppressed_count += 1;
+                    delivered.insert(pid);
+                }
+                LaneOutcome::Failed { pid, failure } => {
+                    failed_count += 1;
+                    assert!(
+                        matches!(
+                            failure,
+                            LaneFailure::SeatPanic {
+                                unit: 1,
+                                seat: 0,
+                                message: Some(_)
+                            }
+                        ),
+                        "failed record must name unit + seat and carry the panic payload"
+                    );
+                    failed.insert(pid);
+                }
+            }
+        }
+        assert!(
+            delivered.is_disjoint(&failed),
+            "a path cannot be both delivered and failed: {delivered:?} / {failed:?}"
+        );
+        let covered: BTreeSet<u64> = delivered.union(&failed).copied().collect();
+        assert_eq!(
+            covered, submitted,
+            "the drain must observe exactly one outcome per submitted path \
+             (delivered ∪ failed == submitted) — the panic must not undercount"
+        );
+        assert_eq!(
+            solved_count + suppressed_count + failed_count,
+            submitted.len(),
+            "merge-side per-path accounting must equal submissions"
+        );
+        assert_eq!(
+            failed,
+            [12, 13, 14].into_iter().collect::<BTreeSet<u64>>(),
+            "the 3rd path and everything after it must land as typed failures"
+        );
+    }
+
+    /// Decision A drive: after a panicking cycle the SAME seat takes the
+    /// next cycle's pinned bin (keyed pins never move), and the panic was
+    /// expressed as data — the verdict consulted, typed failure records
+    /// on the pipe. The panicking bin here rides a REAL executor seat so
+    /// the seat-survives policy is exercised end to end (no real abort —
+    /// the strict `AbortingPolicy` is never installed under test).
+    #[test]
+    fn panicked_seat_survives_and_takes_the_next_cycles_pinned_bin_on_the_same_thread() {
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let verdict = Arc::new(VerdictRecorder {
+            consulted: parking_lot::Mutex::new(Vec::new()),
+        });
+        let observed: Arc<parking_lot::Mutex<Vec<std::thread::ThreadId>>> = Arc::default();
+        let lane_outcomes: Arc<parking_lot::Mutex<Vec<LaneOutcome>>> = Arc::default();
+        for cycle in 0..2 {
+            let observed = Arc::clone(&observed);
+            let verdict = Arc::clone(&verdict);
+            let lane_outcomes = Arc::clone(&lane_outcomes);
+            executor.spawn(0, move || {
+                observed.lock().push(std::thread::current().id());
+                let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+                let mut lane = SolveLane::new(cycle, 0, vec![cycle * 10, cycle * 10 + 1], tx);
+                run_solve_lane(&mut lane, verdict.as_ref(), |lane| {
+                    if cycle == 0 {
+                        lane.suppressed(cycle * 10); // one pid emitted before the panic
+                        red_panic("cycle-0 bin panics (QR3NUS red harness)");
+                    }
+                });
+                drop(lane); // close the pipe so the per-cycle drain completes
+                let mut stash = lane_outcomes.lock();
+                for outcome in rx.into_iter() {
+                    stash.push(outcome);
+                }
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while observed.lock().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the seat did not take the next cycle's pinned bin in time"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let threads = observed.lock().clone();
+        assert_eq!(
+            threads[0], threads[1],
+            "the SAME seat must take the next cycle's pinned bin after the panic"
+        );
+        let consulted = verdict.consulted.lock().clone();
+        assert_eq!(
+            consulted.len(),
+            1,
+            "the panicking cycle must consult the verdict (and only that cycle): {consulted:?}"
+        );
+        let failed: Vec<u64> = lane_outcomes
+            .lock()
+            .iter()
+            .filter_map(|outcome| match outcome {
+                LaneOutcome::Failed { pid, .. } => Some(*pid),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            failed,
+            vec![1],
+            "the panicking cycle's undelivered path must land as a typed failure record"
+        );
+    }
+
+    /// The unit-panic-with-pipe tripwire at policy-object level (decision
+    /// A; no real `std::process::abort` ever runs under test): a panicking
+    /// unit consults the verdict with its (unit, seat) identity, and the
+    /// typed failure records carry that payload.
+    #[test]
+    fn unit_panic_with_result_pipe_consults_the_panic_verdict_with_unit_and_seat_payload() {
+        let verdict = VerdictRecorder {
+            consulted: parking_lot::Mutex::new(Vec::new()),
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+        let mut lane = SolveLane::new(7, 3, vec![21, 22], tx);
+        run_solve_lane(&mut lane, &verdict, |_lane| {
+            red_panic("bin unit panics with its result pipe open (QR3NUS tripwire harness)");
+        });
+        drop(lane); // close the pipe so the drain completes
+        let outcomes: Vec<LaneOutcome> = rx.into_iter().collect();
+
+        assert_eq!(
+            verdict.consulted.lock().as_slice(),
+            [(7, 3)],
+            "the verdict must be consulted exactly once with unit + seat payload"
+        );
+        let failed: Vec<(u64, &LaneFailure)> = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                LaneOutcome::Failed { pid, failure } => Some((*pid, failure)),
+                _ => None,
+            })
+            .collect();
+        let failed_pids: BTreeSet<u64> = failed.iter().map(|(pid, _)| *pid).collect();
+        assert_eq!(
+            failed_pids,
+            [21, 22].into_iter().collect::<BTreeSet<u64>>(),
+            "every undelivered path must be covered by exactly one typed failure"
+        );
+        for (pid, failure) in failed {
+            assert!(
+                matches!(
+                    failure,
+                    LaneFailure::SeatPanic {
+                        unit: 7,
+                        seat: 3,
+                        message: Some(message)
+                    } if message.contains("tripwire")
+                ),
+                "failed record must name unit 7 + seat 3 and carry the panic payload (pid {pid})"
+            );
+        }
+        // The pure policy mapping (decision A): the surviving policy keeps
+        // the seat; the strict abort posture stays a VALUE — it aborts only
+        // when wired outside tests, never here.
+        assert_eq!(
+            SeatSurvivesPolicy.on_unit_panic(7, 3),
+            PanicAction::RecordAndContinue
+        );
+        assert_eq!(AbortingPolicy.on_unit_panic(7, 3), PanicAction::Abort);
     }
 }

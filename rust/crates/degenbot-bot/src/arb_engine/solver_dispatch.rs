@@ -27,12 +27,16 @@ use super::{ArbitrageEngine, BlockMetadata, HashMap, HashSet};
 // it: solve-on-quiet is correct by construction under the stage-separated
 // data plane; stale results are dropped by the Q1a merge gate, never applied.
 
+use crate::arb_engine::fleet_solve_executor::{
+    run_solve_lane, LaneOutcome, SolveLane, SOLVE_BIN_KEY_BASE,
+};
 use crate::arb_engine::inline_sim::{PendingSim, SimPoll, SimulatedPathResult};
 use crate::bot_core::resolve::resolve_hops;
 use crate::bot_core::BotState;
 use ::degenbot_solvers::mixed::{
     HopType, MixedPath, MixedPoolRef, ResolvedHop, ResolvedMixedPath, SolvePathResult,
 };
+use degenbot_workers::dispatcher::SeatSurvivesPolicy;
 
 /// How many slowest-path entries the solve-cycle completion event names
 /// (D63GSE intra-solve visibility).
@@ -46,7 +50,7 @@ static WALK_DENSE_ALERTED: std::sync::atomic::AtomicBool =
 /// One solved path's arm tuple: `(path_id, result, worker clamp twins, the
 /// worker-resolved inline-sim payload)`. The solve arms hand these to the
 /// merge (`merge_one_result`); `None` payload = stance off / hook silence.
-type SolveArmOutcome = (u64, SolvePathResult, u64, Option<SimulatedPathResult>);
+pub(crate) type SolveArmOutcome = (u64, SolvePathResult, u64, Option<SimulatedPathResult>);
 
 // ---------------------------------------------------------------------------
 // RAYPAR T3: LPT-pre-balanced scoped-thread partition
@@ -845,7 +849,7 @@ fn flush_detached_item(
 /// the held outcome and stream it to the drain (7LV6VN T5).
 fn flush_tokio_item(
     held: &mut Vec<(u64, Option<SolveArmOutcome>)>,
-    res_tx: &std::sync::mpsc::Sender<Option<SolveArmOutcome>>,
+    lane: &mut SolveLane,
     done_pid: u64,
     payload: Option<SimulatedPathResult>,
 ) {
@@ -858,7 +862,7 @@ fn flush_tokio_item(
     o.3 = payload;
     let item = held.remove(ix);
     if let Some(outcome) = item.1 {
-        let _ = res_tx.send(Some(outcome));
+        lane.solved(outcome);
     }
 }
 
@@ -2370,6 +2374,11 @@ impl ArbitrageEngine {
         // loud load error), and the rayon arms are gone.
         let mut clamp_twin_count: u64 = 0;
         let mut solved_count: usize = 0;
+        let mut suppressed_count: usize = 0;
+        let mut failed_count: usize = 0;
+        // Seen-pid ledger (QR3NUS): every outcome names its path, so a
+        // duplicate delivery — or a double-count — trips the fuse loudly.
+        let mut outcome_pids: HashSet<u64> = HashSet::new();
         hotpath::measure_block!("arb_solve.tokio_solve", {
             // BXUSGL T1: the dedicated executor streams PER-PATH
             // results to the caller result queue - one bin task per
@@ -2389,7 +2398,11 @@ impl ArbitrageEngine {
                 .fleet_hosted
                 .then(crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor);
             let executor = crate::arb_engine::solve_executor::global_solve_executor();
-            let (res_tx, res_rx) = std::sync::mpsc::channel::<Option<SolveArmOutcome>>();
+            // QR3NUS (Seam D): the pipe carries one typed `LaneOutcome`
+            // per submitted path — a `None` never vanishes on the floor
+            // and a panicked bin's undelivered paths arrive as typed
+            // `Failed` records.
+            let (res_tx, res_rx) = std::sync::mpsc::channel::<LaneOutcome>();
             let bins = compute_bins();
             for (bin_idx, bin) in bins.iter().enumerate() {
                 let bin = bin.clone();
@@ -2397,7 +2410,11 @@ impl ArbitrageEngine {
                 let shared_bin = std::sync::Arc::clone(&shared);
                 let to_solve_bin = std::sync::Arc::clone(&to_solve);
                 let solve_span_bin = solve_span.clone();
-                let run_bin = move || {
+                // QR3NUS (Seam D): the bin's exact owed-pid list at
+                // dispatch — the lane witness uses it to keep outcome
+                // accounting exact even when a unit panics mid-bin.
+                let lane_pids: Vec<u64> = bin.iter().map(|&i| to_solve[i].0).collect();
+                let run_bin = move |lane: &mut SolveLane| {
                     // 7LV6VN T5 (pipelined arm): outcomes park until
                     // their sim lands; the walk never waits on a sim.
                     let mut held: Vec<(u64, Option<SolveArmOutcome>)> = Vec::new();
@@ -2441,7 +2458,7 @@ impl ArbitrageEngine {
                                         // No sim rides this item — flush
                                         // immediately.
                                         held.push((pid, Some((pid, result, twins, None))));
-                                        flush_tokio_item(&mut held, &res_tx, pid, None);
+                                        flush_tokio_item(&mut held, lane, pid, None);
                                         continue;
                                     }
                                     if !result.solver_pool_states.is_empty() {
@@ -2453,27 +2470,41 @@ impl ArbitrageEngine {
                                     held.push((pid, Some((pid, result, twins, None))));
                                     // Fan: flush sims that landed mid-walk.
                                     for (done_pid, payload) in pending.drain_ready() {
-                                        flush_tokio_item(&mut held, &res_tx, done_pid, payload);
+                                        flush_tokio_item(&mut held, lane, done_pid, payload);
                                     }
                                 }
                                 // Same failed-solve stream the legacy arm
-                                // sends (the drain skips None).
+                                // sends — a None IS an outcome (QR3NUS):
+                                // counted at the drain, never merged; it
+                                // carries its pid so accounting stays exact.
                                 None => {
-                                    let _ = res_tx.send(None);
+                                    lane.suppressed(*pid);
                                 }
                             }
                         }
                     }
                     if !pending.is_empty() {
                         for (done_pid, payload) in pending.join_all() {
-                            flush_tokio_item(&mut held, &res_tx, done_pid, payload);
+                            flush_tokio_item(&mut held, lane, done_pid, payload);
                         }
                     }
                 };
+                let lane_key =
+                    SOLVE_BIN_KEY_BASE.saturating_add(u64::try_from(bin_idx).unwrap_or(u64::MAX));
+                // The spawn job (QR3NUS decision A): every solve bin runs
+                // under the lane witness on BOTH executor arms — the panic
+                // stays loud AND typed, the seat survives, and every
+                // undelivered path patches onto the pipe as `Failed`. The
+                // unit/seat record names the stable pin key at this seam
+                // (LW-T2 refines it with the live seat context).
+                let spawn_job = move || {
+                    let mut lane = SolveLane::new(lane_key, lane_key, lane_pids, res_tx);
+                    run_solve_lane(&mut lane, &SeatSurvivesPolicy, run_bin);
+                };
                 if let Some(fleet) = fleet_executor {
-                    fleet.spawn(bin_idx, run_bin);
+                    fleet.spawn(bin_idx, spawn_job);
                 } else {
-                    executor.spawn(run_bin);
+                    executor.spawn(spawn_job);
                 }
             }
             drop(res_tx);
@@ -2489,27 +2520,82 @@ impl ArbitrageEngine {
             );
             let merge_ctx = merge_span.enter();
             while let Ok(item) = res_rx.recv() {
-                let Some((pid, solve_result, worker_clamp_twins, payload)) = item else {
-                    continue;
-                };
-                if !solve_result.solver_pool_states.is_empty() {
-                    tracing::debug!(
-                        "[solver-st] path_id={pid} hops=[{}]",
-                        solve_result.solver_pool_states.join(";")
-                    );
+                // QR3NUS fuse: EVERY drained item is exactly one attempted
+                // path outcome — solved paths merge; a `Suppressed` None IS
+                // an outcome (counted, never merged); a `Failed` arrives
+                // typed with its unit + seat payload. No item is ever
+                // silently skipped.
+                match item {
+                    LaneOutcome::Solved((pid, solve_result, worker_clamp_twins, payload)) => {
+                        if !outcome_pids.insert(pid) {
+                            tracing::error!(
+                                target: "degenbot::solver",
+                                path_id = pid,
+                                "[solve-merge] duplicate lane outcome for path — exactness fuse tripped (QR3NUS)"
+                            );
+                        }
+                        if !solve_result.solver_pool_states.is_empty() {
+                            tracing::debug!(
+                                "[solver-st] path_id={pid} hops=[{}]",
+                                solve_result.solver_pool_states.join(";")
+                            );
+                        }
+                        clamp_twin_count += self.merge_one_result(
+                            solve_block,
+                            metadata,
+                            pid,
+                            solve_result,
+                            worker_clamp_twins,
+                            payload,
+                        );
+                        solved_count += 1;
+                    }
+                    LaneOutcome::Suppressed { pid } => {
+                        if !outcome_pids.insert(pid) {
+                            tracing::error!(
+                                target: "degenbot::solver",
+                                path_id = pid,
+                                "[solve-merge] duplicate suppressed outcome for path — exactness fuse tripped (QR3NUS)"
+                            );
+                        }
+                        suppressed_count += 1;
+                    }
+                    LaneOutcome::Failed { pid, failure } => {
+                        if !outcome_pids.insert(pid) {
+                            tracing::error!(
+                                target: "degenbot::solver",
+                                path_id = pid,
+                                "[solve-merge] duplicate failed outcome for path — exactness fuse tripped (QR3NUS)"
+                            );
+                        }
+                        tracing::error!(
+                            target: "degenbot::solver",
+                            path_id = pid,
+                            failure = ?failure,
+                            "[solve-merge] path outcome lost to a seat panic — typed failure record (QR3NUS)"
+                        );
+                        failed_count += 1;
+                    }
                 }
-                clamp_twin_count += self.merge_one_result(
-                    solve_block,
-                    metadata,
-                    pid,
-                    solve_result,
-                    worker_clamp_twins,
-                    payload,
-                );
-                solved_count += 1;
             }
             drop(merge_ctx);
             merge_span.record("merge.paths", solved_count);
+            // The exactness fuse with a sensor (QR3NUS): every submitted
+            // path owes exactly one outcome; any gap is loud, never silent.
+            // (Real-sink parity promotion cross-checks "total delivered" in
+            // LW-T7.)
+            let drained = solved_count + suppressed_count + failed_count;
+            if drained != to_solve.len() {
+                tracing::error!(
+                    target: "degenbot::solver",
+                    submitted = to_solve.len(),
+                    drained,
+                    solved = solved_count,
+                    suppressed = suppressed_count,
+                    failed = failed_count,
+                    "[solve-merge] outcome accounting undercount — exactness fuse tripped (QR3NUS)"
+                );
+            }
         });
         if let Some(c) = shared.capture.as_ref() {
             tracing::info!(

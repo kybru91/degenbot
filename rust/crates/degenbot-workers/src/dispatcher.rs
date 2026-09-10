@@ -1041,6 +1041,57 @@ fn loud_abort(_reason: &str) {
     std::process::abort();
 }
 
+// ---------------------------------------------------------------------------
+// Panic-verdict policy (QR3NUS, Seam D): a unit panic whose results feed a
+// pipe is expressible as DATA — a policy object decides between converting
+// the panic to typed per-path failure records (the seat survives, decision
+// A) and the loud structural abort. The unit runner consults the verdict;
+// per-path outcome synthesis lives with the caller that owns the pid list
+// (the arb_engine solve-lane adapter).
+// ---------------------------------------------------------------------------
+
+/// What a [`PanicVerdict`] prescribes when a submitted unit panics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanicAction {
+    /// Convert the panic to typed per-path failure records; the seat keeps
+    /// taking its pinned units (QR3NUS decision A).
+    RecordAndContinue,
+    /// Loud structural abort (strict ADR-021 posture). Reserved for
+    /// dev/prod wiring that demands hard failure — never installed under
+    /// test.
+    Abort,
+}
+
+/// Policy object consulted when a submitted unit panics with
+/// `result_pipe: true` (abandoning its results would strand the pipe,
+/// design doc §10).
+pub trait PanicVerdict: Send + Sync + 'static {
+    /// Prescribe the action for a panicking unit. The payload names the
+    /// unit and the seat that was executing it.
+    #[must_use]
+    fn on_unit_panic(&self, unit: u64, seat: u64) -> PanicAction;
+}
+
+/// Seat-survives policy (QR3NUS decision A): the panic becomes typed
+/// failure records on the result pipe, and the seat keeps serving its pin.
+pub struct SeatSurvivesPolicy;
+
+impl PanicVerdict for SeatSurvivesPolicy {
+    fn on_unit_panic(&self, _unit: u64, _seat: u64) -> PanicAction {
+        PanicAction::RecordAndContinue
+    }
+}
+
+/// Strict abort policy (ADR-021 posture): unit panics abort the process.
+/// Dev/prod wiring only — never installed under test.
+pub struct AbortingPolicy;
+
+impl PanicVerdict for AbortingPolicy {
+    fn on_unit_panic(&self, _unit: u64, _seat: u64) -> PanicAction {
+        PanicAction::Abort
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
