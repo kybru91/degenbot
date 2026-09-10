@@ -443,6 +443,31 @@ impl BlockPump {
             .await
     }
 
+    // L3B6AE (epic VHCRD2, DECIDED 2026-09-10) — phasing-trigger POLICY: phase
+    // this method only when a single change must touch MORE THAN TWO of its five
+    // interleaved concerns in one PR (below the threshold the interleaving in a
+    // single-writer loop is measured-and-accepted, not a hazard). Line anchors are
+    // HEAD-of-this-commit (0bd2b8909 + this comment block):
+    //   (1) hotpath guards + timed-exit pruning (hotpath_guard / timed_exit_tick);
+    //   (2) allocator purge control (allocator_ctrl::on_header_observed, header
+    //       branch @1136; init_from_env_at_pump_start @527);
+    //   (3) WS-completeness cross-check (CompletenessDecision Verify @1591 /
+    //       BackfillOwned @1603, behind ws_completeness_enabled);
+    //   (4) posture telemetry on the executor seam (feed_executor_throttle_sample
+    //       header-cadence feed @1159);
+    //   (5) backfill/rewind re-anchoring (fsm.record_backfill @619 + the header
+    //       epoch anchors).
+    // Re-baseline: production body ~1400 lines (492..1891, up to
+    // boundary_drain_dispatch's docs); the original review's "1391+" came from a
+    // drifted revision — churn since is additive test mass, so the
+    // trailing-average shrink claim stays qualitative.
+    // PRESERVE under phasing: Arc<dyn StageHandlers> (the test surface) and the
+    // for_test knobs (set_quiesce_for_test / bot_arc_for_test / header-staleness /
+    // early-slice / log-silence, ~2400-2485), plus the FSM instance and its
+    // mutation points (fsm.set_quiesce_params @611, fsm.record_backfill @619).
+    // The future phaser must document the phase-state carrier decision (shared
+    // struct vs heavy parameter passing) with its change. Decision record:
+    // CONTEXT.md "Block-pump dispatch seam" -> pump-driver phasing (DECIDED).
     /// Processes logs eagerly: each WS log is applied to engine state
     /// immediately and affected paths are solved right away, without
     /// waiting for a block header. Block headers provide metadata

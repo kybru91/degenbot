@@ -369,6 +369,29 @@ clock are owned by ONE module — one **dispatch owner** — but delivered over 
   but falls behind is observed via `pending()` (a lag metric), never aborted;
   a dead (closed-channel) drainer still aborts immediately.
 
+### Pump-driver phasing — DEFERRED with a measured trigger (DECIDED, 2026-09-10; epic `VHCRD2`, task `L3B6AE`)
+
+Defers the original architecture-review card 4 (the `run_with_stream`
+interleaving) **with a policy rather than a preference**: phase the pump driver
+only when a single change must touch MORE THAN TWO of its five interleaved
+concerns in one PR. The concerns: (1) hotpath guards + timed-exit pruning;
+(2) allocator purge control (`allocator_ctrl::on_header_observed` +
+`init_from_env_at_pump_start`); (3) the WS-completeness cross-check
+(`CompletenessDecision` Verify/BackfillOwned arms); (4) posture telemetry on
+the executor seam (`feed_executor_throttle_sample` header-cadence feed);
+(5) backfill/rewind re-anchoring (`fsm.record_backfill` + the header epoch
+anchors). Re-baseline: the production body is ~1400 lines at HEAD
+(`0bd2b8909`) — the review's spuriously-exact "1391+" figure came from a
+drifted revision, the recent churn is additive **test** mass, and the
+trailing-average shrink claim stays qualitative. Preservation constraints under
+any future phasing: the `Arc<dyn StageHandlers>` interface (the test surface),
+the `for_test` knobs, and the FSM mutation points (`fsm.set_quiesce_params`,
+`fsm.record_backfill`) must not change; the phase-state **carrier decision**
+(shared struct vs heavy parameter passing) must be documented with the change.
+**Durable pointer:** the in-code trigger comment sits directly above
+`run_with_stream`'s doc comments in
+`rust/crates/degenbot-bot/src/bot_core/block_pump.rs`.
+
 ## GIL-state discipline module (2026-08-20 architecture review)
 
 - **GIL-state discipline** — the invariant "never hold the GIL while parked
