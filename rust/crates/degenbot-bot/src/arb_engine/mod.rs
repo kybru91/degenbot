@@ -479,9 +479,11 @@ pub struct ArbitrageEngine {
     /// When ON, `rebuild_and_solve_affected`
     /// RETURNS at ENQUEUE end and the solves merge on the sidecar thread.
     detached_solving: bool,
-    /// Monotonic counter bumped per issued detached cycle (the sidecar's
-    /// straggler-age telemetry reads `detached_issued_seq` against it).
-    detached_seq_ctr: u64,
+    /// Monotonic counter bumped per issued SOLVE cycle (43E3H3: BOTH arms —
+    /// the detached arm's enqueue AND the in-cycle arm's entry tick it; it
+    /// is THE ledger's seq half). The sidecar's straggler-age telemetry
+    /// still reads `detached_issued_seq` (detached-only) against it.
+    solve_seq_ctr: u64,
     /// The seq of the most recently issued detached cycle.
     detached_issued_seq: u64,
     /// LPEOBI: does the core hold a configured `max_age` for the V3/V4
@@ -492,24 +494,26 @@ pub struct ArbitrageEngine {
     event_buffer_expiry_enabled: bool,
     /// Sender half of the UNBOUNDED mpsc merge pipe; `Some` from the first
     /// detached enqueue until teardown. Each enqueue clones it into the
-    /// per-bin `std::thread`s.
-    detached_merge_tx: Option<std::sync::mpsc::Sender<solver_dispatch::DetachedMergeItem>>,
+    /// per-bin bin jobs. Carries the unified [`executor::LaneOutcome`]
+    /// (QR3NUS 43E3H3) — BOTH arms submit through it.
+    detached_merge_tx: Option<std::sync::mpsc::Sender<executor::LaneOutcome>>,
     /// Receiver parked until `EngineStages::solve_dirty` spawns the merge
     /// sidecar (taken once via `take_detached_merge_rx`). `Mutex`-wrapped so
     /// the engine stays `Sync` (the parked Receiver behind the worker-only
     /// guard is touched exactly once, by the spawner thread).
-    detached_merge_rx:
-        parking_lot::Mutex<Option<std::sync::mpsc::Receiver<solver_dispatch::DetachedMergeItem>>>,
-    /// LW-T9 note-(a) carry: the detached sidecar's duplicate-outcome fuse
-    /// counter (the QR3NUS exactness assert the in-cycle drain enforces
-    /// via its per-cycle outcome ledger; the sidecar keeps it
-    /// process-cumulative).
-    detached_duplicate_outcomes: std::sync::atomic::AtomicU64,
-    /// The sidecar's seen-(cycle_seq, pid) exactness ledger (LW-T9 note (a)
-    /// carry): the QR3NUS one-outcome-per-cycle assert, sidecar side. Held on
-    /// the ENGINE (`parking_lot` Mutex) — the fuse is stateful across sidecar
-    /// restarts (the pipe outlives any one sidecar thread).
-    detached_seen_outcomes: parking_lot::Mutex<std::collections::HashSet<(u64, u64)>>,
+    detached_merge_rx: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<executor::LaneOutcome>>>,
+    /// LW-T9 note-(a) carry: the duplicate-outcome fuse counter (the QR3NUS
+    /// exactness assert). 43E3H3: BOTH arms feed it — the in-cycle drain's
+    /// ledger claims and the sidecar's — one process-cumulative count.
+    duplicate_outcomes: std::sync::atomic::AtomicU64,
+    /// THE exactness ledger (LW-T9 note (a) -> QR3NUS 43E3H3: ONE ledger
+    /// for BOTH solve arms): one outcome per (`solve_seq`, path)
+    /// EXACTLY once — keyed (`solve_seq`, pid); the in-cycle drain claims
+    /// under its cycle's seq, the sidecar under the enqueue-stamped
+    /// `cycle_seq`. Held on the ENGINE (`parking_lot` Mutex) — the fuse is
+    /// stateful across sidecar restarts (the pipe outlives any one
+    /// sidecar thread) and shared across arms (ONE key zone, design §3.3).
+    outcome_ledger: parking_lot::Mutex<executor::outcome_ledger::OutcomeLedger>,
     /// In-flight gauge: detached results SENT but not yet dispositioned.
     /// `Arc` because the enqueue half's bin threads bump it at send time and
     /// the sidecar decrements it per terminal disposition. At cycle start a
@@ -637,12 +641,14 @@ impl ArbitrageEngine {
             delivery: DeliveryPolicy::default(),
             phase: std::sync::atomic::AtomicU8::new(EnginePhase::Created as u8),
             detached_solving,
-            detached_seq_ctr: 0,
+            solve_seq_ctr: 0,
             detached_issued_seq: 0,
             event_buffer_expiry_enabled: false,
             detached_merge_tx: None,
-            detached_duplicate_outcomes: std::sync::atomic::AtomicU64::new(0),
-            detached_seen_outcomes: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            duplicate_outcomes: std::sync::atomic::AtomicU64::new(0),
+            outcome_ledger: parking_lot::Mutex::new(
+                executor::outcome_ledger::OutcomeLedger::default(),
+            ),
             detached_merge_rx: parking_lot::Mutex::new(None),
             detached_outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             detached_applied: std::sync::atomic::AtomicU64::new(0),

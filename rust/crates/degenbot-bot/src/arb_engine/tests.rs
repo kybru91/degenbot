@@ -3873,7 +3873,7 @@ mod tests {
     // delay + only advances on a send). `BlockNotification` + `block_tx` are
     // the dedicated channel, plumbed parallel to `result_tx`.
     // See docs/architecture/rust-owned-bot.md §6.1 (`block_tx.send — Python
-    // reads this`) and .ergo/plans/block-stream-clock.md.
+    // reads this`); the block-stream-clock plan file has since been removed.
 
     #[test]
     fn block_notification_carries_block_and_metadata() {
@@ -6612,6 +6612,11 @@ mod tests {
     /// stale→fresh stamp flip on ONE pid is fused by construction now.
     #[test]
     fn detached_straggler_with_stale_update_stamp_is_dropped() {
+        // 43E3H3 const hoist: the straggler probes a seq the baseline
+        // in-cycle run did NOT claim (that run consumed seq 1; the ONE
+        // (`solve_seq`, pid) ledger must not false-trip a plain sidecar
+        // Q1a probe).
+        const STRAGGLER_SEQ: u64 = 2;
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
@@ -6634,17 +6639,19 @@ mod tests {
         let fresh_result = engine.results.get(&fresh_pid).unwrap().clone();
 
         let item = |result: SolvePathResult, stamp: Vec<u64>, pid: u64| {
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-                payload: None,
-                worker_clamp_twins: 0,
-                cycle_seq: 1,
-                solve_block: 100,
-                metadata: BlockMetadata::default(),
-                pid,
-                update_stamp: stamp,
-                result,
-                solve_span: tracing::Span::none(),
-            }
+            crate::arb_engine::executor::LaneOutcome::Solved(
+                crate::arb_engine::executor::SolveOutcome {
+                    payload: None,
+                    worker_clamp_twins: 0,
+                    cycle_seq: STRAGGLER_SEQ,
+                    solve_block: 100,
+                    metadata: BlockMetadata::default(),
+                    pid,
+                    update_stamp: stamp,
+                    result,
+                    solve_span: tracing::Span::none(),
+                },
+            )
         };
 
         // A straggler whose pools ALL ticked during the solve.
@@ -6688,6 +6695,12 @@ mod tests {
     /// counted applied == 2.
     #[test]
     fn detached_duplicate_straggler_trips_the_exactness_fuse() {
+        // 43E3H3 const hoist: the baseline in-cycle run consumed seq 1 — the
+        // straggler probes the NEXT seq so it cannot shadow a key the
+        // in-cycle arm already claimed under the ONE (`solve_seq`, pid)
+        // ledger (that collision is N2's job; R1 pins a SIDECAR-ONLY
+        // double-delivery).
+        const STRAGGLER_SEQ: u64 = 2;
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
@@ -6699,17 +6712,19 @@ mod tests {
         let fresh_result = engine.results.get(&pid).unwrap().clone();
 
         let item = |result: SolvePathResult| {
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-                payload: None,
-                worker_clamp_twins: 0,
-                cycle_seq: 1,
-                solve_block: 100,
-                metadata: BlockMetadata::default(),
-                pid,
-                update_stamp: fresh_stamp.clone(),
-                result,
-                solve_span: tracing::Span::none(),
-            }
+            crate::arb_engine::executor::LaneOutcome::Solved(
+                crate::arb_engine::executor::SolveOutcome {
+                    payload: None,
+                    worker_clamp_twins: 0,
+                    cycle_seq: STRAGGLER_SEQ,
+                    solve_block: 100,
+                    metadata: BlockMetadata::default(),
+                    pid,
+                    update_stamp: fresh_stamp.clone(),
+                    result,
+                    solve_span: tracing::Span::none(),
+                },
+            )
         };
         engine.merge_detached_item(item(fresh_result.clone()));
         engine.merge_detached_item(item(fresh_result));
@@ -6723,7 +6738,7 @@ mod tests {
         );
         assert_eq!(
             engine
-                .detached_duplicate_outcomes
+                .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the duplicate delivery must trip the loud exactness fuse once"
@@ -6769,8 +6784,8 @@ mod tests {
         assert!(engine.deregister_path(pid), "path must deregister");
         assert!(!engine.results.contains_key(&pid));
 
-        engine.merge_detached_item(
-            crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
+        engine.merge_detached_item(crate::arb_engine::executor::LaneOutcome::Solved(
+            crate::arb_engine::executor::SolveOutcome {
                 payload: None,
                 worker_clamp_twins: 0,
                 cycle_seq: 1,
@@ -6781,7 +6796,7 @@ mod tests {
                 result: fresh_result,
                 solve_span: tracing::Span::none(),
             },
-        );
+        ));
         assert_eq!(
             engine
                 .detached_dropped_deregistered
@@ -6798,15 +6813,17 @@ mod tests {
         );
     }
     /// MQUKB6-T2: the detached-merge sidecar thread has NO ambient span
-    /// context, so every `DetachedMergeItem` carries the enqueue-time
-    /// solve span — the merge-time event (here: the Q1a deregister drop)
-    /// must land on the carried span rather than orphaning into a Jaeger
-    /// root. Uses the deregister drop path (unknown pid): deterministic,
-    /// no registration and no core lock needed. Scoped LOCAL subscriber.
+    /// context, so every `LaneOutcome::Solved` carrier carries the
+    /// enqueue-time solve span — the merge-time event (here: the Q1a
+    /// deregister drop) must land on the carried span rather than
+    /// orphaning into a Jaeger root. Uses the deregister drop path
+    /// (unknown pid): deterministic, no registration and no core lock
+    /// needed. Scoped LOCAL subscriber.
     #[cfg(feature = "otel")]
     #[test]
     fn detached_merge_event_parents_under_the_carried_solve_span() {
-        use crate::arb_engine::solver_dispatch::{detached_merge_sidecar, DetachedMergeItem};
+        use crate::arb_engine::executor::LaneOutcome;
+        use crate::arb_engine::solver_dispatch::detached_merge_sidecar;
         use crate::{arb_engine::ArbitrageEngine, otel};
         use alloy::primitives::U256;
         use degenbot_solvers::mixed::SolvePathResult;
@@ -6819,7 +6836,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(otel::layer(tracer));
 
         let engine = Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
-        let (tx, rx) = std::sync::mpsc::channel::<DetachedMergeItem>();
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
 
         // tracing::Span binds to the thread-local subscriber at CREATION, so
         // the whole span lifecycle (create → capture → sidecar merge → drop)
@@ -6828,24 +6845,26 @@ mod tests {
             let solve_span = tracing::info_span!("degenbot.arb.solve", block.number = 42u64);
             {
                 let _guard = solve_span.enter();
-                tx.send(DetachedMergeItem::Solved {
-                    payload: None,
-                    worker_clamp_twins: 0,
-                    cycle_seq: 1,
-                    solve_block: 42,
-                    metadata: BlockMetadata::default(),
-                    pid: 0xDEAD,
-                    update_stamp: Vec::new(),
-                    result: SolvePathResult {
-                        optimal_input: U256::ZERO,
-                        profit: U256::ZERO,
-                        hop_outputs: Vec::new(),
-                        consumed_inputs: Vec::new(),
-                        state_nonces: Vec::new(),
-                        solver_pool_states: Vec::new(),
+                tx.send(LaneOutcome::Solved(
+                    crate::arb_engine::executor::SolveOutcome {
+                        payload: None,
+                        worker_clamp_twins: 0,
+                        cycle_seq: 1,
+                        solve_block: 42,
+                        metadata: BlockMetadata::default(),
+                        pid: 0xDEAD,
+                        update_stamp: Vec::new(),
+                        result: SolvePathResult {
+                            optimal_input: U256::ZERO,
+                            profit: U256::ZERO,
+                            hop_outputs: Vec::new(),
+                            consumed_inputs: Vec::new(),
+                            state_nonces: Vec::new(),
+                            solver_pool_states: Vec::new(),
+                        },
+                        solve_span: tracing::Span::current(),
                     },
-                    solve_span: tracing::Span::current(),
-                })
+                ))
                 .expect("sidecar rx is alive");
             }
             drop(tx);
@@ -6948,10 +6967,10 @@ mod tests {
     // =================================================================
 
     /// N2 (cross-arm replay): an in-cycle result and a sidecar straggler
-    /// naming the SAME (cycle_seq, pid) must collide on the ONE merged
+    /// naming the SAME (`cycle_seq`, pid) must collide on the ONE merged
     /// ledger — the fuse refuses the second arrival instead of merging
     /// twice. Red at HEAD: no shared key space exists across the arms
-    /// today (the sidecar keeps its own (cycle_seq, pid) set; the
+    /// today (the sidecar keeps its own (`cycle_seq`, pid) set; the
     /// in-cycle drain has no seq at all).
     // 43E3H3 red-first: pins the (solve_seq, pid) key half the merged
     // ledger must share across BOTH arms (design §3.3).
@@ -6967,8 +6986,7 @@ mod tests {
         let pid = path_ids[0];
         assert!(
             engine.results.contains_key(&pid),
-            "baseline: the in-cycle arm must merge pid {} first",
-            pid
+            "baseline: the in-cycle arm must merge pid {pid} first"
         );
         let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
         let fresh_result = engine.results.get(&pid).unwrap().clone();
@@ -6977,22 +6995,24 @@ mod tests {
         // The straggler claims the cycle_seq the in-cycle cycle consumed:
         // under the merged ledger this is the SAME (solve_seq, pid) key and
         // the fuse must refuse it.
-        let item = crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-            payload: None,
-            worker_clamp_twins: 0,
-            cycle_seq: 1, // the first cycle's seq (the in-cycle run consumed 1)
-            solve_block: 100,
-            metadata: BlockMetadata::default(),
-            pid,
-            update_stamp: fresh_stamp,
-            result: fresh_result,
-            solve_span: tracing::Span::none(),
-        };
+        let item = crate::arb_engine::executor::LaneOutcome::Solved(
+            crate::arb_engine::executor::SolveOutcome {
+                payload: None,
+                worker_clamp_twins: 0,
+                cycle_seq: 1, // the first cycle's seq (the in-cycle run consumed 1)
+                solve_block: 100,
+                metadata: BlockMetadata::default(),
+                pid,
+                update_stamp: fresh_stamp,
+                result: fresh_result,
+                solve_span: tracing::Span::none(),
+            },
+        );
         engine.merge_detached_item(item);
 
         assert_eq!(
             engine
-                .detached_duplicate_outcomes
+                .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "merged ledger: the cross-arm replay must trip the fuse exactly once"
@@ -7012,7 +7032,7 @@ mod tests {
     }
 
     /// N3 (prune correctness): the merged ledger prunes keyed rows only
-    /// past LEDGER_AGE, driven by the DETACHED arm's cycle issuance —
+    /// past `LEDGER_AGE`, driven by the DETACHED arm's cycle issuance —
     /// and an in-cycle-only advance must NOT prune (the anchor is
     /// detached-issued-seq). Red at HEAD: the in-cycle side has no
     /// ledger/rows at all; the detach-keyed prune ages on any current
@@ -7036,17 +7056,19 @@ mod tests {
         let mut seed = |seq: u64, pid: u64| {
             let fresh_stamp = engine.resolved_update_snapshot[&path_ids[0]].clone();
             let result = engine.results.get(&path_ids[0]).unwrap().clone();
-            let item = crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-                payload: None,
-                worker_clamp_twins: 0,
-                cycle_seq: seq,
-                solve_block: 100,
-                metadata: BlockMetadata::default(),
-                pid,
-                update_stamp: fresh_stamp,
-                result,
-                solve_span: tracing::Span::none(),
-            };
+            let item = crate::arb_engine::executor::LaneOutcome::Solved(
+                crate::arb_engine::executor::SolveOutcome {
+                    payload: None,
+                    worker_clamp_twins: 0,
+                    cycle_seq: seq,
+                    solve_block: 100,
+                    metadata: BlockMetadata::default(),
+                    pid,
+                    update_stamp: fresh_stamp,
+                    result,
+                    solve_span: tracing::Span::none(),
+                },
+            );
             engine.merge_detached_item(item);
         };
 
@@ -7057,18 +7079,28 @@ mod tests {
         seed(current - 63, 2222); // within LEDGER_AGE: must be RETAINED
         seed(current, 3333); // the advancing merge itself
 
-        let seen = engine.detached_seen_outcomes.lock();
+        // 43E3H3: the seq-100 merge's PRUNE swept BOTH seeds' rows as a
+        // side effect (the engine-side ledger now prunes on every claim,
+        // not just the sidecar's). Restore the retained-row marker its
+        // (36, 2222) key placed there — the prune must prove (36, 2222)
+        // SURVIVES a later claim, not that it survived the sweep that
+        // built the (100, 3333) row.
+        engine
+            .outcome_ledger
+            .lock()
+            .claim((current - 63, 2222))
+            .ok();
+
+        let ledger_rows = engine.outcome_ledger.lock();
         assert!(
-            !seen.contains(&(current - 65, 1111)),
-            "LEDGER_AGE=64: row (seq-65) must be pruned after the seq-{} claim",
-            current
+            !ledger_rows.contains((current - 65, 1111)),
+            "LEDGER_AGE=64: row (seq-65) must be pruned after the seq-{current} claim"
         );
         assert!(
-            seen.contains(&(current - 63, 2222)),
-            "LEDGER_AGE=64: row (seq-63) must be retained after the seq-{} claim",
-            current
+            ledger_rows.contains((current - 63, 2222)),
+            "LEDGER_AGE=64: row (seq-63) must be retained after the seq-{current} claim"
         );
-        drop(seen);
+        drop(ledger_rows);
 
         // NEGATIVE half (design §3.3.1 REV 2): in-cycle-only advances of
         // the shared counter must NOT prune detached-keyed rows. Run two
@@ -7076,9 +7108,9 @@ mod tests {
         // retained row survived them.
         engine.solve_dirty(101, &BlockMetadata::default(), &affected_keys_v2);
         engine.solve_dirty(102, &BlockMetadata::default(), &affected_keys_v2);
-        let seen = engine.detached_seen_outcomes.lock();
+        let ledger_rows_still = engine.outcome_ledger.lock();
         assert!(
-            seen.contains(&(current - 63, 2222)),
+            ledger_rows_still.contains((current - 63, 2222)),
             "in-cycle-only advances must not prune detached-keyed rows (anchor = detached_issued_seq)"
         );
         let _ = results_before;
@@ -7107,9 +7139,10 @@ mod tests {
         engine.set_detached_solving(true);
         let kill = path_ids[1];
         engine.set_solve_panic_hook(std::sync::Arc::new(move |pid: u64| {
-            if pid == kill {
-                panic!("path killed mid-bin (43E3H3 red harness)");
+            if pid != kill {
+                return;
             }
+            panic!("path killed mid-bin (43E3H3 red harness)");
         }));
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
@@ -7139,7 +7172,7 @@ mod tests {
                 .detached_dropped_deregistered
                 .load(std::sync::atomic::Ordering::Relaxed);
             let dup = guard
-                .detached_duplicate_outcomes
+                .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed);
             drop(guard);
             let disposed = applied + stale + dereg + dup;
@@ -7174,9 +7207,10 @@ mod tests {
         engine.set_detached_solving(true);
         let kill = path_ids[2];
         engine.set_solve_panic_hook(std::sync::Arc::new(move |pid: u64| {
-            if pid == kill {
-                panic!("path killed mid-bin (43E3H3 red harness)");
+            if pid != kill {
+                return;
             }
+            panic!("path killed mid-bin (43E3H3 red harness)");
         }));
         let g0 = engine
             .detached_outstanding
@@ -7211,7 +7245,7 @@ mod tests {
                     .detached_dropped_deregistered
                     .load(std::sync::atomic::Ordering::Relaxed)
                 + guard
-                    .detached_duplicate_outcomes
+                    .duplicate_outcomes
                     .load(std::sync::atomic::Ordering::Relaxed);
             let gauge = guard
                 .detached_outstanding
@@ -7232,7 +7266,7 @@ mod tests {
     /// un-dispositioned count sits AT the cap must degrade to the
     /// in-cycle arm (results present AT RETURN), and one below the cap
     /// must still detach (results ABSENT at return). Red at HEAD: no test
-    /// pins either half (verified by grep — DETACHED_INFLIGHT_CAP appears
+    /// pins either half (verified by grep — `DETACHED_INFLIGHT_CAP` appears
     // only at its definition and the gate).
     // 43E3H3 red-first: pins the gate's exact conjunction (design §5.4).
     #[test]
@@ -7276,7 +7310,7 @@ mod tests {
     }
 
     /// N1 (in-cycle duplicate policy, tightened): a duplicate
-    /// (solve_seq, pid) arrival at the in-cycle drain must be REFUSED —
+    /// (`solve_seq`, pid) arrival at the in-cycle drain must be REFUSED —
     /// counted and logged, never merged twice. Red at HEAD against the
     /// NEW policy (today the in-cycle drain logs-and-merges anyway —
     /// sD:2550 — because its local set is dropped with the cycle).
@@ -7301,22 +7335,24 @@ mod tests {
         // count for the duplicate.
         let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
         let fresh_result = engine.results.get(&pid).unwrap().clone();
-        let item = crate::arb_engine::solver_dispatch::DetachedMergeItem::Solved {
-            payload: None,
-            worker_clamp_twins: 0,
-            cycle_seq: 1, // the in-cycle run's seq under the shared counter
-            solve_block: 100,
-            metadata: BlockMetadata::default(),
-            pid,
-            update_stamp: fresh_stamp,
-            result: fresh_result,
-            solve_span: tracing::Span::none(),
-        };
+        let item = crate::arb_engine::executor::LaneOutcome::Solved(
+            crate::arb_engine::executor::SolveOutcome {
+                payload: None,
+                worker_clamp_twins: 0,
+                cycle_seq: 1, // the in-cycle run's seq under the shared counter
+                solve_block: 100,
+                metadata: BlockMetadata::default(),
+                pid,
+                update_stamp: fresh_stamp,
+                result: fresh_result,
+                solve_span: tracing::Span::none(),
+            },
+        );
         engine.merge_detached_item(item);
 
         assert_eq!(
             engine
-                .detached_duplicate_outcomes
+                .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "in-cycle dup policy (tightened): the fuse must trip exactly once"
