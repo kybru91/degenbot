@@ -119,27 +119,6 @@ pub(crate) struct FleetSolveExecutor {
     solver_seats: usize,
 }
 
-/// The production throttle poller's feed point (LW-T5, Seam E). LW-T9:
-/// always fed — the fleet executor is the sole executor, so a header
-/// sample may boot it (the stance gate is deleted with the stance).
-pub(crate) fn feed_fleet_posture_sample(now_ms: u64, events: u64, throttled_usec: u64) -> bool {
-    let last_ms = LAST_HEADER_SAMPLE_MS.swap(now_ms, Ordering::Relaxed);
-    let elapsed_usec = if last_ms == 0 {
-        0
-    } else {
-        now_ms.saturating_sub(last_ms).saturating_mul(1_000)
-    };
-    crate::arb_engine::executor::global_executor().observe_throttle(
-        now_ms,
-        ThrottleSample {
-            events,
-            throttled_usec,
-            elapsed_usec,
-        },
-    );
-    true
-}
-
 impl crate::arb_engine::executor::Executor for FleetSolveExecutor {
     fn bin_count(&self) -> usize {
         self.bin_count()
@@ -453,11 +432,6 @@ fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, seats: &[mpsc::Sende
         }
     }
 }
-
-/// The wall-ms of the last per-header cgroup throttle sample: the FSM
-/// needs each sample's poll interval (elapsed) and the `block_pump` poller
-/// samples on header cadence (LW-T5, Seam E).
-static LAST_HEADER_SAMPLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 static FLEET_SOLVE_BOOT: OnceLock<FleetBoot> = OnceLock::new();
 static FLEET_EXECUTOR: OnceLock<FleetSolveExecutor> = OnceLock::new();

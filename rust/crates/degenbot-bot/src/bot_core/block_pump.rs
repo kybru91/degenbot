@@ -55,6 +55,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+// LW-T5 (Seam E): the pump feeds the cgroup throttle sample straight
+// through the Executor seam (block_pump no longer reaches into the
+// engine's internal solve-executor module).
+use crate::arb_engine::executor::global_executor;
 use crate::bot_core::stage_machine::QuiesceParams;
 use crate::bot_core::stance;
 use crate::bot_core::{CompletenessDecision, StageDecision, StageMachine};
@@ -67,6 +71,7 @@ use degenbot_ingestion::{
     IngestEvent as WsEvent, Watchdog, WsIngestor, BACKFILL_TIMEOUT_SECS,
     DEFAULT_BACKFILL_CHUNK_SIZE, RELEVANT_TOPICS,
 };
+use degenbot_workers::posture::ThrottleSample;
 use futures_util::{stream, StreamExt};
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -87,6 +92,35 @@ use crate::bot_core::{
 /// overflow callers get a saturated bucket, never a precision-lost value).
 fn us_to_secs(us: u64) -> f64 {
     f64::from(u32::try_from(us).unwrap_or(u32::MAX)) / 1_000_000.0
+}
+
+/// LW-T5 (Seam E): wall-clock anchor for the header throttle-sample
+/// cadence — the pump owns the sample interval. The FSM needs each
+/// sample's poll interval (elapsed), and the pump poller samples on
+/// header cadence, so the delta accounting lives here with the sampler.
+static LAST_HEADER_SAMPLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Feed ONE per-header cgroup throttle sample through the Executor seam.
+/// The pump owns the header sample cadence: `elapsed_usec` is the time
+/// since the previous sample (0 for the first sample, the `last_ms == 0`
+/// sentinel). LW-T9: always fed — the fleet executor is the sole
+/// executor, so a header sample may boot it (the stance gate is deleted
+/// with the stance).
+fn feed_executor_throttle_sample(now_ms: u64, events: u64, throttled_usec: u64) {
+    let last_ms = LAST_HEADER_SAMPLE_MS.swap(now_ms, Ordering::Relaxed);
+    let elapsed_usec = if last_ms == 0 {
+        0
+    } else {
+        now_ms.saturating_sub(last_ms).saturating_mul(1_000)
+    };
+    global_executor().observe_throttle(
+        now_ms,
+        ThrottleSample {
+            events,
+            throttled_usec,
+            elapsed_usec,
+        },
+    );
 }
 
 /// Wall-clock milliseconds since the Unix epoch. The epoch-race anchor
@@ -1089,10 +1123,16 @@ impl BlockPump {
                                     stats.throttled_usec,
                                 );
                                 // LW-T5 (Seam E): the SAME per-block sample
-                                // feeds the fleet submit posture — STANCE-
-                                // GATED inside the feed fn (a legacy-stance
-                                // header sample never boots the fleet).
-                                crate::arb_engine::fleet_solve_executor::feed_fleet_posture_sample(
+                                // feeds the fleet submit posture — through
+                                // the Executor seam now
+                                // (`crate::arb_engine::executor::
+                                // global_executor().observe_throttle`); the
+                                // pump owns the header-cadence delta
+                                // (LAST_HEADER_SAMPLE_MS moved with the
+                                // sampler). LW-T9: always fed (a header
+                                // sample may boot the fleet; the stance gate
+                                // is deleted).
+                                feed_executor_throttle_sample(
                                     wall_ms(),
                                     stats.nr_throttled,
                                     stats.throttled_usec,
