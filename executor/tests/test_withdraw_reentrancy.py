@@ -5,7 +5,7 @@ This test was written to *validate or refute* the H1 finding in the security
 review: "withdraw() is reentrancy-vulnerable — ETH from WETH.withdraw lands in
 self.balance before raw_call(destination), so a reentrant withdraw drains again."
 
-Based on the control-flow trace (documented in `.auto/h1-withdraw-trace.md`),
+Based on the control-flow trace (documented in `.auto/h1-withdraw-trace.md`, since removed),
 the described exploit does **not** hold: by the time `destination`'s fallback
 fires, `self.balance` has already been debited by the outer `raw_call`, and
 `WETH.balanceOf(self)` is already burned. A reentrant `withdraw(amount)` fails

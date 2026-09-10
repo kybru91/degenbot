@@ -3,7 +3,8 @@
 //! in-process `Mutex<Connection>` (epic `2SFL6I`, task `JZLTES`).
 //!
 //! Asserts the section 1.3 no-duplicate-writer invariant
-//! (`docs/migration-guides/pool-updater-chunk-atomicity.md` section 1): "At most one
+//! (`docs/migration-guides/pool-updater-chunk-atomicity.md` section 1, removed in the stale-docs cleanup `71ec78b2`):
+//! "At most one
 //! connection holds a write transaction on the database during a chunk."
 //! `run_pool_update` opens EXACTLY ONE `DegenbotDb::open_for_writes` handle for
 //! the whole run (`run.rs:548`) + each chunk's `tx` is

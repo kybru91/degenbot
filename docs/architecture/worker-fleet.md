@@ -1,6 +1,7 @@
 # The role-switching worker fleet (`degenbot-workers`)
 
-Ergo task `ZXSGTX` (epic `GTX`) · decision record: [ADR-042](../adr/ADR-042-role-switching-worker-fleet.md) · sizing evidence: 2026-09-08/09 survey + solve-cycle tail (task `CIRZHH`, `logs/solve-tail-20260908.md`)
+Ergo task `ZXSGTX` (epic `GTX`) · decision record: [ADR-042](../adr/ADR-042-role-switching-worker-fleet.md) · sizing evidence: 2026-09-08/09 survey + solve-cycle tail (task `CIRZHH`, `logs/solve-tail-20260908.md` — a gitignored
+`logs/` run artifact)
 
 > **Proposed.** The role/state table (§3) and the budget allocation table (§5)
 > are the sign-off checkpoint; implementation of fleet-core is gated on user

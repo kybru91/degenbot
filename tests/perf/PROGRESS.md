@@ -454,4 +454,4 @@ these entirely with bulk address preloading.
 | `src/degenbot/degenbot_rs.pyi` | Type stub for `find_paths_rust` + `PathIterator` |
 | `pyproject.toml` | Removed `networkx` dependency |
 | `tests/perf/bench_pathfinding.py` | Benchmark comparing old (NetworkX) vs new (Rust) |
-| `.ergo/plans/pathfinding-rust-port.md` | Detailed implementation plan |
+| `.ergo/plans/pathfinding-rust-port.md` | Detailed implementation plan (the .ergo/plans/ tree was removed; journals live only in `.ergo/journal.jsonl`) |

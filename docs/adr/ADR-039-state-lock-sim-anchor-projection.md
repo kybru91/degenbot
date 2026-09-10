@@ -8,7 +8,7 @@ Accepted (2026-09-03, epic K4ETHF; adversarially pair-reviewed — review incorp
 
 The overnight + diagnostic soaks attributed the recurring ~2-3s exclusive holds of the core
 'BotState' lock to 'SimAnchorState::snapshot' (dispatch.rs:638 read guard; evidence:
-logs/state-lock-holder-attribution.md, logs/state-lock-impact.md). Two algorithmic defects made a
+the now-removed local run artifacts logs/state-lock-holder-attribution.md and logs/state-lock-impact.md). Two algorithmic defects made a
 "O(pools), no tick data" projection cost seconds per block:
 
 1. **V3 full tick scan.** The snapshot consulted a generic arbitrary-key query interface
@@ -86,5 +86,5 @@ Tests (names as recorded in the tree):
 Pair review: adversarial post-landing pass APPROVED (projection scoped at the enumeration level,
 not the query interface; no S_state memo; the fetch-under-write risk split out as task RATR5A).
 
-T6 soak delta gates pre-registered in logs/state-lock-impact.md; met in the 17min interim soak and
+T6 soak delta gates were pre-registered in the (now-removed local artifact) logs/state-lock-impact.md; met in the 17min interim soak and
 re-confirmed at the full 1h soak (see the impact doc delta tables).

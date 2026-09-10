@@ -9,8 +9,8 @@
 //! premise was REFUTED by mainnet data: V3 hops matched the actual swap
 //! output exactly (engine state is correct — stale state would diverge V3
 //! too), while only the V4 swap diverged by 1-8 units (a solver calc
-//! rounding divergence, not stale state). See
-//! `docs/architecture/sim_v4_swap_step_rounding.md`. The seam stays gated OFF
+//! rounding divergence, not stale state; the sim_v4_swap_step_rounding.md
+//! diagnosis was removed in the stale-docs cleanup `71ec78b2`). The seam stays gated OFF
 //! in production and is retained as a dead switch for future re-probing; the
 //! divergence probe (`super::divergence_probe`) proved the engine's tracked
 //! scalar slots are byte-identical to the RPC at sim time.

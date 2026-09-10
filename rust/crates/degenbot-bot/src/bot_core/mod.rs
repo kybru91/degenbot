@@ -1336,8 +1336,9 @@ impl BotState {
             {
                 // PancakeSwap V3 swaps carry a non-canonical topic0 (the fork
                 // added two trailing data fields to the Swap event) — decode
-                // them via the dedicated decoder so these pools stay live. See
-                // docs/exploration-no-profit-crash.md (stale-state root cause).
+                // them via the dedicated decoder so these pools stay live. See the
+                // exploration-no-profit-crash writeup (stale-state root cause;
+                // removed in the stale-docs cleanup `71ec78b2`).
                 if let Some(event) = decode_v3_pancakeswap_swap_log(log) {
                     self.route_v3_event(
                         crate::bot_core::cl_route::Phase::Backfill,

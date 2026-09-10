@@ -244,7 +244,8 @@ pub(crate) fn derive(
 // T6 — rule-driven walker for the 7 V2/V3-only 3-hop families.
 //
 // Replaces the 7 hand-written arms (`v3v3v3` … `v2v3v2`) with a single
-// rule-driven derivation. The rules (see `/tmp/t6_analysis.md`):
+// rule-driven derivation. The rules (the T6 analysis lived in a scratch file
+// under /tmp and was never committed):
 //
 // **R1 (enclosure root).** Every family is SelfFund-led: a `SelfFund{WETH,
 // optimal}` prepends the plan. The outermost frame is the **last

@@ -5436,7 +5436,8 @@ mod tests {
         use hashbrown::HashMap;
         use std::str::FromStr;
 
-        // Canonical fixture (logs/fixtures/v2_v3_v3_solver_divergence_25641093.md):
+        // Canonical fixture (logs/fixtures/v2_v3_v3_solver_divergence_25641093.md, a
+        // gitignored logs/ artifact since removed):
         // pool pre-swap @25641093 — sqrt 1956421190421993762013571523, tick
         // -74028, liquidity 5407362545736161987; current tick -74028 is
         // INITIALIZED with ln == +current liquidity (full drain on zfo step 0);

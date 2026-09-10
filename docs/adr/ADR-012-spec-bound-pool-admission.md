@@ -229,8 +229,4 @@ The changes:
   constraint the typed mappers preserve).
 - ADR-003 — `Bot` as the single Rust state owner (registration is a
   `Bot` method, so the seam is co-located with state ownership).
-- `docs/ergo-results/zoicez-spec-bound-helpers.md`
-- `docs/ergo-results/mstat2-register-v2-result.md`
-- `docs/ergo-results/24kngf-register-v3-result.md`
-- `docs/ergo-results/k3iicb-register-v4-result.md`
-- `docs/ergo-results/f2evv6-typed-mappers-result.md`
+- the five per-task result attachments for this ADR (zoicez-spec-bound-helpers.md, mstat2-register-v2-result.md, 24kngf-register-v3-result.md, k3iicb-register-v4-result.md, f2evv6-typed-mappers-result.md under `docs/ergo-results/`) — removed in the stale-docs cleanup `71ec78b2`; recoverable from git history at any parent of that commit.

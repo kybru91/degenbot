@@ -73,7 +73,7 @@ Address indices `0xFC`–`0xFF` resolve to the **4 protocol-role sentinels** wit
 | `0xFF` | `V4_NATIVE_SENTINEL` | `NATIVE_ADDRESS` / no-hooks indicator |
 
 **Only protocol roles are sentinels — no path-specific tokens are baked into the contract.**
-User tokens (USDC, WBTC, DAI, …) are *never* sentinels; they go through `t_addresses` via `SET_ADDRESS` per transaction, exactly like every other address. The prior `USER0`/`USER1` sentinels were removed because their savings were partly a benchmark artifact (the 27-path suite uses exactly two hot user tokens in fixed roles) and their `else: USER1_ADDR` catch-all silently mis-resolved unbound reserved bytes (`0xF2`–`0xFB`) — a latent bug. See `.auto/prompt.md` OVERFITTING section and commit `8c75fa6`.
+User tokens (USDC, WBTC, DAI, …) are *never* sentinels; they go through `t_addresses` via `SET_ADDRESS` per transaction, exactly like every other address. The prior `USER0`/`USER1` sentinels were removed because their savings were partly a benchmark artifact (the 27-path suite uses exactly two hot user tokens in fixed roles) and their `else: USER1_ADDR` catch-all silently mis-resolved unbound reserved bytes (`0xF2`–`0xFB`) — a latent bug (the OVERFITTING analysis lived in the since-removed `.auto/prompt.md`). See commit `8c75fa6`.
 
 Range-check optimization: `if idx >= SENTINEL_THRESHOLD (0xFC)` dispatches sentinel resolution; `< 0xFC` does direct `t_addresses[idx]` array lookup. Any byte `>= 0xFC` that isn't PM/SELF/WETH/NATIVE raises `InvalidCommand` (fail-closed, no silent catch-all).
 
@@ -165,7 +165,7 @@ uv run vyper -f ir_runtime contracts/cmd_executor.vy > /tmp/venom_ir.vy
 
 ## Gas Optimization: What Works (Priority Order)
 
-These are proven patterns — see `.auto/ideas.md` for exhaustive details:
+These are proven patterns (details were in the since-removed `.auto/ideas.md`, summarized in this file):
 
 1. **Sentinel addresses** (−67,786 gas) — Eliminate SET_ADDRESS + TLOAD for the 4 protocol-role addresses (PM/SELF/WETH/NATIVE). This is the figure in the table below for the 4 surviving sentinels; the now-removed user sentinels were a *separate, additional* win (segments 2–3, see dead-ends table + commit `8c75fa6`).
 2. **`unsafe_add`/`unsafe_sub` for offset arithmetic** (−19,997 gas) — Skip overflow checks on provably-safe additions
@@ -285,7 +285,7 @@ Bribe configuration is packed into the ABI `config` parameter (bits 8-23 = bribe
 | `docs/transfer-count-investigation.md` | Minimum transfer analysis per path |
 | `README.md` | Comprehensive project documentation (gas benchmarks, architecture, command set) |
 | `SECURITY_REVIEW.md` | Security audit findings and fixes |
-| `FAKE_CONTRACT_AUDIT.md` | Fake vs real contract invariant comparison |
-| `OPTIMIZATION_ANALYSIS.md` | Callback invariant analysis and optimization proposals |
+| `FAKE_CONTRACT_AUDIT.md` (never committed; removed) | Fake vs real contract invariant comparison |
+| `OPTIMIZATION_ANALYSIS.md` (never committed; removed) | Callback invariant analysis and optimization proposals |
 | `docs/arithmetic-profit-tracking-plan.md` | Arithmetic profit tracking analysis (TSTORE overhead vs balanceOf savings) |
-| `.auto/ideas.md` | Exhaustive optimization log with proven patterns and dead ends |
+| `.auto/ideas.md` (removed; content summarized in this file) | Exhaustive optimization log with proven patterns and dead ends |

@@ -1,4 +1,5 @@
-//! T1 (ergo plan /tmp/ergo-gil-fix-plan.md, incident 2026-08-20 #1/#2):
+//! T1 (ergo plan, incident 2026-08-20 #1/#2 — the plan file lived in /tmp and
+//! was never committed):
 //! the cycle between a sync FFI pymethod that takes the BotState WRITE while
 //! holding the GIL and a long-held BotState READ whose holder then wants the
 //! GIL. Pre-fix: permanent inversion - everything freezes on the GIL futex

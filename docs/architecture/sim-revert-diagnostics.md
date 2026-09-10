@@ -77,7 +77,7 @@ because it qualifies what a `Drift` verdict means:
 
 ## Recompute caveats (V2 vs V3/V4)
 
-Per the `V3/V4 recompute feasibility spike` (file since removed):
+Per the `V3/V4 recompute feasibility spike` (spike write-up file removed in the stale-docs cleanup `71ec78b2`; recoverable from git history):
 
 - **V2** — `recompute_v2_amount_out` reuses the solver's `IntHopState::swap`
   (the canonical Uniswap V2 `getAmountOut`) against the engine reserves and,

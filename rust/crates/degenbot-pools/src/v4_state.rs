@@ -172,8 +172,8 @@ pub struct RegisterV4PoolParams {
     /// `PoolManager` `computeSwapStep` charges the COMBINED
     /// `calculateSwapFee(protocol_fee_dir, lp_fee)` pips, NOT `lp_fee` alone,
     /// so this MUST be threaded into the swap-step fee for byte-exact V4 hop
-    /// outputs (the `CurrencyNotSettled` root cause — see
-    /// `docs/architecture/sim_v4_swap_step_rounding.md`). `0` for pools with
+    /// outputs (the `CurrencyNotSettled` root cause — see the sim_v4_swap_step_rounding
+    /// diagnosis, removed in the stale-docs cleanup `71ec78b2`). `0` for pools with
     /// no protocol fee set (swap fee == LP fee).
     pub protocol_fee: u32,
     pub sqrt_price_x96: U256,
@@ -336,8 +336,8 @@ pub struct V4PoolState {
     /// fees. Used by [`crate::v4_state::v4_simulate_swap`] +
     /// [`V4PoolState::build_int_v4_sequence`] to compute the effective
     /// `calculateSwapFee(protocol_fee_dir, lp_fee)` charged by V4's
-    /// `computeSwapStep`. The `CurrencyNotSettled` root cause —
-    /// `docs/architecture/sim_v4_swap_step_rounding.md`.
+    /// `computeSwapStep`. The `CurrencyNotSettled` root cause (diagnosed in the
+    /// sim_v4_swap_step_rounding write-up, removed in the stale-docs cleanup `71ec78b2`).
     pub protocol_fee: u32,
 
     /// Initialized ticks: tick index → (`liquidity_gross`, `liquidity_net`).
@@ -662,7 +662,7 @@ impl V4PoolState {
 
         // V4 charges the COMBINED `swapFee = calculateSwapFee(protocol_fee_dir,
         // lp_fee)`, NOT `lp_fee` alone, when `slot0.protocolFee > 0`. See
-        // `v4_simulate_swap` + `docs/architecture/sim_v4_swap_step_rounding.md`.
+        // `v4_simulate_swap` + the sim_v4_swap_step_rounding diagnosis (removed in the stale-docs cleanup `71ec78b2`).
         let direction_protocol_fee = if zero_for_one {
             degenbot_math::cl::swap_math::protocol_fee_zero_for_one(self.protocol_fee)
         } else {
@@ -873,8 +873,8 @@ pub fn v4_simulate_swap(
     // `slot0.protocolFee > 0`. PoolManager computes this in `Pool.swap` and
     // passes it as the `fee` pips to `computeSwapStep`. Omitting it
     // over-predicts the output → `CurrencyNotSettled` on multi-hop paths
-    // (the V4-only divergence pinned in
-    // `docs/architecture/sim_v4_swap_step_rounding.md`). `fee` here is the
+    // (the V4-only divergence pinned in the sim_v4_swap_step_rounding
+    // diagnosis, removed in the stale-docs cleanup `71ec78b2`). `fee` here is the
     // pool's static LP fee (`PoolKey.fee`); the protocol fee is read from
     // `state.protocol_fee`.
     let direction_protocol_fee = if zero_for_one {

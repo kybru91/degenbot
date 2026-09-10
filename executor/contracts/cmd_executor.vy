@@ -1977,7 +1977,7 @@ def execute(commands: Bytes[MAX_COMMANDS_LENGTH], config: uint256 = 0) -> uint25
     # architecture); for self-fund paths combined_before>0 (the funded entry
     # capital) so the assert is the active money-loss protection. A losing
     # flash path reverts at the protocol layer (flash-loan repayment) before
-    # reaching here. See .auto_archived/m1-profit-guard-retraction.md (the M1
+    # reaching here. See the retired .auto_archived/m1-profit-guard-retraction.md (the M1
     # retraction opposed forcing expected_value>0, which broke flash paths;
     # reading on-chain instead does NOT break them — combined_before=0 is
     # correct for flash paths).

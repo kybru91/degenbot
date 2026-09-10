@@ -98,7 +98,8 @@ The concurrent-sim pipeline is `DEGENBOT_SIM_PIPELINE_CONCURRENCY` (default
 8; 1 = serial A/B arm). Contract: sims overlap across batches; submissions
 stay FIFO in batch-arrival order with the nonce fetched at submit time.
 If the tail/sum ratio rises above ~0.5, the pipeline regressed. Lab + soak
-evidence: `logs/simpipe_lab.md`, `logs/simpipe_soak.md` (K=8 vs K=1: 4.2x
+evidence: the gitignored logs/ artifacts `logs/simpipe_lab.md` and
+`logs/simpipe_soak.md` (since removed; K=8 vs K=1: 4.2x
 tail compression, 0 leaf failures).
 
 Derived quantities (compute these on every investigation):

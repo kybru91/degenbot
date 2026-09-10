@@ -7,7 +7,7 @@ Its only purpose: reenter `executor.withdraw(amount, destination)` from its
 fallback when it receives ETH via raw_call (i.e. at the moment the executor's
 `withdraw` does `raw_call(destination, value=amount)`).
 
-Expected control flow (documented in .auto/h1-withdraw-trace.md):
+Expected control flow (documented in .auto/h1-withdraw-trace.md, since removed):
   - Before raw_call: `WETH.withdraw(amount)` has burned executor's WETH and
     credited `self.balance` (call frame nested inside WETH.withdraw).
   - `raw_call(destination, value=amount)` debits `self.balance` BEFORE running

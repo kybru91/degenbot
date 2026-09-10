@@ -8,7 +8,7 @@ POOL_MANAGER_ADDR and WETH_ADDR only (the two legitimate callers that deliver
 ETH via raw_call: PM native-take and WETH.withdraw). Any other plain-ETH
 transfer reverts.
 
-See .auto/h3-donation-truncation.md.
+See .auto/h3-donation-truncation.md (since removed).
 """
 
 import pytest

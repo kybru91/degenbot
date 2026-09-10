@@ -16,7 +16,7 @@ decided here.
 
 ## Context
 
-The live backrun session (2026-08-02, `docs/exploration-live-debug-session.md`)
+The live backrun session (2026-08-02; captured in the exploration-live-debug-session write-up, removed in the stale-docs cleanup `71ec78b2`)
 repeatedly surfaced a slow-but-connected WS: pool state lags on-chain by 4–37
 blocks while the solver keeps solving on a desynced snapshot. The AV42C7
 solver-state accuracy gate (`DEGENBOT_ASSERT_SOLVER_STATE`) detects this
@@ -115,7 +115,7 @@ to scalar-state repair.
   actionable ("This pool is `DeliveryLag{37}` at the solve block", not a raw
   sqrt diff).
 - Root-causing the live-session failure classes becomes faster — the "open
-  discriminator" gap in `docs/exploration-live-debug-session.md` is closed by
+  discriminator" gap the exploration-live-debug-session write-up (removed in the stale-docs cleanup `71ec78b2`) recorded is closed by
   the typed verdict rather than by hand-decoding log lines.
 - No runtime behaviour regression: today the gate admits/pans the same states;
   this ADR only resolves *what it is* and *where classification lives*. The

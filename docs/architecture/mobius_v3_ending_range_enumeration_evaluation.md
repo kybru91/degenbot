@@ -1,7 +1,8 @@
 # Evaluation: combinatorial ending-range enumeration in the Möbius V3/CL solver
 
 > Ergo task `TT4VOX`. Triggered by the V2-V3-V3 solver divergence fixture
-> (`logs/fixtures/v2_v3_v3_solver_divergence_25641093.md`): a tick_spacing=1
+> (`logs/fixtures/v2_v3_v3_solver_divergence_25641093.md`, a gitignored logs/
+> artifact since removed): a tick_spacing=1
 > DAI/WETH pool whose solver-predicted WETH output over-predicted the on-chain
 > (revm, byte-verified) output by ~2.7× because the `max_ranges` budget was
 > consumed by `liquidity_net=0` word-boundary ticks before any initialized
@@ -307,7 +308,8 @@ incremental in `k`).
 ## 7. Validation / RED-test plan for the follow-up implementation
 
 1. **Fixture RED (`7J22EQ`):** reconstruct the block-25641093 V3 DAI/WETH
-   pool state from `logs/fixtures/v2_v3_v3_solver_divergence_25641093.md`
+   pool state from `logs/fixtures/v2_v3_v3_solver_divergence_25641093.md` (a
+   gitignored logs/ artifact, since removed)
    (`sqrt_price_x96=1956421190421993762013571523`, `tick=-74028`,
    `liquidity=5407362545736161987`, 12 initialized ticks, nearest lower
    initialized tick −84382) and assert the solver's predicted hop-2 output
@@ -388,7 +390,8 @@ green; clippy `-D warnings` clean.
   `7J22EQ` -> `EHSWSX`, `7J22EQ` -> `PXSY47` (sequenced follow-ups),
   `ON5QMD` (rounding parity),
   `BQ43DK` (Tier-3 enforcement).
-- Fixture: `logs/fixtures/v2_v3_v3_solver_divergence_25641093.md`.
+- Fixture: `logs/fixtures/v2_v3_v3_solver_divergence_25641093.md` (a gitignored
+  logs/ artifact, since removed).
 - Code: `rust/crates/degenbot-solvers/src/mobius_v3_int.rs`,
   `rust/crates/degenbot-solvers/src/mobius_int_exact.rs`,
   `rust/crates/degenbot-solvers/src/mobius_int.rs`,
@@ -397,6 +400,7 @@ green; clippy `-D warnings` clean.
   `rust/crates/degenbot-pools/src/v3_state.rs`
   (`build_int_v3_sequence`, `v3_simulate_swap`),
   `rust/crates/degenbot-concentrated-liquidity-math/src/swap_math.rs`.
-- Prior diagnosis doc: `docs/architecture/sim_v4_swap_step_rounding.md`
+- Prior diagnosis doc: `docs/architecture/sim_v4_swap_step_rounding.md` (removed in
+  the stale-docs cleanup `71ec78b2`)
   (the `int_simulate_v3_swap` 2-range approximation finding — `PXSY47`
   retires exactly that seam).

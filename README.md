@@ -1545,7 +1545,6 @@ just dev  # Build and install Python extension
 Additional documentation is available in the [`docs/`](docs/) directory:
 
 - **[Architecture](docs/architecture/)**: High-level architectural patterns
-  - [I/O-Free Pool Architecture](docs/architecture/io-free-pools.md) — how pools keep I/O out of the calculation path
   - [Rust-Owned Settlement-Arbitrage Bot](docs/architecture/rust-owned-bot.md) — the original `ArbitrageEngine` design (Plans 079–082); marked historical, kept as a design-history reference (the current state layer follows the ADR log)
   - [Operator Add-Path Surface](docs/architecture/operator-add-path-surface.md) — steering a live bot (mid-run add-path + bounded on-demand discovery) over the Unix-socket JSON-lines operator channel
   - [Semantic Matching](docs/architecture/semantic-matching.md) — Event processing patterns for Aave

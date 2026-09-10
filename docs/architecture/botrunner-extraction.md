@@ -34,7 +34,8 @@ The driver is a script, not a module, and the tests reach *into* the script for 
 
 - it owns the asyncio event loop, the `main()` policy, SIGINT install/restore, `dotenv`,
   and the CLI (`_build_arg_parser`) — every one of which `docs/migration-guides/
-  three-layer-transition.md` §2.4 / `rust-owned-bot.md` class as `stays-python`;
+  three-layer-transition.md` (removed in the stale-docs cleanup `71ec78b2`) §2.4 /
+  `rust-owned-bot.md` class as `stays-python`;
 - the Rust core already exposes the *engine* the driver controls (`Bot` + `EngineRegistry`
   + the `dispatch_profitable` / `dispatch_and_submit` seam, the `engine.block_stream()`
   pump). A standalone Rust consumer gets those; `BotRunner` is the **cockpit** over them.

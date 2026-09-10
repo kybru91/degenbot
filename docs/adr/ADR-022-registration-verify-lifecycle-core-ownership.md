@@ -5,7 +5,7 @@ grilling for epic `Z5CNPB` (task `IKGQ6F`), settling the D4 decision **D4
 (lifecycle)** and its dependencies: who owns the per-pool registration
 verify-lifecycle, what the verify provider seam is, and what "no pool becomes
 solvable on unverified state" means. Built on the feasibility verdict in
-`docs/migration-guides/verify-lifecycle-core-ownership.md` (spike `A4YORC`).
+the verify-lifecycle-core-ownership feasibility write-up (spike `A4YORC`; removed in the stale-docs cleanup `71ec78b2`).
 
 ## Context
 

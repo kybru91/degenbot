@@ -6,7 +6,8 @@
 //! (`calculate_swap_fee` threaded into `v4_simulate_swap` +
 //! `build_int_v4_sequence` via `V4PoolState.protocol_fee`).
 //!
-//! ## The fixture (captured `logs/debug/v4_fixture_block_25635461.md`)
+//! ## The fixture (captured `logs/debug/v4_fixture_block_25635461.md`, a gitignored
+//! logs/ artifact since removed)
 //!
 //! V4 pool USDC/WETH 0.3% (poolManager `0x…444c…08A90`, pool_id `0xb9fd…857b`),
 //! block 25635461, path=97: amount_in = 13_576_418_983_678 wei WETH (ofz),

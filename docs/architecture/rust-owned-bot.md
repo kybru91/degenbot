@@ -599,7 +599,7 @@ The path set of a *running* bot is steerable without a restart: the operator add
 
 ### 13.2 FFI Topology — Polars-Inspired Three-Layer Architecture
 
-How Python reaches that Rust-owned state across the FFI is canonicalized in **ADR-005: Polars-Inspired Three-Layer Architecture** — the stateful specialization of `rust/AGENTS.md`'s generic three-layer convention. The realized topology:
+How Python reaches that Rust-owned state across the FFI is canonicalized in **ADR-005: Polars-Inspired Three-Layer Architecture** — the stateful specialization of the generic three-layer convention the former `rust/AGENTS.md` (dropped in `affebc8de`) carried. The realized topology:
 
 - **Rust core** — `Bot`, pure Rust, zero `pyo3` imports.
 - **PyO3 wrapper** — `PyBot` (`#[pyclass]`) holds `Arc<parking_lot::RwLock<Bot>>` and *is* the sharing mechanism; `PyLiquidityPool` (carrying a `pool_id` key) and `PyErc20Token` (carrying an `Address` key) clone that `Arc` so N Python handles reference one Rust-owned `Bot`. Reads take a read guard; mutations take a write guard.

@@ -23,8 +23,8 @@
 //! premise ("stale engine state causes `CurrencyNotSettled`") was REFUTED by
 //! mainnet data — V3 hops matched the actual swap output exactly (engine state
 //! is correct) while only the V4 swap diverged by 1-8 units (a solver calc
-//! rounding divergence, not stale state). See
-//! `docs/architecture/sim_v4_swap_step_rounding.md`. The seam stays gated off
+//! rounding divergence, not stale state; the sim_v4_swap_step_rounding.md
+//! diagnosis was removed in the stale-docs cleanup `71ec78b2`). The seam stays gated off
 //! in production; it is a dead switch kept for future re-probing.
 //!
 //! The wrapper persists because the live `BlockSimHandle` chain

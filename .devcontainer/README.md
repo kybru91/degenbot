@@ -93,7 +93,7 @@ time):
 | `just`      | `just`                                    |                                                  |
 | `direnv`    | `direnv`                                  | Hooked into `/etc/bashrc` at build time. The repo `.envrc` is a deliberate no-op inside the container (guarded on `/run/.containerenv`; `containerEnv` owns those vars) — it exists for the host side of the bind mount. |
 | `uv`        | `uv`                                      | Fedora packages uv directly (unlike Ubuntu).     |
-| mold, lld   | `mold`, `lld`                             | Faster cargo linkers (dev-only perf; see `rust/PERF_RESULTS.md`). mold is the default via the user-level `~/.cargo/config.toml` baked in the Dockerfile; lld is installed as a fallback. Scoped to the devcontainer (NOT committed as `rust/.cargo/config.toml`) so CI and non-devcontainer cloners keep using the default system linker. |
+| mold, lld   | `mold`, `lld`                             | Faster cargo linkers (dev-only perf; analysis lived in `rust/PERF_RESULTS.md`, dropped in `f082db7a7`). mold is the default via the user-level `~/.cargo/config.toml` baked in the Dockerfile; lld is installed as a fallback. Scoped to the devcontainer (NOT committed as `rust/.cargo/config.toml`) so CI and non-devcontainer cloners keep using the default system linker. |
 | `tmux`      | `tmux`                                    | baked in (was runtime-installed before)          |
 | git / curl  | `git`, `curl`, `ca-certificates`, ...     |                                                  |
 
@@ -188,7 +188,7 @@ tmux show -gv terminal-overrides         # expect *:Tc present
   force mold on CI (ubuntu-latest, no mold → link failures) and on
   non-devcontainer cloners. Scoping it to the image keeps the repo buildable
   anywhere with the default linker while giving the devcontainer the
-  measured build/link speedups (see `rust/PERF_RESULTS.md` lever #1). To
+  measured build/link speedups (see `rust/PERF_RESULTS.md`, dropped in `f082db7a7`, lever #1). To
   disable mold locally, delete or edit `~/.cargo/config.toml`; to try lld
   instead, swap `-fuse-ld=mold` for `-fuse-ld=lld` (lld is also installed).
 - **Python follows `fedora:latest`** (currently 3.14). The project declares

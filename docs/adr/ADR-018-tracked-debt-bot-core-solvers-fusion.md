@@ -68,7 +68,7 @@ sample-of-one ruling still holds. Instead:
    landing on the fusion knows it is **tracked debt with a trigger**, not
    an accidental coupling.
 4. **Record the disposition in the rubric.**
-   `docs/migration-guides/three-layer-transition.md` gains an entry
+   The `three-layer-transition.md` rubric (in `docs/migration-guides/`; removed in the stale-docs cleanup `71ec78b2`) gains an entry
    applying the triage rubric to `degenbot-bot::solvers`: disposition
    `partial` (the solve math is Rust-owned but not reachable standalone),
    trigger = second engine family.
@@ -101,6 +101,7 @@ sample-of-one ruling still holds. Instead:
   surface).
 - `rust/crates/degenbot-bot/src/lib.rs` — the module doc referencing this
   ADR.
-- `docs/migration-guides/three-layer-transition.md` §"Dispositions" — the
-  `partial` entry for `degenbot-bot::solvers` with the trigger noted.
+- the `three-layer-transition.md` rubric (removed in the stale-docs cleanup `71ec78b2`; recoverable from git
+  history) — its "Dispositions" section carried the `partial` entry for
+  `degenbot-bot::solvers` with the trigger noted.
 - ergo `2PTFMZ` (epic) / `JVRGO4` (this task).

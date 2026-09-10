@@ -28,7 +28,8 @@ the cgroup budget, and nothing that bounds their sum:
   threads per cycle, 3.3 ms CPU each, mostly parked).
 
 Measured sizing inputs (2026-09-08/09 survey + the post-ADR-041 solve-cycle
-tail, task `CIRZHH`; full distributions in `logs/solve-tail-20260908.md`):
+tail, task `CIRZHH`; full distributions in `logs/solve-tail-20260908.md`, a
+gitignored `logs/` run artifact not in the tracked tree):
 
 - Steady state on an 8-core cgroup quota: instrumented solve+sim CPU is ~1.8%
   of quota; the rayon global pool is **idle** (0.4 s CPU / 1158 s across 6

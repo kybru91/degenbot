@@ -301,7 +301,7 @@ by follow-up epic `VK3YDM` (Rust ERC-20 + Curve port). Held-tx sharing between
 `DbConstruction`'s connection and `tick_assembly`'s `SnapshotDb` held-tx
 is a separate, later slice.
 
-Migration note: `docs/migration-guides/construction-io-trait.md`. The formal
+Migration note: the construction-io-trait guide (removed in the stale-docs cleanup `71ec78b2`). The formal
 record of the Construction-I/O trait + adapter pattern lands as a future
 ADR (the ADR-014 slot is taken by the pool-state-deepening decisions —
 see `docs/adr/ADR-014-pool-state-deepening-layer.md`).

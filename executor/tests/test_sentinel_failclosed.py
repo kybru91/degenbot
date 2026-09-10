@@ -74,7 +74,7 @@ class TestM6HookSentinelFailClosed:
     ~+55 gas/V4-swap on hot paths for a purely cosmetic error-message
     improvement. The contract is already fail-closed (invalid hook sentinels
     >= 0xFC that aren't 0xFF hit t_addresses[>=32] → bounds revert). See
-    .auto/m6-hook-sentinel-retraction.md. These tests codify the existing
+    .auto/m6-hook-sentinel-retraction.md (since removed). These tests codify the existing
     fail-closed behavior as a regression guard regardless of which error it
     raises."""
 

@@ -7,7 +7,7 @@ M1 (RETRACTED as a guard; kept as documentation + BipsTooHigh):
   when expected_value == 0 and check_mode != 0) is INCOMPATIBLE with the
   no-prefund flash-borrow architecture — most paths legitimately start the
   executor at 0 balance, so expected_value == 0 is correct, not a
-  misconfiguration. See .auto/m1-profit-guard-retraction.md.
+  misconfiguration. See .auto/m1-profit-guard-retraction.md (since removed).
 
   What WAS kept: the `bribe_bips <= 10000` (BipsTooHigh) bound — without it,
   bribe_bips > 10000 over-bribes (drains more than the actual profit). That is

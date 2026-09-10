@@ -255,7 +255,7 @@ parallel with the CL chain.
   `ReorgPoolState` as the shared supertrait bound, keeps each seam honest.
 
 - **Defer the forward-apply traits behind the `PyPool` /
-  `proposed-pool-interface.md` redesign** — rejected. That track is a
+  `proposed-pool-interface.md` redesign** (the doc file itself was never committed — the track is named in the ADR-005/016 lineage only) — rejected. That track is a
   *cross-family* `Structure`-enumerated handle redesign (a `Pool` wrapper over
   `PoolEntry` + structural views); it is orthogonal to the within-family
   return-type lemma. The two tracks are independent and the forward-apply

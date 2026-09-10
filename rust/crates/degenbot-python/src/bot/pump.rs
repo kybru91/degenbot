@@ -363,8 +363,9 @@ impl PumpState {
     //
     // The whole-batch liquidity-map verifier (`verify_liquidity_maps` and its
     // V3/V4 twins) was REMOVED as redundant + racy (the per-pool two-step
-    // registration lifecycle below is the verify authority; see
-    // dev-run-solver-state-findings.md Addendum 3). What remains here is only
+    // registration lifecycle below is the verify authority; the
+    // dev-run-solver-state-findings.md Addendum 3 evidence lived only under
+    // logs/ and was removed in the stale-docs cleanup `71ec78b2`). What remains here is only
     // the verify CONFIG the per-pool lifecycle consumes.
 
     /// Set the HTTP RPC URL used for verification (ADR-006 D4 T4).

@@ -4,7 +4,7 @@ The solver already streams one candidate per ``ResultBatch`` the moment its
 solve completes (``DEGENBOT_STREAMING_DELIVERY``); the legacy consumer awaited
 each simulate round-trip SEQUENTIALLY, so per-block candidates paid
 ``sum(sim_i)`` of wall time (~130ms/block live, 6.6ms avg per candidate per
-the T1 lab - ``logs/simpipe_lab.md``).
+the T1 lab - ``logs/simpipe_lab.md``, a gitignored logs/ artifact since removed).
 
 This module pipelines the leaf:
 

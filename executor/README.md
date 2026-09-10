@@ -149,7 +149,7 @@ The fake V2/V3/V4 contracts replicate the invariant checks of their real Uniswap
 | V2 reserve update after swap | `_update(balance0, balance1, ...)` | ✅ Same update |
 | V4 sync/settle | `reservesNow - reservesBefore` (balance delta) | ✅ Already correct |
 
-See [`FAKE_CONTRACT_AUDIT.md`](FAKE_CONTRACT_AUDIT.md) for the full comparison between fake and real contracts.
+The full comparison between fake and real contracts lived in `FAKE_CONTRACT_AUDIT.md`, which was never committed and has since been removed.
 
 ## Gas Benchmarks
 
@@ -299,7 +299,7 @@ Additionally, **V4 no-hooks sentinel** (`hooks_idx = 0xFF`) means "no hooks" —
 
 ### Three-Hop Gas Optimization
 
-After extensive optimization, the 27 three-hop permutations total **4,947,078 gas** (sum of per-path gas with profit checks active), with runtime bytecode at ~15,359 bytes. Historical measurements below may differ due to subsequent changes (notably the V3 real-math refactor and the removal of user sentinels — see commit `8c75fa6` and `.auto/ideas.md` Session 13).
+After extensive optimization, the 27 three-hop permutations total **4,947,078 gas** (sum of per-path gas with profit checks active), with runtime bytecode at ~15,359 bytes. Historical measurements below may differ due to subsequent changes (notably the V3 real-math refactor and the removal of user sentinels — see commit `8c75fa6`; the Session 13 detail lived in the since-removed `.auto/ideas.md`).
 
 **Top techniques by gas saved** (cumulative across all 27 paths):
 

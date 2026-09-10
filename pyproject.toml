@@ -296,8 +296,8 @@ bindings = "pyo3"
 # `maturin develop`); the published wheel is built by the PyO3/maturin-action
 # in .github/workflows/release.yml, which passes `--release`
 # explicitly and OVERRIDES the features list — so the shipped artifact is
-# unaffected by this setting and stays fully optimized. See
-# rust/PERF_RESULTS.md "dev-vs-release profile" lever.
+# unaffected by this setting and stays fully optimized. (The detailed lever
+# analysis lived in rust/PERF_RESULTS.md, dropped in `f082db7a7`)
 profile = "dev"
 # Dev builds compile hotpath in (toggle at runtime via DEGENBOT_HOTPATH=1 —
 # see rust/crates/degenbot-bot/src/profiling.rs), plus its Prometheus exporter

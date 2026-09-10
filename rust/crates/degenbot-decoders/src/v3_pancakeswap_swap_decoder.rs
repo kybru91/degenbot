@@ -16,8 +16,8 @@
 //! canonical Uniswap V3 `0xc42079f9…` to `0x19b47279…`. The degenbot
 //! `V3_SWAP_TOPIC` matches ONLY the Uniswap V3 hash, so PancakeSwap V3 swaps
 //! were never decoded; their pool state froze while on-chain price drifted, and
-//! the solver manufactured phantom arbitrage from the stale state (see
-//! `docs/exploration-no-profit-crash.md`).
+//! the solver manufactured phantom arbitrage from the stale state (see the
+//! exploration-no-profit-crash writeup, removed in the stale-docs cleanup `71ec78b2`).
 //!
 //! The fields that drive pool-state updates are byte-identical to Uniswap V3:
 //! `amount0`, `amount1`, `sqrtPriceX96`, `liquidity`, `tick` occupy the same

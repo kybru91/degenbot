@@ -1,7 +1,8 @@
 //! Contract artifact: chunk interrupt -> full rollback -> restart clean (epic `2SFL6I`, task `BHF5BC`).
 //!
 //! THE regression test gating the §1 atomicity + restart invariants
-//! (`docs/migration-guides/pool-updater-chunk-atomicity.md` §1). Reproduces
+//! (`docs/migration-guides/pool-updater-chunk-atomicity.md` §1; prose;
+//! removed in the stale-docs cleanup `71ec78b2`). Reproduces
 //! the user's original bug — a chunk loop that committed pool rows mid-chunk
 //! but rolled back the `last_update_block` stamp, so a restart re-fetched the
 //! same range + hit `UNIQUE constraint failed: pools.address, pools.chain`.

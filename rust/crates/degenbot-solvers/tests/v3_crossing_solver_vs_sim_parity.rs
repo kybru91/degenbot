@@ -11,7 +11,8 @@
 //! (`three_hop_v3_v3_v3`) chains the predicted (higher) amount as hop[2]'s
 //! exact-in → the UNI token's `transfer` reverts `"IIA"`.
 //!
-//! `docs/architecture/sim_v4_swap_step_rounding.md` concludes V4-hop
+//! The sim_v4_swap_step_rounding diagnosis (removed in the stale-docs cleanup `71ec78b2`)
+//! concludes V4-hop
 //! over-prediction is the V4 protocol fee (RZKFKR — DONE) and routinely
 //! claims "V3 hops match exactly." This fixture appears to refute that claim.
 //! Two residual suspects (mirroring the W2UWZO V4 experiment):

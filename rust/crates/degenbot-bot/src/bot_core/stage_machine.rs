@@ -1320,8 +1320,8 @@ impl StageMachine {
 }
 
 // ======================================================================
-// BM35LK — the adaptive trailing-quiesce estimator (epic FIMZES; design
-// logs/quiesce-design-20260908.md §6).
+// BM35LK — the adaptive trailing-quiesce estimator (epic FIMZES; design in
+// the gitignored logs/ design note logs/quiesce-design-20260908.md §6).
 // ======================================================================
 
 /// The settle-window mode declared by the typed config schema

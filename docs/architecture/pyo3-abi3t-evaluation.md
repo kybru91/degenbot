@@ -114,7 +114,7 @@ Re-open this evaluation when **all** hold:
   wheel is justified by real demand).
 - The free-threading soundness audit is complete (GIL release protocol,
   `Mutex`/`RwLock` discipline under `Py_GIL_DISABLED`, per
-  `rust/AGENTS.md`).
+  the former `rust/AGENTS.md`, dropped in `affebc8de`).
 - `MINIMUM_SUPPORTED_VERSION_ABI3T` / maturin tag support has not
   regressed across a PyO3 bump.
 

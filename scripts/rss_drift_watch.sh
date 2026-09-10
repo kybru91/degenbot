@@ -2,7 +2,8 @@
 # FRKBGP close-out: RSS drift-watch baseline sampler (pair-review request).
 # Samples the settlement bot's live RSS hourly for 24h into a CSV to give the
 # drift tripwire a slope baseline: load-plateau vs continuous creep, per
-# logs/solve-cycle-profile.md (tripwire: monotone creep / ~24GiB brush).
+# logs/solve-cycle-profile.md (a gitignored logs/ artifact since removed;
+# tripwire: monotone creep / ~24GiB brush).
 # Resolves the bot per sample as the LARGEST-RSS match of the eth_settlement
 # process family (uv wrapper + python child; the wrapper alone reads ~30MB).
 OUT=/workspaces/degenbot/logs/rss-drift-watch.csv

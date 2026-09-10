@@ -5,7 +5,7 @@
 //!
 //! ## What this proves
 //!
-//! `docs/architecture/sim_v4_swap_step_rounding.md` (addendum) left two
+//! The sim_v4_swap_step_rounding addendum (removed in the stale-docs cleanup `71ec78b2`) left two
 //! residual suspects for the post-round-up-fix `+1` V4 hop over-prediction:
 //!
 //! 1. **Stale active state** — engine `V4PoolState` lags the solve-block RPC
@@ -453,8 +453,8 @@ fn v4_fee1_solver_path_matches_v4_simulate_swap() {
 /// to it (proven below). This exonerates the V4 crossing math: the live
 /// over-prediction (772833263957077) is NOT reproducible at input 3135 on the
 /// on-chain or solver-snapshot state (it maps to ~3 units MORE input) - a
-/// solve-vs-sim state/amount divergence, see
-/// docs/tracked-failures-log-review-2026-08-03.md. Pins the on-chain truth so
+/// solve-vs-sim state/amount divergence, see the tracked-failures log review of
+/// 2026-08-03 (a gitignored logs/ artifact, since removed). Pins the on-chain truth so
 /// any fix keeps `v4_simulate_swap(state, 3135) == 772076574181336`.
 fn build_uni_9a5c1d2f_v4_state() -> V4PoolState {
     let mut tick_data: HashMap<i32, TickInfo> = HashMap::new();
@@ -1580,7 +1580,8 @@ fn v4_uni_9a5c1d2f_oracle_matches_recorded_actual_not_solver_overprediction() {
     // predicted 772833263957077 is NOT reproducible at input 3135 on either the
     // on-chain-at-block state or the solver's snapshot (it maps to ~3 units MORE
     // input) -> a solve-vs-sim state/amount divergence, NOT a crossing-math error
-    // (see docs/tracked-failures-log-review-2026-08-03.md).
+    // (see the tracked-failures log review of 2026-08-03, a gitignored logs/
+    // artifact since removed).
     let seq = state
         .build_int_v4_sequence(60, 3_000, zero_for_one)
         .expect("build int v4 sequence");

@@ -15,7 +15,8 @@
 //! on already-registered pools). The orchestration choreography is identical
 //! between the two (compute word, fetch bitmap, enumerate bits, fetch ticks)
 //! but the key type differs — see
-//! `docs/migration-guides/chain-bootstrap-tick-map.md` §3 for why they are
+//! the chain-bootstrap-tick-map guide (removed in the stale-docs cleanup `71ec78b2`),
+//! §3 — for why they are
 //! kept separate for now (consolidation is a post-`XEANMB` follow-up).
 //!
 //! ## Why this trait lives in `degenbot-pools` (not the bot)
@@ -45,7 +46,7 @@ use crate::TickInfo;
 /// One word's bootstrap result. Mirrors `super::miss::FetchedTickWord` in
 /// structure but lives separately for the call-site distinction
 /// (registration-time Chain arm vs live-pump miss path). Both can be unified
-/// post-`XEANMB` (see `docs/migration-guides/chain-bootstrap-tick-map.md` §3).
+/// post-`XEANMB` (see the chain-bootstrap-tick-map guide, removed in the stale-docs cleanup `71ec78b2`, §3).
 #[derive(Debug, Clone)]
 pub struct BootstrapTickWord {
     /// The tick-bitmap word position that was fetched

@@ -249,6 +249,6 @@ collapse on retirement — every DB becomes `FreshStandalone` /
 - **ADR-005** (Polars-inspired three-layer architecture) — the layer
   placement for `heal` (Rust core owns the logic; PyO3 seam + Python
   shell are thin).
-- **Epic `TGIP5N`** (`.ergo/plan-autoheal-alembic-retirement.md`) — the
+- **Epic `TGIP5N`** (its `.ergo/plan-autoheal-alembic-retirement.md` plan file has since been removed) — the
   task graph that builds and proves the `heal` path; tasks T2-T5 ship
   the implementation, T6 / `OXKANZ` is the release-decision checkpoint.

@@ -178,9 +178,11 @@ crate::config_schema! {
             doc = "Stream solved arms immediately (T3 default); `0` opts out to the debounce sweep.";
         ws_completeness [bool] = true, env = "DEGENBOT_WS_COMPLETENESS", def = "true",
             doc = "WS completeness gating (newHeads + logs double-delivery check); `0` disables.";
-        // BM35LK (epic FIMZES; design logs/quiesce-design-20260908.md §6): the
+        // BM35LK (epic FIMZES; design in the gitignored logs/ design note
+        // logs/quiesce-design-20260908.md §6): the
         // adaptive trailing-quiesce estimator. Default flipped to `adaptive`
-        // after the 2026-09-09 live A/B (logs/perf-after-20260909.md: settle
+        // after the 2026-09-09 live A/B (the untracked `logs/` run artifact
+        // logs/perf-after-20260909.md: settle
         // p50 25→10ms, publish p95 100→50ms, zero late-admit tripwires);
         // `fixed` retains the historical `pump_debounce_ms` behavior. W =
         // clamp(EWMA·quiesce_margin, floor, ceil), the EWMA tracking each

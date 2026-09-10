@@ -17,8 +17,8 @@
 //!
 //! Transport: plain atomics + a per-fan-out DELTA log line (emitted by
 //! degenbot-arbitrage at fan-out exit) — one grep-able line per fan-out, no
-//! Prometheus plumbing for what is a lab instrument. Consumed by
-//! `logs/simpipe_lab.md`.
+//! Prometheus plumbing for what is a lab instrument. Was consumed by the
+//! gitignored logs/ artifact `logs/simpipe_lab.md` (since removed).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};

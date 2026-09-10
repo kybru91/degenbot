@@ -36,7 +36,8 @@ def get_provider_from_config(
     ``DEGENBOT_RPC_HTTP_CHAINID_{cid}`` > caller fallback > config.toml
     ``rpc[cid]`` > raise. This is the single resolution path shared by the
     library, the ``degenbot`` click CLI, and the settlement-arbitrage example (see
-    ``docs/migration-guides/rpc-uri-cascade.md``), so a plain ``export`` in the
+    the rpc-uri-cascade migration guide, removed in the stale-docs cleanup
+    `71ec78b2`), so a plain ``export`` in the
     devcontainer takes effect here too.
 
     Constructs an :class:`~degenbot._ffi.AlloyProvider` over the

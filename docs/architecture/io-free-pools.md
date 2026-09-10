@@ -360,9 +360,9 @@ Pools participating in the Rust solver cache implement the `CacheablePool` proto
 
 - `src/degenbot/curve/types.py` — CurveDataProvider protocol, DyCalculationInputs dataclass, DyCalculator protocol definitions
 - `src/degenbot/types/pool_protocols.py` — Pool simulation and cacheable protocols
-- `plans/completed/017-v2-v3-io-free-migration.md` — Plan to complete ADR-001 Phase 3 (complete)
-- `plans/completed/019-pool-cache-adapter-protocol.md` — CacheablePool protocol plan
-- `plans/completed/045-calculator-explicit-data.md` — DyCalculationInputs: replace pool parameter with explicit data
+- the completed 0-series implementation plans (017 v2/v3 io-free migration,
+  019 CacheablePool protocol, 045 DyCalculationInputs explicit data; the
+  plans/ tree was removed in `6f509d44f`)
 - `docs/adr/ADR-001-io-free-pools.md` — ADR-001 (I/O-free pools)
 
 ---

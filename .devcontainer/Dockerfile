@@ -13,7 +13,7 @@ RUN dnf install -y \
         git \
         just \
         ripgrep \
-        # Faster linkers for cargo (dev-only perf; see rust/PERF_RESULTS.md).
+        # Faster linkers for cargo (dev-only perf; analysis lived in rust/PERF_RESULTS.md (dropped in `f082db7a7`)).
         # mold is the default via the user-level ~/.cargo/config.toml below;
         # lld is installed as a fallback (switch via that config).
         mold lld \
@@ -140,7 +140,7 @@ RUN uv tool install prek
 RUN cargo install --locked cargo-edit
 
 # User-level cargo config: use `mold` as the linker for all cargo builds
-# inside the container (dev-only perf; see rust/PERF_RESULTS.md lever #1).
+# inside the container (dev-only perf; see rust/PERF_RESULTS.md (dropped in `f082db7a7`) lever #1).
 # Lives at ~/.cargo/config.toml (cargo's home config, read in ADDITION to
 # any repo-local .cargo/config.toml) so it travels with the image and
 # applies to every cargo invocation — including rust-analyzer, just recipes,
@@ -157,7 +157,7 @@ RUN cargo install --locked cargo-edit
 RUN mkdir -p "${HOME}/.cargo" \
     && printf '%s\n' \
         '# Devcontainer-only: use mold linker for faster cargo links.' \
-        '# See rust/PERF_RESULTS.md. Remove or swap to lld if mold breaks.' \
+        '# Perf analysis lived in rust/PERF_RESULTS.md (dropped in f082db7a7). Remove or swap to lld if mold breaks.' \
         '[target.x86_64-unknown-linux-gnu]' \
         'rustflags = ["-C", "link-arg=-fuse-ld=mold"]' \
         > "${HOME}/.cargo/config.toml"

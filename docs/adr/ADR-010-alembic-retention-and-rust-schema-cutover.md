@@ -195,6 +195,6 @@ retirement task's exclusive responsibility.
 - **`rust/crates/degenbot-db/src/migrate.rs`** — `ensure_schema` and the
   state machine this ADR extends; the doc comment there already names the
   hybrid period as a "HARD REQUIREMENT."
-- **Epic `2Z3Y46`** (`.ergo/plan-cli-db-migration.md`) — the task graph that
+- **Epic `2Z3Y46`** (its `.ergo/plan-cli-db-migration.md` plan file has since been removed) — the task graph that
   builds and proves the cutover path during 0.6.x; the forbidden-until-0.7
   kill list above is mirrored in that epic's body and in `AGENTS.md`.

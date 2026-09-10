@@ -1743,7 +1743,8 @@ struct RevertedSwapMatch {
     /// slice 2). This is the fix-enabler: it pins the exact pool state the
     /// oracle (`v4_simulate_swap`) must be driven at to reproduce a
     /// recurrence, closing the solve-vs-sim state gap the log's solve-time
-    /// values cannot close (see docs/tracked-failures-log-review-2026-08-03.md).
+    /// values cannot close (see the tracked-failures log review of 2026-08-03, a
+    /// gitignored logs/ artifact since removed).
     sim_scalars: degenbot_pools::tick_map_verify::Slot0HeadScalars,
     /// The exact-in amount the swap consumed (the negative-side delta
     /// magnitude) — the `amountSpecified` that produced `actual_out`.

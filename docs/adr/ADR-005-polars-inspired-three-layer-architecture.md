@@ -15,10 +15,10 @@ degenbot mixes Python and Rust via PyO3 across two distinct questions:
    per-block hot loop?* — previously unanswered. ADR-003 mentions "thin `PyO3` handles
    over `Arc<Mutex<BotCore>>`" in passing but never canonizes the lock type or the
    session-owns-wrapper topology. The "Polars model" was referenced scattered across
-   Plan 079, ADR-003 implications, and `rust/AGENTS.md`, but never recorded as a
+   Plan 079 and ADR-003 implications (the former `rust/AGENTS.md`, dropped in `affebc8de`, covered the generic case), but never recorded as a
    decision for the *stateful* middle-layer case.
 
-`rust/AGENTS.md` already documents the **generic** PyO3 module convention — Python
+The former `rust/AGENTS.md` (dropped in `affebc8de`) documented the **generic** PyO3 module convention — Python
 convenience layer / thin PyO3 wrapper (`*_py.rs`) / pure Rust core (`*.rs`, no `pyo3`
 imports) — and lists Polars as one of two reference projects (Polars + Pydantic). That
 convention covers the *stateless* case (free `#[pyfunction]`s like `decode`/`encode`/
@@ -30,7 +30,7 @@ long-lived mutable state that many Python objects must reference.
 Adopt the **Polars-inspired three-layer architecture** for stateful Rust-owned
 resources, with a **standalone Rust core as a first-class concern** (the crate split
 that lets the core be consumed without Python, like Polars). Three layers with strict
-separation (mirroring `rust/AGENTS.md`'s generic convention, specialized for shared
+separation (mirroring the generic convention of the former `rust/AGENTS.md`, dropped in `affebc8de`, specialized for shared
 state), realized across two Rust crates:
 
 1. **Rust Core** (`Bot`, `V2PoolState`/`V3PoolState`/`V4PoolState`, `DexIdentity`,
@@ -135,7 +135,7 @@ override drops the prefix.
 | PyO3 wrapper (`#[pyclass]`, keeps `Py`) | `Py` + companion name | `PyBot`, `PyLiquidityPool`, `PyErc20Token` |
 | Python companion (orchestration + I/O) | bare noun matching the wrapper minus `Py` | `Bot` ↔ `PyBot`; `Erc20Token` ↔ `PyErc20Token`; `UniswapV2Pool` ↔ `PyLiquidityPool` |
 | Future Rust I/O struct | `Py` + `*Io`/`*Reader` | `PyBotIo` (stateful, holds provider/DB) |
-| Stateful Rust free functions | no `Py` prefix | per `rust/AGENTS.md` (`#[pyfunction]`) |
+| Stateful Rust free functions | no `Py` prefix | per the former `rust/AGENTS.md`, dropped in `affebc8de` (`#[pyfunction]`) |
 
 **Generalized wrapper noun, variant is internal.** The wrapper noun is *generalized* —
 `PyLiquidityPool` (and the standalone-Rust `UniswapV2Pool` reference), not a
@@ -167,7 +167,7 @@ and the canonical preset. Public-API breakage is accepted (0.x major refactor).
 
 > **Status: implemented in slice 7** (steps 1–4). The hollow subclasses are deleted;
 `pool_type_registry.register(..., variant=, dex_identity=)` is the resolution seam.
-See `docs/migration-guides/dex-subclass-collapse.md` for the migration. A pre-existing
+The migration guide recording the subclass collapse was removed in the stale-docs cleanup `71ec78b2`. A pre-existing
 `get_y_camelot` arity bug in the (dead-code) stable `to_hop_state` branch surfaced
 during the fold — resolved by `7b9cfffc` (was tracked in TODO-7ea2e7d9).
 
@@ -191,7 +191,7 @@ unconditionally, with no `name=` override. This is the template for future wrapp
   a PyO3 class. **Rejected**: couples session orchestration (SQLAlchemy, web3.py,
   publisher/subscriber, RPC I/O) to PyO3 lifetime/GIL semantics — `Bot` could no longer
   be constructed without the GIL or unit-tested without the extension built. Breaks the
-  clean separation the generic `rust/AGENTS.md` three-layer rule mandates ("if `pyo3`
+  clean separation the generic three-layer rule (the former `rust/AGENTS.md`, dropped in `affebc8de`) mandates ("if `pyo3`
   appears in a file that isn't `*_py.rs`, it's a code smell") — a Python class can't be
   `*_py.rs`.
 - **Handles re-resolve via a global registry.** `PyLiquidityPool`/`PyErc20Token` hold only a key and
@@ -249,7 +249,7 @@ unconditionally, with no `name=` override. This is the template for future wrapp
   Python reaches that state across FFI*. ADR-003's "thin `PyO3` handles over
   `Arc<Mutex<BotCore>>`" mentioned the handles + Arc but never canonized the lock type
   or the session-owns-wrapper topology — that canonization is this ADR.
-- **`rust/AGENTS.md` "Three-Layer Pattern"** — this ADR is the **stateful
+- **the former `rust/AGENTS.md` (dropped in `affebc8de`) "Three-Layer Pattern"** — this ADR is the **stateful
   specialization** of that generic convention. The generic convention says "pure core /
   thin wrapper / Python convenience"; this ADR adds the stateful topology (shared
   `Arc<RwLock<Core>>`, the-wrapper-is-the-sharing-mechanism, Python session owns the
@@ -403,5 +403,5 @@ Rust foundation commits: `755d1c7b` (pool_family discriminator),
 The companion-to-handle migration is **complete for every pool family**. The
 follow-up epic (layer-3: pump-decode per-block Curve/Balancer state directly
 into `BotState` slots, eliminating the data_provider/rate_provider callables
-for on-chain feeds) is recorded in
-`docs/migration-guides/sealed-pool-seam.md`.
+for on-chain feeds) was recorded in `docs/migration-guides/sealed-pool-seam.md`, a
+guide removed in the stale-docs cleanup `71ec78b2`.

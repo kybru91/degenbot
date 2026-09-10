@@ -159,7 +159,7 @@ state exists).
 
 An earlier framing of this candidate said "do after `USPN7M` lands so the
 structs are settled." `USPN7M` is the *planned* pools-extraction epic
-named in `docs/migration-guides/pools-extraction-inventory.md`, but it is
+named in `docs/migration-guides/pools-extraction-inventory.md` (removed in the stale-docs cleanup `71ec78b2`), but it is
 **not a tracked ergo task** — the inventory doc frames its sub-tasks as
 "to be created." There is no single effort to wait on. The value-only
 leaf sims (`v3_simulate_swap` etc.) are already in `degenbot-pools`; the

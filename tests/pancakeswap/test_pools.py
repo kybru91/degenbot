@@ -2,7 +2,7 @@
 # DEX subclasses (Sushi/Pancake/Swapbased/Camelot) and/or needs anvil. Skipping
 # at module level unblocks the offline collection; pending a full rewrite under
 # anvil to the `UniswapV2Pool` + `dex.variant` model. See
-# docs/migration-guides/dex-subclass-collapse.md.
+# docs/migration-guides/dex-subclass-collapse.md (removed in the stale-docs cleanup `71ec78b2`).
 import pathlib
 from typing import Any
 
