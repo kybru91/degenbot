@@ -421,8 +421,11 @@ class PathRegistrationPipeline:
             msg = (
                 "registration is fleet-hosted only (PRG-5 hard cutover, epic "
                 "IRUMXD): the legacy crawl shell (bounded queue + offload "
-                "executor) is retired — start the bot with the fleet stance "
-                "(DEGENBOT_FLEET=fleet)."
+                "executor) is retired and the worker fleet is the only "
+                "behavior (CQLMM2 stance cutover) — the fleet intake boot "
+                "descriptor is missing, so the engine was not constructed "
+                "or its fleet boot failed; check the worker-census boot "
+                "table for fleet_pool_state_updater_slots."
             )
             raise RuntimeError(msg)
         # The seat-thread at-most-once verify-claims table (the DMZ3DD twin

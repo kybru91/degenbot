@@ -17,7 +17,6 @@ a private `ThreadPoolExecutor`. These tests prove the surfaces:
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -66,7 +65,10 @@ def test_fleet_station_executes_callables_on_named_poolupd_seats() -> None:
         capture_output=True,
         text=True,
         cwd=str(Path(__file__).parents[2]),
-        env={**os.environ, "DEGENBOT_FLEET": "fleet"},
+        # PRG-3 test originally injected DEGENBOT_FLEET=fleet; that env var was
+        # retired loudly by the CQLMM2 stance cutover (config cutover JLFE2F,
+        # commit 2729b52bf) — the worker fleet is now the ONLY behavior, so the
+        # subprocess just inherits the env and boots fleet-hosted by default.
         timeout=120,
         check=False,
     )
