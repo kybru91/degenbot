@@ -881,12 +881,23 @@ mod tests {
         let _serial = test_serial();
         set_diag_enabled_for_tests(true);
         let lock: StateLock<u8> = StateLock::new(0);
+        let key = lock.key_of();
         let guard = lock.read();
         let dump = dump_active_holds();
         assert!(dump.contains("active read holds"));
         assert!(dump.contains("state_lock.rs"), "dump names the site");
         drop(guard);
-        assert!(dump_active_holds().contains("(none)"));
+        // The table is PROCESS-global: while this test's diagnostic window
+        // is open, any parallel cargo-test thread that takes a
+        // StateLock::read (solver dispatch, engine tests) registers a
+        // foreign row — so the "(none)" empty rendering can never be
+        // guaranteed under load (2/4 red on a 24-core host). This test owns
+        // only its OWN row: assert that vanished, tolerating strangers.
+        let after = dump_active_holds();
+        assert!(
+            !after.contains(&format!("lock 0x{key:x}")),
+            "the test's own hold must vanish from the active table after drop: {after}"
+        );
         set_diag_enabled_for_tests(false);
     }
 
