@@ -450,6 +450,11 @@ pub struct ArbitrageEngine {
     /// through the white-box probe accessor.
     #[cfg_attr(not(test), expect(dead_code))]
     fleet_boot_stamp: BootStamp,
+    /// KAHU5W: the chunked-parallel resolve stance as an instance value
+    /// (YI5NGB) — packed at construction from `cfg.solve.solve_resolve_par`;
+    /// the `RESOLVE_PAR_STANCE` process-static is deleted and the one test
+    /// A/B flip site mutates this field through the test-only seam.
+    resolve_par_stance: bool,
     /// Test-only: hook invoked at the start of each path solve — lets the
     /// streaming test slowen one path deterministically.
     #[cfg(test)]
@@ -616,6 +621,7 @@ impl ArbitrageEngine {
         // stance — the fleet installs unconditionally, it is the only
         // behavior.
         let streaming_delivery = cfg.pump.streaming_delivery;
+        let resolve_par_stance = cfg.solve.solve_resolve_par;
         let detached_solving = !cfg!(test) && cfg.solve.detached_solves;
         // YI5NGB: the engine OWNS its fleet boot (KAHU5W) — the stamp is
         // constructed from THIS cfg BEFORE the installer runs, so the
@@ -651,6 +657,7 @@ impl ArbitrageEngine {
             last_gate_us: std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new())),
             streaming_delivery,
             fleet_boot_stamp,
+            resolve_par_stance,
             #[cfg(test)]
             test_solve_delay: None,
             #[cfg(test)]
@@ -869,5 +876,14 @@ impl ArbitrageEngine {
 
     pub(crate) fn set_detached_solving(&mut self, on: bool) {
         self.detached_solving = on;
+    }
+
+    /// YI5NGB: A/B seam (TEST ONLY). The production stance is
+    /// construction-frozen from `cfg.solve.solve_resolve_par` (KAHU5W);
+    /// the parity test drives both arms through this mutator instead of
+    /// flipping a process-global.
+    #[cfg(test)]
+    pub(crate) fn set_resolve_parallel_for_test(&mut self, on: bool) {
+        self.resolve_par_stance = on;
     }
 }

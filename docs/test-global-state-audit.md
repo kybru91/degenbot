@@ -46,7 +46,8 @@ Dispositions: `leave` (safe or already mitigated; reason recorded), `gate`
 | `failure_policy.rs:166` `OVERRIDES` — `installed_override_governs_action` installs `verify_mismatch -> Observe` into a process-global `OnceLock` | shared decision-table override | racy-by-parallelism (latent, benign today) | **leave** — the only overridden bucket (`verify_mismatch`) is asserted by no other parallel reader (`matrix_rows_match_adr_040_table` asserts `severity`, not `action`, for it), and the `FIRST` OnceLock keeps the install single-shot. **Standing rule** recorded here: any future test asserting `action()`/`bucket()` on a bucket another test may override must assert its own bucket only, or the override must ride a typed config. |
 | `failure_policy.rs:300` `COOLDOWNS` | keyed cooldown registry | safe-serialized | **leave** — tests use independent keys (`cooldown_keys_are_independent`); registry keyed, no cross-key reads. |
 | `allocator_ctrl.rs` `AUTO_ENABLED`/`INIT_DONE`/`VERSION_OK` | global stance + one-shot logging | safe-serialized (by ignore) | **leave** — the two env/singleton-touching tests are `#[ignore]` with a "run alone" contract; the default-track tests never toggle the flag. |
-| `arb_engine/solver_dispatch.rs:203` `SOLVE_FLEET_HOSTED` + the three `fleet_*_executor.rs` `FLEET_*_BOOT`/`*_EXECUTOR` `OnceLock`s | global construction stance + first-writer-wins boot descriptor | **racy-by-parallelism** | **inject — fix task filed** (ergo under epic `64ZQLA`). `install_engine_stances` mutates the global before a construction reads it (TOCTOU): between the fleet-stance test's `store(true)` and its restore of `false` (`engine_stages.rs:507`), any parallel test constructing an `ArbEngine` binds fleet-hosted solving and the once-installed fleet boot. Engine construction should derive its stance from the **caller's own cfg** (inject), not from a process-global. |
+| `arb_engine/{fleet_solve,fleet_sim,fleet_registration}_executor.rs` `FLEET_{SOLVE,SIM,REGISTRATION}_BOOT` + the lazy `*_EXECUTOR` `OnceLock`s | construction boot descriptor — install-then-read static + `fallback_boot` absence hatch (scope note: the LIVE half of the old `SOLVE_FLEET_HOSTED` row; that symbol is DELETED from the codebase — zero hits — and the old `engine_stages.rs:507` flip citation was a stale-path phantom: `engine_stages.rs` lives under `arb_engine/`, and the live flip is `arb_engine/tests.rs:7431`) | **racy-by-parallelism → FIXED (YI5NGB)** | **inject — fixed (YI5NGB)**: each engine now OWNS its `FleetBoot::from_config(cfg)` as a construction value — packed as the stamped `BootStamp {boot, engine_id, cfg_hash}` field in `with_core_cfg` (mod.rs:592, the KAHU5W sibling of `streaming_delivery`/`runtime_cfg`) — and the per-role `OnceLock<BootStamp>` statics are the identified COURIER to the single process-wide fleet materialization. The lazy `get_or_init` window per role (`global_fleet_solve_executor` fleet_solve_executor.rs:458, sim :382, registration :415) is CLOSED BY CONSTRUCTION: `fallback_boot` and its ambient-derivation arm are DELETED — a stamp-less fetch aborts `expect(...)`-loud (never a silent boot nobody chose), and any post-first-write construction with a DIFFERENT-cfg boot is recorded in the fleet-boot-audit ledger (prod: count + one warn log per winner/rider pair; tests: ILLEGAL — ledger `panic!`). Census rows + `work-fleet-*` thread names are keyed per ROLE (the five `fleet_solver_slots`/`fleet_simdriver_slots`/`fleet_resolve_slots`/`fleet_merge_slots`/`fleet_pool_state_updater_slots` rows, upserted by resource string in worker_census.rs from `role.census_resource()` at role.rs:115–119; per-role name patterns `work-fleet-solver-{n}`/`work-fleet-sim-{n}`/`work-fleet-resolve-{n}`/`work-fleet-merge-{n}`/`work-fleet-poolupd-{n}` at role.rs:129–140) — every module/resource name here is the tree's verbatim spelling: `fleet_solve_executor.rs`, `fleet_sim_executor.rs`, `fleet_registration_executor.rs` (underscored file names; there is no hyphenated `fleet-registration` module in the tree). They stay single-population: ONE process fleet remains the invariant (only the three materializers call `FleetHost::boot`; per-engine fleets were REJECTED on exactly these census/GOQWCL grounds — `logs/boots-design.md` §4 Option A). The stance statics formerly in this row's scope: the RESOLVE_PAR flip → its own row (next row below); STREAMING/INLINE_SIM/MIN_PROFIT/PROJECTION-MEMO are out of this row (live non-construction consumers; future task). |
+| `arb_engine/solver_dispatch.rs` `RESOLVE_PAR_STANCE` (the old row's phantom `engine_stages.rs:507` pointed at a flip of this static's predecessor; the LIVE flip was `arb_engine/tests.rs:7431` / restore :7487) | construction stance for the chunked-parallel resolve arm — install-then-read AtomicBool, ONE test-driven A/B flip site | **racy-by-parallelism → FIXED (YI5NGB)** | **inject — fixed (YI5NGB)**: the static is DELETED; the stance becomes an `ArbitrageEngine` instance field `resolve_par_stance` packed from `cfg.solve.solve_resolve_par` at construction (the KAHU5W sibling of `streaming_delivery` and `detached_solving`); the A/B test (`resolve_chunk_parity_parallel_matches_serial_and_reuses_cache_walks`, tests.rs:7370) drives BOTH arms through the test-only `set_resolve_parallel_for_test` instance mutator — the two runs keep byte-identical coverage (profit/hop-shape/projection-delta parity + sharded-cache walk-once), the process-global flip/restore pair and its parallel-order dependence are GONE. |
 | `arb_engine/sim_slots.rs` `CAP`/`SLOTS` | first-init defaults | safe-serialized | **leave** — no test installs; all consumers accept the first-initialized default, which is the prod default. |
 | `metrics.rs:165` `GLOBAL`, `otel.rs:85` `HANDLE`, `instruments.rs:961` `PIPELINE` | init-once telemetry singletons | safe-serialized | **leave** — no parallel-asserting tests found; init is idempotent; extra instrumentation from strangers is unobservable in assertions today. |
 | `arb_engine/solver_dispatch.rs:1814`, `solve_executor.rs:118,134` — `solve_worker_count()` as prod sizing input under the legacy (non-fleet) stance | host-shape-coupled prod sizing | host-shape-coupled | **property** — covered by `CVURM7`/`TTANQJ` (the quota→slot authorities) and structurally by `ccc148275` (bins bind at the executor's own seat count). |
@@ -81,8 +82,30 @@ Dispositions: `leave` (safe or already mitigated; reason recorded), `gate`
 
 ## Items requiring action (summary)
 
-1. `SOLVE_FLEET_HOSTED` + fleet-boot `OnceLock` TOCTOU — **filed as an ergo
-   task under epic `64ZQLA`** (inject: per-construction stance from the
-   caller's cfg).
+1. ~~`SOLVE_FLEET_HOSTED` + fleet-boot `OnceLock` TOCTOU~~ —
+   **FIXED (YI5NGB)**: the fleet boots are construction-stamped (the
+   engine owns its boot; the per-role lazy materialization window is
+   closed by construction and red-tested; mixed-cfg rides are
+   ledgered); the phantom `engine_stages.rs:507` citation and the
+   dead `SOLVE_FLEET_HOSTED` symbol are dropped; the last
+   test-owned stance flip (`RESOLVE_PAR_STANCE`, live at
+   `arb_engine/tests.rs:7431`) retired to a construction-packed
+   instance field. See the rewritten rows above and the
+   point-of-record note below.
 2. Standing rule for the failure-policy override store — recorded in the
    table above; no code change.
+
+## Point of record
+
+The 2026-09-10 architecture review that flagged this residue
+(Candidate 3, 'one boot surface'), its adversarial verification, and
+the honest bounding of the live scope (the `FLEET_*_BOOT` OnceLock
+census; `SOLVE_FLEET_HOSTED` already retired; the
+`engine_stages.rs:507` citation exposed as a stale-path phantom) are
+recorded at the repository root:
+[`architecture-review-20260910-095446-adversarial.md`](../architecture-review-20260910-095446-adversarial.md)
+(§'Candidate 3 — one boot surface'; Candidate-3 residual-scope cites
+at its tail). The reviewed report itself:
+[`architecture-review-20260910-095446.html`](../architecture-review-20260910-095446.html).
+Both documents are LINK-ONLY records — edit THIS file's rows, never
+the review artifacts.

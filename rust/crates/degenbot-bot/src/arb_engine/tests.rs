@@ -7368,8 +7368,6 @@ mod tests {
     #[test]
     #[expect(clippy::too_many_lines)] // A/B harness: two full engines, worth the length
     fn resolve_chunk_parity_parallel_matches_serial_and_reuses_cache_walks() {
-        use std::sync::atomic::Ordering;
-
         const N: usize = 600; // >= RESOLVE_PAR_MIN (512) so the parallel arm engages
 
         let build = || {
@@ -7428,8 +7426,9 @@ mod tests {
 
         let run = |parallel: bool| {
             let (mut engine, path_ids, hub_a, hub_b) = build();
-            crate::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE
-                .store(parallel, Ordering::Relaxed);
+            // YI5NGB: the A/B arm drives the INSTANCE stance now (no
+            // process-global flip; no parallel-order dependence).
+            engine.set_resolve_parallel_for_test(parallel);
 
             // Cycle 1: dirty BOTH hubs -> all N paths re-resolve in one cycle.
             engine.process_updates(
@@ -7483,8 +7482,7 @@ mod tests {
         let (serial_results, serial_same_state, serial_proj_delta, path_ids) = run(false);
         let (par_results, par_same_state, par_proj_delta, _path_ids) = run(true);
 
-        // Restore the production stance after the A/B.
-        crate::arb_engine::solver_dispatch::RESOLVE_PAR_STANCE.store(true, Ordering::Relaxed);
+        // YI5NGB: the instance-stance cutover -> nothing process-global remains to restore.
 
         assert_eq!(path_ids.len(), N);
         for (path_id, _unique, _a, _b) in &path_ids {

@@ -203,13 +203,6 @@ struct ResolveChunkOut {
     deferred: Vec<u64>,
 }
 
-fn resolve_parallel_enabled() -> bool {
-    RESOLVE_PAR_STANCE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub(crate) static RESOLVE_PAR_STANCE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
 /// Pre-solve profitability floor for the profit-envelope gate (SU7MAE).
 /// Precedence: `DEGENBOT_MIN_PROFIT_WEI` (decimal wei) > default 0. Default 0
 /// skips only paths whose rigorous upper bound proves zero-or-negative profit.
@@ -355,11 +348,10 @@ pub fn install_engine_stances(
     let min_profit = U256::from(cfg.solve.min_profit_wei);
     let _ = MIN_PROFIT_FLOOR_WEI.set(min_profit);
     crate::bot_core::resolve::install_projection_memo_stance(cfg.solve.cl_projection_cache);
-    // 7LV6VN T2: chunked parallel resolve stance, parsed once at construction.
-    RESOLVE_PAR_STANCE.store(
-        cfg.solve.solve_resolve_par,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // 7LV6VN T2 (YI5NGB): the chunked parallel resolve stance is an ENGINE
+    // instance value now — packed per construction from
+    // cfg.solve.solve_resolve_par (the KAHU5W construction-stance
+    // trajectory); no installer store remains here.
 }
 
 /// K-slowest-path attribution record: (`time_us`, `pieces_visited`,
@@ -1849,7 +1841,7 @@ impl ArbitrageEngine {
             let mut affected_vec: Vec<u64> = affected_path_ids.iter().copied().collect();
             affected_vec.sort_unstable();
             let chunk_outs: Vec<ResolveChunkOut> = hotpath::measure_block!("resolve.chunks", {
-                if !resolve_parallel_enabled() || affected_vec.len() < RESOLVE_PAR_MIN {
+                if !self.resolve_par_stance || affected_vec.len() < RESOLVE_PAR_MIN {
                     vec![resolve_chunk(&affected_vec)]
                 } else {
                     // P6YXA6: the resolve chunk fan-out leaves rayon with
