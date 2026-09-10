@@ -46,8 +46,13 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 /// abort discipline): a dead executor would deadlock the first solve — its
 /// per-path sends would land in a pipe nobody drains — so swallowing the
 /// error is never an option.
+#[expect(
+    clippy::print_stderr,
+    reason = "the abort path must stay legible with no tracing subscriber installed (test harnesses drop the tracing event); stderr is the process's last message"
+)]
 fn abort_executor(context: &str, err: &str) -> ! {
     tracing::error!(context = %context, error = %err, "[solve-executor] unrecoverable - aborting");
+    eprintln!("[solve-executor] UNRECOVERABLE, aborting: {context}: {err}");
     std::process::abort();
 }
 

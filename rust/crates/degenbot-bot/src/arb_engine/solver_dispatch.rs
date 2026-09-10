@@ -52,6 +52,20 @@ type SolveArmOutcome = (u64, SolvePathResult, u64, Option<SimulatedPathResult>);
 // RAYPAR T3: LPT-pre-balanced scoped-thread partition
 // ---------------------------------------------------------------------------
 
+/// The ONE solve-bin sizing seam (P6YXA6): fleet-hosted cycles bin at the
+/// fleet's structural Solver seat count (pins == bins, so every bin owns a
+/// warm keyed seat); every other arm bins at the machine-derived solve
+/// worker count. One funnel so the arms can never re-derive the count and
+/// drift apart (a hermetic fleet under machine-derived bins aborts at the
+/// T2 grant — the host-only `just test-rust` failure).
+pub(crate) fn solve_bin_count(fleet_hosted: bool) -> usize {
+    if fleet_hosted {
+        crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor().bin_count()
+    } else {
+        degenbot_core::cpu_budget::solve_worker_count()
+    }
+}
+
 #[expect(clippy::doc_markdown)]
 /// RAYPAR T3: LPT (longest-processing-time) bin-packing. Sorts items by
 /// descending cost and greedily assigns each to the least-loaded bin. Returns
@@ -2095,11 +2109,7 @@ impl ArbitrageEngine {
             // P6YXA6 sizing reconciliation: fleet-hosted cycles bin at the
             // fleet's STRUCTURAL seat count — pins and bins are the same
             // number, so every bin owns a warm keyed seat across cycles.
-            let n_threads = if self.fleet_hosted {
-                crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor().bin_count()
-            } else {
-                degenbot_core::cpu_budget::solve_worker_count()
-            };
+            let n_threads = solve_bin_count(self.fleet_hosted);
             // Loop-12 KUKHMX: previous-block measured walk sims refine the
             // LPT cost; snapshot once (single lock) before binning.
             // Loop-18: measured gate us rides the same snapshot - gate-heavy
@@ -2649,11 +2659,7 @@ impl ArbitrageEngine {
         // same cost skew as the hot path, so it bins over the structural
         // bin count too — the fleet's Solver seats when fleet-hosted
         // (pins == bins), else solve_worker_count's dedicated-runtime bins.
-        let n_bins = if self.fleet_hosted {
-            crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor().bin_count()
-        } else {
-            degenbot_core::cpu_budget::solve_worker_count()
-        };
+        let n_bins = solve_bin_count(self.fleet_hosted);
         // Cold start has no previous-block sims/gate yet: structural proxy only.
         let costs: Vec<usize> = to_solve
             .iter()

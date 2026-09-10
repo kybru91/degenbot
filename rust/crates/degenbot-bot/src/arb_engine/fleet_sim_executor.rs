@@ -45,12 +45,17 @@ use degenbot_workers::role::WorkerRole;
 /// executor's abort discipline): a dead host would strand in-flight sim
 /// receipts — a scheduling bin waiting on a receipt parks forever (stranded
 /// pipe, design doc §10) — so swallowing the error is never an option.
+#[expect(
+    clippy::print_stderr,
+    reason = "the abort path must stay legible with no tracing subscriber installed (test harnesses drop the tracing event); stderr is the process's last message"
+)]
 fn abort_executor(context: &str, err: &str) -> ! {
     tracing::error!(
         context = %context,
         error = %err,
         "[fleet-sim] unrecoverable — aborting (stranded sim receipt pipe)"
     );
+    eprintln!("[fleet-sim] UNRECOVERABLE, aborting (stranded sim receipt pipe): {context}: {err}");
     std::process::abort();
 }
 

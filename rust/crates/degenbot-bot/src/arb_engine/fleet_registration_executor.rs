@@ -40,11 +40,18 @@ use degenbot_workers::role::WorkerRole;
 /// executors' abort discipline): a dead host would strand in-flight build
 /// receipts — the crawl worker awaiting one parks forever (stranded pipe,
 /// design doc §10) — so swallowing the error is never an option.
+#[expect(
+    clippy::print_stderr,
+    reason = "the abort path must stay legible with no tracing subscriber installed (test harnesses drop the tracing event); stderr is the process's last message"
+)]
 fn abort_executor(context: &str, err: &str) -> ! {
     tracing::error!(
         context = %context,
         error = %err,
         "[fleet-reg] unrecoverable — aborting (stranded intake receipt pipe)"
+    );
+    eprintln!(
+        "[fleet-reg] UNRECOVERABLE, aborting (stranded intake receipt pipe): {context}: {err}"
     );
     std::process::abort();
 }

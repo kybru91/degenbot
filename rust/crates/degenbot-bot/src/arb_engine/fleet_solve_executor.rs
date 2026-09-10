@@ -36,13 +36,33 @@ pub(crate) const SOLVE_BIN_KEY_BASE: PinKey = 1;
 /// abort discipline): a dead host would strand in-flight per-path result
 /// sends in pipes nobody drains, so swallowing the error is never an
 /// option.
+#[expect(
+    clippy::print_stderr,
+    reason = "the abort path must stay legible with no tracing subscriber installed (test harnesses drop the tracing event); stderr is the process's last message"
+)]
 fn abort_executor(context: &str, err: &str) -> ! {
     tracing::error!(
         context = %context,
         error = %err,
         "[fleet-solve] unrecoverable — aborting (stranded result pipe)"
     );
+    eprintln!("[fleet-solve] UNRECOVERABLE, aborting (stranded result pipe): {context}: {err}");
     std::process::abort();
+}
+
+/// The pins == bins invariant check (P6YXA6): a Solver bin index must land
+/// within the structural seat count. Pure (no `&self`) so the tests hold
+/// the contract without booting a fleet.
+fn validate_bin_index(bin: usize, solver_seats: usize) -> Result<(), String> {
+    if bin < solver_seats {
+        Ok(())
+    } else {
+        Err(format!(
+            "bin {bin} exceeds the {solver_seats} structural Solver seats \
+             (pins == bins invariant, P6YXA6); the dispatch arms must bin \
+             at executor.bin_count()"
+        ))
+    }
 }
 
 /// One bin job as the host hands it to a Solver seat.
@@ -144,6 +164,13 @@ impl FleetSolveExecutor {
     /// channel (executor died) is a LOUD abort — a lost bin would strand
     /// its paths' per-path result sends forever (stranded pipe, §10).
     pub(crate) fn spawn(&self, bin: usize, job: impl FnOnce() + Send + 'static) {
+        // The pins == bins invariant (P6YXA6), held at the submit seam: a
+        // bin without a structural seat must abort HERE — with both numbers
+        // in the message — instead of decaying into an FSM transition
+        // refusal deep in dispatch.
+        if let Err(msg) = validate_bin_index(bin, self.solver_seats) {
+            abort_executor("bin submission", &msg);
+        }
         let key = SOLVE_BIN_KEY_BASE.saturating_add(u64::try_from(bin).unwrap_or(u64::MAX));
         let unit = Unit::new(
             self.unit_seq.fetch_add(1, Ordering::Relaxed),
@@ -322,7 +349,7 @@ mod tests {
         load_corpus_fixture, probe_ctx, prod_lpt_bins,
     };
     use super::super::solver_dispatch::solve_one_path;
-    use super::{FleetSolveExecutor, SOLVE_BIN_KEY_BASE};
+    use super::{validate_bin_index, FleetSolveExecutor, SOLVE_BIN_KEY_BASE};
 
     fn hermetic_boot() -> FleetBoot {
         FleetBoot {
@@ -330,6 +357,23 @@ mod tests {
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),
         }
+    }
+
+    /// The pins == bins contract (P6YXA6) as a pure validator: a
+    /// seat-bounded bin index passes; anything over it is shouted down with
+    /// BOTH numbers so the loud abort decodes at a glance.
+    #[test]
+    fn bin_submission_above_the_structural_seat_count_is_a_loud_invariant_violation() {
+        assert!(validate_bin_index(5, 6).is_ok());
+        let err = validate_bin_index(6, 6).expect_err("bin == seats is out of range");
+        assert!(
+            err.contains("bin 6"),
+            "message names the rejected bin: {err}"
+        );
+        assert!(
+            err.contains("6 structural"),
+            "message names the seat count: {err}"
+        );
     }
 
     fn submit_bins(
@@ -373,7 +417,18 @@ mod tests {
     fn fleet_executor_is_result_parity_with_legacy_executor_on_capture_fixture() {
         let items = load_corpus_fixture();
         let ctx = probe_ctx();
-        let bins = prod_lpt_bins(&items, degenbot_core::cpu_budget::solve_worker_count());
+        // P6YXA6 regression: the bins bind at the fleet's STRUCTURAL seat
+        // count — pins == bins. Binning at the machine-derived worker count
+        // instead boots 6 hermetic seats against host-core-derived bins (22
+        // on the 24-core raw host) and aborts at the T2 grant — the
+        // host-only `just test-rust` failure this restructuring pins.
+        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        let bins = prod_lpt_bins(&items, executor.bin_count());
+        assert_eq!(
+            bins.len(),
+            executor.bin_count(),
+            "solver bins must equal the structural Solver seat count (pins == bins, P6YXA6)"
+        );
 
         // Legacy arm: the incumbent private-runtime executor (BXUSGL T1).
         let legacy = {
@@ -408,7 +463,6 @@ mod tests {
         assert!(!legacy.is_empty(), "fixture must produce results");
 
         // Fleet arm: same bins, same jobs, fleet-hosted Solver pins.
-        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
         let fleet = submit_bins(&executor, &bins, &items, &ctx);
 
         assert_eq!(
