@@ -225,6 +225,17 @@ Nominal ⇄ Cordoned
 - **The deadlock ledger applies in cordon:** shed never abandons a unit whose
   results feed a pipe; `Draining` always runs to completion (T7/T8).
 
+**Soak ruling (7OGY5V, 2026-09-10): Solver admission is posture-INVARIANT.**
+LW-T5 (MOVE3D, Seam E) briefly introduced a submit-seam gate refusing Solver
+bins under `Cordoned`; the first in-container soak after the LW-T9 cutover
+found the correctness hole: the bin had been issued before the refusal, the
+result pipe stranded, and the cycle-abort killed the bot on ordinary cgroup
+throttling. The gate contravened this section (cordons hold only Deferrable
+intake + the sim-intake floor; pinned walks are never shed) and
+`workers::role`'s `CordonClass::Never` table for Solver — the gate was
+removed, the LW-T5-era seam test rewritten to pin posture-invariant
+admission, and the submit-seam posture mirror retired with it.
+
 Posture transitions are metrics, not behavior changes to the engine: stages,
 priority, and correctness are posture-invariant; only lease intake changes.
 

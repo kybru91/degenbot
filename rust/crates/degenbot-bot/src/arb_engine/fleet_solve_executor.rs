@@ -27,7 +27,7 @@ use degenbot_workers::dispatcher::{
     BootError, FleetBoot, FleetHost, SubmitError, SubmitReceipt, Unit,
 };
 use degenbot_workers::lane::{LaneCtx, QuitSig};
-use degenbot_workers::posture::{FleetPosture, PostureChange, ThrottleSample};
+use degenbot_workers::posture::ThrottleSample;
 use degenbot_workers::role::WorkerRole;
 use degenbot_workers::slot::PinKey;
 
@@ -54,7 +54,7 @@ fn abort_executor(context: &str, err: &str) -> ! {
     std::process::abort();
 }
 /// Public loud-stop wrapper (ADR-021; used by the `solver_dispatch` submit
-/// seam for posture-gated refusals).
+/// seam for stranded-pipe terminal stops).
 pub(crate) fn abort_loud(context: &str, err: &str) -> ! {
     abort_executor(context, err);
 }
@@ -110,11 +110,6 @@ enum HostMsg {
 pub(crate) struct FleetSolveExecutor {
     tx: mpsc::Sender<HostMsg>,
     unit_seq: AtomicU64,
-    /// The submit-seam posture MIRROR (LW-T5, Seam E): the host thread
-    /// writes the FSM posture after every throttle observation; submit
-    /// consults THIS (never a unit body, never ambient) — the FSM itself
-    /// stays untouched.
-    posture: Arc<parking_lot::Mutex<FleetPosture>>,
     /// The host thread stamps TRUE when an enqueue spilled to the
     /// unbounded host backlog; submit stamps the receipt with (and resets)
     /// the flag — the unit is never dropped (§10 ledger).
@@ -192,7 +187,9 @@ impl FleetSolveExecutor {
         }
         // The submit mirror (LW-T5, Seam E) lives with the host thread and
         // every executor handle shares the same cells.
-        let posture = Arc::new(parking_lot::Mutex::new(FleetPosture::Nominal));
+        // 7OGY5V: no posture MIRROR — posture-invariant Solver admission
+        // retired its only reader (the host FSM still owns every posture
+        // decision: Deferrable hold + sim-intake floor, dispatcher-side).
         let solver_queue_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         // Census: `FleetHost::boot` registered every v1 role row. The seats
         // are the runtime behind the solver pins, named per
@@ -214,12 +211,11 @@ impl FleetSolveExecutor {
                 abort_executor("solver seat spawn", &format!("{err:?}"));
             }
         }
-        let host_posture = Arc::clone(&posture);
         let host_queue_len = Arc::clone(&solver_queue_len);
         let spawned = std::thread::Builder::new()
             .name("work-fleet-solver-host".to_string())
             .spawn(move || {
-                host_loop(rx, host, &seat_senders, &host_posture, &host_queue_len);
+                host_loop(rx, host, &seat_senders, &host_queue_len);
             });
         if let Err(err) = spawned {
             abort_executor("fleet host thread spawn", &format!("{err:?}"));
@@ -228,7 +224,6 @@ impl FleetSolveExecutor {
             tx,
             unit_seq: AtomicU64::new(0),
             solver_seats,
-            posture,
             solver_queue_len,
         })
     }
@@ -270,17 +265,13 @@ impl FleetSolveExecutor {
             true,
             Box::new(work),
         );
-        // LW-T5 (Seam E): the posture consult AT the submit seam — a cordon
-        // refuses a NEW solver submission immediately (admission-side only;
-        // the running units' timeline is untouched and the FSM is never
-        // re-worked from the surface).
-        let observed_posture = *self.posture.lock();
-        if observed_posture != FleetPosture::Nominal {
-            return Err(SubmitError::PostureHeld {
-                posture: observed_posture,
-                role: WorkerRole::Solver,
-            });
-        }
+        // 7OGY5V: Solver admission is posture-INVARIANT (worker-fleet.md §6:
+        // cordon effects are the Deferrable hold + sim-intake floor ONLY;
+        // Solver is CordonClass::Never in workers::role). The LW-T5-era
+        // seam-side refusal was backed out — the soak showed it stranded the
+        // bin's result pipe and aborted the bot on routine cgroup throttling.
+        // The posture mirror still feeds the Deferrable hold + sim floor
+        // downstream (observe_throttle → the dispatcher's own gates).
         if self.tx.send(HostMsg::Enqueue(unit)).is_err() {
             return Err(SubmitError::PortClosed);
         }
@@ -344,12 +335,11 @@ fn host_loop(
     rx: mpsc::Receiver<HostMsg>,
     mut host: FleetHost,
     seats: &[mpsc::Sender<SeatJob>],
-    posture: &Arc<parking_lot::Mutex<FleetPosture>>,
     solver_queue_len: &std::sync::atomic::AtomicUsize,
 ) {
     let mut backlog: VecDeque<Unit> = VecDeque::new();
     while let Ok(msg) = rx.recv() {
-        apply_host_msg(&mut host, &mut backlog, msg, posture, solver_queue_len);
+        apply_host_msg(&mut host, &mut backlog, msg, solver_queue_len);
         pump(&mut host, &mut backlog, seats);
     }
 }
@@ -360,7 +350,6 @@ fn apply_host_msg(
     host: &mut FleetHost,
     backlog: &mut VecDeque<Unit>,
     msg: HostMsg,
-    posture: &Arc<parking_lot::Mutex<FleetPosture>>,
     solver_queue_len: &std::sync::atomic::AtomicUsize,
 ) {
     match msg {
@@ -388,17 +377,10 @@ fn apply_host_msg(
             solver_queue_len.store(host.queue_len(WorkerRole::Solver), Ordering::Relaxed);
         }
         HostMsg::Throttle { now_ms, sample } => {
-            // LW-T5 (Seam E): the FSM owns the posture (slot surface is
-            // untouched); this MIRRORS the verdict into the submit seam.
-            match host.observe_throttle(now_ms, sample) {
-                PostureChange::Entered(_) => {
-                    *posture.lock() = FleetPosture::Cordoned;
-                }
-                PostureChange::Exited => {
-                    *posture.lock() = FleetPosture::Nominal;
-                }
-                PostureChange::Held => {}
-            }
+            // The host FSM OWNS the posture end to end (7OGY5V): the
+            // submit-seam MIRROR was retired when the posture-invariant
+            // Solver ruling (worker-fleet.md §6) removed its only reader.
+            let _ = host.observe_throttle(now_ms, sample);
         }
     }
 }
@@ -714,7 +696,7 @@ mod tests {
         install_default_escalation_port, EscalationError, EscalationPort, EscalationWork, LaneCtx,
     };
     use degenbot_workers::posture::PosturePolicy;
-    use degenbot_workers::posture::{FleetPosture, ThrottleSample};
+    use degenbot_workers::posture::ThrottleSample;
 
     use super::super::solver_dispatch::executor_ab_probe::{
         load_corpus_fixture, probe_ctx, prod_lpt_bins,
@@ -722,7 +704,7 @@ mod tests {
     use super::super::solver_dispatch::{solve_one_path, SolveArmOutcome};
     use super::lane_scaffold::{run_solve_lane, LaneFailure, LaneOutcome, SolveLane};
     use super::WorkerRole;
-    use super::{validate_bin_index, FleetSolveExecutor, SubmitError, SOLVE_BIN_KEY_BASE};
+    use super::{validate_bin_index, FleetSolveExecutor, SOLVE_BIN_KEY_BASE};
 
     fn hermetic_boot() -> FleetBoot {
         FleetBoot {
@@ -1076,14 +1058,17 @@ mod tests {
 
     // ---- LW-T5 (Seam E): posture & precedence at the submit seam ------------
 
-    /// LW-T5 (Seam E): in Cordoned posture the submit seam refuses a NEW
-    /// solver unit IMMEDIATELY with a typed `PostureHeld` — admission-side
-    /// only: the unit running when the posture flipped completes normally
-    /// (RAYPAR T3 never-yield mid-unit; the slot FSM itself is untouched).
+    /// 7OGY5V (soak adjudication, 2026-09-10): Solver admission is
+    /// posture-INVARIANT — design doc §6's cordon effects hold only the
+    /// Deferrable classes + the sim intake floor, and `workers::role`
+    /// declares `Solver` `CordonClass::Never`; a cordon never refuses a
+    /// Solver bin at the submit seam (the LW-T5-era gate over-reached the
+    /// spec and the soak found the refusal stranded the bin's result pipe).
     #[test]
-    fn submit_in_cordoned_posture_fails_typed_at_the_submit_seam_and_running_units_complete() {
+    fn submit_in_cordoned_posture_still_admits_solver_units_and_running_units_complete() {
         let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
         let long_unit_done: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+        let cordoned_done: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         let done = Arc::clone(&long_unit_done);
         executor
             .submit_solve_bin(
@@ -1104,32 +1089,27 @@ mod tests {
             },
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let refused = executor
+        let done2 = Arc::clone(&cordoned_done);
+        executor
             .submit_solve_bin(
                 1,
                 SubmitWork::from(Box::new(move |_ctx| {
-                    red_panic("a posture-held submit must not run its body");
+                    done2.store(true, std::sync::atomic::Ordering::Relaxed);
                 })),
             )
-            .expect_err("the CORDONED submit must refuse TYPED at the submit seam");
-        // The refusal must carry the posture + role in its payload.
-        assert!(
-            matches!(
-                refused,
-                SubmitError::PostureHeld {
-                    posture: FleetPosture::Cordoned,
-                    role: WorkerRole::Solver,
-                }
-            ),
-            "the refusal must carry the posture + role: {refused:?}"
-        );
-        // The occupant was NEVER preempted: it completed on its own timeline
-        // while the posture was already Cordoned.
+            .expect(
+                "posture-invariant Solver admission: a CORDONED posture must \
+                 NEVER refuse a Solver bin (design §6: cordon effects are the \
+                 Deferrable hold + sim-intake floor ONLY)",
+            );
+        // Both the pre-cordon occupant and the cordon-era newcomer complete.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !long_unit_done.load(std::sync::atomic::Ordering::Relaxed) {
+        while !(long_unit_done.load(std::sync::atomic::Ordering::Relaxed)
+            && cordoned_done.load(std::sync::atomic::Ordering::Relaxed))
+        {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the running unit never completed (preempted?)"
+                "a cordon-era unit did not complete"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }

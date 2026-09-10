@@ -16,10 +16,11 @@ PIDFILE="$LOGDIR/bot_run.pid"
 mkdir -p "$LOGDIR"
 
 # --------------------------------------------------------------------------
-# FLEET STANCE REQUIRED (PRG-5, epic IRUMXD): the registration crawl is
-# fleet-hosted only — this launcher exports DEGENBOT_FLEET=fleet below (see
-# that block for the retired DEGENBOT_REG_* knobs). A hand-run without it
-# dies at registration with "registration is fleet-hosted only".
+# POST-LW-T9 CUTOVER (epic XR62VX, commit f3750093d): the fleet executor is
+# the ONLY stance now — the DEGENBOT_FLEET stance key itself is RETIRED and
+# fails the config load loudly if exported; registration/sim/solve host on
+# the ADR-042 fleet unconditionally. (This launcher used to export
+# DEGENBOT_FLEET=fleet — do NOT restore it.)
 #
 # Conservative (HARD/LOUD) defaults now live in the CODE, not here (Z4KQXF).
 # Every invocation — run_bot.sh, a hand-run, a CI/harness — gets loud failure
@@ -98,15 +99,13 @@ export DEGENBOT_WS_TRACE="${DEGENBOT_WS_TRACE:-0}"
 # Code default stays 50 ms; invalid/zero env values fall back to 50 ms.
 export DEGENBOT_PUMP_DEBOUNCE_MS="${DEGENBOT_PUMP_DEBOUNCE_MS:-15}"
 # Registration crawl hosting (PRG-5 hard cutover, epic IRUMXD): the crawl is
-# FLEET-HOSTED ONLY — the retired crawl shell (bounded producer/consumer
-# queue + offload executor) raises at pipeline construction under any other
-# stance ("registration is fleet-hosted only"). The stance holder is read at
-# FFI module init, so this env must be set before the interpreter starts
-# (which is exactly what this launcher does). Retired along with it:
-# DEGENBOT_REG_QUEUE_BOUND / DEGENBOT_REG_WORKERS now FAIL the config load
-# loudly if set (the DEGENBOT_SOLVE_EXECUTOR retirement precedent); the
-# intake sizing is fleet.pool_state_updater_slots (DEGENBOT_FLEET_POOL_STATE_UPDATER_SLOTS).
-export DEGENBOT_FLEET="${DEGENBOT_FLEET:-fleet}"
+# FLEET-HOSTED ONLY, and since LW-T9 (epic XR62VX) the stance key is retired:
+# DEGENBOT_FLEET / fleet.stance in a config FAIL the config load loudly if
+# set — the fleet is unconditional. Alongside it, DEGENBOT_REG_QUEUE_BOUND /
+# DEGENBOT_REG_WORKERS (crawl shell) and DEGENBOT_SOLVE_SIM_INFLIGHT
+# (solve.solve_sim_inflight, sim-slots shadow cap) all fail the load loudly
+# too; survivals are fleet.pool_state_updater_slots / fleet.sim_slot_cap and
+# solve.inline_sim_workers.
 # Typed-config parity (KAHU5W): every DEGENBOT_* env above still works
 # (12-factor parity) but each key also has a typed TOML path — these exports
 # map to telemetry.otel, solve.solve_inline_sim, simulation.sim_exit_on_fail,
@@ -135,8 +134,9 @@ export DEGENBOT_FLEET="${DEGENBOT_FLEET:-fleet}"
 # and the sim-driver cap all derive from the detected cgroup budget inside
 # the Rust core (cpu_budget::leftover_worker_budget), leaving the I/O
 # headroom to the ambient runtime by construction. An operator export of
-# DEGENBOT_SOLVE_CPUS / DEGENBOT_INLINE_SIM_WORKERS / DEGENBOT_SOLVE_SIM_INFLIGHT
+# DEGENBOT_SOLVE_CPUS / DEGENBOT_INLINE_SIM_WORKERS / DEGENBOT_FLEET_SIM_SLOT_CAP
 # still wins when set explicitly - none are pre-set here.
+# (DEGENBOT_SOLVE_SIM_INFLIGHT is retired — fails the load loudly, LW-T9.)
 
 # The actual bot invocation (uv rebuilds the Rust extension if any rust
 # source / Cargo.toml is newer than the installed build).
