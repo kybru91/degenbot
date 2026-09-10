@@ -65,6 +65,7 @@ mod diagnostic;
 // hard cutover, Q6.
 pub mod engine_stages;
 mod event_routing;
+pub(crate) mod executor;
 pub mod fleet_registration_executor;
 mod fleet_sim_executor;
 pub(crate) mod fleet_solve_executor;

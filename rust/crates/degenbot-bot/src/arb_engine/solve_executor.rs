@@ -34,13 +34,16 @@
 //! stream back over a channel as each PATH completes (per-path sends, not
 //! per-bin), so the drain merges fast paths while slow bins still run.
 
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
-/// A pre-composed per-bin solve closure. The sync CPU work inside the async
-/// block is BY DESIGN: the "never block a runtime worker without .await"
-/// rule applies to the shared I/O runtime, and this is deliberately not it
-/// (see module docs). Workers never yield mid-bin.
-type Job = Box<dyn FnOnce() + Send + 'static>;
+use degenbot_workers::lane::{LaneCtx, QuitSig};
+
+/// A pre-composed per-bin solve closure (LW-T8 ruling: the legacy adapter
+/// is a MINI-SEAT array — ONE persistent named std thread per bin; NO
+/// ambient runtime anywhere, so `Handle::try_current() == Err` on every
+/// unit; the only out-of-band capability is the seat's `LaneCtx` port).
+type Job = Box<dyn FnOnce(&LaneCtx) + Send + 'static>;
 
 /// Loud, unrecoverable executor failure (mirror of the ADR-021 tripwire's
 /// abort discipline): a dead executor would deadlock the first solve — its
@@ -57,48 +60,86 @@ fn abort_executor(context: &str, err: &str) -> ! {
 }
 
 pub(crate) struct SolveExecutor {
-    tx: mpsc::Sender<Job>,
+    /// Round-robin seat selector (the callers spawn exactly `seats` jobs in
+    /// bin order, so seat seq % lanes preserves one-thread-per-bin).
+    next: std::sync::atomic::AtomicU64,
+    /// One mailbox per mini-seat (LW-T8 ruling: N persistent named std
+    /// threads, one per bin, each with an mpsc mailbox).
+    lanes: Vec<mpsc::Sender<Job>>,
+}
+
+impl crate::arb_engine::executor::Executor for SolveExecutor {
+    fn bin_count(&self) -> usize {
+        degenbot_core::cpu_budget::solve_worker_count()
+    }
+
+    fn submit(
+        &self,
+        _bin: usize,
+        work: crate::arb_engine::executor::SubmitWork,
+    ) -> Result<
+        degenbot_workers::dispatcher::SubmitReceipt,
+        degenbot_workers::dispatcher::SubmitError,
+    > {
+        // The legacy mini-seat adapter: seats run PLAIN (no ambient runtime)
+        // with their per-seat ctx port as the ONLY out-of-band capability.
+        self.spawn(move |ctx| work(ctx));
+        Ok(degenbot_workers::dispatcher::SubmitReceipt {
+            accepted_with_backlog: false,
+        })
+    }
 }
 
 impl SolveExecutor {
-    /// Build the executor: one host thread installs a private multi-thread
-    /// runtime and pulls jobs off the request channel onto it.
+    /// Build the executor (LW-T8 ruling): a mini-seat array — one persistent
+    /// named std thread per bin (round-robin dispatch preserves
+    /// one-thread-per-bin as the callers spawn exactly `worker_threads`
+    /// jobs in bin order). Plain threads: NO ambient tokio runtime — the
+    /// seat's `LaneCtx` port is the only out-of-band capability, and
+    /// escalations consume the injected port, never the ambient Handle.
     pub(crate) fn new(thread_name: &'static str, worker_threads: usize) -> Self {
-        let (tx, rx) = mpsc::channel::<Job>();
         let thread_name = thread_name.to_string();
-        let spawned = std::thread::Builder::new()
-            .name(format!("{thread_name}-host"))
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_name(thread_name)
-                    .worker_threads(worker_threads.max(1))
-                    .build();
-                let runtime = match runtime {
-                    Ok(rt) => rt,
-                    Err(err) => abort_executor("runtime build", &err.to_string()),
-                };
-                runtime.block_on(async move {
-                    while let Ok(job) = rx.recv() {
-                        tokio::spawn(async move { job() });
+        let seats = worker_threads.max(1);
+        let mut lanes = Vec::with_capacity(seats);
+        for slot in 0..seats {
+            let (stx, srx) = mpsc::channel::<Job>();
+            let spawned = std::thread::Builder::new()
+                .name(format!("{thread_name}-{slot}"))
+                .spawn(move || {
+                    // One-seat LaneCtx (ctx-mint at the executor surface,
+                    // never inside a unit body): no pin, no warm arena,
+                    // escalation through the injected default port.
+                    let ctx = LaneCtx {
+                        pin: 0,
+                        arena: degenbot_workers::dispatcher::ArenaToken::DETACHED,
+                        escalation: degenbot_workers::lane::default_escalation_port()
+                            .unwrap_or_else(degenbot_workers::lane::no_escalation_port),
+                        quit: QuitSig,
+                    };
+                    while let Ok(job) = srx.recv() {
+                        job(&ctx);
                     }
-                    // Channel closed (host sends dropped): shut down. Jobs in
-                    // flight finish; spawned tasks are awaited by the runtime
-                    // on its normal shutdown path.
                 });
-            });
-        if let Err(err) = spawned {
-            abort_executor("host thread spawn", &format!("{err:?}"));
+            if let Err(err) = spawned {
+                abort_executor("legacy seat spawn", &format!("{err:?}"));
+            }
+            lanes.push(stx);
         }
-        Self { tx }
+        Self {
+            next: std::sync::atomic::AtomicU64::new(0),
+            lanes,
+        }
     }
 
-    /// Submit one job (one LPT bin). Never blocks: the channel is unbounded
-    /// and bounded-ness comes from the caller spawning exactly n bins.
-    pub(crate) fn spawn(&self, job: impl FnOnce() + Send + 'static) {
-        // Send errors only when the host is gone (process exiting mid-solve):
-        // nothing can drain results then anyway.
-        let _ = self.tx.send(Box::new(job));
+    /// Submit one job (one LPT bin). Never blocks: the seat lane is
+    /// unbounded and bounded-ness comes from the caller spawning exactly n
+    /// bins in order (round-robin across the mini-seat array pins each bin
+    /// to its own persistent plain thread).
+    pub(crate) fn spawn(&self, job: impl FnOnce(&LaneCtx) + Send + 'static) {
+        let seq = self.next.fetch_add(1, Ordering::Relaxed);
+        let lane =
+            usize::try_from(seq % u64::try_from(self.lanes.len()).unwrap_or(u64::MAX)).unwrap_or(0);
+        let _ = self.lanes[lane].send(Box::new(job));
     }
 }
 
@@ -120,17 +161,25 @@ mod census_honesty_tests {
             .iter()
             .find(|e| e.resource == "solve_executor_fleet")
             .expect("the legacy tokio census row exists");
-        // HONESTY PIN: the row says the workers share one name, and does NOT
-        // claim an `{n}` per-index pattern the legacy runtime never honors.
+        // HONESTY PIN (flipped by the LW-T8 mini-seat ruling): the legacy
+        // seats are now PLAIN THREADS with per-index names — the row claims
+        // the {n} pattern it actually honors.
         assert!(
-            row.thread_name.contains("SAME name"),
-            "the legacy row must state its same-name-for-all multiplicity: {}",
+            row.thread_name.contains("{n}"),
+            "the per-index legacy seats must claim the {{n}} pattern: {}",
             row.thread_name
         );
         assert!(
-            !row.thread_name.contains("{n}"),
-            "a non-per-index runtime must not claim the {{n}} pattern: {}",
+            !row.thread_name.contains("SAME name"),
+            "per-index seats must not claim same-name-for-all anymore: {}",
             row.thread_name
+        );
+        // And the RUNTIME side honors it: one running seat's thread name
+        // matches the per-index pattern (the wedge: off-runtime + per-index).
+        assert!(
+            snap.iter()
+                .any(|e| e.thread_name.starts_with("degenbot-solve-tokio-")),
+            "the census row documents the per-index seat naming"
         );
     }
 }
@@ -149,7 +198,7 @@ pub(crate) fn global_solve_executor() -> &'static SolveExecutor {
         resource: "solve_executor_fleet",
         kind: "tokio multi-thread runtime (solve bins — the LPT-pin fleet host)",
         count: degenbot_core::cpu_budget::solve_worker_count(),
-        thread_name: "degenbot-solve-tokio (SAME name for all workers + the -host dispatcher; per-index naming lands at the fleet cutover — LW-T9)",
+        thread_name: "degenbot-solve-tokio-{n} (legacy PLAIN-THREAD seats; escalation via the LW-T3 port)",
         sizing: "one persistent worker per cpu_budget::solve_worker_count (cgroup budget minus headroom); DEGENBOT_SOLVE_CPUS override (VPD5ZH)",
     });
     SOLVE_EXECUTOR.get_or_init(|| {

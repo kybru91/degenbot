@@ -37,6 +37,7 @@ use ::degenbot_solvers::mixed::{
     HopType, MixedPath, MixedPoolRef, ResolvedHop, ResolvedMixedPath, SolvePathResult,
 };
 use degenbot_workers::dispatcher::SeatSurvivesPolicy;
+use degenbot_workers::lane::LaneCtx;
 
 /// How many slowest-path entries the solve-cycle completion event names
 /// (D63GSE intra-solve visibility).
@@ -63,11 +64,7 @@ pub(crate) type SolveArmOutcome = (u64, SolvePathResult, u64, Option<SimulatedPa
 /// drift apart (a hermetic fleet under machine-derived bins aborts at the
 /// T2 grant — the host-only `just test-rust` failure).
 pub(crate) fn solve_bin_count(fleet_hosted: bool) -> usize {
-    if fleet_hosted {
-        crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor().bin_count()
-    } else {
-        degenbot_core::cpu_budget::solve_worker_count()
-    }
+    crate::arb_engine::executor::global_executor(fleet_hosted).bin_count()
 }
 
 #[expect(clippy::doc_markdown)]
@@ -2385,18 +2382,18 @@ impl ArbitrageEngine {
                             }
                         }
                     };
-                    if self.fleet_hosted {
-                        // ADR-042 F3: the fleet is the sole executor of
-                        // solve bins — this bin submits as a keyed Solver
-                        // unit (per-bin pin, per-path streaming preserved).
-                        crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
-                            .spawn(bin_idx, run_bin);
-                    } else {
-                        // P6YXA6: the executor-stance gate is gone — the
-                        // private tokio solve executor hosts every non-fleet
-                        // bin (the per-cycle std-thread fallback retired with
-                        // the rayon stance it existed for).
-                        crate::arb_engine::solve_executor::global_solve_executor().spawn(run_bin);
+                    // LW-T8: both stances submit through the ONE Executor
+                    // token (the legacy tokio stance is the mini-seat
+                    // adapter; the fleet is the sole executor under
+                    // fleet.stance=fleet).
+                    if let Err(err) =
+                        crate::arb_engine::executor::global_executor(self.fleet_hosted)
+                            .submit(bin_idx, Box::new(move |_ctx| run_bin()))
+                    {
+                        crate::arb_engine::fleet_solve_executor::abort_loud(
+                            "bin submission, posture gate",
+                            &format!("{err}"),
+                        );
                     }
                 }
                 if let Some(p) = crate::instruments::pipeline() {
@@ -2458,10 +2455,7 @@ impl ArbitrageEngine {
             // executor owns these bins (the same keyed Solver units the
             // detached arm submits — the fleet is the SOLE executor of
             // solve bins); the legacy arm keeps the private runtime.
-            let fleet_executor = self
-                .fleet_hosted
-                .then(crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor);
-            let executor = crate::arb_engine::solve_executor::global_solve_executor();
+            // (both stance globals are behind the ONE token — LW-T8.)
             // QR3NUS (Seam D): the pipe carries one typed `LaneOutcome`
             // per submitted path — a `None` never vanishes on the floor
             // and a panicked bin's undelivered paths arrive as typed
@@ -2561,14 +2555,18 @@ impl ArbitrageEngine {
                 // undelivered path patches onto the pipe as `Failed`. The
                 // unit/seat record names the stable pin key at this seam
                 // (LW-T2 refines it with the live seat context).
-                let spawn_job = move || {
-                    let mut lane = SolveLane::new(lane_key, lane_key, lane_pids, res_tx);
+                let spawn_job = move |_ctx: &LaneCtx| {
+                    let mut lane = SolveLane::new(lane_key, lane_key, lane_pids, res_tx.clone());
                     run_solve_lane(&mut lane, &SeatSurvivesPolicy, run_bin);
                 };
-                if let Some(fleet) = fleet_executor {
-                    fleet.spawn(bin_idx, spawn_job);
-                } else {
-                    executor.spawn(spawn_job);
+                // LW-T8: the ONE Executor token submits on both stances.
+                if let Err(err) = crate::arb_engine::executor::global_executor(self.fleet_hosted)
+                    .submit(bin_idx, Box::new(spawn_job))
+                {
+                    crate::arb_engine::fleet_solve_executor::abort_loud(
+                        "bin submission, posture gate",
+                        &format!("{err}"),
+                    );
                 }
             }
             drop(res_tx);
@@ -2777,6 +2775,8 @@ impl ArbitrageEngine {
     /// pipe into the fresh result map. Bin jobs clamp each result against
     /// the pool state (UO3JM4) exactly as the merge-site clamp did.
     #[must_use]
+    /// # Panics
+    /// Propagates the merged-drain exactness-fuse abort through the calling arm.
     pub fn solve_all(&self) -> HashMap<u64, SolvePathResult> {
         // MQUKB6-T0: same span-context re-entry as rebuild_and_solve_affected:
         // bin jobs re-enter this cycle span per work item, so per-path child
@@ -2864,11 +2864,14 @@ impl ArbitrageEngine {
                     }
                 }
             };
-            if self.fleet_hosted {
-                crate::arb_engine::fleet_solve_executor::global_fleet_solve_executor()
-                    .spawn(bin_idx, run_bin);
-            } else {
-                crate::arb_engine::solve_executor::global_solve_executor().spawn(run_bin);
+            // LW-T8: the ONE Executor token submits on both stances.
+            if let Err(err) = crate::arb_engine::executor::global_executor(self.fleet_hosted)
+                .submit(bin_idx, Box::new(move |_ctx| run_bin()))
+            {
+                crate::arb_engine::fleet_solve_executor::abort_loud(
+                    "bin submission, posture gate",
+                    &format!("{err}"),
+                );
             }
         }
         drop(tx);
@@ -4223,7 +4226,7 @@ pub(super) mod executor_ab_probe {
                     let tx = tx.clone();
                     let ctx = Arc::clone(ctx);
                     let items = items.to_vec();
-                    executor.spawn(move || {
+                    executor.spawn(move |_ctx| {
                         for &i in &bin {
                             let _ =
                                 solve_one_path(&ctx, &tracing::Span::none(), i as u64, &items[i]);
@@ -4248,7 +4251,7 @@ pub(super) mod executor_ab_probe {
                     let tx = tx.clone();
                     let ctx = Arc::clone(ctx);
                     let items = items.to_vec();
-                    executor.spawn(move || {
+                    executor.spawn(move |_ctx| {
                         for &i in &bin {
                             let _ =
                                 solve_one_path(&ctx, &tracing::Span::none(), i as u64, &items[i]);

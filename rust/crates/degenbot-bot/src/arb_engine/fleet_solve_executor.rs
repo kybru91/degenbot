@@ -23,7 +23,9 @@ use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 
-use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, SubmitError, Unit};
+use degenbot_workers::dispatcher::{
+    BootError, FleetBoot, FleetHost, SubmitError, SubmitReceipt, Unit,
+};
 use degenbot_workers::lane::{LaneCtx, QuitSig};
 use degenbot_workers::posture::{FleetPosture, PostureChange, ThrottleSample};
 use degenbot_workers::role::WorkerRole;
@@ -50,6 +52,11 @@ fn abort_executor(context: &str, err: &str) -> ! {
     );
     eprintln!("[fleet-solve] UNRECOVERABLE, aborting (stranded result pipe): {context}: {err}");
     std::process::abort();
+}
+/// Public loud-stop wrapper (ADR-021; used by the `solver_dispatch` submit
+/// seam for posture-gated refusals).
+pub(crate) fn abort_loud(context: &str, err: &str) -> ! {
+    abort_executor(context, err);
 }
 
 /// The pins == bins invariant check (P6YXA6): a Solver bin index must land
@@ -96,19 +103,6 @@ enum HostMsg {
     },
 }
 
-/// The submit-seam receipt (LW-T5, Seam E): a unit is NEVER dropped — the
-/// unbounded host backlog absorbs overflow (§10 ledger); the receipt TELLS
-/// the caller which path its unit took.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SubmitReceipt {
-    /// `true` = the role queue was already at cap when admitted: the unit
-    /// rides the unbounded host backlog and drains FIRST on the next pump.
-    /// ADVISORY under mirror lag (the host publishes the length
-    /// asynchronously): the FSM remains authoritative and no unit is ever
-    /// dropped either way — the bit names the resource the unit rides.
-    accepted_with_backlog: bool,
-}
-
 /// The fleet-hosted solve executor. Shared by all engine cycles (the
 /// global static hands out `&'static`, mirroring the incumbent executor's
 /// construction-once contract: persistent seats keep warm L1/L2 +
@@ -145,7 +139,7 @@ pub(crate) fn feed_fleet_posture_sample(now_ms: u64, events: u64, throttled_usec
     } else {
         now_ms.saturating_sub(last_ms).saturating_mul(1_000)
     };
-    global_fleet_solve_executor().observe_throttle(
+    crate::arb_engine::executor::global_executor(true).observe_throttle(
         now_ms,
         ThrottleSample {
             events,
@@ -164,6 +158,27 @@ pub(crate) fn feed_fleet_posture_sample(now_ms: u64, events: u64, throttled_usec
 #[cfg(test)]
 pub(crate) fn global_executor_booted() -> bool {
     FLEET_EXECUTOR.get().is_some()
+}
+
+impl crate::arb_engine::executor::Executor for FleetSolveExecutor {
+    fn bin_count(&self) -> usize {
+        self.bin_count()
+    }
+
+    fn submit(
+        &self,
+        bin: usize,
+        work: crate::arb_engine::executor::SubmitWork,
+    ) -> Result<
+        degenbot_workers::dispatcher::SubmitReceipt,
+        degenbot_workers::dispatcher::SubmitError,
+    > {
+        self.submit_solve_bin(bin, work)
+    }
+
+    fn observe_throttle(&self, now_ms: u64, sample: ThrottleSample) {
+        self.observe_throttle(now_ms, sample);
+    }
 }
 
 impl FleetSolveExecutor {
@@ -241,21 +256,6 @@ impl FleetSolveExecutor {
         self.solver_seats
     }
 
-    /// Submit one LPT bin job keyed to its bin — the ctx-less wrapper over
-    /// [`FleetSolveExecutor::submit_solve_bin`] (the per-path result
-    /// closures don't need the seat ctx). The production arms never
-    /// silently shrink under a cordon: a typed posture refusal here is a
-    /// LOUD abort (ADR-021 classify-and-stop); the serial/sequential
-    /// fallback arm is a downstream decision (LW-T7).
-    pub(crate) fn spawn(&self, bin: usize, job: impl FnOnce() + Send + 'static) {
-        if let Err(err) = self.submit_solve_bin(bin, move |_ctx| job()) {
-            abort_executor(
-                "bin submission under posture",
-                &format!("{err} — the serial/sequential fallback arm is an LW-T7 decision"),
-            );
-        }
-    }
-
     /// Submit one LPT bin job keyed to its bin; the seat hands the unit body
     /// a [`LaneCtx`] carrying the bin's pin key and warm arena identity
     /// (LW-T2 Seam B). The typed submit receipt never drops a unit (the
@@ -267,7 +267,7 @@ impl FleetSolveExecutor {
     pub(crate) fn submit_solve_bin(
         &self,
         bin: usize,
-        work: impl FnOnce(&LaneCtx) + Send + 'static,
+        work: crate::arb_engine::executor::SubmitWork,
     ) -> Result<SubmitReceipt, SubmitError> {
         // The pins == bins invariant (P6YXA6), held at the submit seam: a
         // bin without a structural seat must abort HERE — with both numbers
@@ -715,6 +715,7 @@ pub(crate) use lane_scaffold::{run_solve_lane, LaneOutcome, SolveLane};
 #[cfg(test)]
 #[expect(clippy::expect_used)]
 mod tests {
+    use crate::arb_engine::executor::{Executor as _, SubmitWork};
     use std::collections::BTreeSet;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -778,16 +779,22 @@ mod tests {
                 .iter()
                 .map(|&i| u64::try_from(i).unwrap_or(u64::MAX))
                 .collect();
-            executor.spawn(bin_idx, move || {
-                // Per-path send (not per-bin): the existing per-path result
-                // streaming — byte-for-byte what the run_bin bodies do.
-                for (key, item) in keys.into_iter().zip(items) {
-                    if let Some((pid, r)) = solve_one_path(&ctx, &tracing::Span::none(), key, &item)
-                    {
-                        let _ = tx.send((pid, r));
-                    }
-                }
-            });
+            executor
+                .submit(
+                    bin_idx,
+                    Box::new(move |_ctx| {
+                        // Per-path send (not per-bin): the existing per-path result
+                        // streaming — byte-for-byte what the run_bin bodies do.
+                        for (key, item) in keys.into_iter().zip(items) {
+                            if let Some((pid, r)) =
+                                solve_one_path(&ctx, &tracing::Span::none(), key, &item)
+                            {
+                                let _ = tx.send((pid, r));
+                            }
+                        }
+                    }),
+                )
+                .expect("fixture submit blocked by noise");
         }
         drop(tx);
         let mut results: Vec<(u64, SolvePathResult)> = rx.into_iter().collect();
@@ -832,7 +839,7 @@ mod tests {
                     .iter()
                     .map(|&i| u64::try_from(i).unwrap_or(u64::MAX))
                     .collect();
-                exec.spawn(move || {
+                exec.spawn(move |_ctx| {
                     for (key, item) in keys.into_iter().zip(items) {
                         if let Some((pid, r)) =
                             solve_one_path(&ctx, &tracing::Span::none(), key, &item)
@@ -904,9 +911,14 @@ mod tests {
             for bin in 0..bins {
                 let bin_key = u64::try_from(bin).unwrap_or(u64::MAX);
                 let observed = Arc::clone(&observed);
-                executor.spawn(bin, move || {
-                    observed.lock().push((bin_key, std::thread::current().id()));
-                });
+                executor
+                    .submit(
+                        bin,
+                        Box::new(move |_ctx| {
+                            observed.lock().push((bin_key, std::thread::current().id()));
+                        }),
+                    )
+                    .expect("naming unit accepted");
             }
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -957,11 +969,16 @@ mod tests {
         runtime.block_on(async {
             for _ in 0..3 {
                 let runtime_free = Arc::clone(&runtime_free);
-                executor.spawn(0, move || {
-                    runtime_free
-                        .lock()
-                        .push(tokio::runtime::Handle::try_current().is_err());
-                });
+                executor
+                    .submit(
+                        0,
+                        Box::new(move |_ctx| {
+                            runtime_free
+                                .lock()
+                                .push(tokio::runtime::Handle::try_current().is_err());
+                        }),
+                    )
+                    .expect("probe unit accepted");
             }
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -988,9 +1005,12 @@ mod tests {
         for _cycle in 0..2 {
             let observed = Arc::clone(&observed);
             executor
-                .submit_solve_bin(0, move |ctx| {
-                    observed.lock().push(ctx.clone());
-                })
+                .submit_solve_bin(
+                    0,
+                    SubmitWork::from(Box::new(move |ctx: &LaneCtx| {
+                        observed.lock().push(ctx.clone());
+                    })),
+                )
                 .expect("the nominal ctx submit is accepted");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1071,15 +1091,17 @@ mod tests {
         for bin in 0..seats {
             let names = Arc::clone(&names);
             executor
-                .submit_solve_bin(bin, move |ctx| {
-                    let _ = ctx;
-                    names.lock().push(
-                        std::thread::current()
-                            .name()
-                            .unwrap_or("<unnamed>")
-                            .to_owned(),
-                    );
-                })
+                .submit_solve_bin(
+                    bin,
+                    SubmitWork::from(Box::new(move |_ctx| {
+                        names.lock().push(
+                            std::thread::current()
+                                .name()
+                                .unwrap_or("<unnamed>")
+                                .to_owned(),
+                        );
+                    })),
+                )
                 .expect("the naming probe submit is accepted");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1136,12 +1158,15 @@ mod tests {
         let long_unit_done: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         let done = Arc::clone(&long_unit_done);
         executor
-            .submit_solve_bin(0, move |_ctx| {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                done.store(true, std::sync::atomic::Ordering::Relaxed);
-            })
+            .submit_solve_bin(
+                0,
+                SubmitWork::from(Box::new(move |_ctx| {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    done.store(true, std::sync::atomic::Ordering::Relaxed);
+                })),
+            )
             .expect("the nominal submit is accepted");
-        // Flip the posture to Cordoned through the executor's own seam.
+        // Flip the posture to Cordoned through the executor own seam.
         executor.observe_throttle(
             100,
             ThrottleSample {
@@ -1152,12 +1177,14 @@ mod tests {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
         let refused = executor
-            .submit_solve_bin(1, |_ctx| {
-                red_panic("a posture-held submit must not run its body");
-            })
+            .submit_solve_bin(
+                1,
+                SubmitWork::from(Box::new(move |_ctx| {
+                    red_panic("a posture-held submit must not run its body");
+                })),
+            )
             .expect_err("the CORDONED submit must refuse TYPED at the submit seam");
-        // RED scaffold marker: the posture consult is wired at green — the
-        // refusal must already carry the posture + role in its payload.
+        // The refusal must carry the posture + role in its payload.
         assert!(
             matches!(
                 refused,
@@ -1180,8 +1207,8 @@ mod tests {
         }
     }
 
-    /// LW-T5 (Seam E): overflow past a role's queue cap lands in the
-    /// unbounded host backlog (§10 ledger) and NEVER drops — the receipts
+    /// LW-T5 (Seam E): overflow past a role queue cap lands in the
+    /// unbounded host backlog (S10 ledger) and NEVER drops - the receipts
     /// report accepted-with-backlog, and every submitted unit completes.
     #[test]
     fn overflow_past_the_role_cap_lands_in_the_backlog_and_never_drops() {
@@ -1191,41 +1218,42 @@ mod tests {
         for bin in 0..seats {
             let done = Arc::clone(&occupants_done);
             executor
-                .submit_solve_bin(bin, move |_ctx| {
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                })
+                .submit_solve_bin(
+                    bin,
+                    SubmitWork::from(Box::new(move |_ctx| {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    })),
+                )
                 .expect("occupant submit");
         }
-        // Overflow (queue cap is solver_pin_count × 2): the cap and more
-        // arrive while every seat is mid-unit.
         let extras = seats * 4;
         let drained: Arc<std::sync::atomic::AtomicU64> = Arc::default();
         for bin in 0..extras {
             let drained = Arc::clone(&drained);
             executor
-                .submit_solve_bin(bin % seats, move |_ctx| {
-                    drained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                })
-                .expect("overflow submits are ACCEPTED — backlog, never dropped");
+                .submit_solve_bin(
+                    bin % seats,
+                    SubmitWork::from(Box::new(move |_ctx| {
+                        drained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    })),
+                )
+                .expect("overflow submits are ACCEPTED - backlog, never dropped");
         }
-        // Let the host thread settle (the queue is at cap, seats mid-unit),
-        // then probe: the NEXT submit rides the unbounded backlog and its
-        // receipt must SAY so (accepted-with-backlog, never queued-lost).
         std::thread::sleep(std::time::Duration::from_millis(100));
         let drained_probe = Arc::clone(&drained);
         let probe = executor
-            .submit_solve_bin(0, move |_ctx| {
-                drained_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            })
-            .expect("backlog submits are ACCEPTED — never dropped");
-        // RED scaffold marker: the receipt never reports the backlog state
-        // until green wires the host's queue mirror.
+            .submit_solve_bin(
+                0,
+                SubmitWork::from(Box::new(move |_ctx| {
+                    drained_probe.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                })),
+            )
+            .expect("backlog submits are ACCEPTED - never dropped");
         assert!(
             probe.accepted_with_backlog,
             "the overflow submit must report accepted-with-backlog (the cap was exceeded)"
         );
-        // NEVER dropped: occupants AND every backlog unit complete.
         let total = u64::try_from(seats * 5 + 1).unwrap_or(u64::MAX);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         while occupants_done.load(std::sync::atomic::Ordering::Relaxed)
@@ -1242,7 +1270,7 @@ mod tests {
             occupants_done.load(std::sync::atomic::Ordering::Relaxed)
                 + drained.load(std::sync::atomic::Ordering::Relaxed),
             total,
-            "every submitted unit must complete — never dropped"
+            "every submitted unit must complete - never dropped"
         );
     }
 
@@ -1316,35 +1344,38 @@ mod tests {
             let lane_threads = Arc::clone(&lane_threads);
             let seats_done = Arc::clone(&seats_done);
             executor
-                .submit_solve_bin(bin, move |ctx| {
-                    // The bin escalates its cold-miss work while MID-UNIT — the
-                    // escalation must NOT run on this seat (CPU) but on the
-                    // port's own lane.
-                    let occupied_seats = Arc::clone(&seats_done);
-                    if ctx
-                        .escalate(Box::pin(async move {
-                            // STARVATION CHECK: an escalation completing only
-                            // after all seats drained would be CPU starvation by
-                            // another name.
-                            if occupied_seats.load(Ordering::Relaxed)
-                                == u64::try_from(seats).unwrap_or(0)
-                            {
-                                after_drained.fetch_add(1, Ordering::Relaxed);
-                            }
-                            let name = std::thread::current()
-                                .name()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| "<unnamed>".to_owned());
-                            lane_threads.lock().push(name);
-                            completed.fetch_add(1, Ordering::Relaxed);
-                        }))
-                        .is_err()
-                    {
-                        failures.fetch_add(1, Ordering::Relaxed);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                    seats_done.fetch_add(1, Ordering::Relaxed);
-                })
+                .submit_solve_bin(
+                    bin,
+                    SubmitWork::from(Box::new(move |ctx| {
+                        // The bin escalates its cold-miss work while MID-UNIT — the
+                        // escalation must NOT run on this seat (CPU) but on the
+                        // port's own lane.
+                        let occupied_seats = Arc::clone(&seats_done);
+                        if ctx
+                            .escalate(Box::pin(async move {
+                                // STARVATION CHECK: an escalation completing only
+                                // after all seats drained would be CPU starvation by
+                                // another name.
+                                if occupied_seats.load(Ordering::Relaxed)
+                                    == u64::try_from(seats).unwrap_or(0)
+                                {
+                                    after_drained.fetch_add(1, Ordering::Relaxed);
+                                }
+                                let name = std::thread::current()
+                                    .name()
+                                    .map(str::to_owned)
+                                    .unwrap_or_else(|| "<unnamed>".to_owned());
+                                lane_threads.lock().push(name);
+                                completed.fetch_add(1, Ordering::Relaxed);
+                            }))
+                            .is_err()
+                        {
+                            failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        seats_done.fetch_add(1, Ordering::Relaxed);
+                    })),
+                )
                 .expect("the escalation occupancy submit is accepted");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1495,22 +1526,28 @@ mod tests {
             let observed = Arc::clone(&observed);
             let verdict = Arc::clone(&verdict);
             let lane_outcomes = Arc::clone(&lane_outcomes);
-            executor.spawn(0, move || {
-                observed.lock().push(std::thread::current().id());
-                let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
-                let mut lane = SolveLane::new(cycle, 0, vec![cycle * 10, cycle * 10 + 1], tx);
-                run_solve_lane(&mut lane, verdict.as_ref(), |lane| {
-                    if cycle == 0 {
-                        lane.suppressed(cycle * 10); // one pid emitted before the panic
-                        red_panic("cycle-0 bin panics (QR3NUS red harness)");
-                    }
-                });
-                drop(lane); // close the pipe so the per-cycle drain completes
-                let mut stash = lane_outcomes.lock();
-                for outcome in rx.into_iter() {
-                    stash.push(outcome);
-                }
-            });
+            executor
+                .submit(
+                    0,
+                    Box::new(move |_ctx| {
+                        observed.lock().push(std::thread::current().id());
+                        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+                        let mut lane =
+                            SolveLane::new(cycle, 0, vec![cycle * 10, cycle * 10 + 1], tx);
+                        run_solve_lane(&mut lane, verdict.as_ref(), |lane| {
+                            if cycle == 0 {
+                                lane.suppressed(cycle * 10); // one pid emitted before the panic
+                                red_panic("cycle-0 bin panics (QR3NUS red harness)");
+                            }
+                        });
+                        drop(lane); // close the pipe so the per-cycle drain completes
+                        let mut stash = lane_outcomes.lock();
+                        for outcome in rx.into_iter() {
+                            stash.push(outcome);
+                        }
+                    }),
+                )
+                .expect("seat-stays unit accepted");
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while observed.lock().len() < 2 {

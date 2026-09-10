@@ -162,6 +162,19 @@ pub enum SubmitError {
     PortClosed,
 }
 
+/// The submit-seam receipt (LW-T5, Seam E): a unit is NEVER dropped — the
+/// unbounded host backlog absorbs overflow (§10 ledger); the receipt TELLS
+/// the caller which path its unit took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitReceipt {
+    /// `true` = the role queue was already at cap when admitted: the unit
+    /// rides the unbounded host backlog and drains FIRST on the next pump.
+    /// ADVISORY under mirror lag (the host publishes the length
+    /// asynchronously): the FSM remains authoritative and no unit is ever
+    /// dropped either way — the bit names the resource the unit rides.
+    pub accepted_with_backlog: bool,
+}
+
 /// Why a host state operation was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HostError {
