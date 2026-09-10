@@ -68,6 +68,46 @@ impl EnvVars for MapEnv {
     }
 }
 
+/// Migration doc named by every retired-layout refusal (ergo JLFE2F).
+const MIGRATION_DOC: &str = "docs/config-migration.md";
+
+/// Retired operator-file layout items (ergo JLFE2F, Option B hard cutover):
+/// top-level keys/section names from the pre-0.6 config.toml vocabulary the
+/// typed schema never carried. A surviving item fails the load with a
+/// POINTED problem naming the replacement surface and the migration doc —
+/// silent fail-open here would trade on settings the typed file layer never
+/// received.
+pub(crate) const RETIRED_LAYOUT_ITEMS: &[(&str, &str)] = &[
+    (
+        "rpc",
+        "move per-chain RPC endpoints to the DEGENBOT_RPC_HTTP_CHAINID_<chain> env names (or the Python config.py cascade)",
+    ),
+    (
+        "ws",
+        "move per-chain WebSocket endpoints to the DEGENBOT_RPC_WS_CHAINID_<chain> env names (or the Python config.py cascade)",
+    ),
+    (
+        "database",
+        "the database path is Python-driver domain: set it in the Python config cascade",
+    ),
+    (
+        "otel",
+        "the [otel] table is retired: use the modern telemetry section (telemetry.otel, telemetry.jaeger_endpoint)",
+    ),
+    (
+        "default_chain_id",
+        "default_chain_id is Python-driver domain: set it in the Python config cascade",
+    ),
+];
+
+/// Sanctioned free-form file sections the loader SKIPS: not typed, not
+/// retired. Read as raw tables by \`file_path()\` consumers sharing the
+/// same file.
+///  - \`[failure_policy]\` (ADR-040 D3): per-bucket override table owned by
+///    degenbot-python's failure-policy reader; freedom-of-policy outlives
+///    the typed schema.
+pub(crate) const FREE_FORM_FILE_SECTIONS: &[&str] = &["failure_policy"];
+
 /// Loaded result: the typed config plus per-key provenance.
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
@@ -126,6 +166,27 @@ impl std::fmt::Debug for BotConfigLoader {
     }
 }
 
+/// The canonical STANDARD config file path (ergo JLFE2F): the
+/// \`DEGENBOT_CONFIG\` env override when set — even when missing, the
+/// operator asked for it — else \`$HOME/.config/degenbot/config.toml\` when
+/// it exists, else \`None\` (an absent user file is contractually defaults).
+/// \`BotConfigLoader::with_standard_file_paths\` selects exactly this value,
+/// and raw-table readers resolve the SAME file through this function so
+/// file discovery stays a single contract. The std env reads live in THIS
+/// crate so they stay confined to degenbot-config.
+#[must_use]
+pub fn standard_file_path() -> Option<PathBuf> {
+    if let Some(p) = ::std::env::var("DEGENBOT_CONFIG")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return Some(p.into());
+    }
+    let home = ::std::env::var_os("HOME")?;
+    let path = ::std::path::Path::new(&home).join(".config/degenbot/config.toml");
+    path.is_file().then_some(path)
+}
+
 impl BotConfigLoader {
     /// Empty loader: defaults only (no env, no file, no CLI) until a layer
     /// is attached with the `with_*` builders.
@@ -149,19 +210,7 @@ impl BotConfigLoader {
     /// env read lives HERE so std env stays confined to this crate.
     #[must_use]
     pub fn with_standard_file_paths(mut self) -> Self {
-        if let Some(p) = ::std::env::var("DEGENBOT_CONFIG")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            self.file = Some(p.into());
-            return self;
-        }
-        if let Some(home) = ::std::env::var_os("HOME") {
-            let path = ::std::path::Path::new(&home).join(".config/degenbot/config.toml");
-            if path.is_file() {
-                self.file = Some(path);
-            }
-        }
+        self.file = standard_file_path();
         self
     }
 
@@ -329,6 +378,28 @@ impl BotConfigLoader {
         // A parsed `toml::Table` IS the top-level table.
         let table = &value;
         for (section, section_value) in table {
+            // Sanctioned free-form tables (e.g. [failure_policy], ADR-040
+            // D3): not typed into the schema and NOT retired — consumers
+            // read them from the same file this loader selected (see
+            // file_path()). Skip silently so the typed file layer and the
+            // raw-table reader can share one file.
+            if FREE_FORM_FILE_SECTIONS.contains(&section.as_str()) {
+                continue;
+            }
+            // Retired pre-0.6 layout vocabulary (ergo JLFE2F, Option B hard
+            // cutover): fail pointed, naming the replacement surface and the
+            // migration doc.
+            if let Some((_, replacement)) = RETIRED_LAYOUT_ITEMS
+                .iter()
+                .find(|(name, _)| section.as_str() == *name)
+            {
+                problems.push(format!(
+                    "--config {}: retired config-layout item [{section}] is no \
+                     longer supported — {replacement}; see {MIGRATION_DOC}",
+                    path.display()
+                ));
+                continue;
+            }
             let members: Vec<_> = SCHEMA
                 .iter()
                 .filter(|k| k.section == section.as_str())

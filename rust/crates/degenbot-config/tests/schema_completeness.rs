@@ -20,6 +20,10 @@ const SWEEP_ARTIFACTS: &[&str] = &[
     // owns the four concrete DEGENBOT_MIMALLOC_* keys).
     "DEGENBOT_MIMALLOC_",
     "DEGENBOT_RPC_WS_CHAINID_",
+    // JLFE2F: the family wildcard named by the retired-layout refusal text
+    // in the loader (the dynamic per-chain var
+    // DEGENBOT_RPC_HTTP_CHAINID_<chain_id>).
+    "DEGENBOT_RPC_HTTP_CHAINID_",
     "DEGENBOT_V",
 ];
 
