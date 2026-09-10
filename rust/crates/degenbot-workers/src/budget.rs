@@ -613,4 +613,79 @@ mod tests {
             }
         }
     }
+
+    mod derivation {
+        //! CVURM7 (epic 64ZQLA): `derive` over ARBITRARY quotas AND
+        //! overrides. Total over the input space: a typed `Ok` holding the
+        //! invariants (integer shares sum to at most the floor; the
+        //! fractional remainder banks exactly `Q - declared_sum`; seats
+        //! follow the structural formula) or a typed `BudgetError`
+        //! classifying the refusal. Never a panic, never a silently mis-sized
+        //! budget. NOTE: with a terminal `solver_cpus` override BELOW the
+        //! recorded leftover the banked remainder legitimately exceeds 1
+        //! core (the sum check bounds over-subscription only; under-declared
+        //! shares bank for I/O-dominant spend) — so no `< 1` bound here.
+        use super::*;
+        use proptest::prelude::*;
+
+        fn overrides_shape() -> impl Strategy<Value = BudgetOverrides> {
+            (
+                1u64..=64u64,
+                0u64..=16u64,
+                0u64..=64u64,
+                0usize..=16usize,
+                0usize..=16usize,
+            )
+                .prop_map(|(h, a, s, sim, psu)| BudgetOverrides {
+                    reserve_cpus: Some(h),
+                    ambient_io_workers: Some(a),
+                    solver_cpus: Some(s),
+                    sim_slot_cap: Some(sim),
+                    pool_state_updater_slots: Some(psu),
+                })
+        }
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config::with_cases(512))]
+            #[test]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "quota units (1e6 scale) and share sums (<= 640) are exact in f64"
+            )]
+            fn derive_is_total_and_typed_over_the_whole_input_space(
+                quota_units in 1u64..=64_000_000u64,
+                ov in overrides_shape(),
+            ) {
+                let q = (quota_units as f64) / 1_000_000.0;
+                let floor_q = quota_units / 1_000_000;
+                match FleetBudget::derive(q, &ov) {
+                    Ok(b) => {
+                        // Integer shares sum against (never over) the floor.
+                        prop_assert!(b.declared_sum() <= b.quota_floor);
+                        prop_assert_eq!(b.quota_floor, floor_q);
+                        // The fractional remainder is banked exactly,
+                        // never negative and never beyond the quota.
+                        let sum_f = b.declared_sum() as f64;
+                        prop_assert!((b.fractional_remainder - (q - sum_f)).abs() < 1e-9);
+                        prop_assert!(b.fractional_remainder >= 0.0 && b.fractional_remainder <= q);
+                        // Seats are structural: overrides never move them.
+                        prop_assert_eq!(
+                            b.solver_pin_count,
+                            usize::try_from(floor_q).unwrap_or(usize::MAX)
+                                .saturating_sub(degenbot_core::cpu_budget::DEFAULT_SOLVE_HEADROOM)
+                                .max(1)
+                        );
+                    }
+                    Err(
+                        BudgetError::QuotaTooSmallForPinnedRoles { .. }
+                        | BudgetError::Oversubscribed { .. }
+                        | BudgetError::TooFewSolverCpus { .. },
+                    ) => {
+                        // Exhaustive typed refusal classes; the match arms
+                        // above make any NEW error variant a compile error.
+                    }
+                }
+            }
+        }
+    }
 }

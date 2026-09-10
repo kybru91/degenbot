@@ -759,4 +759,107 @@ mod tests {
         // so the exported counter never jumps backwards.
         assert_eq!(delta_from(Some((100, 999)), Some((5, 50))), (0, 0));
     }
+
+    mod derivation {
+        //! CVURM7 (epic 64ZQLA): host-shape derivation properties. Any
+        //! combination of cgroup quota text and affinity must produce the
+        //! documented `min(ceil(cgroup quota), affinity)` floored at 1 —
+        //! never zero, never a panic, fail-closed on malformed text.
+        use super::*;
+        use proptest::prelude::*;
+
+        /// v2 `cpu.max` text for optional quota units (period `100_000`).
+        fn cpu_max_text(quota_units: Option<u64>) -> String {
+            match quota_units {
+                Some(q) => format!("{q} 100000\n"),
+                None => "max 100000\n".to_owned(),
+            }
+        }
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config::with_cases(256))]
+            #[test]
+            fn budget_is_the_documented_min_of_ceiled_cgroup_and_affinity(
+                quota_units in proptest::option::of(1u64..=64_000_000u64),
+                affinity in 1u64..=1024u64,
+            ) {
+                let affinity_usize = usize::try_from(affinity).unwrap_or(usize::MAX);
+                let root = fixture_dir("prop-budget");
+                write_cpu_max(&root, "", &cpu_max_text(quota_units));
+                let got = effective_budget_from_with_roots(
+                    "0::/\n",
+                    "cgroup2 /fixture cgroup2 rw\n",
+                    affinity_usize,
+                    Some(&root),
+                );
+                let expected = match quota_units {
+                    Some(q) => q.div_ceil(100_000).min(affinity).max(1),
+                    None => affinity,
+                };
+                prop_assert_eq!(
+                    got,
+                    usize::try_from(expected).unwrap_or(usize::MAX)
+                );
+                fs::remove_dir_all(&root).ok();
+                let _ = affinity_usize;
+            }
+
+            #[test]
+            fn malformed_or_absent_cgroup_falls_back_to_affinity(
+                junk in "[a-z =]{0,40}",
+                affinity in 1u64..=1024u64,
+            ) {
+                // Junk on the quota line parses fail-closed: affinity budget.
+                let affinity_usize = usize::try_from(affinity).unwrap_or(usize::MAX);
+                let root = fixture_dir("prop-junk");
+                write_cpu_max(&root, "", &format!("{junk}\n"));
+                let got = effective_budget_from_with_roots(
+                    "0::/\n",
+                    "cgroup2 /fixture cgroup2 rw\n",
+                    affinity_usize,
+                    Some(&root),
+                );
+                prop_assert_eq!(
+                    got,
+                    usize::try_from(affinity).unwrap_or(usize::MAX)
+                );
+                // No cgroup mount at all: affinity budget.
+                prop_assert_eq!(
+                    effective_budget_from_with_roots(
+                        "0::/\n", "proc /proc proc rw\n", affinity_usize, None
+                    ),
+                    usize::try_from(affinity).unwrap_or(usize::MAX)
+                );
+                fs::remove_dir_all(&root).ok();
+            }
+
+            #[test]
+            fn solve_worker_policy_over_arbitrary_override_text(
+                budget in 0usize..=1024usize,
+                cpu_override in proptest::option::of("[a-z0-9]{0,4}"),
+                headroom_override in proptest::option::of("[a-z0-9]{0,2}"),
+            ) {
+                let solve = solve_worker_count_from(
+                    cpu_override.as_deref(),
+                    headroom_override.as_deref(),
+                    budget,
+                );
+                let parsed_cpu = cpu_override
+                    .as_deref()
+                    .and_then(|s| s.trim().parse::<usize>().ok());
+                if let Some(n) = parsed_cpu {
+                    // The terminal override wins outright (floored at 1).
+                    prop_assert_eq!(solve, n.max(1));
+                } else {
+                    // Unparseable/absent override: budget minus headroom,
+                    // floored at 1.
+                    let headroom = headroom_override
+                        .as_deref()
+                        .and_then(|s| s.trim().parse::<usize>().ok())
+                        .unwrap_or(DEFAULT_SOLVE_HEADROOM);
+                    prop_assert_eq!(solve, budget.saturating_sub(headroom).max(1));
+                }
+            }
+        }
+    }
 }
