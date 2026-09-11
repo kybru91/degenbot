@@ -2,10 +2,12 @@
 
 Extracted from ``examples/eth_backrun_v2_v3_v4_rust.py`` (epic 5TSYKN, task
 DKUOBL; renamed ``BackrunSession`` -> ``BotRunner``). ``BotRunner`` is the
-Python-companion cockpit over the Rust-owned engine: it owns the config + the
-three actors (``bot``, ``engine_registry``, ``async_w3``) + the ``Dispatcher``
-+ scalar block state, and is the one place that enforces the phase ordering the
-engine's state machine requires.
+Python-companion cockpit over the Rust-owned engine: it owns the config and
+the lifecycle, while the coordination state itself (the three actors
+``bot``/``engine_registry``/``async_w3`` + the ``Dispatcher`` + the block
+clock) is owned by the ONE ``_SessionState`` built in ``start()`` (FJA2Z7).
+It is the one place that enforces the phase ordering the engine's state
+machine requires.
 
     start():  subscribe -> stream snapshots -> backfill -> verify config
               (``EngineRegistry.start``, stops at Backfilled, pre-resume)
@@ -113,10 +115,11 @@ class PhaseError(RuntimeError):
     """Cockpit phase violation: a lifecycle method ran in the wrong phase.
 
     The session phase machine is ``New -> Started -> Running -> Closed``:
-    ``start()`` is an idempotent no-op until the session is ``Running``;
-    ``run()`` requires ``Started``; ``enqueue_path`` / ``trigger_discovery``
-    require ``Running``; ``shutdown()`` stays deliberately any-phase and
-    idempotent (the SIGINT teardown ordering depends on it).
+    ``start()`` builds once from ``New`` and is an idempotent no-op on
+    ``Started`` re-entry (Running/Closed re-entry raises); ``run()`` requires
+    ``Started``; ``enqueue_path`` / ``trigger_discovery`` require ``Running``;
+    ``shutdown()`` stays deliberately any-phase and idempotent (the SIGINT
+    teardown ordering depends on it).
     """
 
 
@@ -133,9 +136,23 @@ class _Phase(Enum):
 class _SessionState:
     """Cockpit session state (CONTEXT.md term: *session state*).
 
-    The single owner of one pump session's coordination state: the block
-    loop (``consume``) and the dispatch leaf (``dispatch``) both read the
-    same owner instead of the session travelling as a parameter bag.
+    The single owner of one pump session's coordination state, built REAL in
+    ``start()`` (FJA2Z7: no pre-session Option cluster survives on the
+    runner — its same-named attributes are a facade over THIS object once it
+    exists). The block loop (``consume``) and the dispatch leaf
+    (``dispatch``) both read the same owner instead of the session travelling
+    as a parameter bag.
+
+    Write discipline: downstream modules (the block loop, the dispatch leaf,
+    the sim/submit pipeline) read fields directly but mutate ONLY through the
+    owner's mutator methods (``advance_block`` / ``attach_pipeline`` /
+    ``attach_registration_pipeline``) — remote attribute pokes are forbidden.
+    The ``None`` fields are domain options, not phase options: ``sim_ctx`` is
+    ``None`` only for non-Alloy (test) providers, ``bot`` becomes ``None``
+    when the post-registration trim drops it, and the two pipelines attach
+    lazily through their mutators (their producers legitimately land after
+    ``start()``).
+
     Mutable pieces (``current_block``) advance on the owner.
     """
 
@@ -145,18 +162,41 @@ class _SessionState:
     dispatcher: Dispatcher
     cfg: ArbitrageConfig
     current_block: int
-    #: SIMPIPE option A (lazily attached at consumer start - the concurrent
-    #: sim fan-out + single ordered submitter; ``None`` runs the legacy
-    #: serial leaf for A/B).
+    #: The Python-companion bot actor — dropped (``None``) by the
+    #: post-registration trim; the engine keeps its own Bot ref.
+    bot: Bot | None = None
+    #: SIMPIPE option A (attached at consumer start via
+    #: :meth:`attach_pipeline` - the concurrent sim fan-out + single ordered
+    #: submitter; ``None`` runs the legacy serial leaf for A/B).
     sim_submit_pipeline: SimSubmitPipeline | None = None
+    #: NWTUM3 (attached in run() via :meth:`attach_registration_pipeline` when
+    #: the real build_paths runs): the operator add-a-path surface, kept
+    #: reachable for the session's lifetime; ``None`` for injected/fake runs.
+    registration_pipeline: Any = None
+
+    def advance_block(self, block_number: int) -> None:
+        """Advance the session's block clock (the consumer's one mutation)."""
+        self.current_block = block_number
+
+    def attach_pipeline(self, pipeline: SimSubmitPipeline) -> None:
+        """SIMPIPE option A: attach the lazily-built sim/submit pipeline."""
+        self.sim_submit_pipeline = pipeline
+
+    def attach_registration_pipeline(self, pipeline: Any) -> None:
+        """NWTUM3: attach the operator add-a-path surface (built in run())."""
+        self.registration_pipeline = pipeline
 
 
 class BotRunner:
     """Orchestrator that collapses the settlement-arbitrage startup ritual behind one facade.
 
-    Owns the config + the three actors (``bot``, ``engine_registry``, ``async_w3``)
-    + the ``Dispatcher`` + scalar block state, and is the ONE place that
-    enforces the phase ordering the engine's state machine requires:
+    Owns the config and the lifecycle; the coordination state itself (the
+    three actors ``bot``/``engine_registry``/``async_w3``, the ``Dispatcher``,
+    the block clock, the sim context, the pipelines) lives on ONE
+    :class:`_SessionState` built in ``start()`` (FJA2Z7) — the runner's
+    same-named attributes are a facade over that owner, not mirrors. The
+    runner is the ONE place that enforces the phase ordering the engine's
+    state machine requires:
 
         start():  subscribe → stream snapshots → backfill → verify config
                   (``EngineRegistry.start``, stops at Backfilled, pre-resume)
@@ -224,25 +264,23 @@ class BotRunner:
         # Sub-A seam: registration-owned construction context (built in run()
         # for the real build_paths; None for injected builders and until run()).
         self._registration_context: ConstructionContext | None = None
-        # (Sub-B/6VZN7H) + the trim. Owned by run() for the real build_paths;
-        # None until run() with real build_paths (injected fakes have no
-        # construction surface).
-        self._pipeline: Any = None
         # Sub-B seam: the background registration task (production + explicit
         # ``background_registration=True``), awaited for fail-fast in step 5.
+        # (MJJUXL boundary: the session WATCH owns the task set — the runner
+        # keeps these handles only to hand them over + drive the watchdog.)
         self._registration_task: asyncio.Task | None = None
-        # Resolved in start():
-        self.bot: Bot | None = None
-        self.engine_registry: EngineRegistry | None = None
-        self.async_w3: AsyncAlloyProvider | None = None
-        self.dispatcher: Dispatcher | None = None
-        self._sim_ctx: SimulateContext | None = None
+        # Snapshots for the registration pass (nulled by the trim).
         self.v3_snapshot: Any = None
         self.v4_snapshot: Any = None
-        self.current_block: int = 0
+        # FJA2Z7: the phase machine is the ONLY lifecycle state (no
+        # ``_started`` bool — Started re-entry is the no-op; Running/Closed
+        # re-entry is the phase error).
         self._phase: _Phase = _Phase.NEW
+        # THE session (built in start()): the one owner of the coordination
+        # state — actors, dispatcher, block clock, sim context, pipelines.
+        # ``None`` only before start() (there is no session yet; shutdown()'s
+        # any-phase contract and the pre-start injection seams rely on that).
         self._session: _SessionState | None = None
-        self._started = False
         # Created in run():
         self._result_consumer_task: asyncio.Task | None = None
         # MJJUXL: the one owner of the pump session's end-state — the
@@ -263,6 +301,54 @@ class BotRunner:
         # process-global handler (signal.signal pollutes across tests).
         self._install_sigint = install_sigint
 
+    # ── Session facade (FJA2Z7) ──────────────────────────────────────
+    # The _SessionState built in start() is the one STORAGE for the actors,
+    # the dispatcher, the block clock, and the sim context. These properties
+    # are the runner's facade over it — after start() they read/write the
+    # session (no runner-side mirrors); before start() there is no session,
+    # so they read/write the injection seams (a pre-start write IS an
+    # injection: start() adopts it when building the session).
+
+    @property
+    def bot(self) -> Bot | None:
+        """The session's Python-companion bot (``None`` once the trim dropped it).
+
+        Before ``start()``: the injected seam (a write is an injection)."""
+        return self._session.bot if self._session is not None else self._injected_bot
+
+    @bot.setter
+    def bot(self, bot: Bot | None) -> None:
+        if self._session is not None:
+            self._session.bot = bot
+        else:
+            self._injected_bot = bot
+
+    @property
+    def engine_registry(self) -> EngineRegistry | None:
+        """The session's engine registry. Before ``start()``: the injected seam."""
+        return (
+            self._session.engine_registry
+            if self._session is not None
+            else self._injected_engine_registry
+        )
+
+    @engine_registry.setter
+    def engine_registry(self, registry: EngineRegistry) -> None:
+        if self._session is not None:
+            self._session.engine_registry = registry
+        else:
+            self._injected_engine_registry = registry
+
+    @property
+    def async_w3(self) -> AsyncAlloyProvider | None:
+        """The session's dispatch-path provider. Before ``start()``: the injected seam."""
+        return self._session.async_w3 if self._session is not None else self._injected_async_w3
+
+    @property
+    def dispatcher(self) -> Dispatcher | None:
+        """The session's dispatcher. Before ``start()``: ``None`` (no session yet)."""
+        return self._session.dispatcher if self._session is not None else None
+
     # ── Phase A: pre-resume startup ─────────────────────────────────
     async def start(self) -> BotRunner:
         """Build the actors, fetch block state, load snapshots, run ``engine_registry.start()``.
@@ -270,39 +356,39 @@ class BotRunner:
         Stops at ``Backfilled`` — BEFORE ``resume()``. Zero result batches
         emit during this window (the pump isn't running), so ``run()`` can
         attach the consumer in the gap before ``resume()`` without a stale-backlog
-        window. Idempotent guard via ``_started``.
+        window. Idempotent via the phase alone (FJA2Z7): re-entry once Started
+        is a no-op; Running/Closed re-entry raises :class:`PhaseError`.
         """
-        if self._started:
+        if self._phase is _Phase.STARTED:
             return self
         if self._phase is _Phase.RUNNING or self._phase is _Phase.CLOSED:
             msg = f"start() in phase {self._phase.value!r} - session can only start from New"
             raise PhaseError(msg)
-        self._started = True
 
         cfg = self.cfg
 
         # ── Build the three actors (injected or from cfg) ──
-        self.bot = self._injected_bot or self._build_bot(cfg)
-        self.async_w3 = self._injected_async_w3 or await self._build_async_w3(cfg)
-        self.engine_registry = self._injected_engine_registry or EngineRegistry(bot=self.bot)
+        bot = self._injected_bot or self._build_bot(cfg)
+        async_w3 = self._injected_async_w3 or await self._build_async_w3(cfg)
+        engine_registry = self._injected_engine_registry or EngineRegistry(bot=bot)
 
         # ── Fetch current block (for the dispatcher + backfill comparison) ──
         # Note: main()'s start-phase base_fee_next/operator_nonce fetches were
         # dead state (recomputed per-batch inside consume_result_batches) — dropped.
-        latest_block = await self.async_w3.get_block("latest")
+        latest_block = await async_w3.get_block("latest")
         if latest_block is None:
             msg = "Failed to fetch the latest block at session start"
             raise RuntimeError(msg)
-        self.current_block = latest_block["number"]
+        current_block = latest_block["number"]
 
         # ── Coordination state ──
-        self.dispatcher = Dispatcher.for_block(self.current_block)
+        dispatcher = Dispatcher.for_block(current_block)
 
         # Register the operator-verified standard-ERC-20 set as a hard
         # classifier invariant: if the FoT registry ever confirms one of
         # these, the driver panics rather than silently dropping that token's
         # real arbitrage (coarse guard, not an exemption).
-        self.dispatcher.set_fot_verified_non_fot(list(ETH_MAINNET_ALLOWED_TOKENS))
+        dispatcher.set_fot_verified_non_fot(list(ETH_MAINNET_ALLOWED_TOKENS))
 
         # ── Simulation seam context (A5) — one SimulateContext per session,
         # held alongside the dispatcher. The runtime-bytecode file-load stays
@@ -310,15 +396,16 @@ class BotRunner:
         # AsyncAlloyProvider handle is taken from the session's provider so
         # `dispatch_profitable` shares one provider with the rest of the
         # pipeline.
-        async_alloy = self.async_w3.as_async_alloy()
+        async_alloy = async_w3.as_async_alloy()
+        sim_ctx: SimulateContext | None
         if async_alloy is None:
             # Non-Alloy provider (test fakes). Defer the sim context:
             # production sessions are Alloy-backed + build it eagerly here;
             # dispatch raises a clear error if reached without one.
-            self._sim_ctx = None
+            sim_ctx = None
         else:
             runtime_code = _load_executor_runtime_bytecode(cfg)
-            self._sim_ctx = SimulateContext(
+            sim_ctx = SimulateContext(
                 provider=async_alloy,
                 executor_owner=cfg.executor_owner,
                 executor_address=cfg.executor_address,
@@ -334,8 +421,8 @@ class BotRunner:
             # without it stance=1 carries no payloads (harmless but inert).
             # Cheap Arc-clone wiring; the engine only calls the hook under the
             # stance, so installing it unconditionally is a no-op when off.
-            self.engine_registry.engine.install_inline_simulator(
-                self._sim_ctx,
+            engine_registry.engine.install_inline_simulator(
+                sim_ctx,
                 erc6909_profit=ERC6909_PROFIT,
             )
 
@@ -359,7 +446,7 @@ class BotRunner:
         else:
             # Production DB path: snapshot for the V3 pool tracker only
             # (engine feeds from the core store, set at Bot construction).
-            v3_snap, v4_snap, _v3_blk, _v4_blk = get_snapshots(self.bot)
+            v3_snap, v4_snap, _v3_blk, _v4_blk = get_snapshots(bot)
         self.v3_snapshot = v3_snap
         self.v4_snapshot = v4_snap
 
@@ -371,27 +458,29 @@ class BotRunner:
         # in `start()`; the DB path takes no kwargs (snapshot loaded at
         # construction; `snapshot_seed_block` is read from the core
         # `BotState` by `start()` via the `snapshot_seed_block` getter).
-        backfill_target = self.engine_registry.start(
+        backfill_target = engine_registry.start(
             cfg.node_http,
             cfg.node_ws,
             v3_snapshot=start_v3,
             v4_snapshot=start_v4,
             verify_state_view=EthereumMainnetUniswapV4.state_view.address,
         )
-        if backfill_target > self.current_block:
-            self.current_block = backfill_target
-            self.dispatcher.advance_block(backfill_target)
+        if backfill_target > current_block:
+            current_block = backfill_target
+            dispatcher.advance_block(backfill_target)
 
-        assert self.engine_registry is not None
-        assert self.async_w3 is not None
-        assert self.dispatcher is not None
+        # ── THE session: real from here on (FJA2Z7) — the one owner of the
+        # coordination state. The runner keeps no stored copies (its
+        # same-named attributes are the facade over this owner); the two
+        # pipelines attach later through the owner's mutators.
         self._session = _SessionState(
-            engine_registry=self.engine_registry,
-            async_w3=self.async_w3,
-            sim_ctx=self._sim_ctx,
-            dispatcher=self.dispatcher,
+            engine_registry=engine_registry,
+            async_w3=async_w3,
+            sim_ctx=sim_ctx,
+            dispatcher=dispatcher,
             cfg=cfg,
-            current_block=self.current_block,
+            current_block=current_block,
+            bot=bot,
         )
         self._install_sigint_handler()
         self._phase = _Phase.STARTED
@@ -412,10 +501,11 @@ class BotRunner:
             msg = f"run() requires phase 'started' (session phase is {self._phase.value!r})"
             raise PhaseError(msg)
         self._phase = _Phase.RUNNING
-        assert self.engine_registry is not None
-        assert self.async_w3 is not None
-        assert self.bot is not None
-        assert self.dispatcher is not None
+        # The session's construction answers the actor asserts (FJA2Z7): the
+        # actors are real on the owner the moment start() built it.
+        session = self._session
+        assert session is not None
+        assert session.bot is not None
 
         cfg = self.cfg
         consumer = self._consumer or consume_result_batches
@@ -427,12 +517,11 @@ class BotRunner:
         # coordinator-owned (ADR-027 completion): `bot.block_stream()` moves
         # the mpsc receiver out of the PumpState on each call — a second call
         # raises RuntimeError("block_stream() can only be called once").
-        block_stream = self.bot.block_stream()
+        block_stream = session.bot.block_stream()
 
         # Attach the consumer BEFORE resume (consumer-safety invariant).
-        assert self._session is not None
         self._result_consumer_task = asyncio.create_task(
-            consumer(session=self._session, block_stream=block_stream),
+            consumer(session=session, block_stream=block_stream),
             name="result-consumer",
         )
         # MJJUXL: attach the consumer to the session watch the moment it
@@ -444,7 +533,7 @@ class BotRunner:
         )
 
         # 2. Resume the pump — the single gate after which result batches flow.
-        self.engine_registry.engine.resume()
+        session.engine_registry.engine.resume()
 
         # 3. Build paths with the pump live (rolling start).
         path_builder = self._path_builder or build_paths
@@ -457,20 +546,22 @@ class BotRunner:
         registration_context = None
         pipeline = None
         if self._path_builder is None:
-            self._registration_context = ConstructionContext.for_bot(self.bot, self.v3_snapshot)
+            self._registration_context = ConstructionContext.for_bot(session.bot, self.v3_snapshot)
             registration_context = self._registration_context
             # NWTUM3: own the long-lived PathRegistrationPipeline on the session
             # so the operator add-a-path surface (enqueue_path /
             # trigger_discovery) stays reachable for the session's lifetime —
             # including after build_paths returns and the main-loop trim drops
             # the Python bot (the pipeline's retained ConstructionContext keeps
-            # constructing through the Rust PoolBuilder).
-            self._pipeline = PathRegistrationPipeline(
+            # constructing through the Rust PoolBuilder). Attached through the
+            # owner's mutator (FJA2Z7) — its producer legitimately lands here,
+            # in run().
+            pipeline = PathRegistrationPipeline(
                 context=registration_context,
-                engine_registry=self.engine_registry,
+                engine_registry=session.engine_registry,
                 retry_policy=cfg.verification_retry_policy,
             )
-            pipeline = self._pipeline
+            session.attach_registration_pipeline(pipeline)
 
         # Sub-B seam: decouple discovery from the main loop. PRODUCTION (real
         # `build_paths`): spawn the registration pipeline + its post-completion
@@ -498,8 +589,8 @@ class BotRunner:
             self._session_watch.attach_registration(self._registration_task)
         else:
             await path_builder(
-                bot=self.bot,
-                engine_registry=self.engine_registry,
+                bot=session.bot,
+                engine_registry=session.engine_registry,
                 v3_snapshot=self.v3_snapshot,
                 v4_snapshot=self.v4_snapshot,
                 retry_policy=cfg.verification_retry_policy,
@@ -569,10 +660,12 @@ class BotRunner:
         if self._phase is not _Phase.RUNNING:
             msg = f"enqueue_path() needs 'running' (phase is {self._phase.value!r})"
             raise PhaseError(msg)
-        if self._pipeline is None:
+        session = self._session
+        assert session is not None
+        if session.registration_pipeline is None:
             msg = "no live registration pipeline; add-path unavailable (injected/fake run)"
             raise RuntimeError(msg)
-        await self._pipeline.enqueue_path(path_steps, directions=directions)
+        await session.registration_pipeline.enqueue_path(path_steps, directions=directions)
 
     async def trigger_discovery(self, *, bound: int | None = None) -> int:
         """Trigger a bounded one-shot discovery sweep (NWTUM3 / D1c on-demand
@@ -586,10 +679,12 @@ class BotRunner:
         if self._phase is not _Phase.RUNNING:
             msg = f"trigger_discovery() needs 'running' (phase is {self._phase.value!r})"
             raise PhaseError(msg)
-        if self._pipeline is None:
+        session = self._session
+        assert session is not None
+        if session.registration_pipeline is None:
             msg = "no live registration pipeline; on-demand discovery unavailable"
             raise RuntimeError(msg)
-        return await self._pipeline.trigger_discovery(bound=bound)
+        return await session.registration_pipeline.trigger_discovery(bound=bound)
 
     async def _run_registration_background(
         self,
@@ -663,7 +758,8 @@ class BotRunner:
         at process teardown. Callers must keep the canary active whenever
         registration actually finished.
         """
-        assert self.engine_registry is not None
+        registry = self.engine_registry
+        assert registry is not None
         # 3b. Release the held snapshot read transaction (epic XEANMB):
         # `load_snapshot_from_db` opened a deferred read tx so every
         # `assemble_*_tick_map` Db-arm read during `build_paths` shared one
@@ -674,16 +770,17 @@ class BotRunner:
         # Skipped entirely on the cancel/teardown branch (EZOKDR): in-flight
         # executor `assemble_*` clones would trip the canary, and the WAL is
         # moot once the process is exiting.
-        if self.bot is not None:
-            py_bot = getattr(self.bot, "_py_bot", None)
+        bot = self.bot
+        if bot is not None:
+            py_bot = getattr(bot, "_py_bot", None)
             if py_bot is not None and close_read_tx:
                 py_bot.close_snapshot_tx()
 
-        if self.bot is None:
+        if bot is None:
             return
 
         # 4. Trim redundant Python state — Rust engine owns canonical pool state.
-        self.bot.release_python_state()
+        bot.release_python_state()
         self.v3_snapshot = None
         self.v4_snapshot = None
         self.bot = None  # drop the only Python ref; engine keeps its own Bot ref
@@ -692,10 +789,10 @@ class BotRunner:
 
         bot_logger.info(
             f"[startup] State trimmed — "
-            f"{self.engine_registry.engine.v2_pool_count()} V2, "
-            f"{self.engine_registry.engine.v3_pool_count()} V3, "
-            f"{self.engine_registry.engine.v4_pool_count()} V4 pools retained in "
-            f"Rust engine; {self.engine_registry.engine.path_count()} paths registered. "
+            f"{registry.engine.v2_pool_count()} V2, "
+            f"{registry.engine.v3_pool_count()} V3, "
+            f"{registry.engine.v4_pool_count()} V4 pools retained in "
+            f"Rust engine; {registry.engine.path_count()} paths registered. "
             f"Entering main loop.",
         )
 

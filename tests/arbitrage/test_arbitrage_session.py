@@ -1609,7 +1609,9 @@ class TestSessionOperatorSurface:
         )
         await session.start()
         await session.run()
-        assert session._pipeline is None
+        # FJA2Z7: the pipeline lives on the session owner (None for fake runs).
+        assert session._session is not None
+        assert session._session.registration_pipeline is None
         with pytest.raises(RuntimeError, match="no live registration pipeline"):
             await session.enqueue_path([])
         with pytest.raises(RuntimeError, match="no live registration pipeline"):
@@ -1657,9 +1659,11 @@ class TestSessionOperatorSurface:
             path_builder=lambda **_kw: _noop_coro(),
             consumer=consumer,
         )
-        # A live (fake) pipeline is reachable on the running session.
-        session._pipeline = fake_pipeline
         await session.start()
+        # A live (fake) pipeline is reachable on the running session —
+        # attached through the owner's mutator (FJA2Z7).
+        assert session._session is not None
+        session._session.attach_registration_pipeline(fake_pipeline)
         await session.run()
 
         # Full dispatch progress despite the mid-run add — no stall, no abort.

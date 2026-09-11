@@ -57,7 +57,9 @@ async def consume_result_batches(
     pipeline = session.sim_submit_pipeline
     if pipeline is None:
         pipeline = SimSubmitPipeline(session)
-        session.sim_submit_pipeline = pipeline
+        # FJA2Z7: the remote attach rides the owner's mutator — attribute
+        # pokes on the session are forbidden downstream of bot_runner.
+        session.attach_pipeline(pipeline)
 
     if result_iter is None:
         result_iter = aiter(session.engine_registry.engine)
@@ -180,7 +182,9 @@ async def _apply_block_if_ready(fut: asyncio.Task[dict[str, int]], session: _Ses
             )
 
     dispatcher.advance_block(block_number)
-    session.current_block = block_number
+    # FJA2Z7: the block clock advances through the owner's mutator (the
+    # runner-side frozen mirror is gone — every reader consults the session).
+    session.advance_block(block_number)
 
 
 async def _apply_result_if_ready(
