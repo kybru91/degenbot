@@ -92,6 +92,19 @@ pub(crate) enum LaneFailure {
         /// The panic payload when it is a string.
         message: Option<String>,
     },
+    /// The LANE died mid-flight (FF-T4, Z6XTDX): the seat thread
+    /// abandoned its bin before draining its paths — every still-owed
+    /// path becomes one of these terminal records. The fleet cordons
+    /// (the sticky [`degenbot_workers::posture::PostureCause::LaneDeath`]
+    /// input) and the process LIVES: the terminal receipts keep the
+    /// outcome ledger exact (solved + suppressed + failed == submitted),
+    /// never a stranded submitter, never a silent undercount.
+    LaneDeath {
+        /// The host-tracked unit id whose lane died.
+        unit: u64,
+        /// The seat (slot) whose lane died.
+        seat: u64,
+    },
 }
 
 /// The unified solved payload: the solved arm's
@@ -219,11 +232,52 @@ impl SolveLane {
     }
 }
 
+/// The lane-death response (FF-T4, Z6XTDX — AC 3): a lane that died
+/// mid-flight (its seat thread abandoned the bin before draining its
+/// paths) gets TERMINAL RECEIPTS — every still-owed path patched onto
+/// the pipe as exactly one typed `Failed(LaneFailure::LaneDeath)`
+/// record — the cordoned posture (the sticky `PostureCause::LaneDeath`
+/// input; `owner` overrides the process owner for hermetic tests), and
+/// a LIVE process: this never aborts. Returns the patched record count.
+pub(crate) fn lane_death_response(
+    lane: &mut SolveLane,
+    owner: Option<&degenbot_workers::posture::PostureOwner>,
+) -> usize {
+    let unemitted = lane.unemitted();
+    let patched = unemitted.len();
+    let unit = lane.unit;
+    let seat = lane.seat;
+    for pid in unemitted {
+        lane.failed(pid, LaneFailure::LaneDeath { unit, seat });
+    }
+    match owner {
+        Some(owner) => {
+            owner.observe_cause(degenbot_workers::posture::PostureCause::LaneDeath);
+        }
+        None => {
+            degenbot_workers::posture::process()
+                .observe_cause(degenbot_workers::posture::PostureCause::LaneDeath);
+        }
+    }
+    tracing::error!(
+        target: "degenbot::fleet",
+        unit,
+        seat,
+        patched,
+        "[fleet-solve] lane died mid-flight — terminal failure records patched, posture cordoned (sticky), the process lives (FF-T4)"
+    );
+    patched
+}
+
 /// Drive one bin body under the lane witness: a panic is caught (the seat
 /// backstop also survives), the `PanicVerdict` is consulted, and every
 /// still-unemitted path is patched onto the pipe as exactly one typed
 /// `Failed(LaneFailure::SeatPanic)` record — so BOTH arms satisfy
-/// "one outcome per submitted path" even through a panic.
+/// "one outcome per submitted path" even through a panic. A bin body
+/// that RETURNS with still-owed paths is a lane death (the seat
+/// abandoned its bin mid-flight, FF-T4): the lane-death response fires —
+/// terminal receipts + the cordoned posture + a live process — instead of
+/// the silent sender-drop undercount that used to trip the merge fuse.
 pub(crate) fn run_solve_lane(
     lane: &mut SolveLane,
     verdict: &dyn PanicVerdict,
@@ -232,6 +286,9 @@ pub(crate) fn run_solve_lane(
     let outcome = AssertUnwindSafe(|| work(lane));
     let outcome = std::panic::catch_unwind(outcome);
     let Err(payload) = outcome else {
+        if !lane.unemitted().is_empty() {
+            lane_death_response(lane, None);
+        }
         return;
     };
     let message = if let Some(text) = payload.downcast_ref::<&str>() {

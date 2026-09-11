@@ -106,6 +106,10 @@ pub(crate) struct FleetSolveExecutor {
     /// Seat count (read via [`FleetSolveExecutor::bin_count`] — the
     /// dispatch arms bin at exactly this count so every bin has a home).
     solver_seats: usize,
+    /// The resolved lane-to-thread binding (FF-T4 — test-facing
+    /// parity assertions; the host itself moved into the host thread).
+    #[cfg(test)]
+    binding: degenbot_workers::plan::Binding,
 }
 
 impl crate::arb_engine::executor::Executor for FleetSolveExecutor {
@@ -171,6 +175,8 @@ impl FleetSolveExecutor {
     /// `{n}`-templated thread name (pinned: the solver seats; serial:
     /// the ONE serial-0 cycle seat).
     fn boot_seats(host: FleetHost, seat_name_pattern: &'static str) -> Self {
+        #[cfg(test)]
+        let binding = host.plan().binding;
         let solver_seats = host.budget().solver_pin_count;
 
         let (tx, rx) = mpsc::channel::<HostMsg>();
@@ -240,7 +246,16 @@ impl FleetSolveExecutor {
             unit_seq: AtomicU64::new(0),
             solver_seats,
             solver_queue_len,
+            #[cfg(test)]
+            binding,
         }
+    }
+
+    /// Test-facing: the resolved plan binding (FF-T4 — the parity
+    /// tests assert the tier each boot instantiated).
+    #[cfg(test)]
+    fn plan_binding_for_test(&self) -> degenbot_workers::plan::Binding {
+        self.binding
     }
 
     /// Solver seats = the budget's structural LPT bin count. The dispatch
@@ -535,7 +550,7 @@ mod tests {
     use super::WorkerRole;
     use super::{validate_bin_index, FleetSolveExecutor, SOLVE_BIN_KEY_BASE};
     use crate::arb_engine::executor::{
-        run_solve_lane, LaneFailure, LaneOutcome, SolveLane, SolveOutcome,
+        lane_death_response, run_solve_lane, LaneFailure, LaneOutcome, SolveLane, SolveOutcome,
     };
 
     /// A FRESH hermetic posture owner (leaked to `'static`): every test
@@ -1316,6 +1331,230 @@ mod tests {
         );
     }
 
+    /// FF-T4 (Z6XTDX) — AC 3: a lane death mid-flight yields TERMINAL
+    /// RECEIPTS for in-flight paths (typed `LaneFailure::LaneDeath`,
+    /// exactly one outcome per submitted path — the ledger stays
+    /// exact), the CORDONED posture (sticky — clean windows never lift
+    /// it), and a LIVE process (the response returns; the pre-FF-T4
+    /// shape was the merge fuse's loud abort on the undercount).
+    #[test]
+    fn a_lane_death_mid_flight_yields_terminal_receipts_cordon_and_a_live_process() {
+        let owner = hermetic_owner();
+        let submitted: BTreeSet<u64> = [30, 31, 32, 33, 34].into_iter().collect();
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+        let mut lane = SolveLane::new(7, 3, vec![30, 31, 32, 33, 34], tx);
+        // The bin runs partially: two outcomes deliver, then the LANE
+        // DIES — the seat thread is gone mid-flight (no unwind, no more
+        // sends, nothing). 32/33/34 are still owed.
+        lane.solved(SolveOutcome {
+            pid: 30,
+            result: SolvePathResult::default(),
+            worker_clamp_twins: 0,
+            payload: None,
+            cycle_seq: 0,
+            solve_block: 0,
+            metadata: crate::arb_engine::BlockMetadata::default(),
+            update_stamp: vec![],
+            solve_span: tracing::Span::none(),
+        });
+        lane.suppressed(31);
+        // The response (the production wiring drives this body with the
+        // process owner; hermetic tests inject their own — same code):
+        let patched = lane_death_response(&mut lane, Some(owner));
+        drop(lane);
+        assert_eq!(
+            patched, 3,
+            "the three still-owed paths get terminal records"
+        );
+        assert_eq!(owner.current(), FleetPosture::Cordoned);
+        // The sticky discipline: clean throttle windows NEVER lift a
+        // lane-death cordon (the lane is still dead).
+        for i in 0..30_u64 {
+            owner.observe_throttle(
+                10_000 + i * 1_000,
+                ThrottleSample {
+                    events: 0,
+                    throttled_usec: 0,
+                    elapsed_usec: 1_000_000,
+                },
+            );
+        }
+        assert_eq!(
+            owner.current(),
+            FleetPosture::Cordoned,
+            "a lane-death cordon is sticky across clean windows"
+        );
+        // The exactness law through the death: delivered + failed ==
+        // submitted, disjoint, every failure typed LaneDeath.
+        let outcomes: Vec<LaneOutcome> = rx.into_iter().collect();
+        let mut delivered: BTreeSet<u64> = BTreeSet::new();
+        let mut failed: BTreeSet<u64> = BTreeSet::new();
+        for outcome in outcomes {
+            match outcome {
+                LaneOutcome::Solved(item) => {
+                    delivered.insert(item.pid);
+                }
+                LaneOutcome::Suppressed { pid } => {
+                    delivered.insert(pid);
+                }
+                LaneOutcome::Failed { pid, failure } => {
+                    assert_eq!(
+                        failure,
+                        LaneFailure::LaneDeath { unit: 7, seat: 3 },
+                        "the terminal receipt must name the dead lane's unit + seat"
+                    );
+                    failed.insert(pid);
+                }
+            }
+        }
+        assert!(delivered.is_disjoint(&failed));
+        let covered: BTreeSet<u64> = delivered.union(&failed).copied().collect();
+        assert_eq!(
+            covered, submitted,
+            "the lane death leaves the ledger EXACT: one outcome per submitted path"
+        );
+        // A LIVE process: this line running is the proof — the response
+        // returned instead of the abort.
+    }
+
+    /// FF-T4 — the production auto-arm: a bin body that RETURNS with
+    /// still-owed paths (the seat abandoned its bin mid-flight) gets
+    /// the lane-death response through `run_solve_lane` — terminal
+    /// records on the pipe, never the silent sender-drop undercount
+    /// that used to trip the merge fuse.
+    #[test]
+    fn a_bin_that_abandons_its_paths_mid_flight_drains_terminal_records() {
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+        let mut lane = SolveLane::new(9, 1, vec![40, 41, 42], tx);
+        run_solve_lane(&mut lane, &SeatSurvivesPolicy, |lane| {
+            lane.suppressed(40);
+            // The body simply STOPS: 41/42 still owed. (A deliberate
+            // abandon — the injection shape of a mid-flight lane death.)
+        });
+        drop(lane);
+        let outcomes: Vec<LaneOutcome> = rx.into_iter().collect();
+        let failed: BTreeSet<u64> = outcomes
+            .into_iter()
+            .filter_map(|outcome| match outcome {
+                LaneOutcome::Failed { pid, failure } => {
+                    assert_eq!(
+                        failure,
+                        LaneFailure::LaneDeath { unit: 9, seat: 1 },
+                        "the abandon arm patches typed lane-death records"
+                    );
+                    Some(pid)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            failed,
+            [41, 42].into_iter().collect::<BTreeSet<u64>>(),
+            "every still-owed path lands as a typed terminal record"
+        );
+    }
+
+    /// FF-T4 — AC 4: the outcome corpus is IDENTICAL across the pinned
+    /// and serial bindings (parity: the binding changes which threads
+    /// run the lanes, never the outcomes — the promotion-gate
+    /// contract). The corpus is a deterministic three-bin fixture
+    /// (solved / suppressed / a deliberate mid-bin `SeatPanic` / a
+    /// deliberate mid-bin `LaneDeath` abandon); the bins address the
+    /// binding's own bin space (`bin % bin_count`: under serial the
+    /// projection pins ONE solver seat, so every corpus bin routes to
+    /// serial-0 — the same PATHS, the same outcomes).
+    #[test]
+    fn the_outcome_corpus_is_identical_across_the_pinned_and_serial_bindings() {
+        let corpus = |executor: &FleetSolveExecutor| -> Vec<(u64, u64)> {
+            let bin_count = executor.bin_count();
+            assert!(bin_count >= 1);
+            let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+            for bin in 0..3_u64 {
+                let tx = tx.clone();
+                let base = 100 + bin * 10;
+                let pids = vec![base, base + 1, base + 2, base + 3];
+                let work: SubmitWork = Box::new(move |_ctx: &LaneCtx| {
+                    let mut lane = SolveLane::new(bin, bin, pids, tx.clone());
+                    run_solve_lane(&mut lane, &SeatSurvivesPolicy, |lane| {
+                        lane.suppressed(base);
+                        if bin == 1 {
+                            red_panic("the corpus's deliberate mid-bin panic");
+                        }
+                        if bin == 2 {
+                            // The corpus's deliberate mid-bin abandon
+                            // (the LaneDeath arm): base+2/base+3 stay owed.
+                            return;
+                        }
+                        lane.solved(SolveOutcome {
+                            pid: base + 1,
+                            result: SolvePathResult::default(),
+                            worker_clamp_twins: 0,
+                            payload: None,
+                            cycle_seq: 0,
+                            solve_block: 0,
+                            metadata: crate::arb_engine::BlockMetadata::default(),
+                            update_stamp: vec![],
+                            solve_span: tracing::Span::none(),
+                        });
+                        lane.suppressed(base + 2);
+                        lane.suppressed(base + 3);
+                    });
+                });
+                executor
+                    .submit_solve_bin(
+                        usize::try_from(bin % u64::try_from(bin_count).unwrap_or(1)).unwrap_or(0),
+                        work,
+                    )
+                    .expect("the corpus bin submits");
+            }
+            drop(tx);
+            let mut covered: Vec<(u64, u64)> = rx
+                .into_iter()
+                .map(|outcome| match outcome {
+                    LaneOutcome::Solved(item) => (item.pid, 0),
+                    LaneOutcome::Suppressed { pid } => (pid, 1),
+                    LaneOutcome::Failed { pid, failure } => (pid, {
+                        if matches!(failure, LaneFailure::SeatPanic { .. }) {
+                            2
+                        } else {
+                            3
+                        }
+                    }),
+                })
+                .collect();
+            covered.sort_unstable();
+            covered
+        };
+        let pinned = FleetSolveExecutor::boot(hermetic_boot())
+            .expect("the pinned binding boots (8-core auto)");
+        assert_eq!(
+            pinned.plan_binding_for_test(),
+            degenbot_workers::plan::Binding::Pinned,
+            "the 8-core auto host resolves the pinned tier"
+        );
+        let serial = FleetSolveExecutor::boot(FleetBoot {
+            quota_cpus: 2.0,
+            ..hermetic_boot()
+        })
+        .expect("the serial binding boots (2-core auto)");
+        assert_eq!(
+            serial.plan_binding_for_test(),
+            degenbot_workers::plan::Binding::Serial,
+            "the 2-core auto host resolves the serial tier"
+        );
+        let pinned_corpus = corpus(&pinned);
+        assert_eq!(
+            pinned_corpus.len(),
+            12,
+            "the corpus covers every submitted path exactly once (4 per bin)"
+        );
+        let serial_corpus = corpus(&serial);
+        assert_eq!(
+            serial_corpus, pinned_corpus,
+            "parity: the outcome corpus must be identical across bindings"
+        );
+    }
+
     /// Decision A drive: after a panicking cycle the SAME seat takes the
     /// next cycle's pinned bin (keyed pins never move), and the panic was
     /// expressed as data — the verdict consulted, typed failure records
@@ -1346,6 +1585,13 @@ mod tests {
                             if cycle == 0 {
                                 lane.suppressed(cycle * 10); // one pid emitted before the panic
                                 red_panic("cycle-0 bin panics (QR3NUS red harness)");
+                            } else {
+                                // cycle 1 runs CLEAN — every path delivers on
+                                // the surviving seat (FF-T4: a bin that returns
+                                // with still-owed paths is a lane death, not a
+                                // clean cycle; this body owes both and pays both).
+                                lane.suppressed(cycle * 10);
+                                lane.suppressed(cycle * 10 + 1);
                             }
                         });
                         drop(lane); // close the pipe so the per-cycle drain completes
