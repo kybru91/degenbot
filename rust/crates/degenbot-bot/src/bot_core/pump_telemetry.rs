@@ -12,11 +12,12 @@
 //! I/O-free and trivially testable.
 //!
 //! Because every diagnostic is behind one interface, the *deletion test*
-//! applies cleanly in the intended direction: when the investigation closes,
-//! removing the whole seam (or the gated removals tracked by `ergo VSDZ4X`)
-//! means deleting this one module — not surgically carving interleaved `[DIAG]`
-//! sites out of the decision loop. Until then, behavior is byte-identical to
-//! the inline instrumentation it replaces.
+//! applies cleanly in the intended direction: removing the whole seam means
+//! deleting this one module — not surgically carving interleaved `[DIAG]`
+//! sites out of the decision loop. The env-gated solver-state diagnostics
+//! retired separately under `ergo VSDZ4X` (closed done 2026-09-10): the
+//! solve-anchor probe was deleted; the dispatch trace was superseded by
+//! always-on WARN/DEBUG telemetry in `log_dispatcher.rs`.
 //!
 //! Psst — naming: this seals the *block-pump* telemetry. The ADR-021
 //! solver-state tripwire retired with epic MROOY7 task 2UVG3E (its upstream
