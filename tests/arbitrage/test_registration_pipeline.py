@@ -32,8 +32,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 from degenbot.checksum_cache import get_checksum_address
-from degenbot.database.models.pools import UniswapV3PoolTable
-from degenbot.exceptions import VerificationMismatchError
+from degenbot.database.models.pools import UniswapV3PoolTable, UniswapV4PoolTable
+from degenbot.exceptions import (
+    HookedPoolRejectedError,
+    PathRejectedError,
+    VerificationMismatchError,
+)
 from degenbot.runner.build_paths import (
     REG_INTAKE_WINDOW,
     PathRegistrationPipeline,
@@ -311,6 +315,7 @@ WETH_CHECKSUM = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 T1_CHECKSUM = get_checksum_address("0x" + "11" * 20)
 POOL_A = "0x" + "aa" * 20
 POOL_B = "0x" + "bb" * 20
+POOL_C = "0x" + "cc" * 20
 
 
 class _FakeV3Pool:
@@ -441,3 +446,188 @@ def test_path_predicate_evaluates_before_verify() -> None:
     assert outcome.kind == "reject"
     assert registry.verifies == []
     assert len(registry.registrations) == 0
+
+
+# ---------------------------------------------------------------------------
+# Cold-soak negative-memoization (2026-09-11 follow-up to W73FVY): the dup
+# memo only answers candidates whose registration COMPLETED. Stable-negative
+# outcomes - pool-level build refusals and the D7KMQO policy gate - returned
+# unmemoized, so the DFS re-paid full build+verify choreographies on every
+# re-sighting (measured live: 1206 verify lifecycles / 132 unique pools,
+# top pools ~50x, registered paths flat at the boot value for 1h+). Three
+# memos close the hole WITHOUT classifying transient failures as permanent:
+#   1. verify-once-per-pipeline  (a completed verify lifecycle is a pool fact)
+#   2. unregistrable-pool memo   (stable build refusals are pool facts)
+#   3. rejected-path memo        (the policy gate deny is deterministic per
+#                                  hop signature); TRANSIENT register-fails
+#                                  are deliberately NOT memoized.
+# ---------------------------------------------------------------------------
+
+
+class _RegisterThenFailRegistry(_RecordingRegistry):
+    """First crawl-path registration succeeds; every later one fails."""
+
+    def register_crawl_path(self, engine_hops: list) -> tuple[int, bool]:
+        if self.registrations:
+            scripted = RuntimeError("-scripted-register-fail")
+            raise scripted
+        return super().register_crawl_path(engine_hops)
+
+
+def _pipeline_over_registry_three_pools(
+    registry: _RecordingRegistry,
+) -> PathRegistrationPipeline:
+    """Like _pipeline_over_registry but with a third pool; V3-only chain."""
+    pools = {
+        POOL_A: _FakeV3Pool(POOL_A, WETH_CHECKSUM, T1_CHECKSUM, pool_id=101),
+        POOL_B: _FakeV3Pool(POOL_B, T1_CHECKSUM, WETH_CHECKSUM, pool_id=202),
+        POOL_C: _FakeV3Pool(POOL_C, WETH_CHECKSUM, T1_CHECKSUM, pool_id=303),
+    }
+
+    class _Tracker:
+        def get_pool(
+            self,
+            *,
+            pool_address: str,
+            silent: bool = True,
+        ) -> _FakeV3Pool:
+            return pools[pool_address]
+
+    bot = SimpleNamespace(registration_fleet_hosted=lambda: True)
+    ctx = SimpleNamespace(
+        bot=bot,
+        chain_id=1,
+        db=None,
+        uniswap_v3_tracker=_Tracker(),
+        sushiswap_v3_tracker=None,
+        pancakeswap_v3_tracker=None,
+        weth=SimpleNamespace(address=WETH_CHECKSUM),
+    )
+    return PathRegistrationPipeline(
+        context=ctx,
+        engine_registry=registry,  # type: ignore[arg-type]
+    )
+
+
+def test_verify_lifecycle_runs_once_per_pool_across_sightings() -> None:
+    """A completed verify lifecycle is never re-run on later sightings.
+
+    The seat claims table dedups CONCURRENT windows only; a register-fail
+    candidate re-submitted later re-ran the FULL verify choreography for
+    every hop it shared with earlier candidates (measured live: same pool
+    verified ~50x while registered paths stayed flat). Verify-once per
+    pipeline is exact: the lifecycle is a pool-fact operation, and a failed
+    registration does NOT un-verify a pool.
+    """
+    registry = _RegisterThenFailRegistry()
+    pipeline = _pipeline_over_registry_three_pools(registry)
+
+    first = pipeline._registration_unit([
+        _OpaqueStep(type=UniswapV3PoolTable, address=POOL_A, hash=None),
+        _OpaqueStep(type=UniswapV3PoolTable, address=POOL_B, hash=None),
+    ])
+    assert first.kind == "registered"
+
+    shared_hop = [
+        _OpaqueStep(type=UniswapV3PoolTable, address=POOL_A, hash=None),
+        _OpaqueStep(type=UniswapV3PoolTable, address=POOL_C, hash=None),
+    ]
+    second = pipeline._registration_unit(shared_hop)
+    assert second.kind == "register-fail"
+    pipeline._absorb_outcome(second)
+    third = pipeline._registration_unit(shared_hop)
+    assert third.kind == "register-fail"
+    pipeline._absorb_outcome(third)
+
+    # Exactness preserved: register-fail is NOT negatively memoized, so the
+    # candidate re-attempted registration on every sighting.
+    assert len(registry.registrations) == 1
+    assert pipeline.register_fail_count == 2
+
+    # But a pool never re-verifies: A was verified under the FIRST candidate;
+    # C under the second; the third sighting re-verified neither.
+    assert registry.verifies == [POOL_A, POOL_B, POOL_C]
+    assert registry.verifies.count(POOL_A) == 1
+    assert registry.verifies.count(POOL_C) == 1
+
+
+def test_stable_build_refusal_memoizes_the_pool() -> None:
+    """A stably-refused pool (typed build rejection) skips at O(hops).
+
+    v4-hook-rejected is a POOL fact, not a transient failure: any later
+    candidate containing that pool cannot register. The unregistrable-pool
+    memo must answer BEFORE the build is re-attempted (the pathological
+    region re-yielded the same refused pool in ~111k candidates).
+    """
+    build_calls: list[object] = []
+
+    def _build_managed_pool(**kwargs: object) -> None:
+        build_calls.append(kwargs.get("pool_id"))
+        hooked: HookedPoolRejectedError = HookedPoolRejectedError
+        raise hooked
+
+    bot = SimpleNamespace(
+        registration_fleet_hosted=lambda: True,
+        build_managed_pool=_build_managed_pool,
+        build_pool=lambda *a, **k: None,
+    )
+    pipeline, _ = _pipeline_with_bot(bot)
+    steps = [
+        _OpaqueStep(type=UniswapV4PoolTable, address=None, hash=0xDEAD),
+        _OpaqueStep(type=UniswapV4PoolTable, address=None, hash=0xBEEF),
+    ]
+
+    first = pipeline._registration_unit(steps)
+    assert first.kind == "skip"
+    assert first.tag == "v4-hook-rejected"
+    assert first.counts_as_skip is False
+    pipeline._absorb_outcome(first)
+
+    second = pipeline._registration_unit(steps)
+    assert second.kind == "skip"
+    assert second.tag == "v4-hook-rejected"
+    assert second.counts_as_skip is False
+
+    # The refused pool's build is attempted exactly ONCE; the second sighting
+    # is answered from the unregistrable-pool memo without any build.
+    assert build_calls == [0xDEAD]
+
+
+def test_policy_gate_denial_memoizes_the_path() -> None:
+    """A D7KMQO policy deny is deterministic per hop signature.
+
+    The gate evaluates before any work (order preserved), and its denial is
+    stable: re-yielded candidates answer from the rejected-path memo without
+    a second gate evaluation (and without verify - the gate precedes it).
+    """
+    gate_calls: list[list] = []
+
+    class _ScriptedRegistry(_RecordingRegistry):
+        pass
+
+    def _evaluate(pools_and_zfos: list) -> None:
+        gate_calls.append(list(pools_and_zfos))
+        policy_denied: PathRejectedError = PathRejectedError
+        raise policy_denied
+
+    registry = _ScriptedRegistry()
+    registry.path_predicate = SimpleNamespace(evaluate=_evaluate)
+    pipeline = _pipeline_over_registry(registry)
+    steps = _closed_v3_cycle_steps()
+
+    first = pipeline._registration_unit(steps)
+    assert first.kind == "reject"
+    assert first.tag is not None
+    assert first.tag.startswith("PathRejectedError")
+    assert registry.verifies == []  # the gate precedes verify
+    pipeline._absorb_outcome(first)
+
+    second = pipeline._registration_unit(steps)
+    assert second.kind == "reject"
+    # The memo answers with a STABLE tag (the first sighting's tag
+    # interpolates the exception text; the memo's must stay greppable).
+    assert second.tag == "path-rejected-memo"
+    assert registry.verifies == []
+
+    # The gate ran exactly once; the second sighting answered from the memo.
+    assert len(gate_calls) == 1
