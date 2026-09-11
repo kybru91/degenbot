@@ -238,6 +238,38 @@ struct SlotCell {
     arena: Option<ArenaToken>,
 }
 
+/// THE one pin representation is the slot table itself: a cell in
+/// [`SlotState::Pinned`], written ONLY by the T-table (P-SLOT: the FSM's
+/// state is the truth). This renderer derives the `(key, slot)` pin view
+/// from it, in SLOT-INDEX order.
+///
+/// Order contract (deliberate normalization, DNZQ5G): the deleted `pins`
+/// mirror was MRU-ordered (`complete()`'s retain+push); the derived view
+/// is slot-index ordered. No caller observes pin order — the `pins()`
+/// accessor had zero callers repo-wide, and continuation grants are
+/// per-key to per-key seats, so grant order among distinct keys carries
+/// no semantics. Slot-index order is the documented, test-pinned
+/// contract.
+fn pinned_slots(slots: &[SlotCell]) -> impl Iterator<Item = (PinKey, SlotId)> + '_ {
+    slots
+        .iter()
+        .enumerate()
+        .filter_map(|(i, cell)| match cell.state {
+            SlotState::Pinned { key, .. } => Some((key, u64::try_from(i).unwrap_or(SlotId::MAX))),
+            _ => None,
+        })
+}
+
+/// Take the first queued unit for `key` (the pin IS the key: continuation
+/// grants go only to their own pin's seat). A free function over the queue
+/// slice so the derived-pin iteration in [`FleetHost::dispatch`] can hold
+/// the slot table immutably while the queue alone is mutated (disjoint
+/// field borrows — no per-pass pin-snapshot allocation).
+fn take_solver_unit_for(queue: &mut VecDeque<Unit>, key: PinKey) -> Option<Unit> {
+    let pos = queue.iter().position(|u| u.key == Some(key))?;
+    queue.remove(pos)
+}
+
 /// The fleet host: slots, queues, posture, budget, telemetry — harness-
 /// driven core with no production callers yet (design doc §11; hosting of
 /// the real engines is F3–F5).
@@ -254,10 +286,6 @@ pub struct FleetHost {
     posture_watch: PostureWatch,
     slots: Vec<SlotCell>,
     queues: [VecDeque<Unit>; 8],
-    merge_pin: Option<SlotId>,
-    /// Pinned (key, slot) pairs (the pin IS the key: continuations grant
-    /// only to the slot pinned for that key).
-    pins: Vec<(PinKey, SlotId)>,
     epoch_boundary: bool,
     next_arena: u64,
     overflow_count: u64,
@@ -381,8 +409,6 @@ impl FleetHost {
             posture_watch,
             slots,
             queues: Default::default(),
-            merge_pin: None,
-            pins: Vec::new(),
             epoch_boundary: false,
             next_arena: 1,
             overflow_count: 0,
@@ -406,6 +432,11 @@ impl FleetHost {
         Ok(host)
     }
 
+    /// The merge sidecar's slot: structurally the LAST slot of the boot
+    /// table (the pin itself is claimed T1→T2→T4 immediately after boot
+    /// construction — that conversion is the standing proof of the cell's
+    /// state).
+    // 2SIOHJ: SlotLayout owns this read next task
     fn merge_slot_id(&self) -> Option<SlotId> {
         let last = self.slots.len().checked_sub(1)?;
         u64::try_from(last).ok()
@@ -508,22 +539,21 @@ impl FleetHost {
         cell.arena
     }
 
-    /// Slot id of the (unique) merge pin.
+    /// Slot id of the (unique) merge pin: structurally the LAST boot slot
+    /// (boot pins it T1→T2→T4 before anything else can claim it).
+    // 2SIOHJ: SlotLayout owns this read next task
     #[must_use]
-    pub const fn merge_slot(&self) -> Option<SlotId> {
-        self.merge_pin
+    pub fn merge_slot(&self) -> Option<SlotId> {
+        self.merge_slot_id()
     }
 
-    /// The pinned (key, slot) table.
-    #[must_use]
-    pub fn pins(&self) -> &[(PinKey, SlotId)] {
-        &self.pins
-    }
-
-    /// Slot pinned for `key`, if any.
+    /// Slot pinned for `key`, if any — DERIVED over the slot table's
+    /// `Pinned` cells (the one pin representation; no mirror).
     #[must_use]
     pub fn pin_slot(&self, key: PinKey) -> Option<SlotId> {
-        self.pins.iter().find(|(k, _)| *k == key).map(|(_, s)| *s)
+        pinned_slots(&self.slots)
+            .find(|(k, _)| *k == key)
+            .map(|(_, s)| s)
     }
 
     /// Queue length for a role (declared roles hold nothing).
@@ -611,22 +641,17 @@ impl FleetHost {
     /// # Errors
     /// [`HostError::Transition`] (the FSM's `MidCyclePin`) off-boundary.
     pub fn release_pin(&mut self, key: PinKey) -> Result<SlotId, HostError> {
+        // Derived find over the renderer (DNZQ5G): the pin lives in the
+        // cell; no mirror to retain-clear and no merge_pin to reset.
         let slot = self
-            .pins
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, s)| *s)
+            .pin_slot(key)
             .ok_or(HostError::UnknownSlot(SlotId::MAX))?;
         self.apply_transition(slot, Transition::ReleasePin)?;
-        self.pins.retain(|(k, _)| *k != key);
         if let Some(cell) = usize::try_from(slot)
             .ok()
             .and_then(|i| self.slots.get_mut(i))
         {
             cell.arena = None;
-        }
-        if self.merge_pin == Some(slot) {
-            self.merge_pin = None;
         }
         Ok(slot)
     }
@@ -769,8 +794,13 @@ impl FleetHost {
         let mut grants = Vec::new();
 
         // 1. Pinned continuations (T6): cycle-critical, keyed to their pin.
-        let pin_snapshot: Vec<(PinKey, SlotId)> = self.pins.clone();
-        for (key, slot) in pin_snapshot {
+        //    Iterate the DERIVED pin table (slot-index order, DNZQ5G): no
+        //    mirror and no per-pass allocation — the old `self.pins.clone()`
+        //    heap copy is gone; the renderer reads the cells the FSM wrote,
+        //    and nothing below mutates slot states (queue-only mutation,
+        //    hence the disjoint field borrows).
+        let solver_queue = WorkerRole::Solver.index_in_all_roles().map(usize::from);
+        for (key, slot) in pinned_slots(&self.slots) {
             let is_solver_pin = matches!(
                 self.slot_state(slot),
                 Some(SlotState::Pinned {
@@ -781,7 +811,10 @@ impl FleetHost {
             if !is_solver_pin || self.pin_queue_len(key) == 0 {
                 continue;
             }
-            let Some(unit) = self.take_solver_unit_for(key) else {
+            let Some(unit) = solver_queue
+                .and_then(|idx| self.queues.get_mut(idx))
+                .and_then(|q| take_solver_unit_for(q, key))
+            else {
                 continue;
             };
             grants.push((
@@ -927,22 +960,28 @@ impl FleetHost {
             .position(|u| !self.solver_key_is_hot(u.key))
     }
 
-    /// Whether a keyed Solver unit currently has a claimed seat — a live
-    /// pin ([`FleetHost::pin_slot`]) or an in-flight Leased/Running unit
-    /// carrying the same key.
+    /// Whether a keyed Solver unit currently has a claimed seat — ONE pass
+    /// over the slot table (formerly a `pin_slot` probe plus a second
+    /// scan): a live `Pinned` cell (the derived pin table — no mirror) or
+    /// an in-flight Leased/Running unit carrying the same key on a Solver
+    /// seat. Hot-keyed units wait for their own seat's T6 continuation (a
+    /// hot key granted cold would seat one bin on two workers).
     fn solver_key_is_hot(&self, key: Option<PinKey>) -> bool {
         let Some(key) = key else {
             return false;
         };
-        if self.pin_slot(key).is_some() {
-            return true;
-        }
         self.slots.iter().any(|c| {
             matches!(
                 c.state,
-                SlotState::Leased { role: WorkerRole::Solver, key: Some(k) }
-                | SlotState::Running { role: WorkerRole::Solver, key: Some(k) }
-                    if k == key
+                SlotState::Pinned { key: k, .. }
+                | SlotState::Leased {
+                    role: WorkerRole::Solver,
+                    key: Some(k),
+                }
+                | SlotState::Running {
+                    role: WorkerRole::Solver,
+                    key: Some(k),
+                } if k == key
             )
         })
     }
@@ -950,12 +989,6 @@ impl FleetHost {
     fn pin_queue_len(&self, key: PinKey) -> usize {
         self.role_queue(WorkerRole::Solver)
             .map_or(0, |q| q.iter().filter(|u| u.key == Some(key)).count())
-    }
-
-    fn take_solver_unit_for(&mut self, key: PinKey) -> Option<Unit> {
-        let queue = self.role_queue_mut(WorkerRole::Solver)?;
-        let pos = queue.iter().position(|u| u.key == Some(key))?;
-        queue.remove(pos)
     }
     // (index conversions: usize::from(u8) is infallible)
 
@@ -1070,22 +1103,15 @@ impl FleetHost {
                 self.export_gauges();
                 Ok(Completion::BackToIdle)
             }
-            SlotState::Pinned { role, key } => {
-                // Mint the warm arena on first pin; reuse across cycles.
-                if let Some(cell) = usize::try_from(slot)
-                    .ok()
-                    .and_then(|i| self.slots.get_mut(i))
-                {
-                    if cell.arena.is_none() {
-                        cell.arena = Some(ArenaToken(self.next_arena));
-                        self.next_arena += 1;
-                    }
-                }
-                self.pins.retain(|(k, _)| *k != key);
-                self.pins.push((key, slot));
-                if role == WorkerRole::Merge {
-                    self.merge_pin = Some(slot);
-                }
+            SlotState::Pinned { key, .. } => {
+                // The FSM's CompleteToPinned write above IS the pin
+                // registration: the derived renderer reads the cell, so
+                // there is no mirror to update (DNZQ5G deleted the
+                // three-way pins/merge_pin bookkeeping).
+                // ONE arena mint path: ensure_arena (idempotent; minted on
+                // the first pin, reused warm across cycles, DETACHED(0)
+                // never minted).
+                let _ = self.ensure_arena(slot);
                 self.export_gauges();
                 Ok(Completion::Pinned { key })
             }

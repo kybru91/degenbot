@@ -541,6 +541,267 @@ fn overly_small_quotas_never_boot() {
     ));
 }
 
+mod pin_derive {
+    //! DNZQ5G (Q1): the pin table's single-source-of-truth property, driven
+    //! over random legal grant/complete/release sequences. The DERIVED
+    //! renderer (`pinned_slots` — the one pin representation, the slot
+    //! table's `SlotState::Pinned` cells written only by the T-table) must
+    //! equal a naive independent scan of those cells, per op, exactly —
+    //! set identity AND the slot-index order contract. RED history: the
+    //! property was written FIRST against the mirror it replaced (the
+    //! hand-maintained `pins` Vec), where a seeded mirror-desync bug
+    //! (`release_pin` skipping its mirror retain) failed it with the
+    //! minimal drive [Enqueue, Pump, Complete, Release] — "stale
+    //! representation entry (1, 0): cell state Idle". The drive also
+    //! surfaced that the mirror modeled pin CLAIMS (outliving the cell
+    //! across a T6 cycle), so the mirror-subject equality held only at
+    //! steady moments; the renderer subject made the equality
+    //! unconditional.
+
+    use proptest::prelude::*;
+
+    use crate::role::WorkerRole;
+    use crate::slot::{PinKey, SlotState, MERGE_PIN_KEY};
+
+    use super::super::{pinned_slots, EnqueueError, FleetHost, GrantKind, SlotId, Unit};
+    use super::stub_host;
+
+    /// Keys 1..=KEYS: `MERGE_PIN_KEY` (0) is never driven — the boot merge
+    /// pin is never released by the drive, and solve bin keys never collide
+    /// with it (the solve executor's boot assertion).
+    const KEYS: u8 = 6;
+
+    /// Truth by construction: scan the slot table for `Pinned` cells.
+    fn naive_pinned(host: &FleetHost) -> Vec<(PinKey, SlotId)> {
+        host.slot_states()
+            .into_iter()
+            .filter_map(|(slot, state)| match state {
+                SlotState::Pinned { key, .. } => Some((key, slot)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The derived pin view's contract, asserted after EVERY drive op:
+    /// the renderer equals the naive `Pinned` scan EXACTLY (set identity
+    /// plus the slot-index order contract — both scan in slot order),
+    /// `pin_slot` agrees with the unique cell, and one seat per bin holds
+    /// under the churn (the hot-key guard + the T-table's one-`Pinned{k}`
+    /// guarantee — the behavioral payload the renderer now carries).
+    fn assert_pin_view_matches_truth(host: &FleetHost) {
+        let rendered: Vec<(PinKey, SlotId)> = pinned_slots(&host.slots).collect();
+        let naive = naive_pinned(host);
+        assert_eq!(
+            rendered, naive,
+            "the derived pin view must equal the naive Pinned scan"
+        );
+        // Slot-index order (strictly ascending) — the documented contract.
+        assert!(
+            rendered.windows(2).all(|w| w[0].1 < w[1].1),
+            "pins render in slot-index order: {rendered:?}"
+        );
+        for (key, slot) in &rendered {
+            assert_eq!(
+                host.pin_slot(*key),
+                Some(*slot),
+                "pin_slot must agree with the unique cell for key {key}"
+            );
+            let count = host
+                .slot_states()
+                .iter()
+                .filter(|(_, s)| matches!(s, SlotState::Pinned { key: k, .. } if *k == *key))
+                .count();
+            assert_eq!(count, 1, "exactly one Pinned cell for key {key}");
+        }
+        // One seat per bin: no Solver key is claimed by two cells.
+        let mut claims: Vec<PinKey> = host
+            .slot_states()
+            .into_iter()
+            .filter_map(|(_, s)| match s {
+                SlotState::Pinned { key, .. } => Some(key),
+                SlotState::Leased {
+                    role: WorkerRole::Solver,
+                    key: Some(k),
+                }
+                | SlotState::Running {
+                    role: WorkerRole::Solver,
+                    key: Some(k),
+                } => Some(k),
+                _ => None,
+            })
+            .collect();
+        let claimed = claims.len();
+        claims.sort_unstable();
+        claims.dedup();
+        assert_eq!(claims.len(), claimed, "one seat per Solver bin: {claims:?}");
+    }
+
+    /// One drive op.
+    #[derive(Debug, Clone, Copy)]
+    enum PinOp {
+        /// Queue a keyed Solver unit (capacity refusals are the loud,
+        /// counted overflow path — the drive tolerates them).
+        Enqueue { key: u8 },
+        /// One pump pass: dispatch + start every granted unit (T2/T6).
+        Pump,
+        /// Complete one Running slot — T3/T4 (pinnable) or T5 (pooled).
+        Complete { which: u8 },
+        /// Epoch-boundary T9 release of one pinned SOLVER key.
+        Release { which: u8 },
+    }
+
+    fn pin_ops() -> impl Strategy<Value = Vec<PinOp>> {
+        proptest::collection::vec(
+            prop_oneof![
+                3 => any::<u8>().prop_map(|key| PinOp::Enqueue { key }),
+                4 => any::<u8>().prop_map(|_| PinOp::Pump),
+                3 => any::<u8>().prop_map(|which| PinOp::Complete { which }),
+                1 => any::<u8>().prop_map(|which| PinOp::Release { which }),
+            ],
+            0..=28,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(512))]
+        #[test]
+        fn the_derived_pin_view_always_equals_a_naive_scan_of_pinned_cells(
+            ops in pin_ops(),
+        ) {
+            let mut host = stub_host();
+            assert_pin_view_matches_truth(&host);
+            let mut unit_id = 1_u64;
+            for op in ops {
+                match op {
+                    PinOp::Enqueue { key } => {
+                        let id = unit_id;
+                        unit_id += 1;
+                        if let Err(err) = host.enqueue(Unit::noop(
+                            id,
+                            WorkerRole::Solver,
+                            Some(1 + u64::from(key % KEYS)),
+                        )) {
+                            assert!(
+                                matches!(err, EnqueueError::QueueFull { .. }),
+                                "solver intake is refused only by the bounded queue: {err}"
+                            );
+                        }
+                    }
+                    PinOp::Pump => {
+                        for (grant, unit) in host.dispatch() {
+                            assert!(matches!(
+                                grant.kind,
+                                GrantKind::PinContinuation | GrantKind::NewPinClaim
+                            ));
+                            host.start(grant.slot, &unit)
+                                .expect("a dispatch grant always starts (T2/T6)");
+                        }
+                    }
+                    PinOp::Complete { which } => {
+                        let running: Vec<SlotId> = host
+                            .slot_states()
+                            .into_iter()
+                            .filter(|(_, s)| matches!(s, SlotState::Running { .. }))
+                            .map(|(slot, _)| slot)
+                            .collect();
+                        let Some(&slot) =
+                            running.get(usize::from(which) % running.len().max(1))
+                        else {
+                            continue;
+                        };
+                        host.complete(slot)
+                            .expect("running slots complete (T3/T4/T5)");
+                    }
+                    PinOp::Release { which } => {
+                        // Release candidates come from the NAIVE scan (truth
+                        // by construction), Solver pins only.
+                        let pinned: Vec<(PinKey, SlotId)> = naive_pinned(&host)
+                            .into_iter()
+                            .filter(|(key, slot)| {
+                                *key != MERGE_PIN_KEY
+                                    && host.slot_state(*slot)
+                                        == Some(SlotState::Pinned {
+                                            role: WorkerRole::Solver,
+                                            key: *key,
+                                        })
+                            })
+                            .collect();
+                        let Some(&(key, slot)) =
+                            pinned.get(usize::from(which) % pinned.len().max(1))
+                        else {
+                            continue;
+                        };
+                        host.begin_epoch();
+                        assert_eq!(
+                            host.release_pin(key),
+                            Ok(slot),
+                            "T9 releases the live pin for key {key}"
+                        );
+                        host.end_epoch();
+                    }
+                }
+                assert_pin_view_matches_truth(&host);
+            }
+        }
+    }
+
+    /// The pin-order contract (DNZQ5G): the derived pin view renders in
+    /// SLOT-INDEX order — the deliberate normalization of the old mirror's
+    /// MRU order (no caller observes pin order; `pins()` had zero callers
+    /// and continuations are per-key to per-key seats).
+    #[test]
+    fn pins_render_in_slot_index_order() {
+        let mut host = stub_host();
+        // Claim two solver pins; dispatch grants queue order onto the
+        // lowest idle slots: key 9 → slot 0, key 1 → slot 1 (keys
+        // DELIBERATELY out of numeric order).
+        host.enqueue(Unit::noop(1, WorkerRole::Solver, Some(9)))
+            .expect("queue");
+        host.enqueue(Unit::noop(2, WorkerRole::Solver, Some(1)))
+            .expect("queue");
+        let grants = host.dispatch();
+        assert_eq!(grants.len(), 2, "two cold claims, two idle solver seats");
+        let slot9 = grants[0].0.slot;
+        let slot1 = grants[1].0.slot;
+        for (grant, unit) in grants {
+            host.start(grant.slot, &unit).expect("T2");
+            host.complete(grant.slot).expect("T3");
+        }
+        let rendered: Vec<(PinKey, SlotId)> = pinned_slots(&host.slots).collect();
+        assert_eq!(
+            rendered,
+            vec![(9, slot9), (1, slot1), (MERGE_PIN_KEY, 15)],
+            "slot-index order, NOT key order (the boot merge pin renders last)"
+        );
+        assert!(slot9 < slot1, "claims landed on ascending slots");
+        // MRU → slot-index normalization: run ONE T6 continuation cycle on
+        // the LOWER-slot pin (key 9). The old `pins` mirror was MRU-ordered
+        // (complete()'s retain+push), so this completion would have
+        // re-ordered the table to [(1, slot1), (9, slot9)] — most recently
+        // completed first. The derived renderer is slot-index ordered;
+        // order among distinct keys carries no semantics (continuations
+        // are per-key to per-key seats), so the normalization is
+        // unobservable.
+        host.enqueue(Unit::noop(3, WorkerRole::Solver, Some(9)))
+            .expect("queue");
+        for (grant, unit) in host.dispatch() {
+            assert_eq!(grant.kind, GrantKind::PinContinuation);
+            assert_eq!(
+                grant.slot, slot9,
+                "the pin IS the key: the continuation grants to its own seat"
+            );
+            host.start(grant.slot, &unit).expect("T6");
+            host.complete(grant.slot).expect("T3");
+        }
+        let rendered: Vec<(PinKey, SlotId)> = pinned_slots(&host.slots).collect();
+        assert_eq!(
+            rendered,
+            vec![(9, slot9), (1, slot1), (MERGE_PIN_KEY, 15)],
+            "slot-index order survives the cycle (the mirror would have MRU-reordered)"
+        );
+    }
+}
+
 /// LW-T2 (Seam B): the lane ctx's warm arena is minted at the GRANT seam —
 /// the FIRST cycle's ctx already carries the warm token; the identity
 /// survives cycles within a pin, and a T9 role switch yields a DIFFERENT

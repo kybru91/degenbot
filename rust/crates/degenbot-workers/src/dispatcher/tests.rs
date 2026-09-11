@@ -111,6 +111,89 @@ fn boot_pins_exactly_one_merge_and_registers_the_census() {
     }
 }
 
+/// DNZQ5G (Q1): the FSM can only reach `Pinned{k}` on ONE cell (the
+/// one-seat-per-bin contract), and the derived `pin_slot` agrees with
+/// that unique cell across claim and T6 cycles.
+#[test]
+fn exactly_one_pin_per_key_is_representable() {
+    let mut host = host();
+    // Claim key 7 through the dispatch path (T1→T2→T3).
+    host.enqueue(Unit::noop(1, WorkerRole::Solver, Some(7)))
+        .expect("queue");
+    let grants = host.dispatch();
+    let slot = grants
+        .iter()
+        .find(|(g, _)| g.kind == GrantKind::NewPinClaim)
+        .expect("the cold claim is granted")
+        .0
+        .slot;
+    host.start(slot, &Unit::noop(1, WorkerRole::Solver, Some(7)))
+        .expect("T2");
+    host.complete(slot).expect("T3");
+    let pinned = |host: &FleetHost| {
+        host.slot_states()
+            .into_iter()
+            .filter_map(|(s, st)| match st {
+                SlotState::Pinned {
+                    role: WorkerRole::Solver,
+                    key,
+                } => Some((s, key)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(pinned(&host), vec![(slot, 7)]);
+    assert_eq!(host.pin_slot(7), Some(slot));
+    // A T6 cycle (start + complete) cannot produce a second `Pinned{7}`:
+    // the seat re-pins to the SAME cell.
+    host.start(slot, &Unit::noop(2, WorkerRole::Solver, Some(7)))
+        .expect("T6");
+    host.complete(slot).expect("T3 again");
+    assert_eq!(
+        pinned(&host),
+        vec![(slot, 7)],
+        "still exactly one Pinned{{7}} after the continuation cycle"
+    );
+    assert_eq!(host.pin_slot(7), Some(slot));
+}
+
+/// DNZQ5G (Q1) shim: `merge_slot()` reads the LAST boot slot (the boot
+/// construction pins it there T1→T2→T4); 2SIOHJ's `SlotLayout` owns this
+/// read next.
+#[test]
+fn merge_slot_reads_the_boot_layout() {
+    let host = host();
+    let merge = host.merge_slot().expect("merge pinned at boot");
+    let (last, last_state) = *host.slot_states().last().expect("non-empty table");
+    assert_eq!(
+        merge, last,
+        "the merge slot is structurally the last boot slot"
+    );
+    assert_eq!(
+        last_state,
+        SlotState::Pinned {
+            role: WorkerRole::Merge,
+            key: MERGE_PIN_KEY,
+        }
+    );
+    // No second merge pin anywhere in the table.
+    assert_eq!(
+        host.slot_states()
+            .iter()
+            .filter(|(_, s)| {
+                matches!(
+                    s,
+                    SlotState::Pinned {
+                        role: WorkerRole::Merge,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn merge_is_never_queued_and_declared_roles_are_gated() {
     let mut host = host();
