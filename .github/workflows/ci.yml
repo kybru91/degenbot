@@ -263,7 +263,7 @@ jobs:
     # Consolidation of the former python-lint / python-test matrix /
     # python-test-anvil jobs, which were byte-identical environments (uv +
     # Rust toolchain + maturin develop) differing only in their final
-    # commands. The 3.12 floor leg absorbs the lint steps and the anvil tier;
+    # commands. The 3.12 floor leg absorbs the lint steps and the anvil tier; the other versions run a limited set of testsW;
     # 3.14 is the ceiling leg. 3.13 was dropped as a mid-endpoint.
     name: Python ${{ matrix.python-version }} (fleet ${{ matrix.fleet-profile }})
     needs: changes
@@ -276,11 +276,12 @@ jobs:
         # tier boots the serial binding); job B is forced `pinned` (the
         # operator override: seats and fan-out, marked oversubscribed on
         # the sub-floor host). The 3.12 floor leg carries both profiles;
-        # the 3.14 ceiling leg stays auto.
+        # all others stay auto.
         python-version:
           - "3.12"
           - "3.13"
           - "3.14"
+          - "3.15"
         fleet-profile:
           - auto
         include:
