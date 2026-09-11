@@ -7677,4 +7677,64 @@ pub(crate) mod test_keys {
             Self::new()
         }
     }
+
+    // Cold-start trace (detached-cycle arm attribution): the cycle span must
+    // carry `cycle.arm` for BOTH arms, and the degraded-in-cycle stamp must be
+    // derivable WITHOUT log archaeology. The helper below is the ONE wiring
+    // site (solver_dispatch, at the machine's begin_cycle verdict).
+    #[cfg(feature = "otel")]
+    #[test]
+    fn cycle_arm_span_field_stamps_both_arms() {
+        use crate::arb_engine::solver_dispatch::record_cycle_arm_telemetry;
+        use opentelemetry_sdk::trace::InMemorySpanExporter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let exporter = InMemorySpanExporter::default();
+        let (provider, tracer) = crate::otel::provider_with_exporter(exporter.clone());
+        let subscriber = tracing_subscriber::registry().with(crate::otel::layer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let detached =
+                tracing::info_span!("degenbot.arb.solve", cycle.arm = tracing::field::Empty,);
+            let _g = detached.enter();
+            record_cycle_arm_telemetry(&detached, "detached", false);
+            drop(_g);
+
+            let degraded =
+                tracing::info_span!("degenbot.arb.solve", cycle.arm = tracing::field::Empty,);
+            let _g = degraded.enter();
+            record_cycle_arm_telemetry(&degraded, "in_cycle", true);
+        });
+
+        provider.force_flush().expect("flush");
+        let spans = exporter.get_finished_spans().expect("spans");
+        let solve_spans: Vec<_> = spans
+            .iter()
+            .filter(|sp| sp.name.as_ref() == "degenbot.arb.solve")
+            .collect();
+        assert_eq!(
+            solve_spans.len(),
+            2,
+            "expected exactly the two stamped cycle spans; got {spans:?}"
+        );
+        // Completion order is not send order (the exporter drains LIFO) —
+        // assert the VALUE SET, one span per arm stamp.
+        let arm_values: Vec<String> = solve_spans
+            .iter()
+            .filter_map(|sp| {
+                sp.attributes
+                    .iter()
+                    .find(|kv| kv.key == opentelemetry::Key::from_static_str("cycle.arm"))
+                    .and_then(|kv| match &kv.value {
+                        opentelemetry::Value::String(v) => Some(v.to_string()),
+                        _ => None,
+                    })
+            })
+            .collect();
+        assert!(
+            arm_values.contains(&"detached".to_string())
+                && arm_values.contains(&"in_cycle".to_string()),
+            "both arms must stamp cycle.arm exactly once each; got {arm_values:?}"
+        );
+    }
 }

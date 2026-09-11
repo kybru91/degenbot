@@ -176,6 +176,9 @@ impl EngineStages {
             "degenbot.arb.solve",
             block.number = block,
             cycle.solve_block = tracing::field::Empty,
+            // Cold-start trace: the dispatch arm ("detached" | "in_cycle"),
+            // recorded at the machine's begin_cycle verdict in solver_dispatch.
+            cycle.arm = tracing::field::Empty,
         );
         // ZZS6CG: exact-match reparent onto this block's published pump
         // span. The work now runs INLINE in the driver (no drainer task), so

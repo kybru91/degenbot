@@ -182,6 +182,8 @@ pub mod instruments {
         pub fn count_detached_stale_dropped(&self) {}
         /// no-op
         pub fn count_detached_applied(&self) {}
+        /// no-op (cold-start trace: degraded-cycle counter)
+        pub fn count_detached_degraded_cycle(&self) {}
     }
 
     /// Epic FRKBGP close-out: resident set bytes (drift-watch). Default

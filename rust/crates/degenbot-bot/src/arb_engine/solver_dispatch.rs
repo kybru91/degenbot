@@ -54,6 +54,20 @@ static WALK_DENSE_ALERTED: std::sync::atomic::AtomicBool =
 static SIM_BOOT_REFUSAL_LOGGED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// THE one arm-attribution wiring site (cold-start trace): the cycle span is
+/// tagged with `cycle.arm` (`detached` | `in_cycle`), and an in-cycle cycle
+/// under the detached stance — the machine's cap verdict at begin — fires the
+/// `degenbot.detached.degraded_cycles` counter. Pipeline-free by design: a
+/// consumer without the meter installed is a no-op (pure-Rust/test seams).
+pub(crate) fn record_cycle_arm_telemetry(span: &tracing::Span, arm: &'static str, degraded: bool) {
+    span.record("cycle.arm", arm);
+    if degraded {
+        if let Some(p) = crate::instruments::pipeline() {
+            p.count_detached_degraded_cycle();
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RAYPAR T3: LPT-pre-balanced scoped-thread partition
 // ---------------------------------------------------------------------------
@@ -2070,6 +2084,10 @@ impl ArbitrageEngine {
         self.walk_memo.begin_block(solve_block);
         // If no paths are affected, just update the block number
         if affected_path_ids.is_empty() {
+            // Cold-start trace: keys with NO registered paths reach here as a
+            // bookkeeping-only pass (span exists, no dispatch) — stamp so the
+            // cycle span never reads as arm-less.
+            record_cycle_arm_telemetry(&solve_span, "skipped_empty", false);
             // 6XB6NJ: monotone advance on the block cursor.
             self.cursor.advance_solved(solve_block);
             return;
@@ -2616,10 +2634,20 @@ impl ArbitrageEngine {
         // consult, the ONE seq tick, and the merge-pipe open-once + Sender
         // clone all live on the machine now. The construction-stamped
         // `detached_solving` stance reads in here.
+        let arm = self.detached_cycle.begin_cycle(self.detached_solving);
+        // Cold-start trace: attribute the arm on the cycle span + count a
+        // degraded verdict BEFORE the arms move ownership (the machine has
+        // already latched the begin decision — detached_cycle::transition).
+        match &arm {
+            Arm::Detached { .. } => record_cycle_arm_telemetry(&solve_span, "detached", false),
+            Arm::InCycle => {
+                record_cycle_arm_telemetry(&solve_span, "in_cycle", self.detached_solving);
+            }
+        }
         if let Arm::Detached {
             cycle_seq,
             merge_tx,
-        } = self.detached_cycle.begin_cycle(self.detached_solving)
+        } = arm
         {
             hotpath::measure_block!("arb_solve.detached_enqueue", {
                 // The Q1a freshness oracle: each item rides the per-hop

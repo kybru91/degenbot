@@ -181,6 +181,9 @@ pub struct PipelineInstruments {
     detached_stale_dropped: Counter<u64>,
     /// Epic SRQEK5 T2: detached stragglers applied to the results map.
     detached_applied: Counter<u64>,
+    /// Cold-start trace: cycles the machine DEGRADED to the in-cycle arm
+    /// (`Arm::InCycle` under the detached stance — the in-flight cap verdict).
+    detached_degraded_cycles: Counter<u64>,
     /// Epic K4ETHF T2: time an acquisition waited for the core `BotState`
     /// lock, labeled by `site` (closed set from
     /// `bot_core::state_lock::site_class_for`) + `mode` (read|write).
@@ -507,6 +510,10 @@ impl PipelineInstruments {
             detached_applied: meter
                 .u64_counter("degenbot.detached.applied")
                 .with_description("Detached stragglers applied to the results map")
+                .build(),
+            detached_degraded_cycles: meter
+                .u64_counter("degenbot.detached.degraded_cycles")
+                .with_description("Solve cycles DEGRADED to the in-cycle arm (in-flight cap verdict at begin)")
                 .build(),
             state_lock_wait: meter
                 .f64_histogram("degenbot.state_lock.wait")
@@ -874,6 +881,11 @@ impl PipelineInstruments {
     /// One detached straggler applied to the results map.
     pub fn count_detached_applied(&self) {
         self.detached_applied.add(1, &[]);
+    }
+
+    /// One solve cycle DEGRADED to the in-cycle arm (the cap verdict at begin).
+    pub fn count_detached_degraded_cycle(&self) {
+        self.detached_degraded_cycles.add(1, &[]);
     }
 
     /// Epic K4ETHF T2: one state-lock acquisition wait. `site` is a small
