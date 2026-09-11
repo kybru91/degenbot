@@ -178,33 +178,84 @@ def test_fleet_station_executes_callables_on_named_fleet_seats() -> None:
     assert "FLEET-OK" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
 
 
+_LEGACY_CHILD = """
+import os
+import sys
+
+# FF-T5 determinism (the addendum): a FRESH process - no engine
+# constructed, no stance env - so the legacy-stance view is what the
+# child sees, regardless of which in-process test ran first under
+# pytest-randomly/xdist (the pass/skip wobble is dead by construction).
+os.environ.pop("DEGENBOT_FLEET", None)
+os.environ.pop("DEGENBOT_FLEET_PROFILE", None)
+
+from degenbot._ffi import Bot
+
+bot = Bot(1)
+assert bot.registration_fleet_hosted() is False, "a fresh process boots legacy"
+try:
+    bot.submit_registration_unit(lambda: 1)
+except RuntimeError as exc:
+    assert "not fleet-hosted" in str(exc), exc
+else:
+    raise AssertionError("the legacy stance must refuse the fleet intake")
+
+from types import SimpleNamespace
+from degenbot.runner.build_paths import PathRegistrationPipeline
+
+ctx = SimpleNamespace(
+    bot=bot,
+    chain_id=1,
+    db=None,
+    uniswap_v3_tracker=None,
+    sushiswap_v3_tracker=None,
+    pancakeswap_v3_tracker=None,
+    weth=None,
+)
+try:
+    PathRegistrationPipeline(context=ctx, engine_registry=None)
+except RuntimeError as exc:
+    assert "fleet-hosted only" in str(exc), exc
+else:
+    raise AssertionError("PRG-5: a pipeline over a legacy bot must refuse")
+
+print("LEGACY-OK")
+"""
+
+
 def test_legacy_stance_keeps_the_incumbent_pool() -> None:
-    """No engine stance installed (test-session default): intake refuses."""
-    bot = Bot(1)
-    # The pytest session boots WITHOUT the fleet stance (module-init holder
-    # read the live env), so the intake gate refuses loudly and the legacy
-    # worker pool remains the execution home.
-    if bot.registration_fleet_hosted():
-        pytest.skip("session env carries DEGENBOT_FLEET=fleet")
-    with pytest.raises(RuntimeError, match="not fleet-hosted"):
-        bot.submit_registration_unit(lambda: 1)
+    """No engine stance installed (a fresh process): intake refuses."""
+    # FF-T5 (the addendum determinism fix): the legacy-stance assertions
+    # run in a SUBPROCESS - a fresh process never carries another test's
+    # in-process engine construction, so the skip condition (and the
+    # pass/skip wobble under pytest-randomly/xdist) is gone: the test is
+    # deterministic on every host and every ordering.
+    proc = subprocess.run(
+        [sys.executable, "-c", _LEGACY_CHILD],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parents[2]),
+        timeout=120,
+        check=False,
+    )
+    assert "LEGACY-OK" in proc.stdout, (
+        f"stdout={proc.stdout!r} stderr_tail={proc.stderr[-1500:]!r}"
+    )
 
 
 def test_legacy_stance_pipeline_construction_refuses() -> None:
     """PRG-5 hard cutover: a pipeline over a legacy-stance bot refuses."""
-    bot = Bot(1)
-    if bot.registration_fleet_hosted():
-        pytest.skip("session env carries DEGENBOT_FLEET=fleet")
-    ctx = SimpleNamespace(
-        bot=bot,
-        chain_id=1,
-        db=None,
-        uniswap_v3_tracker=None,
-        sushiswap_v3_tracker=None,
-        pancakeswap_v3_tracker=None,
-        weth=None,
+    # The subprocess child asserts BOTH legacy arms (the intake refusal
+    # and the pipeline construction refusal): one fresh process, both
+    # contracts, deterministic under every test ordering.
+    proc = subprocess.run(
+        [sys.executable, "-c", _LEGACY_CHILD],
+        capture_output=True,
+        text=True,
+        cwd=str(Path(__file__).parents[2]),
+        timeout=120,
+        check=False,
     )
-    from degenbot.runner.build_paths import PathRegistrationPipeline
-
-    with pytest.raises(RuntimeError, match="fleet-hosted only"):
-        PathRegistrationPipeline(context=ctx, engine_registry=None)
+    assert "LEGACY-OK" in proc.stdout, (
+        f"stdout={proc.stdout!r} stderr_tail={proc.stderr[-1500:]!r}"
+    )

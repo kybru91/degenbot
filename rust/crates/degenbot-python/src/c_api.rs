@@ -42,6 +42,10 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(crate::build_info::build_number, m)?)?;
     m.add_function(wrap_pyfunction!(crate::build_info::build_fingerprint, m)?)?;
 
+    // FF-T5 (NT7HJC): the runtime fleet status — budget, plan,
+    // census ("degenbot.runtime_status()").
+    m.add_function(wrap_pyfunction!(crate::runtime_status::runtime_status, m)?)?;
+
     // Ambient-runtime driver seam (VJGZJ2): lets a Python driver satisfy the
     // ambient-runtime-only policy on the verify seams. Unconditional —
     // degenbot-core (the runtime singleton) is.

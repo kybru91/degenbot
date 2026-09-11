@@ -87,6 +87,7 @@ pub mod fleet_intake;
 mod fleet_registration_executor;
 mod fleet_sim_executor;
 pub(crate) mod fleet_solve_executor;
+pub mod fleet_status;
 pub mod inline_sim;
 pub mod lifecycle;
 pub mod path_info;

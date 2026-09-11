@@ -191,6 +191,9 @@ pub mod instruments {
         None
     }
 
+    /// no-op (FF-T5 fleet profile metric)
+    pub fn note_fleet_profile(_summary: &crate::arb_engine::fleet_status::FleetProfileSummary) {}
+
     /// Always `None` — metrics are compiled out of this build.
     #[must_use]
     pub fn pipeline() -> Option<&'static PipelineInstruments> {

@@ -183,6 +183,16 @@ pub fn boot_installed() -> bool {
     FLEET_REGISTRATION_BOOT.get().is_some()
 }
 
+/// The installed stamp's BOOT value (FF-T5, NT7HJC — the runtime
+/// status's authoritative source: the boot the FIRST engine
+/// construction derived from ITS OWN config). `None` pre-construction.
+#[must_use]
+pub fn stamped_boot() -> Option<degenbot_workers::dispatcher::FleetBoot> {
+    FLEET_REGISTRATION_BOOT
+        .get()
+        .map(crate::arb_engine::boot_stamp::BootStamp::boot)
+}
+
 /// The process-wide fleet registration intake executor, built lazily on the
 /// first fleet-stance intake submission and persisting for the process
 /// lifetime. Crate-internal (LNQDOA §4.2): its only callers are the

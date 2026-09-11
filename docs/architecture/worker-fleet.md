@@ -437,3 +437,56 @@ field, FF-T2): `pinned` = dedicated seat threads (the fleet roles under the
 pinned binding), `shared` = pooled runtimes (the ambient I/O runtime, the
 inline-sim runtime), `logical` = a lane riding other threads' time (hoisted
 capacities; the fleet roles become logical lanes under the serial binding).
+
+## 14. The tier table and the cutover (FF-T5, NT7HJC)
+
+"auto" resolves host tiers EVERYWHERE via the plan ("degenbot-workers
+plan.rs", fleetplan/1 - one pure function of the budget; no call site
+decides a tier on its own). The tiers:
+
+| Host cores | "auto" resolves | What runs | Notes |
+|---|---|---|---|
+| < 2 | refused | nothing | BelowHostFloor - no tier can host the fleet sum; a typed boot error, the process survives (FF-T1) |
+| 2 - 5 | serial | one named cycle seat per host (work-fleet-serial-0) over the same queue and HostPump; the solve host's keyed-mailbox construction runs the projection's ONE solver seat (serial-0) | the census rows print logical; carries the QuotaTooSmallForPinnedRoles it fell from (tier_refused); the production alert fires (degenbot_fleet_profile{binding="serial"}) |
+| >= 6 | pinned | today's topology: one dedicated thread per seat (work-fleet-sim-{n} / work-fleet-poolupd-{n} / the keyed solver seats) | the boot-frozen SlotLayout; the promotion gate |
+| forced pinned (any >= 2) | pinned | the pinned seats and fan-out, **marked oversubscribed** on sub-floor hosts (plan.oversubscribed) | the operator override is honored, never a silent narrow |
+| forced serial (any >= 2) | serial | the serial seats | ditto |
+
+**"degenbot.runtime_status()"** returns the live view: the plan
+(fleet_booted, profile, quota_cpus, binding, oversubscribed,
+tier_refused), the projected budget (the seat/share table), and the
+census rows (with the lane-to-thread binding per resource).
+Pre-construction it is the live default-profile projection
+(fleet_booted: false).
+
+**The metric**: degenbot_fleet_profile{profile,binding,oversubscribed}
+(one series, value 1) - the ops alerting reads binding="serial" (a
+production host on the small-host tier is a degradation signal, never a
+silent narrow).
+
+**The pin view (post-DNZQ5G)**: the pin table's single source of truth is
+the slot table's SlotState::Pinned cells, rendered by pinned_slots in
+slot-index order - the hand-maintained mirror is gone; the derived
+renderer IS the representation.
+
+**The binary loud-exit mapping (FF-T1)**: the BOOT-REFUSAL family
+(BelowHostFloor, QuotaTooSmallForPinnedRoles under a forced profile
+that cannot host it) is typed and sticky in the library - the process
+survives; the degenbot binary maps the surfaced BootRefused to its
+named exit. The RUNTIME strand aborts (seat/host thread spawn, enqueue
+refusal, completion refusal, the closed-channel close arm) keep
+abort_executor and their byte-pinned wording - ADR-040 fatal bucket, by
+design.
+
+**Lane-death terminal receipts (FF-T4)**: a lane that dies mid-flight
+patches every still-owed path onto the pipe as one typed
+Failed(LaneFailure::LaneDeath) record (the ledger stays exact), the
+posture cordons via the sticky PostureCause::LaneDeath input, and the
+process LIVES.
+
+**The CI profile matrix (FF-T5)**: job A is "auto" on the standard 4-vCPU
+runner (the real small-host path - the serial tier); job B is forced
+"pinned" (the seats and fan-out, marked oversubscribed). The
+budget-algebra (the pure plan/budget tiering tests) and the binding-parity
+gates (the pinned-vs-serial outcome-corpus identity) run as named CI
+steps.

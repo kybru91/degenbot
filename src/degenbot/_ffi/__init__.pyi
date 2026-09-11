@@ -135,6 +135,16 @@ def call_on_ambient_runtime(fn: object) -> object:
 
 def build_fingerprint() -> str: ...
 def build_number() -> int: ...
+def runtime_status() -> dict[str, Any]:
+    """FF-T5 (NT7HJC): the runtime fleet status.
+
+    Returns a dict with the resolved plan (``fleet_booted``, ``profile``,
+    ``quota_cpus``, ``binding`` (pinned/serial), ``oversubscribed``,
+    ``tier_refused``), the projected budget (``budget``: the seat/share
+    table), and the worker census rows (``census``: one dict per
+    resource, with the lane-to-thread ``binding`` per row).
+    """
+
 def build_path_graph(
     database_path: str,
     chain_id: int,
@@ -1535,6 +1545,7 @@ __all__ = [
     "pool",
     "price",
     "provider",
+    "runtime_status",
     "shutdown_log_drainer",
     "shutdown_subscriber_drainer",
     "simulation",

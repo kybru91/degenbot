@@ -876,6 +876,11 @@ fn abort_executor(desc: &SeatRoleDesc, context: &str, err: &str) -> ! {
 /// [`BootRole`] row.
 pub(crate) fn install_boot(courier: &OnceLock<BootStamp>, desc: &SeatRoleDesc, stamp: BootStamp) {
     crate::arb_engine::boot_stamp::record_ride(desc.boot_role, &stamp);
+    // FF-T5 (NT7HJC): record the resolved fleet profile ONCE (first
+    // writer wins, like the stamp itself): the process summary feeds the
+    // degenbot_fleet_profile metric, and a serial-tier resolution fires
+    // the production alert (never a silent narrow).
+    crate::arb_engine::fleet_status::record_fleet_profile_at_install(&stamp.boot());
     let _ = courier.set(stamp);
 }
 

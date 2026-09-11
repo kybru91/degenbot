@@ -157,6 +157,16 @@ jobs:
       - name: Run Tests
         run: just test-rust
 
+      # FF-T5 (NT7HJC): the fleet budget-algebra (the pure plan/budget
+      # tiering tests) and the binding-parity gates (the pinned-vs-serial
+      # outcome-corpus identity) run as a NAMED step so a fleet-tier
+      # regression is readable in the check log, not buried in the suite.
+      - name: Run fleet budget-algebra + binding parity gates (FF-T5)
+        run: |
+          cd rust
+          cargo test -p degenbot-workers -- plan budget
+          cargo test -p degenbot-bot -- the_outcome_corpus lane_death
+
       # Former standalone "Solver Golden Replay (F2 gate)" job; the golden
       # regression now fails the `rust` job.
       - name: Run two-sided golden replay gate (offline, blocks merge)
@@ -255,15 +265,26 @@ jobs:
     # Rust toolchain + maturin develop) differing only in their final
     # commands. The 3.12 floor leg absorbs the lint steps and the anvil tier;
     # 3.14 is the ceiling leg. 3.13 was dropped as a mid-endpoint.
-    name: Python ${{ matrix.python-version }}
+    name: Python ${{ matrix.python-version }} (fleet ${{ matrix.fleet-profile }})
     needs: changes
     if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     strategy:
       matrix:
+        # FF-T5 (NT7HJC) - the fleet profile matrix: job A is `auto` on the
+        # standard 4-vCPU runner (the REAL small-host path: the 2-5-core
+        # tier boots the serial binding); job B is forced `pinned` (the
+        # operator override: seats and fan-out, marked oversubscribed on
+        # the sub-floor host). The 3.12 floor leg carries both profiles;
+        # the 3.14 ceiling leg stays auto.
         python-version:
           - "3.12"
           - "3.14"
+        fleet-profile:
+          - auto
+        include:
+          - python-version: "3.12"
+            fleet-profile: pinned
 
     steps:
       - uses: actions/checkout@v7
@@ -313,3 +334,7 @@ jobs:
 
       - name: Run Tests
         run: just test-python
+        env:
+          # FF-T5: the profile leg force (auto is the enum default - same
+          # behavior as unset; pinned is the forced-override leg).
+          DEGENBOT_FLEET_PROFILE: ${{ matrix.fleet-profile }}

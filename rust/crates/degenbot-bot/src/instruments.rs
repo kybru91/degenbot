@@ -134,6 +134,12 @@ pub struct PipelineInstruments {
     /// (`resource` = the `degenbot_core::worker_census` registry id, a
     /// small closed set). Rendered as `degenbot_worker_census{resource=...}`.
     worker_census: Gauge<f64>,
+    /// FF-T5 (NT7HJC): the resolved fleet profile — one series,
+    /// low-cardinality labels (profile / binding / oversubscribed),
+    /// value 1. Rendered as
+    /// `degenbot_fleet_profile{profile=...,binding=...}`; the ops
+    /// alerting reads `binding="serial"` (the production alert).
+    fleet_profile: Gauge<f64>,
     /// Candidates entering the simulate fan-out (per-batch sizes summed).
     candidates_found: Counter<u64>,
     /// Solver CL-hop self-corrections (input/forward clamp + output align).
@@ -407,6 +413,12 @@ impl PipelineInstruments {
                 .f64_gauge("degenbot.worker.census")
                 .with_description(
                     "Worker census (PE4FPM): declared worker/slot count per execution resource; the resource label is the census registry id",
+                )
+                .build(),
+            fleet_profile: meter
+                .f64_gauge("degenbot.fleet.profile")
+                .with_description(
+                    "The resolved fleet host-binding profile (FF-T5): profile / binding / oversubscribed; alert on binding=\"serial\" (the small-host tier)",
                 )
                 .build(),
             candidates_found: meter
@@ -745,6 +757,29 @@ impl PipelineInstruments {
             .record(workers, &[KeyValue::new("resource", resource.to_owned())]);
     }
 
+    /// FF-T5 (NT7HJC): the resolved fleet profile — one series,
+    /// value 1, the labels carry the tier.
+    pub fn set_fleet_profile(
+        &self,
+        summary: &crate::arb_engine::fleet_status::FleetProfileSummary,
+    ) {
+        self.fleet_profile.record(
+            1.0,
+            &[
+                KeyValue::new("profile", summary.profile),
+                KeyValue::new("binding", summary.binding),
+                KeyValue::new(
+                    "oversubscribed",
+                    if summary.oversubscribed {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                ),
+            ],
+        );
+    }
+
     /// A batch of `n` candidates entered the simulate fan-out.
     pub fn count_candidates_found(&self, n: u64) {
         self.candidates_found.add(n, &[]);
@@ -982,7 +1017,15 @@ pub fn pipeline() -> Option<&'static PipelineInstruments> {
                 // including lazily-booted resources registered after the
                 // boot dump.
                 degenbot_core::worker_census::set_export_hook(export_worker_census);
-                PipelineInstruments::new(&meter)
+                let instruments = PipelineInstruments::new(&meter);
+                // FF-T5 (NT7HJC): if the stamp installed BEFORE the
+                // pipeline, record the fleet profile now (the install
+                // path re-fires through note_fleet_profile when the
+                // pipeline came first).
+                if let Some(summary) = crate::arb_engine::fleet_status::fleet_profile_summary() {
+                    instruments.set_fleet_profile(&summary);
+                }
+                instruments
             })
         })
         .as_ref()
@@ -994,6 +1037,16 @@ pub fn pipeline() -> Option<&'static PipelineInstruments> {
 fn export_worker_census(entries: &[degenbot_core::worker_census::WorkerCensusEntry]) {
     if let Some(p) = pipeline() {
         export_worker_census_with(p, entries);
+    }
+}
+
+/// FF-T5 (NT7HJC): record the resolved fleet profile (the stamp-install
+/// site calls this; the pipeline may not exist yet — the build path
+/// below re-reads the summary so both orders land one series). No-op
+/// while the pipeline is un-built (non-otel builds / gate off).
+pub fn note_fleet_profile(summary: &crate::arb_engine::fleet_status::FleetProfileSummary) {
+    if let Some(p) = pipeline() {
+        p.set_fleet_profile(summary);
     }
 }
 

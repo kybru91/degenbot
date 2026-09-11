@@ -9,6 +9,7 @@ from .abi import decode_single as abi_decode_single
 from .abi import encode as abi_encode
 from .bot import Bot
 from .checksum_cache import get_checksum_address
+from .runtime_status import runtime_status
 from .version import __version__
 
 # isort: split
@@ -126,4 +127,5 @@ __all__ = (
     "get_checksum_address",
     "logger",
     "pool_type_registry",
+    "runtime_status",
 )

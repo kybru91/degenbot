@@ -977,3 +977,54 @@ _Avoid_: "quote", "oracle", "gate" (admission-control connotations),
 
 
 
+
+
+## The worker fleet (FF-T5 glossary - epic OFQ2UW)
+
+The fleet's execution vocabulary - one meaning per word, closed set
+(the long form is docs/architecture/worker-fleet.md):
+
+- **Lane** - a logical ownership lane: WHO owns which receipts and
+  ledger writes (H reserve, A ambient, R resolve, M merge, the
+  PoolStateUpdater / SimDriver / Solver seats). A lane names ownership,
+  never a thread.
+- **Seat** - a runtime a unit executes on. Pooled seats contend on one
+  shared work queue (SimDriver, PoolStateUpdater); keyed solver seats
+  are one-per-bin persistent mailboxes (bins == pins). A seat is named
+  for the census (work-fleet-sim-{n}, work-fleet-poolupd-{n},
+  work-fleet-serial-0).
+- **Binding** - the adapter that maps lanes to threads (FF-T3): pinned
+  = one dedicated thread per seat (the 6+-core tier); serial = one
+  named cycle seat per host running every granted unit in grant order
+  (the 2-5-core tier); logical = a lane riding other threads' time
+  (how the census prints serial-tier rows).
+- **Plan** - one pure function of the budget (FF-T2, fleetplan/1):
+  quota + profile + overrides -> binding + the projected budget +
+  oversubscription marks + the tier refusal it fell from. "auto"
+  resolves tiers everywhere through it; no call site decides a tier on
+  its own.
+- **Budget** - the seat/share table (H reserve, A ambient I/O, R
+  resolve, M merge, the solver pins, the SimDriver and PoolStateUpdater
+  slot caps), sum-checked against floor(quota).
+- **Census** - the worker registry: one row per execution resource
+  (thread-name pattern, sizing rule, count, binding). Boot-dumped as
+  one structured log line; exported as the degenbot.worker.census
+  metric; visible per row through runtime_status().
+- **Intake receipt** - the awaiting caller's join on a submitted intake
+  unit (registration builds). Held in the unbounded section-10 backlog
+  under a cordon - never dropped; the submitter is never stranded.
+- **Lane-death terminal receipt** - a lane that dies mid-flight patches
+  every still-owed path onto the pipe as one typed
+  Failed(LaneFailure::LaneDeath) record: the outcome ledger stays
+  exact, the posture cordons (sticky), the process lives.
+- **Posture cause** - WHY the fleet cordoned (FF-T4): the throttle
+  hysteresis (enter on the sample triggers, exit on the clean window)
+  or a lane death (enter immediately, sticky - the clean window never
+  lifts it; only a fresh process does).
+- **runtime_status()** - the live-process view (FF-T5):
+  degenbot.runtime_status() returns the plan, the projected budget, and
+  the census rows. Pre-construction it is the default-profile
+  projection (fleet_booted: false).
+
+_Avoid_: "worker pool" for fleet seats (the legacy incumbent pool was
+the ThreadPoolExecutor the fleet replaced), "mode" for binding.

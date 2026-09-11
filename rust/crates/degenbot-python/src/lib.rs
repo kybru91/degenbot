@@ -95,6 +95,10 @@ pub mod price;
 pub mod python_log_layer;
 #[cfg(feature = "rpc")]
 pub mod rpc;
+/// FF-T5 (NT7HJC): the runtime fleet status — budget, plan, census
+/// ("degenbot.runtime_status()"). Unconditional — the plan
+/// function and the census are.
+pub mod runtime_status;
 #[cfg(feature = "simulation")]
 pub mod simulation;
 pub mod solady;
