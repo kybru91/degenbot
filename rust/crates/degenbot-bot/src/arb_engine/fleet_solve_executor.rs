@@ -24,8 +24,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 
 use crate::arb_engine::boot_stamp::{BootRole, BootStamp};
+use crate::arb_engine::seat_host::{GrantContract, HostDiscipline, HostMsg, HostPump, SeatSink};
 use degenbot_workers::dispatcher::{
-    BootError, FleetBoot, FleetHost, SubmitError, SubmitReceipt, Unit,
+    BootError, FleetBoot, FleetHost, Grant, GrantKind, SubmitError, SubmitReceipt, Unit,
 };
 use degenbot_workers::lane::{LaneCtx, QuitSig};
 use degenbot_workers::role::WorkerRole;
@@ -87,16 +88,6 @@ struct SeatJob {
     ctx: LaneCtx,
 }
 
-/// Host-bound message: a submitted bin unit, or a seat reporting its unit
-/// done (completion drives T3 — the seat re-pins warm for the next cycle).
-/// (JCI2FW Part A: the retired `HostMsg::Throttle` posture-feed arm is
-/// dissolved — the ONE process posture owner is fed by the block pump and
-/// this host consults it through `FleetHost`'s read-throughs.)
-enum HostMsg {
-    Enqueue(Unit),
-    SeatDone { seat: u64 },
-}
-
 /// The fleet-hosted solve executor. Shared by all engine cycles (the
 /// global static hands out `&'static`, mirroring the incumbent executor's
 /// construction-once contract: persistent seats keep warm L1/L2 +
@@ -104,9 +95,13 @@ enum HostMsg {
 pub(crate) struct FleetSolveExecutor {
     tx: mpsc::Sender<HostMsg>,
     unit_seq: AtomicU64,
-    /// The host thread stamps TRUE when an enqueue spilled to the
-    /// unbounded host backlog; submit stamps the receipt with (and resets)
-    /// the flag — the unit is never dropped (§10 ledger).
+    /// The BOUNDED role-queue length at the LAST stamp (spill or
+    /// `SeatDone`) — NOT the backlog depth (6HE6RF comment fix; the
+    /// mechanism is kept). `submit_solve_bin`'s receipt bit compares
+    /// this against the queue cap: "the role queue was >= cap at the
+    /// last stamp" — an advisory lagging flag exactly as
+    /// `SubmitReceipt`'s doc says; the unit is never dropped either way
+    /// (§10 ledger).
     solver_queue_len: Arc<std::sync::atomic::AtomicUsize>,
     /// Seat count (read via [`FleetSolveExecutor::bin_count`] — the
     /// dispatch arms bin at exactly this count so every bin has a home).
@@ -267,10 +262,16 @@ impl FleetSolveExecutor {
             return Err(SubmitError::PortClosed);
         }
         Ok(SubmitReceipt {
-            // The receipt's backlog bit reads the host's queue MIRROR: at or
-            // over the cap, this unit rides the unbounded host backlog and
-            // drains FIRST on the next pump (§10 ledger) — never dropped, never
-            // silent.
+            // The receipt's backlog bit compares the host's queue STAMP (the
+            // BOUNDED role-queue length at the last spill/SeatDone stamp —
+            // NOT the backlog depth) against the cap: TRUE means the role
+            // queue was at/over cap at the last stamp, so this unit rides the
+            // unbounded host backlog and drains FIRST on the next pump (§10
+            // ledger) — never dropped, never silent. ADVISORY under mirror
+            // lag: the stamp is published asynchronously on the host thread,
+            // so the bit is a lagging flag exactly as `SubmitReceipt`'s doc
+            // says (6HE6RF fixed the overstated "backlog mirror" comment;
+            // the mechanism is kept).
             accepted_with_backlog: self.solver_queue_len.load(Ordering::Relaxed)
                 >= self.solver_seats.saturating_mul(2),
         })
@@ -304,139 +305,132 @@ fn seat_loop(seat: u64, rx: mpsc::Receiver<SeatJob>, done: &mpsc::Sender<HostMsg
     }
 }
 
-/// The dispatch loop (design doc §4): enqueue → precedence-grant →
-/// execute. Owns the `FleetHost` exclusively; every FSM transition runs
-/// here. Exits when the submission channel closes (all executor handles
-/// dropped — process teardown), letting seats drain their mailboxes.
-///
-/// `rx` is taken by value under an explicit lint expectation: the
-/// Receiver's ownership moves into the spawned host thread — a borrow
-/// cannot cross the thread boundary.
-#[expect(clippy::needless_pass_by_value)]
+/// The solve host's dispatch loop: build the unified [`HostPump`] for the
+/// Solver pin role (the FOLD MAP — everything per-host is a field) and run
+/// the ONE recv → apply → pump loop (6HE6RF). The seat model (per-seat
+/// keyed mailboxes, warm arenas) stays HERE — P-RZEWTX; only the message
+/// triple joined `seat_host`. (`rx` moves into
+/// [`HostPump::run`] — the thread-boundary move the pre-fold loop
+/// needed a lint expectation for is now `run`'s.)
 fn host_loop(
     rx: mpsc::Receiver<HostMsg>,
     mut host: FleetHost,
     seats: &[mpsc::Sender<SeatJob>],
     solver_queue_len: &std::sync::atomic::AtomicUsize,
 ) {
-    let mut backlog: VecDeque<Unit> = VecDeque::new();
-    while let Ok(msg) = rx.recv() {
-        apply_host_msg(&mut host, &mut backlog, msg, solver_queue_len);
-        pump(&mut host, &mut backlog, seats);
+    let sink = SolveSink { seats };
+    let discipline = SolveDiscipline;
+    let mut backlog = VecDeque::new();
+    HostPump {
+        host: &mut host,
+        backlog: &mut backlog,
+        role: WorkerRole::Solver,
+        grants: GrantContract::SolverPins,
+        sink: &sink,
+        // The typed-submit receipt's advisory stamp — present iff the host
+        // serves a typed-receipt submit seam (the pooled port has nothing
+        // to inform). It stores the BOUNDED role-queue length at the last
+        // stamp (spill or SeatDone) — the honest mirror note, 6HE6RF.
+        mirror: Some(solver_queue_len),
+        discipline: &discipline,
     }
+    .run(rx);
 }
 
-/// Apply one submission or completion (both arrive on the single host
-/// channel — completions can never starve behind a blocking recv).
-fn apply_host_msg(
-    host: &mut FleetHost,
-    backlog: &mut VecDeque<Unit>,
-    msg: HostMsg,
-    solver_queue_len: &std::sync::atomic::AtomicUsize,
-) {
-    match msg {
-        HostMsg::Enqueue(unit) => {
-            // Pre-check capacity INSTEAD of failing enqueue: the host
-            // thread owns every queue mutation, so the check is exact.
-            // Units that do not fit spill to the backlog (unbounded, like
-            // the legacy mpsc) and drain FIRST on the next pump — never
-            // dropped (§10 ledger). The spill STAMPS the backlog mirror so
-            // a submit receipt honestly reports accepted-with-backlog.
-            if host.queue_len(WorkerRole::Solver) >= host.queue_cap(WorkerRole::Solver) {
-                backlog.push_back(unit);
-                solver_queue_len.store(host.queue_len(WorkerRole::Solver), Ordering::Relaxed);
-            } else if let Err(err) = host.enqueue(unit) {
-                // v1-active Solver units cannot hit RoleNotActive /
-                // MergeNeverQueued / PostureHeld; any such error is a
-                // broken invariant, not a drop.
-                abort_executor("solver enqueue", &err.to_string());
-            }
-        }
-        HostMsg::SeatDone { seat } => {
-            if let Err(err) = host.complete(seat) {
-                abort_executor("seat completion (T3)", &err.to_string());
-            }
-            solver_queue_len.store(host.queue_len(WorkerRole::Solver), Ordering::Relaxed);
-        }
-    }
+/// The solve host's seat model (P-RZEWTX, unchanged by 6HE6RF): per-seat
+/// keyed mailboxes — a seat is a persistent pin (T3/T6 warm arenas), so a
+/// granted unit routes POSITIONALLY to the grant slot's mailbox (2SIOHJ:
+/// seat i <-> `SlotLayout::solver.start` + i).
+struct SolveSink<'a> {
+    seats: &'a [mpsc::Sender<SeatJob>],
 }
 
-/// The one precedence grant loop pass (design doc §4): backlog first, then
-/// dispatch grants onto seats. Grants apply T2 (start) at grant time — the
-/// seat's mailbox send IS the claim — and completion arrives via
-/// [`HostMsg::SeatDone`] (T3).
-fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, seats: &[mpsc::Sender<SeatJob>]) {
-    // Backlog drains FIRST (FIFO across the loud-overflow seam).
-    while backlog.front().is_some() {
-        if host.queue_len(WorkerRole::Solver) >= host.queue_cap(WorkerRole::Solver) {
-            break;
-        }
-        let Some(unit) = backlog.pop_front() else {
-            break;
+impl SeatSink for SolveSink<'_> {
+    fn deliver(&self, host: &mut FleetHost, grant: Grant, unit: Unit) {
+        // Positional seat map (2SIOHJ): seat i <-> FleetHost slot
+        // `SlotLayout::solver.start + i` — the solver home range is cut
+        // from index 0 at exactly this vec's length (pinned at the
+        // executor's construction), so the get is the identity map over
+        // the solver seats; any non-solver grant has no mailbox and is
+        // a loud abort, never a silent re-seat. (6HE6RF: the explicit
+        // `GrantContract::SolverPins` kind check in the unified pump
+        // now fires BEFORE this get — this arm is the second, seat-map
+        // layer of the same loud contract.)
+        let Some(seat_tx) = self
+            .seats
+            .get(usize::try_from(grant.slot).unwrap_or(usize::MAX))
+        else {
+            abort_executor(
+                "dispatch grant",
+                "unknown seat (seat i <-> SlotLayout solver_range.start + i —                  a non-solver grant has no mailbox)",
+            );
         };
-        if let Err(err) = host.enqueue(unit) {
-            abort_executor("backlog drain", &err.to_string());
+        // LW-T2 (Seam B): mint the warm arena at the grant seam — the
+        // ctx handed to the unit at dispatch time ALWAYS carries the
+        // warm identity (stable across cycles; released at T9). An
+        // unknown slot here is structurally unreachable (the grant came
+        // from THIS host) — a silent default would violate the loud
+        // posture, so it aborts with BOTH numbers, P6YXA6-style.
+        let arena = host.ensure_arena(grant.slot).unwrap_or_else(|| {
+            abort_executor(
+                "arena mint at grant",
+                &format!(
+                    "slot {} hosts no arena for bin key {}",
+                    grant.slot,
+                    unit.key.unwrap_or(0)
+                ),
+            );
+        });
+        let ctx = LaneCtx {
+            pin: unit.key.unwrap_or(0),
+            arena,
+            // LW-T3 (Seam C): the injected default escalation port (the
+            // inline-sim runtime, registered at hook install) — lanes
+            // without one are refused TYPED at escalate, never dropped.
+            escalation: degenbot_workers::lane::default_escalation_port()
+                .unwrap_or_else(degenbot_workers::lane::no_escalation_port),
+            quit: QuitSig,
+        };
+        let job = SeatJob {
+            unit: grant.unit,
+            work: unit.work,
+            ctx,
+        };
+        if seat_tx.send(job).is_err() {
+            // A dead seat cannot drain its pinned bins' results —
+            // stranded pipe (§10).
+            abort_executor("seat mailbox send", "seat thread is gone");
         }
     }
-    loop {
-        let grants = host.dispatch();
-        if grants.is_empty() {
-            break;
-        }
-        for (grant, unit) in grants {
-            if let Err(err) = host.start(grant.slot, &unit) {
-                abort_executor("grant start (T2)", &err.to_string());
-            }
-            // Positional seat map (2SIOHJ): seat i <-> FleetHost slot
-            // `SlotLayout::solver.start + i` — the solver home range is cut
-            // from index 0 at exactly this vec's length (pinned at the
-            // executor's construction), so the get is the identity map over
-            // the solver seats; any non-solver grant has no mailbox and is
-            // a loud abort, never a silent re-seat.
-            let Some(seat_tx) = seats.get(usize::try_from(grant.slot).unwrap_or(usize::MAX)) else {
-                abort_executor(
-                    "dispatch grant",
-                    "unknown seat (seat i <-> SlotLayout solver_range.start + i — \
-                     a non-solver grant has no mailbox)",
-                );
-            };
-            // LW-T2 (Seam B): mint the warm arena at the grant seam — the
-            // ctx handed to the unit at dispatch time ALWAYS carries the
-            // warm identity (stable across cycles; released at T9). An
-            // unknown slot here is structurally unreachable (the grant came
-            // from THIS host) — a silent default would violate the loud
-            // posture, so it aborts with BOTH numbers, P6YXA6-style.
-            let arena = host.ensure_arena(grant.slot).unwrap_or_else(|| {
-                abort_executor(
-                    "arena mint at grant",
-                    &format!(
-                        "slot {} hosts no arena for bin key {}",
-                        grant.slot,
-                        unit.key.unwrap_or(0)
-                    ),
-                );
-            });
-            let ctx = LaneCtx {
-                pin: unit.key.unwrap_or(0),
-                arena,
-                // LW-T3 (Seam C): the injected default escalation port (the
-                // inline-sim runtime, registered at hook install) — lanes
-                // without one are refused TYPED at escalate, never dropped.
-                escalation: degenbot_workers::lane::default_escalation_port()
-                    .unwrap_or_else(degenbot_workers::lane::no_escalation_port),
-                quit: QuitSig,
-            };
-            let job = SeatJob {
-                unit: grant.unit,
-                work: unit.work,
-                ctx,
-            };
-            if seat_tx.send(job).is_err() {
-                // A dead seat cannot drain its pinned bins' results —
-                // stranded pipe (§10).
-                abort_executor("seat mailbox send", "seat thread is gone");
-            }
-        }
+}
+
+/// The solve host's abort discipline: the same free [`abort_executor`]
+/// the module has always owned — the unified triple's SHARED contexts
+/// route through here, and the solve-specific contexts keep their
+/// pre-fold strings byte-identical.
+struct SolveDiscipline;
+
+impl HostDiscipline for SolveDiscipline {
+    fn fail(&self, context: &str, err: &str) -> ! {
+        abort_executor(context, err)
+    }
+
+    fn enqueue_refused(&self, err: &str) -> ! {
+        abort_executor("solver enqueue", err)
+    }
+
+    fn completion_refused(&self, err: &str) -> ! {
+        abort_executor("seat completion (T3)", err)
+    }
+
+    fn foreign_grant(&self, kind: GrantKind) -> ! {
+        abort_executor(
+            "dispatch grant",
+            &format!(
+                "non-solver grant in the solve executor (grant kind {kind:?} — \
+                 a non-Solver grant has no keyed seat)"
+            ),
+        )
     }
 }
 
@@ -1422,5 +1416,49 @@ mod tests {
             PanicAction::RecordAndContinue
         );
         assert_eq!(AbortingPolicy.on_unit_panic(7, 3), PanicAction::Abort);
+    }
+    /// 6HE6RF (the unified row-#6 tripwire, Q3.2): the solve host's
+    /// grant-kind contract is now EXPLICIT — `GrantContract::SolverPins`
+    /// inside the unified [`HostPump`] — so a foreign grant is a broken
+    /// host contract, denied loudly, NEVER seated. Pre-fold the contract
+    /// held only by the `seats.get(slot)` indexing accident, and under
+    /// Nominal posture a foreign unit was silently SEATED on a Solver
+    /// seat with a minted warm arena (the 6HE6RF red, catalog row #6);
+    /// the pooled side aborted loudly (`seat_host`'s pre-existing check).
+    /// The abort itself is a process abort (uncatchable in-process), so
+    /// the contract is pinned at its pure predicate, mirroring
+    /// `seat_host`'s loud check.
+    #[test]
+    fn solver_host_aborts_on_a_foreign_grant() {
+        use degenbot_workers::dispatcher::GrantKind;
+
+        use crate::arb_engine::seat_host::GrantContract as Contract;
+        let solver = Contract::SolverPins;
+        for kind in [GrantKind::NewPinClaim, GrantKind::PinContinuation] {
+            assert!(
+                solver.admits(kind),
+                "the solve host serves the {kind:?} grant (the Solver pin pair)"
+            );
+        }
+        for kind in [
+            GrantKind::Sim,
+            GrantKind::Resolve,
+            GrantKind::PoolStateUpdate,
+        ] {
+            assert!(
+                !solver.admits(kind),
+                "a {kind:?} grant is a broken solve-host contract — denied loudly, never seated"
+            );
+        }
+        // The pooled predicate, mirrored: exactly ONE kind.
+        let pooled = Contract::Single(GrantKind::Sim);
+        assert!(
+            pooled.admits(GrantKind::Sim),
+            "the sim host serves sim grants"
+        );
+        assert!(
+            !pooled.admits(GrantKind::NewPinClaim),
+            "a NewPinClaim grant is a broken sim-host contract"
+        );
     }
 }

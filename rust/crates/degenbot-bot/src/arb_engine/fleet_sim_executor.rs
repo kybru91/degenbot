@@ -24,9 +24,12 @@
 //! `host_loop`, `apply_host_msg`/`pump` admission, the boot install/global
 //! boilerplate) is SHARED with the registration executor — ONE seat host
 //! (`arb_engine::seat_host`) parameterized by this module's [`SIM_ROLE`]
-//! descriptor. The solve executor is deliberately NOT hosted there
-//! (per-seat channel model + posture-invariant typed-submit admission —
-//! the design gate lives in `seat_host`'s module doc).
+//! descriptor. 6HE6RF: the solve executor's host-MESSAGE triple joins
+//! that machinery too (the ONE [`HostPump`] behind all three fleet
+//! hosts); its SEAT MODEL (per-seat keyed mailboxes, warm arenas) and
+//! typed submit seam stay in `fleet_solve_executor.rs` — the RZEWTX
+//! design gate now covers only the seat models (see `seat_host`'s
+//! module doc).
 //!
 //! Sim units carry no pin key (the `SimDriver` role is pooled, T5: run →
 //! back-to-idle); the merge pin / Solver-pin lanes of the shared host FSM

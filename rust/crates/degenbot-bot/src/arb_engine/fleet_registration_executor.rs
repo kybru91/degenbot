@@ -18,9 +18,12 @@
 //! `host_loop`, `apply_host_msg`/`pump` admission, the boot install/global
 //! boilerplate) is SHARED with the sim executor — ONE seat host
 //! (`arb_engine::seat_host`) parameterized by this module's [`REG_ROLE`]
-//! descriptor. The solve executor is deliberately NOT hosted there
-//! (per-seat channel model + posture-invariant typed-submit admission —
-//! the design gate lives in `seat_host`'s module doc).
+//! descriptor. 6HE6RF: the solve executor's host-MESSAGE triple joins
+//! that machinery too (the ONE [`HostPump`] behind all three fleet
+//! hosts); its SEAT MODEL (per-seat keyed mailboxes, warm arenas) and
+//! typed submit seam stay in `fleet_solve_executor.rs` — the RZEWTX
+//! design gate now covers only the seat models (see `seat_host`'s
+//! module doc).
 //!
 //! Unit bodies are the crawl's pool-build callables: they ride the FFI at
 //! the seat boundary (`Python::attach` in the closure), release the GIL
