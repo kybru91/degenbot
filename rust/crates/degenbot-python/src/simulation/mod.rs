@@ -64,8 +64,14 @@ pub fn add_simulation_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     submod.add_class::<PySimulateContext>()?;
     submod.add_class::<PyDispatchCandidate>()?;
     submod.add_class::<PyDispatchOutcome>()?;
+    submod.add_class::<crate::simulation::dispatch::PyPayloadOutcome>()?;
+    submod.add_class::<crate::simulation::dispatch::PyPayloadVerdict>()?;
     submod.add_function(wrap_pyfunction!(
         crate::simulation::dispatch::dispatch_profitable_py,
+        &submod
+    )?)?;
+    submod.add_function(wrap_pyfunction!(
+        crate::simulation::dispatch::merge_payload_results_py,
         &submod
     )?)?;
     submod.add_function(wrap_pyfunction!(

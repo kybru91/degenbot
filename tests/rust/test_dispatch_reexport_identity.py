@@ -21,8 +21,11 @@ import degenbot.dispatch as d
 from degenbot._ffi.simulation import (
     DispatchCandidate,
     DispatchOutcome,
+    PayloadOutcome,
+    PayloadVerdict,
     SimulateContext,
     dispatch_profitable_py,
+    merge_payload_results_py,
 )
 from degenbot._ffi.submission import (
     Dispatcher,
@@ -72,23 +75,45 @@ def test_fetch_fee_history_is_identity_alias() -> None:
     assert d.fetch_fee_history is fetch_fee_history_py
 
 
-def test_all_nine_symbols_reachable_from_package() -> None:
-    """All 9 stable names are exported from ``degenbot.dispatch``.
+def test_merge_payload_results_is_identity_alias() -> None:
+    """``degenbot.dispatch.merge_payload_results`` is the Rust pyfunction
+    (NUUJFA: the inline-sim payload arm routes through the same seam the
+    FFI batch join uses)."""
+    assert d.merge_payload_results is merge_payload_results_py
+
+
+def test_payload_outcome_is_identity_alias() -> None:
+    """``degenbot.dispatch.PayloadOutcome`` is the Rust pyclass itself."""
+    assert d.PayloadOutcome is PayloadOutcome
+
+
+def test_payload_verdict_is_identity_alias() -> None:
+    """``degenbot.dispatch.PayloadVerdict`` is the Rust pyclass itself."""
+    assert d.PayloadVerdict is PayloadVerdict
+
+
+def test_all_symbols_reachable_from_package() -> None:
+    """Every stable name is exported from ``degenbot.dispatch``.
 
     ``SubmitCandidate`` joined the surface with the inline-sim seam
     (SIMPIPE2 T3): the runner builds submit records from payload batches,
-    so it is a public name alongside the FFI leaf wrappers.
+    so it is a public name alongside the FFI leaf wrappers. NUUJFA added
+    the payload seam (``merge_payload_results`` + the two pyclasses) when
+    the payload arm started routing through the same Rust sim join.
     """
     expected = {
         "DispatchCandidate",
         "DispatchOutcome",
         "Dispatcher",
+        "PayloadOutcome",
+        "PayloadVerdict",
         "SimulateContext",
         "SubmitCandidate",
         "TxSigner",
         "dispatch_and_submit",
         "dispatch_profitable",
         "fetch_fee_history",
+        "merge_payload_results",
     }
     assert expected.issubset(set(dir(d)))
     assert expected == set(d.__all__)

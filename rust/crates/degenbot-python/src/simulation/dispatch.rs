@@ -47,17 +47,20 @@ use crate::prelude::*;
 use crate::provider::AlloyProvider;
 use crate::simulation::candidate::PyDispatchCandidate;
 use crate::simulation::context::PySimulateContext;
-use crate::simulation::outcome::PyDispatchOutcome;
+use crate::simulation::outcome::{path_info_to_py_dict, PyDispatchOutcome};
 use crate::submission::dispatcher::PyDispatcher;
 use degenbot_arbitrage::BlockPriorityFees;
-use degenbot_arbitrage::{dispatch_profitable_results, DispatchCandidate, DispatchOutcome};
+use degenbot_arbitrage::{
+    dispatch_profitable_results, DispatchCandidate, DispatchOutcome, MIN_PROFIT_NET,
+};
 use degenbot_arbitrage::{CapturedSwap, SimResult, SimulateContext};
 use degenbot_bot::bot_core::state_lock::StateLock;
 use degenbot_executor::composers::{HopInfo, PathInfo};
 use degenbot_submission::{PoolKey, SubmitCandidate};
 use pyo3::exceptions::PyValueError;
-use pyo3::types::PyList;
+use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
+use std::collections::hash_map;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::Instrument as _;
@@ -366,4 +369,549 @@ fn derive_path_pools(hops: &[HopInfo]) -> HashSet<PoolKey> {
             HopInfo::V3(v3) => PoolKey::new(format!("{}", v3.pool_address)),
         })
         .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The inline-sim payload seam (NUUJFA) — one sim seam for both entry arms
+// ─────────────────────────────────────────────────────────────────────────
+//
+// The engine's inline-sim payloads (SIMPIPE2 T3) used to be re-categorized
+// in Python (_dispatch.py::_merge_payload_outcome): a per-hop JSON set
+// comprehension re-derived the mutual-exclusion pool keys
+// (derive_path_pools' mirror) and the payload net profit was re-compared
+// against the MIN_PROFIT_NET threshold value. Both facts are Rust-owned —
+// this seam reuses the FFI batch's own join (join_sim_result →
+// derive_path_pools) + the core's threshold constant so the policy is
+// evaluated exactly once, here, for both arms. Python renders the returned
+// rows/verdicts only (the _dispatch.py docstring's contract).
+
+/// The payload arm of the sim seam (NUUJFA): derive the dispatch-policy
+/// facts for the engine's inline-sim payload records Rust-side, through the
+/// SAME row builder the FFI batch join uses.
+///
+/// Each payload dict is the `result_channel` serializer's primitive field-set
+/// (`path_id` / `gross_profit` / `net_profit` / `gas_used` / `priority_fee` /
+/// `base_fee_next` / `execute_calldata` / `access_list` / `failure`). Per entry:
+///
+/// 1. The registered path's typed hops are resolved via the SAME
+///    engine projection the FFI batch candidates use
+///    (`PyArbitrageEngine::path_info_for_core`) and routed through
+///    `join_sim_result` → `derive_path_pools` — the mutual-exclusion set is
+///    byte-identical to the FFI batch row for the same path id, by
+///    construction (V4 → `pool_id_hex`; V2/V3 → EIP-55 Display).
+/// 2. Categorization applies the core's `MIN_PROFIT_NET` constant ONCE
+///    (the dispatch step-6 arm: 'net >= `MIN_PROFIT_NET`' submits; below
+///    counts gas-unprofitable). A failure payload becomes a sim-fail row.
+///    Python receives the verdict as a `kind` string only — it never reads
+///    the threshold value.
+/// 3. The join reassembles the payload's primitive fields into the core
+///    `SimResult` row the FFI join consumes, so the submit row shape is the
+///    exact `PyDispatchOutcome.gas_profitable` handoff.
+///
+/// Args:
+///     payloads: list of payload dicts (one per inline-sim entry).
+///     engine: the `PyArbitrageEngine` (the typed-hop resolver — the same
+///         engine the payload-producing result batch came from).
+///     `executor_address`: the session executor contract (the join stamps it
+///         identically on every row, like `dispatch_profitable_py` does).
+///
+/// Returns:
+///     `PayloadOutcome` — the merged record set Python renders (submit rows,
+///     unprofitable tally, sim-fail rows, `path_infos`, captured swaps are
+///     empty on the payload arm: the engine's inspector capture rides the
+///     render dict, not a `CapturedSwap` vector).
+///
+/// # Errors
+///
+/// `ValueError`: a payload dict is missing a required field, the calldata is
+/// not bytes, or a `path_id` is not registered in the engine (the pool-key
+/// derivation needs the typed hops).
+#[pyfunction]
+#[pyo3(signature = (payloads, engine, executor_address))]
+pub fn merge_payload_results_py(
+    payloads: &Bound<'_, PyList>,
+    engine: &crate::bot::engine::PyArbitrageEngine,
+    executor_address: &str,
+) -> PyResult<PyPayloadOutcome> {
+    let py = payloads.py();
+    let executor = crate::address_utils::parse_address(executor_address)
+        .map_err(|e| PyValueError::new_err(format!("Invalid executor address: {e}")))?;
+
+    // The join map — one registered PathInfo per payload path_id, resolved
+    // through the SAME projection the FFI batch snapshots before its fan-out
+    // (dispatch_profitable_py's path_info_by_id). The join then runs the
+    // IDENTICAL derive_path_pools hop walk both arms share.
+    let mut path_info_by_id: HashMap<u64, PathInfo> = HashMap::with_capacity(payloads.len());
+    let mut path_info_dicts: Vec<(u64, Py<PyDict>)> = Vec::with_capacity(payloads.len());
+    let mut sim_results: Vec<SimResult> = Vec::with_capacity(payloads.len());
+    let mut failures: Vec<(u64, String, Option<usize>, String)> = Vec::new();
+    let mut unprofitable_count: usize = 0;
+
+    for item in payloads.iter() {
+        let entry = item
+            .cast::<PyDict>()
+            .map_err(|_| PyValueError::new_err("payloads must be a list of payload dicts"))?;
+        let path_id: u64 = required_u64(entry, "path_id")?;
+
+        // The [profit]-render path_info dict — the ONE serializer shape
+        // (`path_info_to_py_dict`) both outcomes' path_infos emit. One resolve
+        // per DISTINCT path_id (multiple payload entries may share a path —
+        // the old Python arm per-entry looped `payload_path_info` per entry).
+        if let hash_map::Entry::Vacant(slot) = path_info_by_id.entry(path_id) {
+            let path_info = engine
+                .path_info_for_core(py, path_id)
+                .and_then(std::result::Result::ok)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "path_id {path_id} is not registered in this engine; \
+                         the payload pool keys cannot be derived"
+                    ))
+                })?;
+            path_info_dicts.push((path_id, path_info_to_py_dict(py, &path_info)?.unbind()));
+            slot.insert(path_info);
+        }
+
+        // The failure arm — the sim-fail row in the FFI failures row shape
+        // (the Rust arm of the retired Python _inline_failure_record).
+        if let Some(fobj) = entry.get_item("failure")? {
+            if !fobj.is_none() {
+                let fdict = fobj
+                    .cast::<PyDict>()
+                    .map_err(|_| PyValueError::new_err("payload field 'failure' must be a dict"))?;
+                failures.push(payload_failure_row(path_id, fdict)?);
+                continue;
+            }
+        }
+
+        // Non-failure payloads reassemble into the core SimResult the FFI
+        // join consumes (the field-for-field parity the inline_sim module
+        // doc's table guarantees); categorization below.
+        sim_results.push(payload_sim_result(entry, path_id)?);
+    }
+
+    // ── Join + categorize (the FFI batch arm's exact shape) ──
+    // join_sim_result derives EACH row's path_pools from the typed hops in
+    // this map; the threshold arm reads the core MIN_PROFIT_NET constant —
+    // the same comparison dispatch_profitable_results step 6 applies.
+    let mut candidates: Vec<SubmitCandidate> = Vec::with_capacity(sim_results.len());
+    let mut verdicts: Vec<Py<PyPayloadVerdict>> = Vec::with_capacity(sim_results.len());
+    for r in &sim_results {
+        let joined = join_sim_result(r, &path_info_by_id, executor);
+        if r.net_profit >= alloy::primitives::U256::from(MIN_PROFIT_NET) {
+            candidates.push(joined);
+            verdicts.push(PyPayloadVerdict::wrap(py, r.path_id, "submit"));
+        } else {
+            unprofitable_count += 1;
+            verdicts.push(PyPayloadVerdict::wrap(py, r.path_id, "unprofitable"));
+        }
+    }
+
+    Ok(PyPayloadOutcome {
+        candidates,
+        unprofitable_count,
+        failures,
+        path_info_dicts,
+        verdicts,
+    })
+}
+
+/// Extract a required u64 field off one payload dict (NUUJFA seam helper).
+fn required_u64(entry: &Bound<'_, PyDict>, key: &str) -> PyResult<u64> {
+    entry
+        .get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("payload dict missing '{key}'")))?
+        .extract()
+        .map_err(|_| PyValueError::new_err(format!("payload field '{key}' must be an int")))
+}
+
+/// Reassemble the core `SimResult` from one payload dict — the FFI join's
+/// input row, field-for-field (`inline_sim`'s parity table). The `access_list`
+/// rows the serializer emitted (the EIP-2930 JSON shape) are parsed back
+/// into the alloy `AccessList` so the joined row is complete —
+/// `join_sim_result` copies it through `r.access_list` exactly as it does
+/// the FFI survivor's.
+fn payload_sim_result(entry: &Bound<'_, PyDict>, path_id: u64) -> PyResult<SimResult> {
+    let gross_obj = entry
+        .get_item("gross_profit")?
+        .ok_or_else(|| PyValueError::new_err("payload dict missing 'gross_profit'"))?;
+    let gross_profit: alloy::primitives::U256 =
+        crate::conversion::alloy::extract_python_u256(&gross_obj)?;
+    let net_obj = entry
+        .get_item("net_profit")?
+        .ok_or_else(|| PyValueError::new_err("payload dict missing 'net_profit'"))?;
+    let net_profit: alloy::primitives::U256 =
+        crate::conversion::alloy::extract_python_u256(&net_obj)?;
+    let calldata = entry
+        .get_item("execute_calldata")?
+        .ok_or_else(|| PyValueError::new_err("payload dict missing 'execute_calldata'"))?;
+    let calldata_bytes: &[u8] = calldata
+        .cast::<PyBytes>()
+        .map_err(|_| PyValueError::new_err("payload field 'execute_calldata' must be bytes"))?
+        .as_bytes();
+
+    // The access_list rows (the EIP-2930 JSON shape the serializer emits) —
+    // parsed back into the alloy AccessList the SimResult carries so the
+    // join stamps the row exactly like the FFI batch survivor.
+    let access_list = match entry.get_item("access_list")? {
+        Some(v) if !v.is_none() => Some(parse_payload_access_list(&v)?),
+        _ => None,
+    };
+
+    Ok(SimResult {
+        path_id,
+        gross_profit,
+        net_profit,
+        gas_used: required_u64(entry, "gas_used")?,
+        priority_fee: required_u128(entry, "priority_fee")?,
+        base_fee_next: required_u128(entry, "base_fee_next")?,
+        execute_calldata: alloy::primitives::Bytes::copy_from_slice(calldata_bytes),
+        access_list,
+        captured_swaps: Vec::new(),
+        hop_count: 0,
+    })
+}
+
+/// Parse the payload's access-list rows (the EIP-2930 JSON shape
+/// `result_channel` emits: [{`address`, `storageKeys`: ["0x…32-byte hex", …]}, …])
+/// into the alloy `AccessList` (the same decode the submission seam's
+/// `parse_access_list` applies to `PySubmitCandidate`'s optional rows).
+fn parse_payload_access_list(v: &Bound<'_, PyAny>) -> PyResult<alloy::rpc::types::AccessList> {
+    let entries = v
+        .try_iter()?
+        .map(|row_any| {
+            let row_ob = row_any?;
+            let row = row_ob
+                .cast::<PyDict>()
+                .map_err(|_| PyValueError::new_err("access-list row must be a dict"))?;
+            let addr_str: String = row
+                .get_item("address")?
+                .ok_or_else(|| PyValueError::new_err("access-list row missing 'address'"))?
+                .extract()?;
+            let address: alloy::primitives::Address =
+                degenbot_core::address_utils::parse_address(&addr_str)
+                    .map_err(|e| PyValueError::new_err(format!("bad access-list address: {e}")))?;
+            let mut storage_keys: Vec<alloy::primitives::FixedBytes<32>> = Vec::new();
+            if let Some(keys) = row.get_item("storageKeys")? {
+                if !keys.is_none() {
+                    for key in keys.try_iter()? {
+                        let key = key.map_err(|_| {
+                            PyValueError::new_err("storageKeys must be a list of hex strings")
+                        })?;
+                        let hex: String = key.extract().map_err(|_| {
+                            PyValueError::new_err("storage key must be a hex string")
+                        })?;
+                        let bytes = alloy::primitives::hex::decode(&hex)
+                            .map_err(|e| PyValueError::new_err(format!("bad storage key: {e}")))?;
+                        let fb = alloy::primitives::FixedBytes::<32>::try_from(bytes.as_slice())
+                            .map_err(|_| PyValueError::new_err("storage key must be 32 bytes"))?;
+                        storage_keys.push(fb);
+                    }
+                }
+            }
+            Ok::<_, PyErr>(alloy::rpc::types::AccessListItem {
+                address,
+                storage_keys,
+            })
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(alloy::rpc::types::AccessList(entries))
+}
+
+/// Extract a required u128 field off one payload dict (NUUJFA seam helper).
+fn required_u128(entry: &Bound<'_, PyDict>, key: &str) -> PyResult<u128> {
+    entry
+        .get_item(key)?
+        .ok_or_else(|| PyValueError::new_err(format!("payload dict missing '{key}'")))?
+        .extract()
+        .map_err(|_| PyValueError::new_err(format!("payload field '{key}' must be an int")))
+}
+
+/// Build the [sim-fail] row from the payload's failure sub-dict — the FFI
+/// failures row keys (`path_id`/`bucket`/`fail_index`/`revert_data`),
+/// byte-equal to what the retired Python `_inline_failure_record` produced
+/// (the EVM-diagnostic extras default empty — the inline sim surfaces
+/// revert detail through `revert_data` alone).
+fn payload_failure_row(
+    path_id: u64,
+    failure: &Bound<'_, PyDict>,
+) -> PyResult<(u64, String, Option<usize>, String)> {
+    let bucket = match failure.get_item("bucket")? {
+        Some(v) if !v.is_none() => v.extract::<String>()?,
+        _ => "inline-fail".to_string(),
+    };
+    let fail_index = match failure.get_item("fail_index")? {
+        Some(v) if !v.is_none() => Some(v.extract::<usize>().map_err(|_| {
+            PyValueError::new_err("payload field 'fail_index' must be an int or null")
+        })?),
+        _ => None,
+    };
+    let revert_hex = match failure.get_item("revert_data")? {
+        Some(v) if !v.is_none() => {
+            if let Ok(s) = v.extract::<String>() {
+                s.trim_start_matches("0x").to_string()
+            } else {
+                let bytes: &[u8] = v.extract().map_err(|_| {
+                    PyValueError::new_err("payload field 'revert_data' must be hex str or bytes")
+                })?;
+                alloy::primitives::hex::encode(bytes)
+            }
+        }
+        _ => String::new(),
+    };
+    Ok((path_id, bucket, fail_index, revert_hex))
+}
+
+/// The per-entry categorization verdict — Python switches its render
+/// branch on kind and reads nothing else. (submit / unprofitable; failure
+/// entries surface through the failures rows, not a verdict.)
+impl PyPayloadVerdict {
+    fn wrap(py: Python<'_>, path_id: u64, kind: &'static str) -> Py<PyPayloadVerdict> {
+        #[expect(clippy::unwrap_used)] // PyResult from Bound::new for a plain
+        // pyclass cannot fail (no __new__ override, no GC-tracked fields).
+        Py::new(py, PyPayloadVerdict { path_id, kind }).unwrap()
+    }
+}
+#[pyclass(name = "PayloadVerdict", module = "degenbot._ffi.simulation")]
+pub struct PyPayloadVerdict {
+    /// The payload's path id.
+    pub(crate) path_id: u64,
+    /// "submit" | "unprofitable".
+    pub(crate) kind: &'static str,
+}
+
+#[pymethods]
+impl PyPayloadVerdict {
+    /// The path id the verdict belongs to.
+    #[getter]
+    fn path_id(&self) -> u64 {
+        self.path_id
+    }
+
+    /// "submit" | "unprofitable" — the arm tag (the threshold comparison ran
+    /// Rust-side; Python renders the branch, it does not re-apply the rule).
+    #[getter]
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+}
+
+/// The merged inline-sim payload record set (NUUJFA) — the payload arm of
+/// `PyDispatchOutcome`, built by `merge_payload_results_py`. Rust owns every
+/// policy fact; Python renders + stitches these getters into the merged
+/// outcome view.
+#[pyclass(name = "PayloadOutcome", module = "degenbot._ffi.simulation")]
+pub struct PyPayloadOutcome {
+    /// The joined submit rows (the exact `PyDispatchOutcome.gas_profitable`
+    /// element type — `dispatch_and_submit` re-extracts them unchanged).
+    pub(crate) candidates: Vec<SubmitCandidate>,
+    /// Valid sims below the threshold (Rust-categorized).
+    pub(crate) unprofitable_count: usize,
+    /// The [sim-fail] rows (FFI failures-row shape).
+    pub(crate) failures: Vec<(u64, String, Option<usize>, String)>,
+    /// The [profit]-render `path_info` dicts (`path_info_to_py_dict` shape).
+    pub(crate) path_info_dicts: Vec<(u64, Py<PyDict>)>,
+    /// The per-entry arm verdicts (`path_id` + `kind`).
+    pub(crate) verdicts: Vec<Py<PyPayloadVerdict>>,
+}
+
+#[pymethods]
+impl PyPayloadOutcome {
+    /// The submit rows — `list[SubmitCandidate]`, the `gas_profitable`
+    /// handoff shape (each element re-extracts as a `PySubmitCandidate`).
+    #[getter]
+    fn candidates<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for c in &self.candidates {
+            let bound = Bound::new(
+                py,
+                crate::submission::submit::PySubmitCandidate { inner: c.clone() },
+            )?;
+            list.append(bound)?;
+        }
+        Ok(list)
+    }
+
+    /// Valid sims whose net profit fell below the threshold — the merged
+    /// outcome's `gas_unprofitable_count` slice.
+    #[getter]
+    fn unprofitable_count(&self) -> usize {
+        self.unprofitable_count
+    }
+
+    /// The [sim-fail] rows — list[dict] with the FFI failures row keys
+    /// (`path_id` / `bucket` / `fail_index` / `revert_data`).
+    #[getter]
+    fn failures<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for (path_id, bucket, fail_index, revert_hex) in &self.failures {
+            let dict = PyDict::new(py);
+            dict.set_item("path_id", path_id)?;
+            dict.set_item("bucket", bucket)?;
+            match fail_index {
+                Some(idx) => dict.set_item("fail_index", idx)?,
+                None => dict.set_item("fail_index", py.None())?,
+            }
+            dict.set_item("revert_data", revert_hex)?;
+            list.append(dict)?;
+        }
+        Ok(list)
+    }
+
+    /// `{path_id: path_info dict}` — the [profit]-render source (the SAME
+    /// one-serializer shape `PyDispatchOutcome.path_infos` emits).
+    #[getter]
+    fn path_infos<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let dict = PyDict::new(py);
+        for (pid, info) in &self.path_info_dicts {
+            dict.set_item(pid, info.bind(py))?;
+        }
+        Ok(dict)
+    }
+
+    /// The per-entry verdicts — `list[PayloadVerdict]` (`path_id` + `kind`).
+    #[getter]
+    fn verdicts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let list = PyList::empty(py);
+        for v in &self.verdicts {
+            list.append(v.bind(py))?;
+        }
+        Ok(list)
+    }
+}
+#[cfg(test)]
+mod payload_seam_tests {
+    #![expect(clippy::unwrap_used)] // test-only unwraps
+    use super::*;
+    use degenbot_executor::composers::{V2HopInfo, V3HopInfo, V4HopInfo};
+
+    fn v2_hop(addr: &str) -> HopInfo {
+        HopInfo::V2(V2HopInfo {
+            pool_address: addr.parse().unwrap(),
+            token0_address: addr.parse().unwrap(),
+            token1_address: addr.parse().unwrap(),
+            fee: 30,
+            zfo: true,
+        })
+    }
+
+    fn v3_hop(addr: &str) -> HopInfo {
+        HopInfo::V3(V3HopInfo {
+            pool_address: addr.parse().unwrap(),
+            token0_address: addr.parse().unwrap(),
+            token1_address: addr.parse().unwrap(),
+            fee: 3000,
+            zfo: true,
+        })
+    }
+
+    fn v4_hop(pool_id_hex: &str) -> HopInfo {
+        HopInfo::V4(V4HopInfo {
+            pool_manager_address: "0x000000000004444c5dc75cb358380d2e3de08a90"
+                .parse()
+                .unwrap(),
+            pool_id_hex: pool_id_hex.to_string(),
+            currency0_address: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+                .parse()
+                .unwrap(),
+            currency1_address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+                .parse()
+                .unwrap(),
+            fee: 500,
+            tick_spacing: 10,
+            hook_address: alloy::primitives::Address::ZERO,
+            zfo: true,
+        })
+    }
+
+    /// NUUJFA byte-identity: the V4 keying rule produces the `pool_id_hex`
+    /// and the V2/V3 rule the EIP-55 (checksummed) Display form — the exact
+    /// sets the old Python set-comprehension mirrored. Mixed-family paths
+    /// key the same on both entry arms (the payload arm calls THIS walk via
+    /// `join_sim_result`; the FFI batch join calls the identical fn).
+    #[test]
+    fn derive_path_pools_mixed_families_byte_identity() {
+        let checksum_addr = alloy::primitives::address!("c02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        // The EIP-55 checksummed form the Display impl produces.
+        assert_eq!(
+            format!("{checksum_addr}"),
+            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+        );
+
+        let v4_id = "0x4f88f7c99022eace4740c6898f59ce6a2e798a1e64ce54589720b7153eb224a7";
+
+        // A path with a V4 hop + a path with V2 and V3 hops.
+        let hops_v4v2 = vec![
+            v4_hop(v4_id),
+            v2_hop("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
+        ];
+        let hops_v3 = vec![
+            v3_hop("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
+            v2_hop("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
+        ];
+
+        let set_v4v2 = derive_path_pools(&hops_v4v2);
+        let set_v3 = derive_path_pools(&hops_v3);
+
+        // V4 key is the raw pool_id_hex string.
+        assert!(set_v4v2.contains(&PoolKey::new(v4_id)));
+        // V2/V3 keys are the EIP-55 checksummed Display forms.
+        assert!(set_v4v2.contains(&PoolKey::new("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")));
+        assert!(set_v3.contains(&PoolKey::new("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")));
+        assert!(set_v3.contains(&PoolKey::new("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")));
+        // The sets are disjoint across the mixed paths except the shared
+        // checksummed address — the is_path_blocked overlap semantics.
+        assert_eq!(set_v4v2.len(), 2);
+        assert_eq!(set_v3.len(), 2);
+        let only_v4: std::collections::HashSet<_> = set_v4v2
+            .difference(&set_v3)
+            .map(PoolKey::to_string)
+            .collect();
+        assert_eq!(only_v4, std::iter::once(v4_id.to_string()).collect());
+    }
+
+    /// The join entry-point parity: a payload `SimResult` reassembled row
+    /// and a hypothetical FFI survivor for the same path id pass through the
+    /// SAME `join_sim_result` — so the `path_pools` sets are equal by
+    /// construction. The payload arm's map (`path_id` → `PathInfo`) is
+    /// exactly what the FFI join receives from its arg-extract snapshot.
+    #[test]
+    fn join_sim_result_sets_are_entry_independent() {
+        let v4_id = "0x4f88f7c99022eace4740c6898f59ce6a2e798a1e64ce54589720b7153eb224a7";
+        let mut map = HashMap::new();
+        map.insert(
+            7u64,
+            PathInfo::new(vec![
+                v4_hop(v4_id),
+                v2_hop("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
+            ]),
+        );
+        let sim = SimResult {
+            path_id: 7,
+            gross_profit: alloy::primitives::U256::from(600_000_000_000u64),
+            net_profit: alloy::primitives::U256::from(500_000_000_000u64),
+            gas_used: 300_000,
+            priority_fee: 2,
+            base_fee_next: 30,
+            execute_calldata: alloy::primitives::Bytes::from(vec![0xab, 0x58, 0x98, 0xe8, 0x01]),
+            access_list: None,
+            captured_swaps: Vec::new(),
+            hop_count: 2,
+        };
+        let executor = "0x690b9a9e9aa1c9db991c7721a92d351db4fac990"
+            .parse()
+            .unwrap();
+        let row = join_sim_result(&sim, &map, executor);
+        assert!(row.path_pools.contains(&PoolKey::new(v4_id)));
+        assert!(row
+            .path_pools
+            .contains(&PoolKey::new("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2")));
+        assert_eq!(row.path_pools.len(), 2);
+        assert_eq!(row.gross_profit, sim.gross_profit);
+        assert_eq!(row.net_profit, sim.net_profit);
+        assert_eq!(row.gas_used, sim.gas_used);
+        assert_eq!(row.priority_fee, sim.priority_fee);
+        assert_eq!(row.base_fee_next, sim.base_fee_next);
+        assert_eq!(row.access_list, None);
+        assert_eq!(row.execute_calldata, sim.execute_calldata);
+    }
 }

@@ -160,6 +160,20 @@ impl PySubmitCandidate {
     fn priority_fee(&self) -> u128 {
         self.inner.priority_fee
     }
+
+    /// The mutual-exclusion pool-key set the join stamped (NUUJFA): the
+    /// parity-test read surface — the payload arm's rows must carry the
+    /// byte-identical set the FFI batch join derives for the same path. The
+    /// strings are the `PoolKey` display forms (V4 `pool_id_hex`; V2/V3
+    /// EIP-55 checksummed addresses).
+    #[getter]
+    fn path_pools(&self) -> HashSet<String> {
+        self.inner
+            .path_pools
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect()
+    }
 }
 
 /// The local `ReceiptProbe` impl — polls `Provider::get_transaction_receipt`.

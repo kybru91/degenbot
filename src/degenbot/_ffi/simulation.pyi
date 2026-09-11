@@ -96,6 +96,52 @@ def dispatch_profitable_py(
     *,
     engine: ArbitrageEngine | None = None,
 ) -> Coroutine[Any, Any, DispatchOutcome]: ...
+def merge_payload_results_py(
+    payloads: list[dict[str, Any]],
+    engine: ArbitrageEngine,
+    executor_address: str,
+) -> PayloadOutcome:
+    """Merge the inline-sim payload records through the Rust seam (NUUJFA).
+
+    Derives the dispatch-policy facts Rust-side — the mutual-exclusion pool
+    keys (``derive_path_pools`` over the engine's typed hops) and the net
+    profitability threshold (``MIN_PROFIT_NET``) — through the SAME
+    ``join_sim_result`` row builder the FFI batch join uses, and returns the
+    merged record set Python renders.
+
+    Raises:
+        ValueError: a payload dict is malformed or a ``path_id`` is not
+            registered in the engine (pool keys cannot be derived).
+
+    """
+
+class PayloadVerdict:
+    """The per-entry categorization verdict (Rust-owned, NUUJFA)."""
+
+    @property
+    def path_id(self) -> int: ...
+    @property
+    def kind(self) -> str:
+        """One of ``"submit"`` / ``"unprofitable"`` — the arm tag."""
+
+class PayloadOutcome:
+    """The merged inline-sim payload record set (NUUJFA).
+
+    The payload arm of :class:`DispatchOutcome`, built by
+    :func:`merge_payload_results_py`.
+    """
+
+    @property
+    def candidates(self) -> list[SubmitCandidate]: ...
+    @property
+    def unprofitable_count(self) -> int: ...
+    @property
+    def failures(self) -> list[dict[str, Any]]: ...
+    @property
+    def path_infos(self) -> dict[int, dict[str, Any]]: ...
+    @property
+    def verdicts(self) -> list[PayloadVerdict]: ...
+
 def simulate_in_process_revert_probe(
     path_id: int,
     runtime_bytecode: bytes,
@@ -120,8 +166,11 @@ def simulate_in_process_success_probe(path_id: int) -> dict[str, Any]:
 __all__ = [
     "DispatchCandidate",
     "DispatchOutcome",
+    "PayloadOutcome",
+    "PayloadVerdict",
     "SimulateContext",
     "dispatch_profitable_py",
+    "merge_payload_results_py",
     "simulate_in_process_revert_probe",
     "simulate_in_process_success_probe",
 ]

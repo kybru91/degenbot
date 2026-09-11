@@ -7,7 +7,12 @@ DZTFSJ). Owns the encode→simulate→submit leaf
 renderers that contextualize ``DispatchOutcome``.
 
 The renderers are display-only (``stays-python``); all sim/submit arithmetic
-runs in the Rust core. Only candidate-list shaping + log rendering happen here.
+runs in the Rust core. Only candidate-list shaping + log rendering happen
+here — NUUJFA closed the last hole: the inline-sim payload arm routes
+through the same Rust sim seam (``merge_payload_results`` → the FFI batch's
+``join_sim_result``/``derive_path_pools`` + the Rust ``MIN_PROFIT_NET``
+gate), so pool-key derivation and threshold categorization no longer
+duplicate in Python.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from degenbot.dispatch import (
     TxSigner,
     dispatch_and_submit,
     dispatch_profitable,
+    merge_payload_results,
 )
 from degenbot.logging import logger as bot_logger
 from degenbot.runner._render import (
@@ -296,30 +302,6 @@ class MergedOutcome:
         return merged
 
 
-def _inline_failure_record(pid: int, payload: dict) -> dict:
-    """Shape a payload ``failure`` sub-dict into the FFI ``failures`` row shape.
-
-    The renderer reads ``path_id``/``bucket``/``fail_index``/``revert_data``
-    positionally and everything else via ``.get`` — the payload carries the
-    scalar trio plus the revert bytes; the EVM-diagnostic extras default empty
-    (the inline sim surfaces revert detail through ``revert_data``).
-    """
-    failure = payload["failure"]
-    revert_data = failure.get("revert_data") or b""
-    revert_hex = revert_data if isinstance(revert_data, str) else bytes(revert_data).hex()
-    return {
-        "path_id": pid,
-        "bucket": failure.get("bucket") or "inline-fail",
-        "fail_index": failure.get("fail_index"),
-        "revert_data": revert_hex,
-        "reverting_frame": None,
-        "captured_swaps": payload.get("captured_swaps") or [],
-        "reverted_swaps": [],
-        "call_trace": [],
-        "log_full_count": 0,
-    }
-
-
 def _merge_payload_outcome(
     session: _SessionState,
     base_outcome: DispatchOutcome | None,
@@ -327,63 +309,47 @@ def _merge_payload_outcome(
 ) -> _SimOutcome | None:
     """Stitch inline-sim payload records into (or over) the FFI batch outcome.
 
-    Per-entry presence decides: each payload either yields a
-    :class:`SubmitCandidate` (gross/net/gas/calldata/access-list from the
-    engine's inline sim — the same field-set the FFI join stamps) or a
-    ``[sim-fail]`` record through the payload's ``failure`` field. Entries
-    whose net profit falls below :data:`MIN_PROFIT_NET` count as
-    gas-unprofitable (valid sim, below threshold — same categorization the
-    FFI fan-out applies).
+    NUUJFA: the payload arm routes through the SAME sim seam the FFI batch
+    uses (:func:`merge_payload_results`), so the mutual-exclusion pool keys
+    (the Rust `derive_path_pools` walk over the engine's typed hops) and the
+    net-profit threshold (the Rust-owned `MIN_PROFIT_NET` constant) are
+    evaluated exactly once, Rust-side, for BOTH entry arms. This function
+    only renders/stitches the returned record rows — honoring this module's
+    docstring contract.
 
-    ``base_outcome`` is the FFI outcome for the REMAINING (payload-less)
-    entries — ``None`` only when there was nothing to send through the FFI
+    Per-entry presence decides: each payload yields a submit row (built by
+    the Rust `join_sim_result` FFI join over the engine's registered
+    `PathInfo`), a gas-unprofitable tally entry (Rust-categorized), or a
+    `[sim-fail]` record (the FFI row shape, built by the same seam). The
+    below-threshold verdict arrives as a Rust `kind` string — no threshold
+    value crosses to Python.
+
+    `base_outcome` is the FFI outcome for the REMAINING (payload-less)
+    entries — `None` only when there was nothing to send through the FFI
     batch at all.
     """
     if not payloads:
         return base_outcome or None
-    candidates: list[SubmitCandidate] = []
-    failures: list[dict] = []
-    path_infos: dict[int, dict] = {}
-    unprofitable = 0
     sim_ctx = session.sim_ctx
     if sim_ctx is None:
         msg = "SimulateContext is required to merge payload records"
         raise RuntimeError(msg)
-    executor_address = sim_ctx.executor_address
-    engine = session.engine_registry.engine
 
-    for raw_pid, payload in payloads.items():
-        pid = int(raw_pid)
-        path_info = engine.payload_path_info(pid)
-        hops: list[dict] = path_info.get("hops", []) if path_info else []
-        if path_info is not None:
-            path_infos[pid] = path_info
-        # The mutual-exclusion set, derived from the hops exactly as the FFI
-        # join does (V4 -> pool_id_hex; V2/V3 -> checksummed pool_address).
-        path_pools = {h["pool_id_hex"] if h["family"] == "V4" else h["pool_address"] for h in hops}
-        if payload.get("failure") is not None:
-            failures.append(_inline_failure_record(pid, payload))
-            continue
-        if int(payload["net_profit"]) < MIN_PROFIT_NET:
-            unprofitable += 1
-            continue
-        candidates.append(
-            SubmitCandidate(
-                pid,
-                int(payload["gross_profit"]),
-                int(payload["net_profit"]),
-                int(payload["gas_used"]),
-                int(payload["priority_fee"]),
-                int(payload["base_fee_next"]),
-                bytes(payload["execute_calldata"]),
-                executor_address,
-                access_list=payload.get("access_list"),
-                path_pools=path_pools,
-            )
-        )
+    # THE SIM SEAM (NUUJFA): the payload records route through the SAME Rust
+    # join the FFI batch uses — the mutual-exclusion path_pools derive from
+    # the engine's typed hops (derive_path_pools) and the MIN_PROFIT_NET
+    # gate applies there, ONCE. The submit rows arrive as PySubmitCandidate
+    # (the gas_profitable element type) ready for dispatch_and_submit.
+    outcome = merge_payload_results(
+        [payloads[pid] for pid in sorted(payloads)],
+        session.engine_registry.engine,
+        sim_ctx.executor_address,
+    )
+    candidates = list(outcome.candidates)
+    failures = list(outcome.failures)
+    path_infos = dict(outcome.path_infos)
+    unprofitable = outcome.unprofitable_count
 
-    if base_outcome is None and not (candidates or failures or unprofitable):
-        return None
     return MergedOutcome(base_outcome, candidates, failures, path_infos, unprofitable)
 
 
