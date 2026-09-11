@@ -1439,8 +1439,9 @@ class TestPathRegistrationPipeline:
         # One explicit path registered through the shared consume body.
         assert pipeline.path_count == 1
         assert reg.register_path_calls == 1
-        # PRG-4: no Python dedup set — the engine signature dedup answers the
-        # repeat (asserted by test_enqueue_path_dedups_repeat).
+        # W73FVY: the pipeline dup memo answers the repeat (asserted by
+        # test_enqueue_path_dedups_repeat); the engine registry stays the
+        # source of truth behind it.
 
     async def test_enqueue_path_dedups_repeat(self) -> None:
         pipeline, reg, t_base = self._make_pipeline()
@@ -1449,11 +1450,12 @@ class TestPathRegistrationPipeline:
         await pipeline.enqueue_path([step], directions=[True])
 
         # Second add of the identical (pools, directions) path is a duplicate,
-        # not a second registration — the ENGINE answers it (PRG-4: dedup is
-        # by construction core-side; the repeat FFI call returns the existing
-        # path_id with created=False).
+        # not a second registration — the pipeline memo answers it BEFORE the
+        # verify/registration stage (W73FVY: behind the memo, every duplicate
+        # re-paid the verify choreography; the engine's own dedup remains the
+        # source of truth for memo misses).
         assert pipeline.path_count == 1
-        assert reg.register_path_calls == 2
+        assert reg.register_path_calls == 1
         assert pipeline.dup_count == 1
 
     async def test_trigger_discovery_bounded_feeds_shared_consume(self) -> None:

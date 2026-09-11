@@ -440,6 +440,12 @@ class PathRegistrationPipeline:
         self.v4_hook_rejected = 0
         self.v4_dynamic_fee_rejected = 0
         self.other_exc_count = 0
+        # W73FVY dup fast-path memo: hop signatures (tuple of (pool_id, zfo))
+        # already answered by a completed registration. Lives IN FRONT of the
+        # V3/V4 verify choreography — behind it, duplicate candidates re-paid
+        # the full build+verify sequence for every sighting because the engine
+        # dedup only answers at register_crawl_path. See _registration_unit.
+        self._registered_paths_seen: set[tuple[tuple[int, bool], ...]] = set()
         # INN6TK observability: reason-tagged skip breakdown + time-throttled
         # progress emission. The legacy `[build_paths] Progress` line only fires
         # when `path_count` crosses each 1000-boundary; a discovery-heavy crawl
@@ -572,7 +578,56 @@ class PathRegistrationPipeline:
         # it propagates out of the seat (through the receipt) and aborts the
         # pipeline loudly. Every OTHER registration-stage exception is the
         # counted engine-reject path.
+        #
+        # Order within the try: directions → policy gate → hop ids → the dup
+        # fast-path → verify → register. The D7KMQO docstring promises
+        # "before any work", and the dup fast-path (W73FVY) must sit in front
+        # of verify: behind it, every duplicate candidate re-paid the full
+        # verify choreography because the engine dedup only answers at
+        # register_crawl_path (post-PRG-4 the crawl could not outrun its own
+        # duplicates — verified-pool thrash of 945 lifecycles/122 pools live).
         try:
+            # Resolve directions. A resolution failure is a fatal invariant
+            # violation (subgraph vs constructed-pool disagree); the raised
+            # DirectionResolutionError aborts the registration pipeline and
+            # propagates to shut the bot down loudly.
+            zfo_list = self._resolve_path_directions(pools, directions)
+            if zfo_list is None:
+                # Operator-pinned directions whose per-hop count disagrees with
+                # the resolved path — the `zip(strict=True)` below would raise
+                # a cryptic TypeError (None is not iterable): name it, skip.
+                return RegistrationUnitOutcome(kind="skip", tag="direction-mismatch")
+
+            # D7KMQO: enforce deployment policy before any work — the same
+            # pre-check register_path runs for the operator surface (a
+            # rejection is a typed PathRejectedError subtype, never engine).
+            reg.path_predicate.evaluate(list(zip(pools, zfo_list, strict=True)))
+
+            engine_hops = [
+                (self._pool_engine_id(pool), zfo) for pool, zfo in zip(pools, zfo_list, strict=True)
+            ]
+
+            # Dup fast-path (W73FVY): answer hop signatures ALREADY registered
+            # before the verify choreography, with the SAME outcome shape the
+            # engine dedup produces (created=False → the driver folds the dup
+            # counters identically, v4_hops parity included). The engine path
+            # registry stays the source of truth: this memo is exact within
+            # the pipeline (every crawl path and both operator surfaces funnel
+            # through _registration_unit; no other production caller registers
+            # crawl paths), and a memo miss merely re-pays the old cost — the
+            # engine still dedups at register_crawl_path. Concurrency: the
+            # signature is an immutable tuple and the only mutation is
+            # set.add (GIL-atomic); a raced duplicate add is idempotent, and
+            # a raced miss still resolves through engine dedup. Memory is
+            # bounded by the registered-path cap (MAX_REGISTERED_PATHS).
+            hop_sig = tuple(engine_hops)
+            if hop_sig in self._registered_paths_seen:
+                return RegistrationUnitOutcome(
+                    kind="registered",
+                    created=False,
+                    v4_hops=v4_hops,
+                )
+
             for pool, pt in zip(pools, pool_type_strs, strict=True):
                 if pt == "V2":
                     # V2 needs no lifecycle; mirror the retired
@@ -605,26 +660,6 @@ class PathRegistrationPipeline:
                         ),
                     )
 
-            # Resolve directions. A resolution failure is a fatal invariant
-            # violation (subgraph vs constructed-pool disagree); the raised
-            # DirectionResolutionError aborts the registration pipeline and
-            # propagates to shut the bot down loudly.
-            zfo_list = self._resolve_path_directions(pools, directions)
-            if zfo_list is None:
-                # Operator-pinned directions whose per-hop count disagrees with
-                # the resolved path — the `zip(strict=True)` below would raise
-                # a cryptic TypeError (None is not iterable): name it, skip.
-                return RegistrationUnitOutcome(kind="skip", tag="direction-mismatch")
-
-            # D7KMQO: enforce deployment policy before any work — the same
-            # pre-check register_path runs for the operator surface (a
-            # rejection is a typed PathRejectedError subtype, never engine).
-            reg.path_predicate.evaluate(list(zip(pools, zfo_list, strict=True)))
-
-            engine_hops = [
-                (self._pool_engine_id(pool), zfo) for pool, zfo in zip(pools, zfo_list, strict=True)
-            ]
-
             # PRG-4: the engine path registry dedups by construction; `created`
             # is False exactly when the core signature dedup answered, and the
             # cap refusal surfaces as the typed PathRegistryFullError (PRG-4).
@@ -650,6 +685,10 @@ class PathRegistrationPipeline:
                     detail=f"{type(exc).__name__}: {exc}",
                     v4_hops=v4_hops,
                 )
+
+            # Only a completed registration (created or engine-dedup'd dup)
+            # enters the memo — a failed verify never registered a path.
+            self._registered_paths_seen.add(hop_sig)
         except (
             VerificationMismatchError,
             VerificationRpcError,

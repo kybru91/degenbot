@@ -31,6 +31,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from degenbot.checksum_cache import get_checksum_address
+from degenbot.database.models.pools import UniswapV3PoolTable
 from degenbot.exceptions import VerificationMismatchError
 from degenbot.runner.build_paths import (
     REG_INTAKE_WINDOW,
@@ -303,3 +305,139 @@ def _no_progress_noise(monkeypatch: pytest.MonkeyPatch) -> None:
         "_PROGRESS_INTERVAL_S",
         1_000_000.0,
     )
+
+
+WETH_CHECKSUM = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+T1_CHECKSUM = get_checksum_address("0x" + "11" * 20)
+POOL_A = "0x" + "aa" * 20
+POOL_B = "0x" + "bb" * 20
+
+
+class _FakeV3Pool:
+    """Pool double deep enough for direction resolution + engine ids."""
+
+    def __init__(self, address: str, token0: str, token1: str, pool_id: int) -> None:
+        self.address = address
+        self.token0 = SimpleNamespace(address=token0)
+        self.token1 = SimpleNamespace(address=token1)
+        self._py_pool = SimpleNamespace(pool_id=pool_id)
+
+
+class _RecordingRegistry:
+    """Engine-registry double: records verify + crawl-path calls."""
+
+    def __init__(self) -> None:
+        self.verifies: list[str] = []
+        self.registrations: list[list] = []
+        self._next_path_id = 0
+        self.path_predicate = SimpleNamespace(evaluate=lambda pools_and_zfos: None)
+
+    def run_v3_verify_lifecycle_sync(self, address: str) -> None:
+        self.verifies.append(address)
+
+    def register_crawl_path(self, engine_hops: list) -> tuple[int, bool]:
+        self.registrations.append(list(engine_hops))
+        self._next_path_id += 1
+        return (self._next_path_id, True)
+
+
+def _pipeline_over_registry(
+    registry: _RecordingRegistry,
+) -> PathRegistrationPipeline:
+    """A pipeline whose V3 builds answer from a fixed address -> pool map."""
+
+    pools = {
+        POOL_A: _FakeV3Pool(POOL_A, WETH_CHECKSUM, T1_CHECKSUM, pool_id=101),
+        POOL_B: _FakeV3Pool(POOL_B, T1_CHECKSUM, WETH_CHECKSUM, pool_id=202),
+    }
+
+    class _Tracker:
+        def get_pool(
+            self,
+            *,
+            pool_address: str,
+            silent: bool = True,
+        ) -> _FakeV3Pool:
+            return pools[pool_address]
+
+    bot = SimpleNamespace(registration_fleet_hosted=lambda: True)
+    ctx = SimpleNamespace(
+        bot=bot,
+        chain_id=1,
+        db=None,
+        uniswap_v3_tracker=_Tracker(),
+        sushiswap_v3_tracker=None,
+        pancakeswap_v3_tracker=None,
+        weth=SimpleNamespace(address=WETH_CHECKSUM),
+    )
+    return PathRegistrationPipeline(
+        context=ctx,
+        engine_registry=registry,  # type: ignore[arg-type]
+    )
+
+
+def _closed_v3_cycle_steps() -> list[_OpaqueStep]:
+    """WETH->T1 (pool A) then T1->WETH (pool B): the cycle closes."""
+    return [
+        _OpaqueStep(type=UniswapV3PoolTable, address=POOL_A, hash=None),
+        _OpaqueStep(type=UniswapV3PoolTable, address=POOL_B, hash=None),
+    ]
+
+
+def test_duplicate_candidate_short_circuits_before_verify_and_engine() -> None:
+    """A hop signature already registered answers dup WITHOUT verify or RPC.
+
+    The PRG-4 cutover moved dedup behind the V3/V4 verify lifecycles, so every
+    duplicate candidate re-ran the full choreography (observed live: 945
+    verify lifecycles for 122 unique pools). The memo in front of verify must
+    return the SAME outcome shape the engine dedup produces (created=False)
+    while leaving the engine's registry untouched after the first sighting.
+    """
+    registry = _RecordingRegistry()
+    pipeline = _pipeline_over_registry(registry)
+    steps = _closed_v3_cycle_steps()
+
+    first = pipeline._registration_unit(steps)
+    assert first.kind == "registered"
+    assert first.created is True
+    pipeline._absorb_outcome(first)
+    assert pipeline.path_count == 1
+    assert registry.registrations == [[(101, True), (202, True)]]
+
+    second = pipeline._registration_unit(steps)
+    assert second.kind == "registered"
+    assert second.created is False
+    pipeline._absorb_outcome(second)
+    # Counter parity: the dup fold matches the engine-dedup fold.
+    assert pipeline.path_count == 1
+    assert pipeline.dup_count == 1
+    assert pipeline._skip_reasons["dup"] == 1
+
+    # The engine saw each hop verified exactly once and registered once.
+    assert registry.verifies == [POOL_A, POOL_B]
+    assert len(registry.registrations) == 1
+
+
+def test_path_predicate_evaluates_before_verify() -> None:
+    """D7KMQO policy enforcement happens before any verify choreography.
+
+    The predicate docstring promises "before any work"; PRG-4 left it after
+    the verify loop, so a policy-rejected path paid lifecycles first. A
+    rejection must now surface with the engine never having verified.
+    """
+    registry = _RecordingRegistry()
+    pipeline = _pipeline_over_registry(registry)
+
+    class _PolicyRejection(Exception):
+        """The recorded D7KMQO refusal."""
+
+    def _refuse(pools_and_zfos: object) -> None:
+        msg = "policy: not deployed"
+        raise _PolicyRejection(msg)
+
+    registry.path_predicate = SimpleNamespace(evaluate=_refuse)
+
+    outcome = pipeline._registration_unit(_closed_v3_cycle_steps())
+    assert outcome.kind == "reject"
+    assert registry.verifies == []
+    assert len(registry.registrations) == 0

@@ -232,3 +232,7 @@ logs/
 # sphinx-autoapi generated source (recreated each build; autoapi_keep_files=False)
 docs/autoapi/
 hp.json
+
+# agent-harness workspace snapshots (full repo copies incl. unformatted rust bins;
+# break the rust-fmt pre-commit hook — 2026-09-11)
+autoresearch/
