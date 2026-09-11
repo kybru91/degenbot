@@ -405,6 +405,14 @@ pub struct ArbitrageEngine {
     /// line so a block's two real cycles (65/1853 overnight) are attributable
     /// instead of looking like duplicate logging.
     solve_entry: &'static str,
+    /// Cold-start trace: the CURRENT solve cycle's dispatch arm — `detached`
+    /// | `in_cycle` | `skipped_empty` (the cycle-span vocabulary), latched by
+    /// the dispatch at the machine's begin verdict (the `solve_entry`
+    /// precedent). Read AFTER `solve_dirty` returns, where the cycle's
+    /// duration and Mutex hold are measurable, so those histograms can be
+    /// attributed by arm. `unset` = no cycle dispatched yet (a bug signal,
+    /// deliberately visible rather than folded into `skipped_empty`).
+    cycle_arm: &'static str,
     /// Paths registered via `register_and_solve_path` that have been eagerly
     /// solved and appended to `results`. Tracked so `rebuild_and_solve_affected`
     /// can merge them instead of discarding them when it replaces `self.results`.
@@ -622,6 +630,7 @@ impl ArbitrageEngine {
             results: DashMap::new(),
             cursor: BlockCursor::default(), // (0, None, 0, false) — the pre-cursor init, unchanged
             solve_entry: "drain",
+            cycle_arm: "unset",
             pending_new_paths: HashSet::new(),
             next_path_id: 1, // path IDs start at 1
             path_signatures: HashMap::new(),

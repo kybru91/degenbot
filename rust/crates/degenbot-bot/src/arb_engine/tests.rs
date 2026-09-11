@@ -7378,6 +7378,72 @@ mod tests {
         );
     }
 
+    /// Cold-start trace (degraded-state measurement): the dispatch LATCHES the
+    /// cycle's arm on the engine (the `solve_entry` precedent) — a span field
+    /// alone is unreadable to the caller, and the caller (`EngineStages`) is
+    /// the only place the cycle's duration and Mutex hold are measurable,
+    /// i.e. AFTER `solve_dirty` returns. `unset` is the never-dispatched
+    /// sentinel: deliberately visible rather than folded into
+    /// `skipped_empty`.
+    #[test]
+    fn cycle_arm_label_latches_for_every_dispatch_arm() {
+        let (mut engine, pool_ids, _path_ids) = detached_fixture(0);
+        assert_eq!(
+            engine.cycle_arm(),
+            "unset",
+            "no cycle has been dispatched yet"
+        );
+        // Sub-cap under the detached stance: the detached arm.
+        engine.set_detached_solving(true);
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        assert_eq!(
+            engine.cycle_arm(),
+            "detached",
+            "a sub-cap cycle under the detached stance must latch the detached arm"
+        );
+        // At the in-flight cap: the DEGRADED arm — the population the
+        // counter tallies and the histogram tail must belong to.
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed); // == DETACHED_INFLIGHT_CAP
+        engine.solve_dirty(101, &BlockMetadata::default(), &affected_keys_v2);
+        assert_eq!(
+            engine.cycle_arm(),
+            "in_cycle",
+            "a cap-degraded cycle must latch in_cycle: under the detached stance in_cycle IS the degraded set"
+        );
+        // A dirty key with NO registered paths: the bookkeeping-only pass.
+        engine
+            .detached_cycle
+            .outstanding
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let orphan = engine.register_v2_pool(
+            Address::from([0x77_u8; 20]),
+            usdc(1_000_000),
+            weth(500),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        engine.solve_dirty(
+            102,
+            &BlockMetadata::default(),
+            &[degenbot_solvers::affected_keys::AffectedKey::new(
+                HopType::V2,
+                orphan,
+            )],
+        );
+        assert_eq!(
+            engine.cycle_arm(),
+            "skipped_empty",
+            "a dirty key with no registered paths must latch the bookkeeping-only arm"
+        );
+    }
+
     #[test]
     fn detached_inflight_below_cap_still_detaches() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(400);
@@ -7684,6 +7750,7 @@ pub(crate) mod test_keys {
     // site (solver_dispatch, at the machine's begin_cycle verdict).
     #[cfg(feature = "otel")]
     #[test]
+    #[expect(clippy::expect_used)]
     fn cycle_arm_span_field_stamps_both_arms() {
         use crate::arb_engine::solver_dispatch::record_cycle_arm_telemetry;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
@@ -7696,14 +7763,23 @@ pub(crate) mod test_keys {
         tracing::subscriber::with_default(subscriber, || {
             let detached =
                 tracing::info_span!("degenbot.arb.solve", cycle.arm = tracing::field::Empty,);
-            let _g = detached.enter();
-            record_cycle_arm_telemetry(&detached, "detached", false);
-            drop(_g);
+            let guard = detached.enter();
+            assert_eq!(
+                record_cycle_arm_telemetry(&detached, "detached", false),
+                "detached",
+                "the helper returns the label the caller latches on the engine"
+            );
+            drop(guard);
 
             let degraded =
                 tracing::info_span!("degenbot.arb.solve", cycle.arm = tracing::field::Empty,);
-            let _g = degraded.enter();
-            record_cycle_arm_telemetry(&degraded, "in_cycle", true);
+            let guard = degraded.enter();
+            assert_eq!(
+                record_cycle_arm_telemetry(&degraded, "in_cycle", true),
+                "in_cycle",
+                "the degraded arm's label is the latch value read back by EngineStages"
+            );
+            drop(guard);
         });
 
         provider.force_flush().expect("flush");

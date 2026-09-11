@@ -207,8 +207,11 @@ impl EngineStages {
             }
             // KNEUQX: surface the cycle's anchored block on the span.
             span.record("cycle.solve_block", engine.results_block());
+            // Cold-start trace: the arm the dispatch latched THIS cycle on
+            // (the span field is unreadable here) attributes the hold sample.
+            let cycle_arm = engine.cycle_arm();
             if let Some(p) = crate::instruments::pipeline() {
-                p.observe_mutex_hold_duration(hold_start.elapsed().as_secs_f64());
+                p.observe_mutex_hold_duration(hold_start.elapsed().as_secs_f64(), cycle_arm);
             }
             // SRQEK5 (WV62TX): spawn the detached merge sidecar at the FIRST
             // detached enqueue (rx take + spawn atomic under the held guard).
@@ -219,7 +222,7 @@ impl EngineStages {
             }
         }
         if let Some(p) = crate::instruments::pipeline() {
-            p.observe_solve_duration(solve_start.elapsed().as_secs_f64());
+            p.observe_solve_duration(solve_start.elapsed().as_secs_f64(), engine.cycle_arm());
             p.count_solves_executed();
         }
     }

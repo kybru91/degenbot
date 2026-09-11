@@ -364,7 +364,7 @@ fn solver_instruments_render_with_verdict_labels() {
     let meter = provider.meter("degenbot.test");
     let p = PipelineInstruments::new(&meter);
 
-    p.observe_solve_duration(0.012);
+    p.observe_solve_duration(0.012, "detached");
     p.count_solves_executed();
     p.set_registered_paths(42);
     p.count_candidates_found(7);

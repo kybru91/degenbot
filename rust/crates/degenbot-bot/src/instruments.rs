@@ -241,7 +241,7 @@ impl PipelineInstruments {
     #[must_use]
     #[expect(clippy::too_many_lines)] // one instrument per block; splitting hides the inventory
     pub fn new(meter: &Meter) -> Self {
-        Self {
+        let instruments = Self {
             header_to_publish: meter
                 .f64_histogram("degenbot.epoch.header_to_publish")
                 .with_unit("s")
@@ -571,7 +571,16 @@ impl PipelineInstruments {
                     "Resident set bytes of the bot process (drift-watch, FRKBGP close-out)",
                 )
                 .build(),
-        }
+        };
+        // Cold-start trace: zero-initialize the degraded-cycle counter. The
+        // OTel Prometheus exporter omits an instrument that never recorded a
+        // measurement, so an ABSENT series was previously indistinguishable
+        // from "never degraded" (the 2026-09-11 cold soak hit exactly that:
+        // `_applied_total` and `_in_flight` rendered, `degraded_cycles` did
+        // not). This explicit 0 keeps the series always present, making a
+        // scraped `0` mean what it says.
+        instruments.detached_degraded_cycles.add(0, &[]);
+        instruments
     }
 
     /// Header accepted → Published-stage dispatch (the epoch race).
@@ -727,13 +736,21 @@ impl PipelineInstruments {
     }
 
     /// Engine-`Mutex` hold duration for a dirty solve cycle (T2 instrument).
-    pub fn observe_mutex_hold_duration(&self, secs: f64) {
-        self.mutex_hold_duration.record(secs, &[]);
+    /// `arm` is the cycle-span vocabulary (`detached` | `in_cycle` |
+    /// `skipped_empty`); under the detached stance `in_cycle` IS the DEGRADED
+    /// population (the cap verdict the `degenbot.detached.degraded_cycles`
+    /// counter tallies), so its tail is separable from the detached arm's.
+    pub fn observe_mutex_hold_duration(&self, secs: f64, arm: &'static str) {
+        self.mutex_hold_duration
+            .record(secs, &[KeyValue::new("arm", arm)]);
     }
 
-    /// One dirty-carrying solve cycle's duration.
-    pub fn observe_solve_duration(&self, secs: f64) {
-        self.solve_duration.record(secs, &[]);
+    /// One dirty-carrying solve cycle's duration (same `arm` attribution as
+    /// the hold above — the pairing is what answers "what does degradation
+    /// cost" per cycle).
+    pub fn observe_solve_duration(&self, secs: f64, arm: &'static str) {
+        self.solve_duration
+            .record(secs, &[KeyValue::new("arm", arm)]);
     }
 
     /// One per-path solve closure's duration (gate + decomposed solver).
@@ -1192,7 +1209,7 @@ mod kind_tests {
         let instruments = PipelineInstruments::new(&provider.meter("test"));
         // A 45s sample must land BETWEEN the new tail bounds, not fuse into
         // the old +inf-only tail: le=30 must separate it from le=60.
-        instruments.observe_solve_duration(45.0);
+        instruments.observe_solve_duration(45.0, "in_cycle");
         let text = crate::metrics::render(&registry);
         for bound in ["10", "30", "60"] {
             assert!(
@@ -1349,7 +1366,7 @@ mod kind_tests {
             crate::metrics::build_prometheus_provider().expect("prometheus provider build");
         let instruments = PipelineInstruments::new(&provider.meter("test_lat"));
         // A realistic solve: ~0.67 s. Must land BETWEEN 0.5 and 1.0 buckets.
-        instruments.observe_solve_duration(0.67);
+        instruments.observe_solve_duration(0.67, "detached");
         let text = crate::metrics::render(&registry);
         // Assert ms-scale le values are present (explicit boundaries replaced
         // the 5s-first default bucket set).
@@ -1361,6 +1378,75 @@ mod kind_tests {
         }
         // Sanity: solve_duration family is scrapeable.
         assert!(text.contains("degenbot_solve_duration_seconds_bucket"));
+        drop(provider);
+    }
+
+    /// Cold-start trace (degraded-state measurement): the degraded-cycle
+    /// counter must render BEFORE it ever fires. The 2026-09-11 cold soak
+    /// scraped `/metrics` for 24 min and never saw
+    /// `degenbot_detached_degraded_cycles_total` while its siblings
+    /// (`_applied_total`, `_in_flight`) rendered — a never-measured `OTel`
+    /// instrument is omitted from the exposition, so "never degraded" and
+    /// "not exported" were indistinguishable. Zero-initializing the counter
+    /// makes a missing series impossible and a `0` scrape meaningful.
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn degraded_cycle_counter_renders_before_any_degradation() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_degraded_zero"));
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("degenbot_detached_degraded_cycles_total"))
+            .expect("the degraded counter must be exported at 0 (a missing series reads as 'never degraded')");
+        assert!(line.ends_with(" 0"), "{line} != 0");
+        instruments.count_detached_degraded_cycle();
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("degenbot_detached_degraded_cycles_total"))
+            .expect("the counter stays exported after firing");
+        assert!(line.ends_with(" 1"), "{line} != 1");
+        drop(provider);
+    }
+
+    /// Cold-start trace (degraded-state measurement, impact half): the solve
+    /// latency histograms carry the dispatch arm, so the DEGRADED population's
+    /// tail — `in_cycle` under the detached stance, the cap verdict the
+    /// `degenbot.detached.degraded_cycles` counter tallies — is separable from
+    /// the detached arm's in Prometheus. Values are the cycle-span vocabulary
+    /// (`detached` | `in_cycle` | `skipped_empty`).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn solve_latency_histograms_carry_the_arm_label() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_arm_label"));
+        instruments.observe_solve_duration(0.67, "in_cycle");
+        instruments.observe_mutex_hold_duration(0.9, "detached");
+        let text = crate::metrics::render(&registry);
+        // The exposition carries scope labels too (otel_scope_name), so
+        // match family + arm + value instead of a literal whole-label string.
+        let mut attributed = 0;
+        for line in text.lines() {
+            let want_arm = if line.starts_with("degenbot_solve_duration_seconds_count") {
+                Some("in_cycle")
+            } else if line.starts_with("degenbot_solve_mutex_hold_seconds_count") {
+                Some("detached")
+            } else {
+                None
+            };
+            if let Some(arm) = want_arm {
+                if line.contains(&format!("arm=\"{arm}\"")) && line.ends_with(" 1") {
+                    attributed += 1;
+                }
+            }
+        }
+        assert_eq!(
+            attributed, 2,
+            "both solve-latency histograms must attribute their sample to the cycle's arm ({text})"
+        );
         drop(provider);
     }
 }

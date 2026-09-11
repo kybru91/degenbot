@@ -32,6 +32,13 @@ impl ArbitrageEngine {
         self.solve_entry = entry;
     }
 
+    /// The CURRENT cycle's dispatch arm (see the field note): the latency
+    /// histograms' `arm` label, read by the caller that observes the cycle.
+    #[must_use]
+    pub fn cycle_arm(&self) -> &'static str {
+        self.cycle_arm
+    }
+
     /// KNEUQX: the block the MOST RECENT solve cycle ran anchored on - the
     /// solve-anchor resolution (request block floored by the pool-state head,
     /// see `crate::bot_core::solve_anchor`), stamped into the cycle's
