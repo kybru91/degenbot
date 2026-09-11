@@ -2,8 +2,8 @@
 
 degenbot consumes only a small slice of ``eth_typing``: the ``ChainId``
 int-enum (as hash-equal dict keys into deployment registries) and a handful
-of address/hash/block/ABI annotation aliases. This module owns those so the
-``eth_typing`` dependency can be dropped with a hard cutover.
+of address/hash/block/ABI annotation aliases. This module owns those; the
+``eth_typing`` dependency has since been dropped outright.
 
 Address and hash aliases are plain ``str`` (not ``NewType``): the runtime is
 already plain strings (EIP-55 checksummed), matching

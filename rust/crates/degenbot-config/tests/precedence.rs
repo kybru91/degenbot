@@ -204,112 +204,6 @@ fn quiesce_keys_precedence_chain_env_beats_file_beats_default() {
     cleanup(&path);
 }
 
-/// P6YXA6 hard cutover: `solve.executor` is retired — the role-switching
-/// worker fleet (and its private-runtime tokio fallback) is the ONLY solve
-/// executor. A surviving `DEGENBOT_SOLVE_EXECUTOR` setting must FAIL the
-/// load loudly and point at the replacement (the deprecation-style hard
-/// error kept for one release; not silence, not a warn-and-default).
-/// RED before the key was removed: the loader accepted the enum happily.
-#[test]
-fn retired_executor_env_fails_the_load_loudly() {
-    let err = must_err(
-        &BotConfigLoader::new().with_env(map_env(&[("DEGENBOT_SOLVE_EXECUTOR", "tokio")])),
-    );
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("DEGENBOT_SOLVE_EXECUTOR"),
-        "the error names the retired variable: {msg}"
-    );
-    assert!(
-        msg.contains("fleet"),
-        "the error names the replacement (the worker fleet): {msg}"
-    );
-}
-
-/// LW-T9 hard cutover: `fleet.stance` is retired — the worker fleet is the
-/// ONLY behavior (ADR-042 Q6 ended; ergo CQLMM2). A surviving
-/// `DEGENBOT_FLEET` setting must FAIL the load loudly and name the
-/// retirement (mirror of the P6YXA6 `DEGENBOT_SOLVE_EXECUTOR` treatment;
-/// the deprecation-style hard error is kept for one release). RED before
-/// the key was removed: the loader parsed the enum happily.
-#[test]
-fn retired_fleet_stance_env_fails_the_load_loudly() {
-    let err = must_err(&BotConfigLoader::new().with_env(map_env(&[("DEGENBOT_FLEET", "fleet")])));
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("DEGENBOT_FLEET"),
-        "the error names the retired variable: {msg}"
-    );
-    assert!(
-        msg.contains("fleet.stance"),
-        "the error names the retired typed key: {msg}"
-    );
-    assert!(
-        msg.contains("retired") || msg.contains("no longer supported"),
-        "the error states the retirement, not a parse failure: {msg}"
-    );
-}
-
-/// The TOML layer of the same retirement: a surviving `[fleet] stance = ...
-///` entry fails the load loudly, naming `fleet.stance` (beyond the generic
-/// unknown-key error, per the retired-[otel]-table treatment).
-#[test]
-fn retired_fleet_stance_toml_key_fails_the_load_loudly() {
-    let path = temp_toml("retired-stance", "[fleet]\nstance = \"fleet\"\n");
-    let err = must_err(&BotConfigLoader::new().without_env().with_config_path(&path));
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("fleet.stance"),
-        "the error names the retired TOML key: {msg}"
-    );
-    assert!(
-        msg.contains("retired") || msg.contains("no longer supported"),
-        "the error states the retirement: {msg}"
-    );
-    cleanup(&path);
-}
-
-/// LW-T9 hard cutover (ruling `sim_slots` (a)): `solve.solve_sim_inflight` is
-/// retired with the `SimSlots` semaphore — its only production consumer. A
-/// surviving `DEGENBOT_SOLVE_SIM_INFLIGHT` setting fails the load loudly and
-/// names the successor keys (`fleet.sim_slot_cap` /
-/// `solve.inline_sim_workers`).
-/// RED before the key was removed: the loader typed the value happily.
-#[test]
-fn retired_sim_inflight_env_fails_the_load_loudly() {
-    let err = must_err(
-        &BotConfigLoader::new().with_env(map_env(&[("DEGENBOT_SOLVE_SIM_INFLIGHT", "8")])),
-    );
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("DEGENBOT_SOLVE_SIM_INFLIGHT"),
-        "the error names the retired variable: {msg}"
-    );
-    assert!(
-        msg.contains("fleet.sim_slot_cap") && msg.contains("solve.inline_sim_workers"),
-        "the error names the successor keys: {msg}"
-    );
-}
-
-/// The TOML layer of the same retirement: a surviving
-/// `[solve] solve_sim_inflight` entry fails the load loudly, naming the key
-/// and the successors.
-#[test]
-fn retired_sim_inflight_toml_key_fails_the_load_loudly() {
-    let path = temp_toml("retired-sim-inflight", "[solve]\nsolve_sim_inflight = 8\n");
-    let err = must_err(&BotConfigLoader::new().without_env().with_config_path(&path));
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("solve.solve_sim_inflight"),
-        "the error names the retired TOML key: {msg}"
-    );
-    assert!(
-        msg.contains("fleet.sim_slot_cap") && msg.contains("solve.inline_sim_workers"),
-        "the error names the successor keys: {msg}"
-    );
-    cleanup(&path);
-}
-
 #[test]
 fn every_layer_for_every_type_in_sequence() {
     // (BM35LK: the quiesce keys ride the same loader machinery — asserted
@@ -357,9 +251,8 @@ fn every_layer_for_every_type_in_sequence() {
 #[test]
 fn loader_fails_closed_on_bad_values_and_unknown_keys() {
     // LW-T9: the RETIRED stance key is not a schema key anymore — a CLI
-    // override naming it is rejected as unknown (the env-layer path fails
-    // loudly with the actionable retirement message; see
-    // retired_fleet_stance_env_fails_the_load_loudly), no silent fallback.
+    // override naming it is rejected as unknown (fail-closed, no silent
+    // fallback).
     let err = must_err(
         &BotConfigLoader::new()
             .without_env()
@@ -371,9 +264,7 @@ fn loader_fails_closed_on_bad_values_and_unknown_keys() {
     );
 
     // P6YXA6: the RETIRED executor key is not a schema key anymore — a CLI
-    // override naming it is rejected as unknown (the env-layer path fails
-    // loudly with the actionable retirement message; see
-    // retired_executor_env_fails_the_load_loudly).
+    // override naming it is rejected as unknown (fail-closed).
     let err = must_err(
         &BotConfigLoader::new()
             .without_env()
@@ -464,27 +355,21 @@ fn runtime_io_workers_invalid_value_fails_closed() {
     );
 }
 
+/// Post-migration contract: the retired env names are plain unknown env —
+/// the migration-shim refusals have been removed, so a surviving variable
+/// neither fails the load nor resurrects legacy behavior (it is ignored).
 #[test]
-fn legacy_tokio_worker_threads_env_fails_the_load() {
-    // SMTH6M: the raw `TOKIO_WORKER_THREADS` read that sized the ambient
-    // runtime is retired. Its name is NOT a schema key; a surviving setting
-    // must fail the load loudly (config-loader fail-closed convention) and
-    // point at the replacement, never silently size the runtime.
-    let ok = BotConfigLoader::new().with_env(map_env(&[])).load();
-    assert!(
-        ok.is_ok(),
-        "absence of the legacy name must not fail the load"
-    );
-    let err = must_err(&BotConfigLoader::new().with_env(map_env(&[("TOKIO_WORKER_THREADS", "2")])));
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("TOKIO_WORKER_THREADS"),
-        "the legacy name is named in the error: {msg}"
-    );
-    assert!(
-        msg.contains("DEGENBOT_IO_WORKERS"),
-        "the error points at the replacement key: {msg}"
-    );
+fn retired_env_shims_are_ignored() {
+    let ok = BotConfigLoader::new()
+        .with_env(map_env(&[
+            ("TOKIO_WORKER_THREADS", "2"),
+            ("DEGENBOT_SOLVE_EXECUTOR", "tokio"),
+            ("DEGENBOT_FLEET", "fleet"),
+            ("DEGENBOT_SOLVE_SIM_INFLIGHT", "8"),
+            ("DEGENBOT_LPT_PARTITION", "4"),
+        ]))
+        .load();
+    assert!(ok.is_ok(), "retired env names are ignored: {ok:?}");
 }
 
 #[test]

@@ -44,8 +44,7 @@ def build_arbitrage_arg_parser() -> argparse.ArgumentParser:
         help=(
             "HTTP RPC endpoint for the arbitrage chain (Ethereum mainnet). "
             "Highest-priority source in the RPC URI cascade: "
-            "--node-http > DEGENBOT_RPC_HTTP_CHAINID_1 > NODE_HOST_HTTP "
-            "> config.toml rpc[1] > error."
+            "--node-http > DEGENBOT_RPC_HTTP_CHAINID_1 > config.toml rpc[1] > error."
         ),
     )
     parser.add_argument(
@@ -55,8 +54,7 @@ def build_arbitrage_arg_parser() -> argparse.ArgumentParser:
         help=(
             "WebSocket RPC endpoint for the arbitrage chain (Ethereum mainnet). "
             "Highest-priority source in the RPC URI cascade: "
-            "--node-ws > DEGENBOT_RPC_WS_CHAINID_1 > NODE_HOST_WEBSOCKET "
-            "> config.toml ws[1] > error."
+            "--node-ws > DEGENBOT_RPC_WS_CHAINID_1 > config.toml ws[1] > error."
         ),
     )
     parser.add_argument(

@@ -360,9 +360,8 @@ def resolve_rpc_uris(
        plain ``export`` in the devcontainer takes effect (the .env-file dict is
        NOT consulted).
     3. ``fallback_http`` / ``fallback_ws`` — caller-supplied lower-priority
-       candidates. The settlement-arbitrage example uses this slot to inject the deprecated
-       ``NODE_HOST_*`` rebuilt URIs without leaking that naming into the
-       library resolver.
+       candidates (a public extension point; no in-repo caller since the
+       ``NODE_HOST_*`` retirement).
     4. config.toml ``rpc[chain_id]`` / ``ws[chain_id]`` via
        :func:`load_config_from_file` (only when :data:`CONFIG_FILE` exists).
     5. raise :class:`RpcNotConfiguredError` — no ``localhost`` default.

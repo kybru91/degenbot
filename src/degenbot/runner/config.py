@@ -16,7 +16,6 @@ legacy ``main()`` (``filter_thin_margin_results`` with its ``BPS_DENOM`` /
 """
 
 import dataclasses
-import warnings
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -238,12 +237,6 @@ class ArbitrageConfig:
           is overridden to ``INJECTED_EXECUTOR_ADDRESS``.
         - permutation: a CLI string becomes a singleton frozenset; ``None`` stays ``None``.
 
-        Deprecated: ``NODE_HOST_HTTP``/``NODE_PORT_HTTP``/
-        ``NODE_HOST_WEBSOCKET``/``NODE_PORT_WEBSOCKET`` (host+port composition)
-        are rebuilt into full URIs and injected as the resolver *fallback* slot
-        (below OS env, above config.toml), emitting ``DeprecationWarning``. Migrate
-        to ``DEGENBOT_RPC_HTTP_CHAINID_{chain_id}`` / ``..._WS_CHAINID_{cid}``.
-
         Returns:
             A frozen ``ArbitrageConfig`` with cascade-resolved ``node_http``/``node_ws``.
 
@@ -275,36 +268,11 @@ class ArbitrageConfig:
                 raise ValueError(msg)
 
         # ── Node URLs — delegated to the library cascade (resolve_rpc_uris) ──
-        # Legacy NODE_HOST_*/NODE_PORT_* host+port form is rebuilt into a full
-        # URI and passed as the resolver *fallback* slot (below OS env, above
-        # config.toml) so existing mainnet.env users keep working — but it emits
-        # a DeprecationWarning pointing at the chain-id-discriminated envvar.
-        fallback_http: str | None = None
-        fallback_ws: str | None = None
-        legacy_http_host = env.get("NODE_HOST_HTTP")
-        if legacy_http_host:
-            fallback_http = f"{legacy_http_host}:{env.get('NODE_PORT_HTTP') or '8545'}"
-            warnings.warn(
-                f"NODE_HOST_HTTP is deprecated; set DEGENBOT_RPC_HTTP_CHAINID_{chain_id} instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        legacy_ws_host = env.get("NODE_HOST_WEBSOCKET")
-        if legacy_ws_host:
-            fallback_ws = f"{legacy_ws_host}:{env.get('NODE_PORT_WEBSOCKET') or '8546'}"
-            warnings.warn(
-                f"NODE_HOST_WEBSOCKET is deprecated; set "
-                f"DEGENBOT_RPC_WS_CHAINID_{chain_id} instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
         node_http, node_ws = resolve_rpc_uris(
             chain_id,
             cli_http=cli_http,
             cli_ws=cli_ws,
-            fallback_http=fallback_http,
-            fallback_ws=fallback_ws,
         )
 
         # ── Executor ──

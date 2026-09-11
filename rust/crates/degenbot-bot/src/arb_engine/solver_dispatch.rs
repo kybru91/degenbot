@@ -2774,10 +2774,10 @@ impl ArbitrageEngine {
         }
 
         // P6YXA6 hard cutover: ONE in-cycle dispatch. The LPT bins ride the
-        // fleet-hosted executor under `fleet.stance=fleet`, else the
-        // dedicated private tokio runtime — no executor-stance gate
-        // (`solve.executor` is retired with the `DEGENBOT_SOLVE_EXECUTOR`
-        // loud load error), and the rayon arms are gone.
+        // fleet-hosted executor, else the dedicated private tokio runtime —
+        // no executor-stance gate (`solve.executor` retired at the cutover;
+        // its migration-shim refusal has since been removed), and the rayon
+        // arms are gone.
         // 43E3H3 (design §3.3): this arm now draws its ledger seq from the
         // SAME monotone counter the detached arm stamps enqueue with — the
         // ONE (solve_seq, pid) key zone covers BOTH arms. `detached_issued_seq`

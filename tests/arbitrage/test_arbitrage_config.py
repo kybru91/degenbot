@@ -10,13 +10,13 @@ that delegates RPC resolution to the library `resolve_rpc_uris` cascade
 Node resolution no longer defaults to `localhost`. A chain with no configured
 endpoint in any layer raises `RpcNotConfiguredError` (a `ValueError` subclass)
 pointing at `DEGENBOT_RPC_*_CHAINID_{cid}` / config.toml. The legacy
-`NODE_HOST_*`/`NODE_PORT_*` host+port form is retained only as a deprecated
-fallback that emits `DeprecationWarning`.
+`NODE_HOST_*`/`NODE_PORT_*` variables are retired and ignored.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import warnings
 
 import pytest
 
@@ -160,61 +160,42 @@ class TestRpcCascade:
         assert cfg.node_ws == "wss://ws-env.example"
 
 
-class TestLegacyNodeHostDeprecation:
-    """NODE_HOST_*/NODE_PORT_* still work but emit DeprecationWarning (fallback slot)."""
+class TestLegacyNodeHostIgnored:
+    """NODE_HOST_*/NODE_PORT_* are retired: the variables are ignored (no warning)."""
 
-    def test_legacy_rebuilds_uri_and_warns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_legacy_vars_are_fully_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(_HTTP_ENV, raising=False)
         monkeypatch.delenv(_WS_ENV, raising=False)
 
         monkeypatch.setattr(
             config_module, "CONFIG_FILE", type("P", (), {"exists": lambda self: False})()
         )
-
         env = _full_env() | {
             "NODE_HOST_HTTP": "https://legacy.example",
             "NODE_PORT_HTTP": "8545",
             "NODE_HOST_WEBSOCKET": "wss://legacy.example",
             "NODE_PORT_WEBSOCKET": "8546",
         }
-        with (
-            pytest.warns(DeprecationWarning, match="DEGENBOT_RPC_HTTP_CHAINID"),
-            pytest.warns(DeprecationWarning, match="DEGENBOT_RPC_WS_CHAINID"),
-        ):
-            cfg = ArbitrageConfig.from_env(env, live=False, permutation=None)
+        # No RPC source in any layer → RpcNotConfiguredError, and no
+        # DeprecationWarning either (the variables are not consulted at all).
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            with pytest.raises(RpcNotConfiguredError):
+                ArbitrageConfig.from_env(env, live=False, permutation=None)
 
-        assert cfg.node_http == "https://legacy.example:8545"
-        assert cfg.node_ws == "wss://legacy.example:8546"
-
-    def test_legacy_beats_config_but_loses_to_os_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # OS env set → legacy ignored (legacy is the fallback slot, below OS env)
+    def test_legacy_vars_lose_to_os_env_without_warnings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         _set_rpc_env(monkeypatch, http="https://from-env.example", ws="wss://ws-env.example")
         env = _full_env() | {
             "NODE_HOST_HTTP": "https://legacy.example",
             "NODE_PORT_HTTP": "8545",
         }
-        with pytest.warns(DeprecationWarning, match="DEGENBOT_RPC"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
             cfg = ArbitrageConfig.from_env(env, live=False, permutation=None)
 
         assert cfg.node_http == "https://from-env.example"
-
-    def test_legacy_http_only_warns_once_for_http(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv(_HTTP_ENV, raising=False)
-        monkeypatch.delenv(_WS_ENV, raising=False)
-
-        monkeypatch.setattr(
-            config_module, "CONFIG_FILE", type("P", (), {"exists": lambda self: False})()
-        )
-        env = _full_env() | {
-            "NODE_HOST_HTTP": "https://legacy.example",
-            "NODE_PORT_HTTP": "8545",
-        }
-        # http comes from legacy; ws has NO source at all → raises (no localhost default)
-        with (
-            pytest.raises(RpcNotConfiguredError),
-            pytest.warns(DeprecationWarning, match="DEGENBOT_RPC_HTTP_CHAINID"),
-        ):
-            ArbitrageConfig.from_env(env, live=False, permutation=None)
 
 
 class TestPermutationOverride:

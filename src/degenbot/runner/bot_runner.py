@@ -75,8 +75,8 @@ def _make_arbitrage_config(node_http: str) -> DegenbotConfig:
     The chain identity is Ethereum mainnet (1); the RPC is the caller's
     ``node_http`` — the cascade-resolved endpoint from
     :func:`degenbot.config.resolve_rpc_uris` (CLI > OS env
-    ``DEGENBOT_RPC_HTTP_CHAINID_1`` > legacy ``NODE_HOST_*`` > config.toml
-    ``rpc[1]``). When config.toml was the winning source, ``node_http`` already
+    ``DEGENBOT_RPC_HTTP_CHAINID_1`` > config.toml ``rpc[1]``). When
+    config.toml was the winning source, ``node_http`` already
     equals ``rpc[1]``, so the injection here is consistent rather than a bypass.
     The Bot enforces the connected RPC's ``eth_chainId`` matches at construction.
 

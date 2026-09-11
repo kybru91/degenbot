@@ -17,9 +17,7 @@
 //! budget (`crate::cpu_budget`) — the leftover after the solve bins take
 //! theirs — and NOT from `available_parallelism`, which reads 24 host cores
 //! inside an 8-core cgroup quota in this devcontainer. Operators pin it
-//! with the typed `runtime.io_workers` key (env `DEGENBOT_IO_WORKERS`); the
-//! legacy tokio-conventional `TOKIO_WORKER_THREADS` env name is rejected at
-//! config load.
+//! with the typed `runtime.io_workers` key (env `DEGENBOT_IO_WORKERS`).
 //!
 //! # Lazy Initialization
 //!

@@ -289,75 +289,6 @@ impl BotConfigLoader {
                     }
                 }
             }
-
-            // SMTH6M: the ambient runtime used to size itself from the raw
-            // `TOKIO_WORKER_THREADS` env var (a tokio-conventional name, not
-            // a DEGENBOT_* key). That read is retired — the runtime now takes
-            // `runtime.io_workers` / the cgroup budget derivation — so a
-            // surviving legacy setting FAILS the load loudly and points at
-            // the replacement. Silent fail-open here would resurrect the
-            // quota-violating sizing this migration removes.
-            if let Some(raw) = env.get("TOKIO_WORKER_THREADS") {
-                problems.push(format!(
-                    "legacy env var TOKIO_WORKER_THREADS={raw:?} is no longer supported; \
-                     size the ambient I/O runtime via runtime.io_workers \
-                     (env DEGENBOT_IO_WORKERS) or let it derive from the cgroup CPU budget"
-                ));
-            }
-
-            // P6YXA6 hard cutover: solve.executor was retired with the Rayon
-            // dispatch arms — the role-switching worker fleet (and its
-            // private-runtime tokio fallback) is the ONLY solve executor. A
-            // surviving DEGENBOT_SOLVE_EXECUTOR setting fails the load
-            // loudly and points at the replacement: silent fail-open here
-            // would resurrect the stance-gated dispatch this cutover removes
-            // (the deprecation-style hard error is kept for one release).
-            if let Some(raw) = env.get("DEGENBOT_SOLVE_EXECUTOR") {
-                problems.push(format!(
-                    "retired env var DEGENBOT_SOLVE_EXECUTOR={raw:?} is no longer supported; \
-                     the worker fleet is the only solve executor since the hard cutover \
-                     (ADR-042 / ergo P6YXA6) — remove the variable; per-bin fleet hosting \
-                     needs no executor stance selection"
-                ));
-            }
-
-            // P6YXA6: solve bins are ALWAYS LPT-pre-balanced now (the rayon
-            // fallback this flag disabled is retired) — a surviving variable
-            // fails the load loudly for one release.
-            // LW-T9 hard cutover: the fleet stance retired with the tokio
-            // solve executor (ergo CQLMM2) — the worker fleet is the ONLY
-            // behavior. A surviving DEGENBOT_FLEET setting fails the load
-            // loudly (mirror of the DEGENBOT_SOLVE_EXECUTOR treatment; the
-            // deprecation-style hard error is kept for one release).
-            if let Some(raw) = env.get("DEGENBOT_FLEET") {
-                problems.push(format!(
-                    "retired env var DEGENBOT_FLEET={raw:?} is no longer supported: \
-                     fleet is the only stance since LW-T9 (the worker fleet is \
-                     the only behavior; ADR-042 / ergo CQLMM2) — remove the \
-                     variable; the fleet.stance key is retired with it"
-                ));
-            }
-
-            // LW-T9 hard cutover: the SimSlots semaphore retired with the
-            // legacy arb-sim detached threads (only production consumer of
-            // the cap) — fleet sim capacity comes from fleet.sim_slot_cap
-            // and inline-sim sizing from solve.inline_sim_workers.
-            if let Some(raw) = env.get("DEGENBOT_SOLVE_SIM_INFLIGHT") {
-                problems.push(format!(
-                    "retired env var DEGENBOT_SOLVE_SIM_INFLIGHT={raw:?} is no \
-                     longer supported: fleet is the only stance since LW-T9 — \
-                     SimDriver capacity is fleet.sim_slot_cap and inline-sim \
-                     sizing is solve.inline_sim_workers"
-                ));
-            }
-
-            if let Some(raw) = env.get("DEGENBOT_LPT_PARTITION") {
-                problems.push(format!(
-                    "retired env var DEGENBOT_LPT_PARTITION={raw:?} is no longer supported; \
-                     solve bins are always LPT-pre-balanced since the hard cutover \
-                     (ADR-042 / ergo P6YXA6) — remove the variable"
-                ));
-            }
         }
 
         // Layer 4 (highest): CLI / explicit argument overrides.
@@ -446,49 +377,6 @@ impl BotConfigLoader {
                 continue;
             };
             for (field, field_value) in section_table {
-                // LW-T9 hard cutover: the fleet stance key is retired with
-                // the tokio solve executor — a surviving entry fails the
-                // load POINTEDLY (retirement message), not with the generic
-                // unknown-key error (mirror of the retired-[otel]-table
-                // treatment; ergo CQLMM2).
-                // LW-T9: the retired SimSlots cap key fails POINTEDLY too
-                // (the fleet SimDriver budget and the inline-sim sizing are
-                // the successors — no dead-but-parsable key may remain).
-                if section.as_str() == "solve" && field.as_str() == "solve_sim_inflight" {
-                    problems.push(format!(
-                        "--config {}: retired key solve.solve_sim_inflight is \
-                         no longer supported: fleet is the only stance since \
-                         LW-T9 — SimDriver capacity is fleet.sim_slot_cap and \
-                         inline-sim sizing is solve.inline_sim_workers; see \
-                         {MIGRATION_DOC}",
-                        path.display()
-                    ));
-                    continue;
-                }
-                // LW-T9: the retired SimSlots cap key fails POINTEDLY too
-                // (the fleet SimDriver budget and the inline-sim sizing are
-                // the successors — no dead-but-parsable key may remain).
-                if section.as_str() == "solve" && field.as_str() == "solve_sim_inflight" {
-                    problems.push(format!(
-                        "--config {}: retired key solve.solve_sim_inflight is \
-                         no longer supported: fleet is the only stance since \
-                         LW-T9 — SimDriver capacity is fleet.sim_slot_cap and \
-                         inline-sim sizing is solve.inline_sim_workers; see \
-                         {MIGRATION_DOC}",
-                        path.display()
-                    ));
-                    continue;
-                }
-                if section.as_str() == "fleet" && field.as_str() == "stance" {
-                    problems.push(format!(
-                        "--config {}: retired key fleet.stance is no \
-                         longer supported: fleet is the only stance since \
-                         LW-T9 (the worker fleet is the only behavior; \
-                         ADR-042 / ergo CQLMM2) — remove the key; see {MIGRATION_DOC}",
-                        path.display()
-                    ));
-                    continue;
-                }
                 let Some(key) = members.iter().copied().find(|k| k.field == field.as_str()) else {
                     problems.push(format!(
                         "--config {}: unknown key {field} in section [{section}]",
