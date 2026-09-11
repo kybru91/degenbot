@@ -41,7 +41,7 @@ impl ArbitrageEngine {
     /// phase children (fanout/resolve/stage) always carry the anchor.
     #[must_use]
     pub fn results_block(&self) -> u64 {
-        self.results_block
+        self.cursor.results_block()
     }
 
     pub fn solve_dirty(
@@ -93,7 +93,8 @@ impl ArbitrageEngine {
         // Re-solve only paths containing updated pools (no batch send)
         self.rebuild_and_solve_affected(affected, block_number, metadata);
 
-        self.last_processed_block = Some(block_number);
+        // 6XB6NJ: monotone advance on the block cursor.
+        self.cursor.advance_processed(block_number);
     }
 
     /// One buffered-event expiry round under its own `degenbot.arb.expire`
@@ -153,14 +154,16 @@ impl ArbitrageEngine {
     ///
     /// The `block > last_solved_block` guard is load-bearing: it makes the
     /// boundary advance one-shot even when the tombstone re-fires for an
-    /// already-finalized block.
+    /// already-finalized block. 6XB6NJ: the guarded transition lives on the
+    /// block cursor (`BlockCursor::finalize`); this method threads the
+    /// terminal publish through the same guard.
     ///
-    /// `last_solved_block` + `has_logs_this_block` are owned by the engine
-    /// since ergo task LEZJAS (the pump's `&mut` out-params retired); a
-    /// mid-flight engine joining the pump can inherit the pump's last solved
-    /// block via `set_last_solved_block` (ADR-006 D4).
+    /// The solved boundary + the logs flag are engine-owned since ergo task
+    /// LEZJAS (the pump's `&mut` out-params retired; now on the block
+    /// cursor); a mid-flight engine joining the pump can inherit the pump's
+    /// last solved block via `set_last_solved_block` (ADR-006 D4).
     pub fn finalize_block(&mut self, block: u64, metadata: &BlockMetadata) {
-        if block > self.last_solved_block {
+        if self.cursor.finalize(block) {
             // PWPPAZ T1 (supersedes the two former solve branches and the
             // X35QKN empty-block inlining): the finalize is tombstone-
             // dispatched and executed by the drainer while the SUCCESSOR
@@ -170,14 +173,8 @@ impl ArbitrageEngine {
             // 1,755 paths of block 84's dirt; 98f7cf52 repeats the pattern
             // blocks apart). Unconsumed dirt now waits for the pump's
             // drained-settle gate (plus its T2 early slice) — solve cycles
-            // are the settle gate's exclusive job. The boundary is:
-            //   last_solved_block / has_logs_this_block / last_processed_
-            //   block / results_block advance + the terminal publish.
-            self.last_solved_block = block;
-            self.has_logs_this_block = false;
-            self.last_processed_block = Some(block);
-            // Anchor is monotonic: never regress a real solve's anchor.
-            self.results_block = self.results_block.max(block);
+            // are the settle gate's exclusive job. The boundary is the
+            // cursor's guarded four-field advance + the terminal publish.
             self.compute_diff_and_send(metadata);
         }
         // Authoritative per-family apply split (2SDIQW): hotpath labels do
@@ -245,7 +242,8 @@ impl ArbitrageEngine {
             block_number,
             metadata,
         );
-        self.last_processed_block = Some(block_number);
+        // 6XB6NJ: monotone advance on the block cursor.
+        self.cursor.advance_processed(block_number);
     }
 
     /// Process pre-decoded V4 updates.

@@ -133,10 +133,15 @@ impl DeliveryPolicy {
     ///
     /// If the channel is full, the batch is dropped — the next one will carry
     /// a correct cumulative diff.
+    ///
+    /// 6XB6NJ: `anchored` is handed in by the engine from the block cursor
+    /// (`BlockCursor::is_anchored`) — the policy consumes the cursor's
+    /// predicate instead of re-deriving it from the raw `results_block`.
     pub fn diff_and_send(
         &mut self,
         results: &HashMap<u64, SolvePathResult>,
         results_block: u64,
+        anchored: bool,
         metadata: &BlockMetadata,
         inline_payloads: &HashMap<u64, SimulatedPathResult>,
     ) {
@@ -152,7 +157,6 @@ impl DeliveryPolicy {
         // (metadata only) and do NOT commit these candidates to `delivered` —
         // they are re-delivered once the first real solve anchors them at a
         // valid block.
-        let anchored = results_block != 0;
         if !anchored && !results.is_empty() {
             tracing::warn!(
                 results = results.len(),
@@ -324,7 +328,7 @@ impl ArbitrageEngine {
     /// window). The [`DeliveryPolicy`] refuses to publish at block 0 (safety
     /// net) if no anchor has been seeded yet.
     pub fn compute_diff_and_send(&mut self, metadata: &BlockMetadata) {
-        let results_block = self.results_block;
+        let results_block = self.cursor.results_block();
         // f701ccd3 bridge: capture the settle-entered block span as the
         // propagation parent for `results_block` — the Python simulate seam
         // re-attaches it (telemetry::simulate_dispatch_span) so the whole
@@ -344,8 +348,15 @@ impl ArbitrageEngine {
                 .map(|e| (*e.key(), e.value().clone()))
                 .collect();
         self.inline_payloads.clear();
-        self.delivery
-            .diff_and_send(&results_snapshot, results_block, metadata, &inline_payloads);
+        // 6XB6NJ: the anchored gate comes from the block cursor.
+        let anchored = self.cursor.is_anchored();
+        self.delivery.diff_and_send(
+            &results_snapshot,
+            results_block,
+            anchored,
+            metadata,
+            &inline_payloads,
+        );
     }
 
     /// De-register a path from the engine.
@@ -435,7 +446,13 @@ mod tests {
         // Pretend Python already saw path 3 at an older value.
         policy.delivered.insert(3, solve_result(700));
 
-        policy.diff_and_send(&results, 42, &BlockMetadata::default(), &HashMap::default());
+        policy.diff_and_send(
+            &results,
+            42,
+            true,
+            &BlockMetadata::default(),
+            &HashMap::default(),
+        );
 
         let batch = rx.try_recv().expect("diff_and_send with a channel sends");
         assert_eq!(batch.solve_block, 42);
@@ -463,7 +480,13 @@ mod tests {
         let mut policy = DeliveryPolicy::default();
         let mut results: HashMap<u64, SolvePathResult> = HashMap::new();
         results.insert(1, solve_result(500));
-        policy.diff_and_send(&results, 7, &BlockMetadata::default(), &HashMap::default());
+        policy.diff_and_send(
+            &results,
+            7,
+            true,
+            &BlockMetadata::default(),
+            &HashMap::default(),
+        );
         assert!(policy.delivered.contains_key(&1));
     }
 
@@ -485,7 +508,13 @@ mod tests {
         results.insert(1, solve_result(500)); // above threshold, would be fresh if anchored
 
         // results_block == 0 (cold start, no solve yet): batch is EMPTY.
-        policy.diff_and_send(&results, 0, &BlockMetadata::default(), &HashMap::default());
+        policy.diff_and_send(
+            &results,
+            0,
+            false,
+            &BlockMetadata::default(),
+            &HashMap::default(),
+        );
         let batch = rx
             .try_recv()
             .expect("zero-anchor still sends metadata batch");
@@ -505,7 +534,13 @@ mod tests {
 
         // First real solve advances results_block to 42: the deferred candidate
         // is now delivered as fresh at a valid anchor.
-        policy.diff_and_send(&results, 42, &BlockMetadata::default(), &HashMap::default());
+        policy.diff_and_send(
+            &results,
+            42,
+            true,
+            &BlockMetadata::default(),
+            &HashMap::default(),
+        );
         let batch = rx.try_recv().expect("anchored solve delivers");
         assert!(
             batch.fresh.iter().any(|(id, _)| *id == 1),

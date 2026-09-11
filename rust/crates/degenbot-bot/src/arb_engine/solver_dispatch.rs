@@ -2078,7 +2078,8 @@ impl ArbitrageEngine {
         self.walk_memo.begin_block(solve_block);
         // If no paths are affected, just update the block number
         if affected_path_ids.is_empty() {
-            self.results_block = solve_block;
+            // 6XB6NJ: monotone advance on the block cursor.
+            self.cursor.advance_solved(solve_block);
             return;
         }
 
@@ -2812,7 +2813,8 @@ impl ArbitrageEngine {
                     "[solve-phase] detached cycle enqueued (merge runs on the sidecar)"
                 );
             });
-            self.results_block = solve_block;
+            // 6XB6NJ: monotone advance on the block cursor.
+            self.cursor.advance_solved(solve_block);
             // ENQUEUE-END return semantics (T2 acceptance: "return is
             // enqueue-end, not apply-end"): the engine Mutex hold ENDS here;
             // the sidecar re-acquires it per merged straggler.
@@ -3088,7 +3090,8 @@ impl ArbitrageEngine {
             "[solve-phase] cycle complete (clamp done)"
         );
 
-        self.results_block = solve_block;
+        // 6XB6NJ: monotone advance on the block cursor.
+        self.cursor.advance_solved(solve_block);
         // Note: no compute_diff_and_send here — the pump controls when
         // batches are dispatched (debounce timer or block boundary).
     }
@@ -3147,7 +3150,7 @@ impl ArbitrageEngine {
         let memo = std::sync::Arc::clone(&self.walk_memo);
         let path_pools: HashMap<u64, std::sync::Arc<MixedPath>> = self.path_pools.clone();
         let core = std::sync::Arc::clone(self.core());
-        let results_block = self.results_block;
+        let results_block = self.cursor.results_block();
         let runtime_cfg = self.runtime_cfg;
         let (tx, rx) = std::sync::mpsc::channel::<(u64, SolvePathResult)>();
         for (bin_idx, bin) in bins.iter().enumerate() {

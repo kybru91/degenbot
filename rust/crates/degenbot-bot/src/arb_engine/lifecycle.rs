@@ -314,7 +314,7 @@ impl ArbitrageEngine {
                 .iter()
                 .map(|r| (*r.key(), r.value().clone()))
                 .collect(),
-            self.results_block,
+            self.cursor.results_block(),
         )
     }
 
@@ -322,7 +322,7 @@ impl ArbitrageEngine {
     /// Returns `None` if no block has been processed yet.
     #[must_use]
     pub const fn last_processed_block(&self) -> Option<u64> {
-        self.last_processed_block
+        self.cursor.last_processed_block()
     }
 
     /// Set the last processed block manually.
@@ -332,8 +332,11 @@ impl ArbitrageEngine {
     /// the pump would restart from `first_observed_block` and buffer
     /// events that the Python pools already reflect, causing
     /// double-application when pools are later registered.
-    pub const fn set_last_processed_block(&mut self, block: u64) {
-        self.last_processed_block = Some(block);
+    ///
+    /// 6XB6NJ: a monotone advance on the block cursor — a lower value
+    /// cannot pull the processed boundary backwards.
+    pub fn set_last_processed_block(&mut self, block: u64) {
+        self.cursor.advance_processed(block);
     }
 
     /// The last block this engine's `finalize_block` guard advanced past.
@@ -343,15 +346,20 @@ impl ArbitrageEngine {
     /// tombstone `finalize_block(block > 0)` fires).
     #[must_use]
     pub const fn last_solved_block(&self) -> u64 {
-        self.last_solved_block
+        self.cursor.last_solved_block()
     }
 
     /// Seed the engine's `last_solved_block` (e.g. on mid-flight join: a late
     /// engine inherits the pump's current solved block). Test helper too — the
     /// `finalize_block_threads_metadata_into_send` test pre-seeds 0 to fire the
     /// guard. Production pump path lets `finalize_block` advance it.
+    ///
+    /// 6XB6NJ: a monotone advance on the block cursor. Behavior-preserving
+    /// on every existing call path (the ADR-006 D4 inherit + tests): the
+    /// engine starts at 0 and the production stamps are non-decreasing, so
+    /// the max is the same value the old unconditional write landed.
     pub fn set_last_solved_block(&mut self, block: u64) {
-        self.last_solved_block = block;
+        self.cursor.advance_solved_boundary(block);
     }
 
     /// Seed the cold-start `results_block` anchor to a **settled** block (the
@@ -366,12 +374,11 @@ impl ArbitrageEngine {
     /// cold-start candidates deliver immediately at a valid, verification-safe
     /// solve block.
     ///
-    /// Only fills when `results_block` is still `0`: once a real solve has
-    /// established a (possibly higher) anchor, we never regress it.
+    /// 6XB6NJ: a plain monotone advance on the block cursor — the old
+    /// only-if-zero guard is subsumed ("never regress" holds by
+    /// construction; see `BlockCursor::advance_solved`).
     pub fn set_solve_anchor(&mut self, block: u64) {
-        if self.results_block == 0 {
-            self.results_block = block;
-        }
+        self.cursor.advance_solved(block);
     }
 
     /// Whether any forward log applied since the last `finalize_block` (the
@@ -380,14 +387,14 @@ impl ArbitrageEngine {
     /// since LEZJAS; returns `false` until the first `record_logs_this_block`.
     #[must_use]
     pub const fn has_logs_this_block(&self) -> bool {
-        self.has_logs_this_block
+        self.cursor.has_logs_this_block()
     }
 
     /// Record that at least one forward log applied this block (clears on the
     /// next `finalize_block`). Replaces the pump's `has_logs_this_block = true;`
     /// out-param write (ergo task LEZJAS).
     pub fn record_logs_this_block(&mut self) {
-        self.has_logs_this_block = true;
+        self.cursor.record_logs();
     }
 
     /// Resolve and solve all registered paths. **Solve-only — does NOT dispatch
@@ -437,7 +444,9 @@ impl ArbitrageEngine {
         for (pid, r) in results {
             self.results.insert(pid, r);
         }
-        self.results_block = block_number;
+        // 6XB6NJ: monotone advance on the block cursor (the cold-start
+        // sweep can no longer drag a seeded resume anchor backwards).
+        self.cursor.advance_solved(block_number);
 
         // Intentionally no compute_diff_and_send here: dispatching would
         // advance `delivered` (claiming "Python has seen these") before any

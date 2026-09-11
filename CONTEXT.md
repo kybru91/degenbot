@@ -68,6 +68,14 @@ operator credentials); the block loop and the dispatch leaf read the same
 owner instead of it travelling as a parameter bag.
 _Avoid_: "session dict", "cockpit config".
 
+**Session watch** — the cockpit's one owner (`degenbot.runner._session_watch`)
+of a pump session's end-state: the watch-set assembly ({consumer} + optional
+{registration, watchdog}), the `SessionEndVerdict` ranking (fail-fast outranks
+the watchdog in the same wait batch — written once, not per loop), and teardown.
+The former twin await loops and the run/finally, `__aexit__`, and
+`shutdown()` teardown sites collapse to calls into it.
+_Avoid_: "await loop", "fail-fast wrapper", "pump-ended handler".
+
 ### Pool registration lifecycle (D4 / IKGQ6F)
 
 Canonical terms for the CL (V3/V4) pool registration verify-lifecycle — the
@@ -660,6 +668,29 @@ cross-consumer infrastructure ("diagnostics, verification … all consume it");
 this decision *realizes* that for the single-call layer. No new crate deps
 (all four straggler crates already depend on `degenbot-rpc`), no pyo3-in-cores
 violation, no behaviour change.
+
+## Arb-engine per-cycle machines (2026-09-10 state/transition review)
+
+- **Detached-cycle machine** — the one owner (`arb_engine/detached_cycle.rs`)
+  of the detached/in-cycle solve-arm lifecycle: per-cycle states
+  `Unopened → Open → Saturated` (saturated = the inflight cap is reached; the
+  cycle degrades to in-cycle), the merge pipe open/take, the outstanding gauge
+  pairing, the seq counters, the outcome-ledger key policy, the disposition
+  counters, and the sidecar spawn. One total transition table plus a
+  conformance walk, mirroring `degenbot-workers`' `slot.rs`. The
+  construction-stamped `detached_solving` boot flag reads into
+  `begin_cycle`; it is not machine state.
+  _Avoid_: "detached arm plumbing", "sidecar state".
+- **Engine block cursor** — the one owner (`arb_engine/block_cursor.rs`) of
+  the engine-side block-coordinate residue (`results_block`,
+  `last_processed_block`, `last_solved_block`, `has_logs_this_block`):
+  every advance is monotone-max; the resume-time cold-start anchor seed is a
+  plain advance ("never regress" by construction, including a late detached
+  stamp). Completes ADR-041 §3.5's anchor-soup fold on the engine side; the
+  `DeliveryPolicy` anchored gate consumes `is_anchored()` rather than
+  re-deriving it from a raw integer.
+  _Avoid_: "anchor soup" (the retired shape), "results_block" as a
+  free-floating field.
 
 ## Block epoch, StageMachine, cheap-read StateView, degenbot-ingestion (ADR-041, 2026-09 — epic `MROOY7`)
 

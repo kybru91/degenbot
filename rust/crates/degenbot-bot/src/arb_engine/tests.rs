@@ -1040,7 +1040,7 @@ mod tests {
         // A real solve has anchored `results_block` (the delivery-policy
         // solve-anchor guard defers candidates while it is still 0 — see
         // `diff_and_send_with_zero_anchor_defers_candidates_and_does_not_commit`).
-        engine.results_block = 100;
+        engine.set_results_block_for_test(100);
 
         // send_result_batch computes the diff, sends it, and advances
         // `delivered` to the above-threshold subset.
@@ -1086,7 +1086,8 @@ mod tests {
         // Pump seeds the settled resume boundary (block 500) at resume.
         engine.set_solve_anchor(500);
         assert_eq!(
-            engine.results_block, 500,
+            engine.results_block(),
+            500,
             "cold-start anchor seeded to settled resume block"
         );
 
@@ -1138,11 +1139,42 @@ mod tests {
         assert!(engine.delivery.delivered.contains_key(&path_id));
 
         // Never regress a real solve anchor: a later seed must not lower it.
-        engine.results_block = 900;
+        engine.set_results_block_for_test(900);
         engine.set_solve_anchor(600);
         assert_eq!(
-            engine.results_block, 900,
+            engine.results_block(),
+            900,
             "set_solve_anchor never clobbers a real anchor"
+        );
+    }
+
+    /// 6XB6NJ pin (the review's Q6 strengthening): the solve-stamp path is
+    /// MONOTONE - a late/stale stamp can no longer regress the results
+    /// anchor. Both stamps below go through the REAL solve-stamp path
+    /// (`solve_dirty` -> `rebuild_and_solve_affected`'s anchor re-stamp):
+    /// block 10 anchors first, then a stale block-5 cycle (a lagging drain
+    /// entry, a re-fired boundary, a detached straggler) must NOT pull the
+    /// anchor backwards - delivery would re-emit at a regressed
+    /// `solve_block`. RED before the block cursor: the stamp was an
+    /// unconditional `self.results_block = solve_block` write.
+    #[test]
+    fn late_solve_stamp_cannot_regress_results_anchor() {
+        let mut engine = ArbitrageEngine::new();
+
+        // First solve cycle anchors at block 10.
+        engine.solve_dirty(10, &BlockMetadata::default(), &[]);
+        assert_eq!(
+            engine.results_block(),
+            10,
+            "the solve-stamp path anchors results_block at the cycle's solve block"
+        );
+
+        // A late/stale stamp through the same path must not regress it.
+        engine.solve_dirty(5, &BlockMetadata::default(), &[]);
+        assert_eq!(
+            engine.results_block(),
+            10,
+            "a stale solve stamp must never regress the results anchor"
         );
     }
 
@@ -1180,7 +1212,7 @@ mod tests {
         // Anchor the solve at a real block: candidates are only deliverable
         // once `results_block` is non-zero (solve-anchor delivery guard — a 0
         // anchor would sim at block 0, the 0x841820 code-less panic).
-        engine.results_block = 100;
+        engine.set_results_block_for_test(100);
         engine.compute_diff_and_send(&BlockMetadata::default());
 
         let batch = rx
@@ -1226,7 +1258,7 @@ mod tests {
 
         // Anchor the solve at a real block (solve-anchor delivery guard — see
         // `diff_and_send_with_zero_anchor_defers_candidates_and_does_not_commit`).
-        engine.results_block = 100;
+        engine.set_results_block_for_test(100);
         engine.compute_diff_and_send(&BlockMetadata::default());
 
         let batch = rx
@@ -5499,11 +5531,10 @@ mod tests {
     /// the successor's first-dirt under the dead block's identity (traces
     /// ab13f75f: finalize(83) solved 1,755 paths of 84's dirt; 98f7cf52 and
     /// the fresh census: 2/20 blocks with the degenerate pattern). The
-    /// boundary is now bookkeeping-only: the guard branch advances
-    /// `last_solved_block` / `has_logs_this_block` / `last_processed_block` /
-    /// `results_block` and emits the terminal publish; dirt stays unconsumed
-    /// for the pump's drained-settle gate. RED while `finalize_block` still
-    /// called `solve_dirty`.
+    /// boundary is now bookkeeping-only: the guarded transition advances the
+    /// block cursor (6XB6NJ: `BlockCursor::finalize`) and emits the terminal
+    /// publish; dirt stays unconsumed for the pump's drained-settle gate. RED
+    /// while `finalize_block` still called `solve_dirty`.
     #[test]
     #[expect(clippy::expect_used)]
     fn finalize_block_consumes_no_dirt_and_emits_no_solve() {

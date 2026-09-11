@@ -35,6 +35,7 @@
 //! | [`solver_dispatch`] | Path resolution, solver dispatch, rebuild logic |
 //! | [`delivery_lifecycle`] | Delivery lifecycle: channel open/send/close + the end-of-stream contract (incident 2026-08-20 #2) |
 //! | [`delivery_policy`] | Delivery policy: diff computation, thresholds, delivered-bookkeeping (BI7UZV) |
+//! | [`block_cursor`] | The engine block cursor — one owner of the engine-side block-coordinate residue (6XB6NJ) |
 //! | [`lifecycle`] | Path registration, buffer management, engine accessors |
 //! | [`py_binding`] | PyO3 wrapper (`PyArbitrageEngine`) |
 //! | [`tests`] | Unit tests |
@@ -48,6 +49,7 @@ use ::degenbot_solvers::mixed::{HopType, MixedPath, ResolvedMixedPath, SolvePath
 use alloy::primitives::aliases::U112;
 use alloy::primitives::Address;
 
+use self::block_cursor::BlockCursor;
 use self::boot_stamp::BootStamp;
 use self::delivery_policy::DeliveryPolicy;
 use crate::bot_core::resolve::HopProjectionCache;
@@ -57,6 +59,10 @@ use crate::bot_core::BotState;
 // THE construction-stamped fleet boot carrier (YI5NGB): the engine's own
 // FleetBoot value + the ride ledger the per-role fleet statics consult.
 mod boot_stamp;
+// 6XB6NJ: the ONE engine block cursor — the consolidated owner of the
+// engine-side block-coordinate residue (completes ADR-041 §3.5's
+// engine-side anchor fold; see the module's own doc header).
+pub(crate) mod block_cursor;
 // Sub-modules — each contains `impl ArbitrageEngine` or `impl PyArbitrageEngine` blocks.
 mod delivery_lifecycle;
 mod delivery_policy;
@@ -376,23 +382,15 @@ pub struct ArbitrageEngine {
     /// `Mutex`. Writes happen during the sequential `clamp_merge` phase;
     /// reads snapshot the shards into a `HashMap` for the delivery policy.
     results: DashMap<u64, SolvePathResult>,
-    /// Block number for the last solved results
-    results_block: u64,
-    /// Last block number processed by `process_block`.
-    /// `None` means no block has been processed yet.
-    /// Used by the pump to determine the backfill boundary on startup.
-    last_processed_block: Option<u64>,
-    /// The last block this engine's `finalize_block` guard advanced past
-    /// (i.e. the last block whose dirty-path solve + diff send completed).
-    /// Owned by the engine since ergo task LEZJAS (the pump's `&mut` out-
-    /// params retired). Initialize to `0` so the first header/tombstone
-    /// `finalize_block(block > 0)` fires; survives a mid-flight engine
-    /// joining the pump (ADR-006 D4).
-    last_solved_block: u64,
-    /// Whether any forward log applied since the last `finalize_block`.
-    /// `true` after `record_logs_this_block()` (the pump's forward-log path),
-    /// cleared by `finalize_block`. Owned by the engine since LEZJAS.
-    has_logs_this_block: bool,
+    /// 6XB6NJ: the ONE engine block cursor — the consolidated owner of the
+    /// block-coordinate residue (the `results_block` solve-anchor stamp
+    /// [KNEUQX], the `last_processed_block` backfill boundary hint, the
+    /// `last_solved_block` finalize boundary, and the
+    /// `has_logs_this_block` forward-log flag). Every advance rule lives
+    /// on the cursor (monotone-max; see the `block_cursor` module docs —
+    /// one intentional strengthening: a late/stale stamp can no longer
+    /// regress the anchor).
+    cursor: BlockCursor,
     /// REMED1 T2: which entry drove the CURRENT solve cycle - `drain`
     /// (`EngineStages::solve_dirty`, per-log streaming) vs `finalize` (the
     /// boundary catch in `finalize_block`). Emitted on the cycle-complete
@@ -646,10 +644,7 @@ impl ArbitrageEngine {
             cl_projection_memo: crate::bot_core::resolve::projection_memo_enabled(),
             pool_to_paths: HashMap::new(),
             results: DashMap::new(),
-            results_block: 0,
-            last_processed_block: None,
-            last_solved_block: 0,
-            has_logs_this_block: false,
+            cursor: BlockCursor::default(), // (0, None, 0, false) — the pre-cursor init, unchanged
             solve_entry: "drain",
             pending_new_paths: HashSet::new(),
             next_path_id: 1, // path IDs start at 1
