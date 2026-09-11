@@ -306,18 +306,25 @@ mod tests {
     }
 
     /// F2 (YI5NGB): the mixed-cfg fire drill — a SECOND engine's
-    /// construction with a DIVERGENT cfg (`fleet.quota_cpus = 4.0`) must
-    /// make the ride ILLEGAL in tests.
+    /// construction with a DIVERGENT cfg must make the ride ILLEGAL in
+    /// tests.
+    ///
+    /// The divergence knob must diverge on EVERY host tier: a pure
+    /// `fleet.quota_cpus` override can hash byte-equal to the default
+    /// construction on a host whose detected quota IS that value (a
+    /// 4-vCPU CI runner detects exactly 4.0, making the quota-only ride
+    /// legal and the fire drill mute). The `runtime.fleet_profile=pinned`
+    /// fold is tier-proof — a schema-default boot is always `Auto` — and
+    /// `fleet.quota_cpus=4.0` rides along for the original intent.
     ///
     /// Route (the REV 2 contract): engine B goes through
     /// `ArbitrageEngine::with_core_cfg` DIRECTLY with a LOCALLY
-    /// loader-built config (`BotConfigLoader::new().without_env()
-    /// .with_cli_overrides(["fleet.quota_cpus=4.0"])`) — never through
-    /// the config holder (no holder- or stance-side `install` call of any
-    /// name) and no default-installing `with_core` construction anywhere
-    /// between the snapshots: the divergent value stays a LOCAL
-    /// construction fact and cannot leak into any parallel or later
-    /// construction (R10).
+    /// loader-built config (`BotConfigLoader::new().without_env()` + the
+    /// CLI overrides) — never through the config holder (no holder- or
+    /// stance-side `install` call of any name) and no default-installing
+    /// `with_core` construction anywhere between the snapshots: the
+    /// divergent value stays a LOCAL construction fact and cannot leak
+    /// into any parallel or later construction (R10).
     #[test]
     fn mixed_cfg_ride_is_illegal_in_tests() {
         use crate::bot_core::state_lock::StateLock;
@@ -341,6 +348,10 @@ mod tests {
         let loaded = BotConfigLoader::new()
             .without_env()
             .with_cli("fleet.quota_cpus", "4.0")
+            // The tier-proof divergence knob (see the F2 doc): a default
+            // boot is profile-Auto on every host, so profile=Pinned cannot
+            // byte-match the winner's hash anywhere.
+            .with_cli("runtime.fleet_profile", "pinned")
             .load()
             .expect("the divergent cfg must load from explicit sources");
         let cfg_b = Arc::new(loaded.config);

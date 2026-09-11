@@ -6120,10 +6120,44 @@ mod tests {
     /// RED before the per-path result-queue streaming exists: the batched
     /// barrier merges everything only AFTER the slowest solve, so the drain
     /// probe stays empty past the deadline while the slow path still runs.
+    ///
+    /// Pinned-tier fixture (FF-T2): the streaming-merge premise binds only
+    /// on a host whose auto-resolved fleet binding is pinned (see the
+    /// host-tier gate in the body); the serial tier's ONE solve seat has no
+    /// second LPT bin to stream a fast merge into the probe.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the T1 acceptance carries the whole hook-probe + streaming-ordering story in one deterministic body"
+    )]
     #[test]
     fn tokio_executor_merges_fast_paths_while_slow_path_solves() {
         if std::thread::available_parallelism().is_ok_and(|n| n.get() < 2) {
             eprintln!("skipping: streaming-merge test requires >=2 cores");
+            return;
+        }
+        // Host-tier gate (FF-T2): the premise needs the PINNED tier's
+        // multi-seat solver fan-out — the slow path isolated in its own LPT
+        // bin while the other bins stream fast merges into the probe. On a
+        // 2-5-core host the auto profile resolves the fleet to the serial
+        // binding by design (ONE cycle lane, ONE solve seat): there is no
+        // second bin to merge anything before the slow path's release
+        // marker, so the ordering assertion cannot bind there. The
+        // serial-tier delivery story is covered by
+        // `streaming_delivery_emits_fast_result_while_slow_path_solves`
+        // (which tolerates the single-seat ordering). Mirror the <2-core
+        // self-skip channel.
+        let tier_quota =
+            degenbot_workers::budget::detected_quota_cpus(&degenbot_config::FleetConfig::default());
+        if degenbot_workers::budget::FleetBudget::derive(
+            tier_quota,
+            &degenbot_workers::budget::BudgetOverrides::default(),
+        )
+        .is_err()
+        {
+            eprintln!(
+                "skipping: the fleet resolves this host to the serial tier \
+                 ({tier_quota} cores) — one solve seat, no second LPT bin"
+            );
             return;
         }
         let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =

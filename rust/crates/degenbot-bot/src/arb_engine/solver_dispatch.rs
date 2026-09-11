@@ -101,7 +101,11 @@ pub(crate) fn lpt_partition(
             .min_by_key(|&(_, l)| l)
             .map_or(0, |(i, _)| i);
         bins[mi].push(i);
-        loads[mi] += cost(i);
+        // Measured per-path costs are unbounded (the stance fixtures pin
+        // placement with near-u64::MAX walks, and the serial tier's ONE
+        // solve seat accumulates EVERY item's cost into bin 0): the
+        // accumulation must not overflow — saturate instead of panicking.
+        loads[mi] = loads[mi].saturating_add(cost(i));
     }
     bins
 }
@@ -4732,8 +4736,42 @@ mod fleet_sim_stance_tests {
     /// family is the fleet `SimDriver` seats (`work-fleet-sim-{n}`) and the
     /// executor's census row is registered (the `fleet_merge_slots` pattern
     /// from the BCA77G work).
+    ///
+    /// Pinned-tier fixture (FF-T2): the seat-shape contract binds only on a
+    /// host whose auto-resolved fleet binding is pinned (see the host-tier
+    /// gate in the body). On the serial tier the sims ride
+    /// `work-fleet-serial-0` by design.
+    #[expect(
+        clippy::print_stderr,
+        reason = "the self-skip channel names the host tier that cannot host the pinned topology"
+    )]
     #[test]
     fn fleet_sims_run_on_simdriver_seats_with_the_census_row() {
+        // Host-tier gate (FF-T2): the identity contract under test is the
+        // PINNED binding's topology (pooled `work-fleet-sim-{n}` SimDriver
+        // seats + the census row). On a 2-5-core host the auto profile
+        // resolves the fleet to the serial binding — sims legitimately ride
+        // the named cycle lane (`work-fleet-serial-0`, whose own identity is
+        // covered by `serial_units_execute_on_the_named_serial_seat`) — so
+        // the pinned seat-shape assertion can only bind on a pinned-tier
+        // host. Skip there (the F-suite's documented self-skip channel)
+        // rather than asserting a topology this host cannot host.
+        match crate::arb_engine::fleet_sim_executor::global_fleet_sim_executor() {
+            Ok(executor)
+                if executor.host_plan_binding() == degenbot_workers::plan::Binding::Serial =>
+            {
+                eprintln!(
+                    "skipping: the fleet materialized the SERIAL binding on this \
+                     host (2-5 cores) — sims ride `work-fleet-serial-0` by design"
+                );
+                return;
+            }
+            Ok(_) => (),
+            Err(err) => {
+                eprintln!("skipping: the fleet sim boot was refused on this host ({err})");
+                return;
+            }
+        }
         let items = strided_corpus(4);
         let pool_refs = pool_refs_for(&items);
         let sim = CorpusSim::new();
