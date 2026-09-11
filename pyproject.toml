@@ -18,7 +18,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "alembic ~= 1.19",
-    "click ~= 8.4",
+    "click ~= 8.5",
     "pydantic ~= 2.13",
     "pydantic-settings ~= 2.15",
     "sqlalchemy ~= 2.0",
