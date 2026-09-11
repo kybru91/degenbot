@@ -137,6 +137,22 @@ impl FleetSolveExecutor {
     /// [`BootError`] — the fleet budget sum check or a boot invariant.
     pub(crate) fn boot(boot: FleetBoot) -> Result<Self, BootError> {
         let host = FleetHost::boot(boot)?;
+        // FF-T3 (Z2YW52): the LANE-TO-THREAD BINDING SEAM — the same
+        // adapter slot the pooled pair runs (seat_host): the PINNED
+        // binding preserves today's topology exactly (the per-seat
+        // keyed mailboxes over the ONE HostPump); the serial binding is
+        // a SeatSink + ONE grant lane over the same HostPump and lands
+        // with FF-T4 — until then the arm refuses with the plan's
+        // typed pending refusal (never a silent narrow).
+        match host.plan().binding {
+            degenbot_workers::plan::Binding::Pinned => Ok(Self::boot_pinned(host)),
+            degenbot_workers::plan::Binding::Serial => Err(host.plan().pending_serial_refusal()),
+        }
+    }
+
+    /// The PINNED binding's instantiation (today's topology, verbatim: one
+    /// persistent keyed mailbox per Solver pin over the ONE `HostPump`).
+    fn boot_pinned(host: FleetHost) -> Self {
         let solver_seats = host.budget().solver_pin_count;
 
         let (tx, rx) = mpsc::channel::<HostMsg>();
@@ -205,12 +221,12 @@ impl FleetSolveExecutor {
         if let Err(err) = spawned {
             abort_executor("fleet host thread spawn", &format!("{err:?}"));
         }
-        Ok(Self {
+        Self {
             tx,
             unit_seq: AtomicU64::new(0),
             solver_seats,
             solver_queue_len,
-        })
+        }
     }
 
     /// Solver seats = the budget's structural LPT bin count. The dispatch

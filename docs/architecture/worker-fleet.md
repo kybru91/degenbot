@@ -380,3 +380,51 @@ process (ADR-021 loud-stop discipline).
   green, no solve-tail regression, census rows sane (`arb_sim_workers` /
   `detached_merge_sidecar` / `sim_slots` rows are retired with LW-T9 — their
   presence in a post-T9 dump is itself a failure).
+
+## 13. Lanes and bindings (FLEETFLOOR FF-T3)
+
+Lanes are **logical**: the lane vocabulary names who owns which receipts and
+ledger writes, never which thread runs them. A **binding** is the adapter that
+maps lanes to threads. One lane interface; two bindings (the no-third-binding
+rule holds until a forcing function demands one):
+
+- **pinned** — today's topology, exactly: one dedicated thread per seat
+  (`work-fleet-sim-{n}` / `work-fleet-poolupd-{n}` / the keyed solver seats),
+  6+ core hosts (the pinned-role floor), the boot-frozen `SlotLayout`.
+- **serial** — the 2-5 core arm (lands with FF-T4): one ambient I/O lane plus
+  one cycle thread running reserve -> resolve -> solve -> merge in order,
+  exactly one solve seat (`serial-0`). It is a `SeatSink` + ONE grant lane
+  over the SAME `HostPump` — not a new lane interface.
+
+The lane-to-thread seam lives in two pieces, both already ONE shape
+(`seat_host.rs`): `HostPump` (admission + backlog drain + grant loop — the
+host-message triple every fleet host runs) and `SeatSink` (the per-host-kind
+seat model: the pooled `WorkQueue` vs the solve host's per-seat keyed
+mailboxes). A binding *instantiates* these seams per the boot plan
+(`degenbot-workers` `plan.rs`, `fleetplan/1`): the executor boots gate on
+`host.plan().binding` — `Pinned` runs today's instantiation verbatim, and the
+serial arm refuses with the plan's typed pending refusal until FF-T4 lands.
+
+**Lane ownership (receipts and ledger writes):**
+
+| Lane | Owns |
+|---|---|
+| H reserve | the stage-machine rows; no fleet receipts |
+| A ambient | pump/dispatch/delivery on `degenbot-io-rt-{n}`; no per-unit receipts |
+| R resolve | pooled units' slot-FSM completions; no caller pipes |
+| M merge | EVERY path's terminal send — the QR3NUS exactness fuse (solved + suppressed + failed == submitted) is enforced at the merge drain, per cycle |
+| PoolStateUpdater | each intake unit's receipt (the awaiting caller's join), held in the unbounded §10 backlog under cordon — never dropped |
+| SimDriver | each sim request's per-request receipt channel, admitted under the cordon sim-intake floor |
+| Solver seats | each bin's per-path result sends into the merge pipe through the lane witness (the one-outcome-per-path ledger; a panicked bin's undelivered pids arrive typed as `Failed`) |
+
+The outcome ledger, intake receipts, and the exactness fuse are
+**binding-independent by construction**: a binding changes which threads run
+the lanes, never the ownership. Parity across bindings is the promotion gate
+(the pinned path is pinned by the executor suites + the LW-T7 golden replay
+in CI; the serial arm rides the same corpus when it lands).
+
+The worker census prints the lane-to-thread binding per entry (`binding`
+field, FF-T2): `pinned` = dedicated seat threads (the fleet roles under the
+pinned binding), `shared` = pooled runtimes (the ambient I/O runtime, the
+inline-sim runtime), `logical` = a lane riding other threads' time (hoisted
+capacities; the fleet roles become logical lanes under the serial binding).

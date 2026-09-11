@@ -319,6 +319,70 @@ mod tests {
         hermetic_boot_with_owner(hermetic_owner())
     }
 
+    /// FF-T3 (Z2YW52): no new binding is reachable from `auto` yet — the
+    /// serial arm lands with FF-T4. A sub-floor auto host refuses with
+    /// the tier's own typed refusal (the pinned derivation's
+    /// `QuotaTooSmallForPinnedRoles`, the CI-stable message), and a FORCED
+    /// serial profile refuses with the named pending-arm invariant:
+    /// neither path may run the pinned topology silently narrower.
+    #[test]
+    fn auto_cannot_reach_the_serial_binding_pre_ff_t4() {
+        // A 4-core auto host: the plan resolves the serial tier (FF-T2),
+        // and the boot re-raises the tier refusal — typed, named.
+        let result = FleetRegistrationExecutor::boot(FleetBoot {
+            quota_cpus: 4.0,
+            profile: degenbot_config::FleetProfile::Auto,
+            ..hermetic_boot()
+        });
+        let Err(err) = result else {
+            panic!("the serial tier refuses pre-FF-T4")
+        };
+        assert!(
+            matches!(
+                err,
+                BootError::Budget(BudgetError::QuotaTooSmallForPinnedRoles { .. })
+            ),
+            "auto on a sub-floor host re-raises the tier refusal, got {err:?}"
+        );
+        // A FORCED serial profile: the named pending-arm invariant.
+        let result = FleetRegistrationExecutor::boot(FleetBoot {
+            profile: degenbot_config::FleetProfile::Serial,
+            ..hermetic_boot()
+        });
+        let Err(err) = result else {
+            panic!("forced serial refuses pre-FF-T4")
+        };
+        assert!(
+            matches!(&err, BootError::Invariant(msg) if msg.contains("FF-T4")),
+            "forced serial names the pending arm, got {err:?}"
+        );
+    }
+
+    /// FF-T3 (Z2YW52): the census prints the lane-to-thread binding per
+    /// entry — the fleet rows stamp `pinned` (dedicated seat threads)
+    /// under the pinned binding.
+    #[test]
+    fn the_fleet_census_rows_stamp_the_lane_to_thread_binding() {
+        let executor = FleetRegistrationExecutor::boot(hermetic_boot()).expect("fleet intake boot");
+        drop(executor);
+        let rows = degenbot_core::worker_census::snapshot();
+        let fleet_rows: Vec<_> = rows
+            .iter()
+            .filter(|entry| entry.resource.starts_with("fleet_"))
+            .collect();
+        assert!(
+            !fleet_rows.is_empty(),
+            "the host registers the fleet census rows"
+        );
+        for row in fleet_rows {
+            assert_eq!(
+                row.binding, "pinned",
+                "the pinned binding owns dedicated seat threads (row {})",
+                row.resource
+            );
+        }
+    }
+
     fn hermetic_boot_with_owner(owner: &'static PostureOwner) -> FleetBoot {
         FleetBoot {
             profile: degenbot_config::FleetProfile::Auto,

@@ -84,6 +84,42 @@
 //! - Loud aborts: every seat/host failure funnels through [`abort_executor`],
 //!   whose tag (`[fleet-sim]` / `[fleet-reg]`) and stranded-pipe noun stay
 //!   byte-identical per role.
+//!
+//! # The lane interface (FF-T3, Z2YW52 — lanes stay logical)
+//!
+//! Lanes are LOGICAL: the LANEWARDEN lane vocabulary names WHO owns
+//! which receipts and ledger writes, never which thread runs them — the
+//! BINDING is the adapter that maps lanes to threads (two today: pinned,
+//! and the serial binding that lands with FF-T4). One lane interface,
+//! binding-independent by construction:
+//!
+//! - **H (reserve)** — the pump-driven host lane: the block pump feeds
+//!   the ONE posture owner and the stage machine; it owns no fleet
+//!   receipts of its own (its “writes” are the stage-machine rows).
+//! - **A (ambient)** — the ambient I/O runtime (`degenbot-io-rt-{n}`):
+//!   pump/dispatch/delivery/pyo3-async work; no per-unit receipts.
+//! - **R (resolve)** — the pooled resolve seats (dispatcher lane): the
+//!   resolve units' completions ride the slot FSM (T5), no caller pipes.
+//! - **M (merge)** — the merge sidecar's per-path result pipe: EVERY
+//!   solved/suppressed/failed path's terminal send lands here — the
+//!   QR3NUS/LW-T7 exactness fuse (solved + suppressed + failed ==
+//!   submitted) is enforced at the merge drain, per cycle.
+//! - **`PoolStateUpdater` seats** — the registration intake: each unit
+//!   owns its intake receipt (the awaiting caller's join), held in the
+//!   unbounded §10 backlog under a cordon (never dropped).
+//! - **`SimDriver` seats** — the inline sims: each request owns its
+//!   per-request receipt channel (the walker's `PendingSim`), admitted
+//!   under the cordon sim-intake floor.
+//! - **Solver seats** — the keyed bins: each bin's per-path result
+//!   sends feed the merge pipe through the lane witness (`SolveLane`:
+//!   the per-cycle one-outcome-per-path ledger; a panicked bin's
+//!   undelivered pids arrive as typed `Failed` records).
+//!
+//! The outcome ledger, intake receipts, and the exactness fuse live at
+//! the LANE level: a binding changes WHICH THREADS run the lanes, never
+//! the ownership. The census `binding` field prints the mapping per
+//! entry (`pinned` = dedicated seat threads, `shared` = pooled runtimes,
+//! `logical` = a lane riding other threads' time).
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -558,6 +594,28 @@ impl SeatHost {
     /// [`BootError`] — the fleet budget sum check or a boot invariant.
     pub(crate) fn boot(desc: &'static SeatRoleDesc, boot: FleetBoot) -> Result<Self, BootError> {
         let host = FleetHost::boot(boot)?;
+        // FF-T3 (Z2YW52): the LANE-TO-THREAD BINDING SEAM — one lane
+        // interface, the binding is the adapter that maps lanes to
+        // threads (the second adapter at the Executor seam; the
+        // two-adapter rule makes the seam real). The PINNED binding
+        // preserves today's topology exactly (the pooled WorkQueue seat
+        // model over the ONE HostPump); the serial binding — a SeatSink
+        // + ONE grant lane over the SAME HostPump, not a new lane
+        // interface — lands with FF-T4: until then the arm refuses
+        // here with the plan's typed pending refusal (never a silent
+        // narrow).
+        match host.plan().binding {
+            degenbot_workers::plan::Binding::Pinned => Ok(Self::boot_pinned(desc, host)),
+            degenbot_workers::plan::Binding::Serial => Err(host.plan().pending_serial_refusal()),
+        }
+    }
+
+    /// The PINNED binding's instantiation (today's topology, verbatim:
+    /// the pooled seat threads over the shared `WorkQueue`, the host thread
+    /// running the ONE `HostPump` triple). Behavior-identical by
+    /// construction — the parity corpus (the LW-T7 golden replay +
+    /// the executor suites) is the regression harness.
+    fn boot_pinned(desc: &'static SeatRoleDesc, host: FleetHost) -> Self {
         let seats = (desc.seats)(host.budget());
         let (tx, rx) = mpsc::channel::<HostMsg>();
         // Pooled seats contend on ONE shared work queue: a grant lands a
@@ -597,13 +655,13 @@ impl SeatHost {
                 &format!("{err:?}"),
             );
         }
-        Ok(Self {
+        Self {
             desc,
             tx,
             unit_seq: AtomicU64::new(0),
             #[cfg(test)]
             seats,
-        })
+        }
     }
 
     /// Test-facing seat count (the role's budget slot cap).
