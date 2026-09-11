@@ -16,7 +16,7 @@ The pre-0.6 file vocabulary (`[rpc]`, `[ws]`, `[database]`, `[otel]`, top-level 
 | `[ws]` per-chain endpoints | `DEGENBOT_RPC_WS_CHAINID_<chain>` env names (or the Python config cascade) |
 | `[database]` `filepath` | Python config cascade (`src/degenbot/config.py`, `DatabaseSettings`) |
 | `[otel]` `endpoint` / `enabled` | the modern `telemetry` section: `telemetry.otel` (toggle) and `telemetry.jaeger_endpoint` (OTLP endpoint) |
-| top-level `default_chain_id` | Python config cascade (`src/degenbot/config.py`) |
+| top-level `default_chain_id` | `DEGENBOT_DEFAULT_CHAIN_ID` env — the Python config cascade (`src/degenbot/config.py`) |
 
 ## In-schema key retirements (typed migrations)
 
@@ -33,6 +33,14 @@ or TOML key fails the load loudly with a pointed message, for one release.
 ## What is NOT retired
 
 `[failure_policy]` is deliberately **not** typed and **not** rejected: it is the ADR-040 D3 free-form per-bucket override table, read as a raw TOML table from the same file the loader selected (`BotConfigLoader::file_path()`). Files may keep it unchanged.
+
+Known adjacent gap (same family as the retired Python-domain keys): the
+`[deployments]` overlay table (Python deployment-registry overlay,
+`src/degenbot/registry/deployment_loader.py`) is in neither the typed schema
+nor the loader's free-form list, so a file carrying it is refused with the
+generic "unknown section" error at the typed boot. It must join
+`FREE_FORM_FILE_SECTIONS` (or the schema) before the overlay is usable in the
+shared file.
 
 ## The new layout
 
@@ -65,7 +73,7 @@ jaeger_endpoint = "http://localhost:4318"
 [failure_policy]  # unchanged, still free-form
 ```
 
-with the Python-domain settings supplied through the environment (`DEGENBOT_RPC_HTTP_CHAINID_1=http://localhost:8545` — a HOST-machine example; in the devcontainer, see the CAUTION below) or the Python config cascade (`BotConfig(database=…, rpc={1: "http://localhost:8545"}, default_chain_id=1)`).
+with the Python-domain settings supplied through the environment (`DEGENBOT_RPC_HTTP_CHAINID_1=http://localhost:8545` — a HOST-machine example; in the devcontainer, see the CAUTION below) or the Python config cascade (`BotConfig(database=…, rpc={1: "http://localhost:8545"}, default_chain_id=1)`). The `degenbot` CLI reads the session chain id from `DEGENBOT_DEFAULT_CHAIN_ID` (e.g. `DEGENBOT_DEFAULT_CHAIN_ID=1` for mainnet — a HOST-machine example like the RPC names above).
 
 CAUTION (2026-09-10 incident): inside the degenbot devcontainer, do NOT export these
 `DEGENBOT_RPC_*` names from a shell rc file (`.bashrc` etc.), and do not use

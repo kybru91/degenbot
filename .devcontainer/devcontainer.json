@@ -238,6 +238,13 @@
     // container's own loopback (`rpc[1]=http://localhost:8545` in config.toml).
     "DEGENBOT_RPC_HTTP_CHAINID_1": "http://host.containers.internal:8545",
     "DEGENBOT_RPC_WS_CHAINID_1": "ws://host.containers.internal:8546",
+    // Python-cascade session chain id (degenbot.config._env_default_chain_id):
+    // the CLI boot's DEGENBOT_DEFAULT_CHAIN_ID layer. The shared operator file
+    // no longer carries top-level default_chain_id (JLFE2F refuses it at the
+    // typed Rust boot). CREATE-TIME field: takes effect on the attach path
+    // only after rebuild.sh (see the edit-drift warning at the top of this
+    // file); until then, export it in the shell.
+    "DEGENBOT_DEFAULT_CHAIN_ID": "1",
     // T5 (RMH23E): bind the Prometheus scrape endpoint on all interfaces so
     // the -p 9464:9464 publish (runArgs above) can forward host traffic into
     // it. The code default is loopback-only, which pasta cannot reach

@@ -1308,8 +1308,9 @@ Commands accepting `--to-block` support the following formats:
 |----------|--------|-------------|
 | `DEGENBOT_DEBUG` | `1`, `true`, `yes` | Enable debug-level logging output |
 | `DEGENBOT_DEBUG_FUNCTION_CALLS` | `1`, `true`, `yes` | Enable function call trace logging |
-| `DEGENBOT_RPC_HTTP_CHAINID_<ID>` | any HTTP(S) URL | HTTP RPC endpoint for chain `<ID>`; overrides `config.toml` `[rpc]` |
-| `DEGENBOT_RPC_WS_CHAINID_<ID>` | any WS(S) URL | WebSocket endpoint for chain `<ID>`; overrides `config.toml` `[ws]` |
+| `DEGENBOT_DEFAULT_CHAIN_ID` | integer chain id | The chain this `Bot` session targets (the Python cascade's env layer — required by the `degenbot` CLI in the 0.6 modern layout; see [docs/config-migration.md](docs/config-migration.md)) |
+| `DEGENBOT_RPC_HTTP_CHAINID_<ID>` | any HTTP(S) URL | HTTP RPC endpoint for chain `<ID>` (cascade layer; the retired file key `[rpc]` is refused at boot) |
+| `DEGENBOT_RPC_WS_CHAINID_<ID>` | any WS(S) URL | WebSocket endpoint for chain `<ID>` (cascade layer; the retired file key `[ws]` is refused at boot) |
 
 ```bash
 DEGENBOT_DEBUG=1 python my_script.py
@@ -1317,38 +1318,38 @@ DEGENBOT_DEBUG=1 python my_script.py
 
 ### Configuration File
 
-Degenbot uses a TOML configuration file located at `~/.config/degenbot/config.toml`:
+The operator file `~/.config/degenbot/config.toml` (or the `DEGENBOT_CONFIG`
+override) is the typed Rust `BotConfig` file layer: its tables must name
+declared schema sections (see
+[docs/rust-config-keys.md](docs/rust-config-keys.md) for the authoritative,
+generated key reference), plus the free-form `[failure_policy]` table.
+Python-domain settings live in the environment instead:
 
 ```toml
-# The chain this Bot session targets (required). One Bot per chain — see ADR-006.
-# Must match a chain ID key in [rpc]; the connected RPC's eth_chainId is
-# enforced to match at construction (fail-fast)
-default_chain_id = 1
+[telemetry]
+otel = true
+jaeger_endpoint = "http://localhost:4318"
+metrics_addr = "0.0.0.0:9464"
 
-[rpc]
-# Chain ID to HTTP RPC endpoint mapping
-1 = "https://eth-mainnet.example.com"
-8453 = "https://base-mainnet.example.com"
-
-[ws]
-# Chain ID to WebSocket endpoint mapping — the settlement-arbitrage pump
-# subscribes to newHeads over WS, so a bot run needs this
-1 = "wss://eth-mainnet.example.com/ws"
-8453 = "wss://base-mainnet.example.com/ws"
-
-[database]
-# SQLite database path (optional, defaults to platform-specific location)
-path = "/path/to/degenbot.db"
+# Free-form per-bucket failure-reaction overrides (ADR-040). An empty or
+# missing table runs the default matrix.
+[failure_policy]
 ```
 
-`default_chain_id` (required) selects the single chain this `Bot` targets — a
-`Bot` refuses to construct without it, and the connected RPC's `eth_chainId`
-is enforced to match it at construction. (Per-chain RPC/WS endpoints can also
-be supplied via the `DEGENBOT_RPC_{HTTP,WS}_CHAINID_<ID>` env vars above — the
-cascade is CLI flags > OS env > `config.toml`.) A `[deployments]` table may
-additionally carry a user overlay on the shipped pool-type/deployment
-registry (`src/degenbot/registry/deployments.json` is the single source of
-truth).
+Python-domain settings are supplied through the cascade (CLI flags > OS env):
+
+- `DEGENBOT_DEFAULT_CHAIN_ID` — the single chain this `Bot` targets (ADR-006,
+  one Bot per chain). Required by the `degenbot` CLI; a `Bot` refuses to
+  construct without it, and the connected RPC's `eth_chainId` is enforced to
+  match at construction.
+- `DEGENBOT_RPC_HTTP_CHAINID_<ID>` / `DEGENBOT_RPC_WS_CHAINID_<ID>` — per-chain
+  HTTP/WS RPC endpoints.
+
+The SQLite database defaults to `~/.config/degenbot/degenbot.db`. A surviving
+pre-0.6 vocabulary key (`default_chain_id`, `[rpc]`, `[ws]`, `[database]`,
+`[otel]`) is refused at boot — see
+[docs/config-migration.md](docs/config-migration.md) for the replacement
+table.
 
 ## The Rust Core (`degenbot_rs` Rust crate, `degenbot._ffi` Python module)
 

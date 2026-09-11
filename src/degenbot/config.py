@@ -5,7 +5,6 @@ import tomllib
 from pathlib import Path
 from typing import Annotated
 
-import tomlkit
 from pydantic import BaseModel, HttpUrl, PlainSerializer, WebsocketUrl, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +14,12 @@ from degenbot.types.aliases import ChainId
 
 _HTTP_ENV_PREFIX = "DEGENBOT_RPC_HTTP_CHAINID_"
 _WS_ENV_PREFIX = "DEGENBOT_RPC_WS_CHAINID_"
+
+# JLFE2F follow-up: the 0.6 cutover retired top-level `default_chain_id` from
+# the shared operator file (the typed Rust loader refuses it at boot —
+# degenbot-python/src/lib.rs exits 2), so the Python cascade owns the chain id
+# through this env name instead (docs/config-migration.md replacement table).
+_DEFAULT_CHAIN_ID_ENV_VAR = "DEGENBOT_DEFAULT_CHAIN_ID"
 
 CONFIG_DIR = Path.home() / ".config" / "degenbot"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
@@ -149,6 +154,35 @@ def _env_http_var(chain_id: ChainId) -> str:
 
 def _env_ws_var(chain_id: ChainId) -> str:
     return f"{_WS_ENV_PREFIX}{chain_id}"
+
+
+def _env_default_chain_id() -> int | None:
+    """Resolve the session chain id from the OS env layer of the cascade.
+
+    The 0.6 cutover (JLFE2F) retired top-level ``default_chain_id`` from the
+    shared operator file, but the Python CLI boot (``_init_config``) has no
+    other source for it. The cascade therefore carries the env layer the
+    migration doc's replacement names: ``DEGENBOT_DEFAULT_CHAIN_ID`` outranks
+    the retired file key.
+
+    Returns:
+        The parsed chain id, or ``None`` when the variable is unset or empty.
+
+    Raises:
+        ValueError: When the variable is set to a non-integer value.
+
+    """
+    raw = os.environ.get(_DEFAULT_CHAIN_ID_ENV_VAR)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        msg = (
+            f"{_DEFAULT_CHAIN_ID_ENV_VAR}={raw!r} is not a valid chain id. "
+            f"Set it to an integer, e.g. {_DEFAULT_CHAIN_ID_ENV_VAR}=1."
+        )
+        raise ValueError(msg) from None
 
 
 def _resolve_one(
@@ -367,32 +401,49 @@ def load_config_from_file(config_path: Path) -> DegenbotConfig:
     )
 
 
-def save_config_to_file(config: DegenbotConfig) -> None:
-    """Save config to file."""
-    CONFIG_FILE.write_text(
-        tomlkit.dumps(
-            config.model_dump(),
-        ),
-    )
-
-
 def _init_config() -> DegenbotConfig:
+    """Load — or bootstrap — the Python-domain config for the CLI boot.
+
+    The shared operator file is the typed Rust BotConfig file layer (JLFE2F,
+    docs/config-migration.md): it carries the typed schema sections, and the
+    Python-domain keys it once carried are refused there at boot. Python never
+    writes the file — an absent operator file is contractually schema defaults
+    — so the bootstrap creates the directory + database only. The session
+    chain id arrives from the env layer (``_env_default_chain_id``), which
+    outranks a surviving retired file key.
+
+    Returns:
+        The computed value.
+
+    """
     if not CONFIG_DIR.exists():
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         logger.info(f"Created a configuration directory at {CONFIG_DIR}.")
 
     if CONFIG_FILE.exists():
-        return load_config_from_file(CONFIG_FILE)
+        config = load_config_from_file(CONFIG_FILE)
+    else:
+        # No operator file: the legacy bootstrap saved a DegenbotConfig dump
+        # here, which both refused to serialize (tomlkit raises on the unset
+        # chain id TOML cannot represent) and would have written the retired
+        # ``default_chain_id`` key the typed loader rejects at boot. The
+        # modern layout is file-absent-tolerant: defaults + DB only.
+        logger.info(
+            f"No operator configuration file at {CONFIG_FILE}; defaults apply. "
+            "Typed sections: docs/rust-config-keys.md. Python-domain keys "
+            "(chain id, RPC endpoints) live in the environment — see "
+            "docs/config-migration.md."
+        )
+        config = DegenbotConfig(
+            database=DatabaseSettings(
+                path=DB_PATH,
+            ),
+            rpc={},
+        )
 
-    config = DegenbotConfig(
-        database=DatabaseSettings(
-            path=DB_PATH,
-        ),
-        rpc={},
-    )
-
-    save_config_to_file(config)
-    logger.info(f"Created a configuration file at {CONFIG_FILE}.")
+    env_chain_id = _env_default_chain_id()
+    if env_chain_id is not None:
+        config.default_chain_id = env_chain_id
 
     # Skip database creation for in-memory databases
     if config.database.path.name != ":memory:" and not config.database.path.exists():
