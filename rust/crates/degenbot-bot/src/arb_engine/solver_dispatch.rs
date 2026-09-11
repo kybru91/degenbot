@@ -1112,174 +1112,603 @@ impl ArbitrageEngine {
     /// `Suppressed` never bumped (their lane sends bypass the
     /// gauge-bumping submit closure); decrementing them instead would SAG
     /// the gauge and silently defeat `DETACHED_INFLIGHT_CAP`.
-    #[expect(clippy::too_many_lines)]
     // Deliberate: this IS the disposition table (design §4.4) — one match
     // over the three LaneOutcome arms with the variant-gated gauge rule,
     // kept as a single table so the pairing invariant is readable in one
     // place. The pre-merge twin was similarly long for the same reason.
+    // THE FOLD (WNH5OL): the three-variant disposition table itself is
+    // now `drain_lane_outcomes` below. This envelope keeps ONLY what is
+    // inherently per-item and Solved-arm-only — the in-flight gauge
+    // decrement (the variant-gated pairing: only the Solved arm ever
+    // bumped, see the gauge notes above) and the Q1a freshness oracle
+    // (a Solved straggler vs its enqueue-time stamps) — then hands the
+    // item to THE ONE drain under the sidecar's per-item Mutex
+    // acquisition (contract 3: SidecarPerItemHold; the drain never
+    // locks for itself).
     pub(crate) fn merge_detached_item(&mut self, item: LaneOutcome) {
-        match item {
-            LaneOutcome::Solved(SolveOutcome {
-                pid,
-                result,
-                worker_clamp_twins,
-                payload,
-                solve_block,
-                metadata,
-                cycle_seq,
-                update_stamp,
-                solve_span,
-            }) => {
-                // The in-flight gauge was bumped at SEND time in the enqueue
-                // half and is decremented here exactly once per Solved item,
-                // so a bin that dies before sending never leaks a count.
-                let outstanding_now = self
-                    .detached_outstanding
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-                    .saturating_sub(1);
-                if let Some(p) = crate::instruments::pipeline() {
-                    p.set_detached_in_flight(outstanding_now);
+        let LaneOutcome::Solved(solved) = &item else {
+            // Keyless Suppressed/Failed witnesses have no envelope work
+            // (the gauge never bumped them — REV 2 Defect 1): straight to
+            // the drain's no-claim arms. Seq/block fields are inert here
+            // (nothing is claimed — contract 4's no-claim witness).
+            let policy = LaneArmPolicy {
+                ledger_seq: 0,
+                lock: LaneDrainLockContext::SidecarPerItemHold,
+                claim_all_lanes: false,
+                solve_block: 0,
+                metadata: BlockMetadata::default(),
+            };
+            let mut counts = LaneDrainCounts::default();
+            self.drain_lane_outcomes(std::iter::once(item), &policy, &mut counts);
+            let _ = counts;
+            return;
+        };
+        // The in-flight gauge was bumped at SEND time in the enqueue
+        // half and is decremented here exactly once per Solved item,
+        // so a bin that dies before sending never leaks a count.
+        let outstanding_now = self
+            .detached_outstanding
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
+        if let Some(p) = crate::instruments::pipeline() {
+            p.set_detached_in_flight(outstanding_now);
+        }
+        hotpath::gauge!("detached_solve_in_flight").set(f64::from(
+            u32::try_from(outstanding_now).unwrap_or(u32::MAX),
+        ));
+        // MQUKB6-T2: re-enter the enqueue-time cycle span for the
+        // whole merge (Q1a drop/apply events + any profit emit
+        // parent there). Inert without a subscriber or for
+        // `Span::none()` test items.
+        let merge_span = solved.solve_span.clone();
+        let _merge_ctx = merge_span.enter();
+        let age_cycles = self.detached_issued_seq.saturating_sub(solved.cycle_seq);
+        // Q1a deregister: nothing to merge into — drop, never
+        // re-create.
+        let Some(registered) = self.path_pools.get(&solved.pid) else {
+            self.detached_dropped_deregistered
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(p) = crate::instruments::pipeline() {
+                p.count_detached_stale_dropped();
+            }
+            tracing::debug!(
+                target: crate::telemetry::DIAGNOSTIC_TARGET,
+                path_id = solved.pid,
+                detached_seq = solved.cycle_seq,
+                "[detached] straggler dropped (path deregistered)"
+            );
+            return;
+        };
+        // Q1a stale: re-read the LIVE per-hop clocks; any advance
+        // since the enqueue resolve invalidates the straggler's
+        // intake.
+        let live_stamp: Vec<u64> = {
+            let core = self.core.read();
+            registered
+                .pools
+                .iter()
+                .map(|pool_ref| core.pool_update_block(pool_ref.pool_key))
+                .collect()
+        };
+        if live_stamp != solved.update_stamp {
+            self.detached_dropped_stale
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(p) = crate::instruments::pipeline() {
+                p.count_detached_stale_dropped();
+            }
+            tracing::info!(
+                target: crate::telemetry::DIAGNOSTIC_TARGET,
+                path_id = solved.pid,
+                detached_seq = solved.cycle_seq,
+                detached_age_cycles = age_cycles,
+                "[detached] straggler dropped (stale: pools moved during the solve)"
+            );
+            return;
+        }
+        // QR3NUS exactness fuse carried to the DETACHED sidecar
+        // (LW-T9 note (a) carry; now THE ONE ledger, 43E3H3): the
+        // in-cycle drain claims the same engine-side ledger keyed
+        // (solve_seq, pid) — this sidecar claims (cycle_seq, pid)
+        // with the cycle_seq its enqueue stamped. A duplicate
+        // delivery is a bin/pipe bug (an outcome emitted twice):
+        // merge-twice would double-apply the Q1a policy and
+        // double-emit, so the fuse trips loudly and the item is
+        // refused. The ledger keeps recent cycles only (the
+        // in-flight cap bounds meaningful straggler age); older
+        // cycle keys are pruned. The claim follows the Q1a gates
+        // and precedes the applied increment — the ledger records
+        // exactly what reached the merge (an item Q1a dropped was
+        // never a merge attempt; its flags stay fireable).
+        // WNH5OL: THE claim itself is the drain's Solved arm below
+        // (one claim per outcome — the table's role). This envelope
+        // owns the CLAIM'S ORDER: the Q1a gates above run BEFORE the
+        // drain, so a Q1a-dropped straggler still never reaches the
+        // claim and its flags stay fireable.
+        // THE DRAIN (WNH5OL): claim + merge for the Q1a-fresh
+        // straggler under the sidecar's per-item Mutex hold
+        // (contract 3's SidecarPerItemHold; the drain never locks).
+        // Borrow-scope note: the envelope's post-drain log fields are
+        // read BEFORE the item moves into the drain (the drain's own
+        // merge logs carry the same fields forward).
+        let (log_pid, log_seq) = (solved.pid, solved.cycle_seq);
+        let policy = LaneArmPolicy {
+            ledger_seq: solved.cycle_seq,
+            lock: LaneDrainLockContext::SidecarPerItemHold,
+            claim_all_lanes: false,
+            solve_block: solved.solve_block,
+            metadata: solved.metadata,
+        };
+        let mut counts = LaneDrainCounts::default();
+        self.drain_lane_outcomes(std::iter::once(item), &policy, &mut counts);
+        // The applied flag rides the DRAIN's admitted merge: the claim
+        // precedes the applied increment and the ledger records exactly
+        // what reached the merge — a refused duplicate increments only
+        // `duplicate_outcomes` (the fuse), never this flag.
+        if counts.solved > 0 {
+            self.detached_applied
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(p) = crate::instruments::pipeline() {
+                p.count_detached_applied();
+            }
+            tracing::debug!(
+                target: crate::telemetry::DIAGNOSTIC_TARGET,
+                path_id = log_pid,
+                detached_seq = log_seq,
+                detached_age_cycles = age_cycles,
+                "[detached] straggler merged (unchanged intake)"
+            );
+        }
+        // ADR-021 publish-verifier scoping retired (task 2UVG3E): the
+        // solver-state verifier (and its publish change set) is gone
+        // — merges apply the Q1a stale policy only.
+    }
+}
+
+// --------------------------------------------------------------------------
+// THE arm policy + THE one drain (WNH5OL, epic BPZUCM fold).
+// --------------------------------------------------------------------------
+// The two walk arms (
+//  - detached enqueue, `run_bin` at ~:2291 (tip), 90 code lines,
+//  - in-cycle dispatch, `run_bin` at ~:2528 (tip), 102 code lines
+// ) shared ~64 code lines at the adversarial review (6b281ee49 measured
+// similarity 0.667). The fold deletes them by making every difference DATA:
+// an arm-policy value below (`LaneArmPolicy`) + the one drain consuming
+// `LaneOutcome` exactly once (`drain_lane_outcomes`), so the lane walk body
+// (`drive_lane_walk`) is parameterized entirely by the policy.
+//
+// --------------------------------------------------------------------------
+// THE FOUR SEQUENCING CONTRACTS — each named at its enforcement site below
+// (search "contract 1..4"; the accept conditions of WNH5OL).
+// --------------------------------------------------------------------------
+// Contract 1 — DETACHED_INFLIGHT_CAP backpressure: the detached arm keeps
+//   its enqueue gate on `detached_outstanding < DETACHED_INFLIGHT_CAP`; the
+//   walk's flush path bumps the gauge at Solved SEND success (never for
+//   Suppressed/Failed), and the sidecar's drain decrements for Solved only
+//   (variant-gated pair — the REV2-Defect-1 rule).
+// Contract 2 — enqueue-end return: the detached walk runs from 'static bin
+//   threads; the enqueue loop submits and RETURNS with the engine Mutex
+//   released (the `if self.detached_solving ... { ...; return; }` block in
+//   `rebuild_and_solve_affected`). The merged stragglers re-acquire the
+//   Mutex per item on the sidecar thread.
+// Contract 3 — lock-context duality: the in-cycle drain runs INSIDE the
+//   whole-cycle engine-Mutex hold on the calling thread; the detached
+//   sidecar acquires the engine Mutex PER straggler item. DECIDED: the
+//   drain is a plain `&mut self` method (`drain_lane_outcomes`) callable
+//   under EXISTING holds in both contexts, never locking for itself; the
+//   sidecar wraps ONLY the per-item lock acquisition (its body runs with
+//   `engine.lock()` already held). The `LaneArmPolicy::lock` field names
+//   which context each arm's drain is invoked from (an inventory of holds;
+//   reading it is a no-op — the compile-time guarantee is the `&mut self`
+//   signature itself, which cannot hold a second lock).
+// Contract 4 — keyless detached Suppressed witness: THE DECIDED CHOICE is
+//   to KEEP the detached Suppressed (and Failed) no-claim semantics: those
+//   witnesses carry `pid` at `suppressed()`/`failed()` but NO faithful
+//   cycle_seq (the pre-witness rows lacked it), so a proxy key would either
+//   false-trip the fuse against a same-pid Solved of the next cycle or mask
+//   a duplicate. The per-cycle Suppressed FAILED arm (carrier-keyed) keeps
+//   its keyed claim. The decision is carried in the policy (`claim_ll`),
+//   and the breaker `detached_suppressed_replay_does_not_trip_the_fuse`
+//   (drain) added below pins the exact key space distribution; see the
+//   policy comment at `claim_ll` for the full rationale.
+// --------------------------------------------------------------------------
+
+/// The arm policy (WNH5OL): the data difference between the two dispatch
+/// arms, named. The lane walk body is ONE function; every per-arm behavior
+/// rides this value (the carrier stamps and the drain lock-context + claim
+/// policy; the detached gauge hook stays on the lane itself —
+/// `SolveLane::set_on_solved_send`, contract 1's send-success-only bump).
+pub(crate) struct LaneArmPolicy {
+    /// The ledger key half (sequencing contract 4 + the ONE-domain rule of
+    /// 43E3H3): the exact `solve_seq` tick this arm's drain claims
+    /// `(seq, pid)` with on the shared ONE ledger for carrier-keyed
+    /// outcomes (Solved always; the Suppressed/Failed claim decision is
+    /// `claim_all_lanes` below).
+    pub(crate) ledger_seq: u64,
+    /// The drain's lock context (contract 3): carried so the two call
+    /// paths NAME the hold that covers them. The drain never locks —
+    /// the compile-time guarantee is the `&mut self` signature itself
+    /// (it cannot take a second engine Mutex); this field is the
+    /// inventory plate (read-only), deliberately unlocked.
+    #[expect(
+        dead_code,
+        reason = "contract 3's name plate: the hold is NAMED, never consulted — the &mut self drain signature itself proves no second lock"
+    )]
+    pub(crate) lock: LaneDrainLockContext,
+    /// Suppressed/Failed claim policy (contract 4): `true` iff every lane
+    /// outcome arriving at this arm's drain arrives carrier-keyed (all
+    /// three variants claim — the in-cycle arm). `false` = the detached
+    /// arm's keyless pid-only witness (no claim on Suppressed/Failed; see
+    /// the contract-4 module block).
+    pub(crate) claim_all_lanes: bool,
+    /// The solve block this cycle is solving (the drain's anchor for the
+    /// carrier's `solve_block` debug assert and the merge call).
+    pub(crate) solve_block: u64,
+    /// The cycle's block metadata ('static bins cannot borrow `&metadata`,
+    /// so the walk copies it and the drain reads it through the policy).
+    pub(crate) metadata: BlockMetadata,
+}
+
+/// Which context holds the engine Mutex around the drain call (contract 3's
+/// name plate). The drain is a `&mut self` method and takes no lock of its
+/// own; this enum exists so both call sites NAME their hold rather than
+/// leave it implicit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaneDrainLockContext {
+    /// `rebuild_and_solve_affected` holds the engine Mutex for the whole
+    /// cycle ("The engine Mutex stays held by THIS cycle").
+    InCycleHold,
+    /// The sidecar acquired the engine Mutex for ONE merged item
+    /// (`engine.lock().merge_detached_item(item)` in
+    /// `detached_merge_sidecar`).
+    SidecarPerItemHold,
+}
+
+impl ArbitrageEngine {
+    /// THE ONE DRAIN (WNH5OL): consume `LaneOutcome`s EXACTLY once per
+    /// outcome — every variant claim runs through the shared one ledger
+    /// (`OutcomeLedger::claim`, the QR3NUS fuse). The two per-variant match
+    /// bodies (detached sidecar's `merge_detached_item` and the in-cycle
+    /// drain's inline match) folded into this single table; the arm
+    /// difference is the `LaneArmPolicy` (claim policy + lock context), not
+    /// the body.
+    ///
+    /// CONTRACT 3 (lock-context duality): this is the decided shape — a
+    /// plain `&mut self` method that NEVER locks. The in-cycle drain calls
+    /// it under the cycle's engine-Mutex hold; the detached sidecar calls
+    /// it (via `merge_detached_item`) with the Mutex acquired per item. No
+    /// re-lock, no double-lock possible in either context.
+    ///
+    /// CONTRACT 4 (the Suppressed/Failed claim decision, as data): `claim`
+    /// for Suppressed/Failed iff `policy.claim_all_lanes` — true only for
+    /// the in-cycle arm (its carrier rows carry the full typed key
+    /// `(in_cycle_seq, pid)`); the detached arm passes `false` because its
+    /// `Suppresseed`/`Failed` witnesses are pid-only (keyless) — see the
+    /// contract-4 block in the module comment and
+    /// `detached_suppressed_replay_does_not_trip_the_fuse` in the drain
+    /// breaker tests.
+    #[expect(clippy::too_many_lines)]
+    // Deliberate: this IS the disposition table (design §4.4) — one match
+    // over the three LaneOutcome arms, folded (WNH5OL) from the two former
+    // per-arm drain bodies and kept as ONE table so the one-ledger claim
+    // rule (contract 4) and the variant-gated gauge pairing stay readable
+    // in a single place. The pre-fold twin bodies were similarly long for
+    // the same reason.
+    fn drain_lane_outcomes(
+        &mut self,
+        items: impl IntoIterator<Item = LaneOutcome>,
+        policy: &LaneArmPolicy,
+        counts: &mut LaneDrainCounts,
+    ) {
+        for item in items {
+            match item {
+                LaneOutcome::Solved(o) => {
+                    let pid = o.pid;
+                    if self
+                        .outcome_ledger
+                        .lock()
+                        .claim((policy.ledger_seq, pid))
+                        .is_err()
+                    {
+                        self.duplicate_outcomes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(
+                            target: crate::telemetry::DIAGNOSTIC_TARGET,
+                            path_id = pid,
+                            ledger_seq = policy.ledger_seq,
+                            "[solve-merge] duplicate lane outcome for path — exactness fuse tripped (QR3NUS)"
+                        );
+                        continue;
+                    }
+                    debug_assert_eq!(
+                        o.solve_block, policy.solve_block,
+                        "carrier/drain solve_block mismatch — wrong-arm delivery"
+                    );
+                    let SolveOutcome {
+                        result: solve_result,
+                        worker_clamp_twins,
+                        payload,
+                        ..
+                    } = o;
+                    if !solve_result.solver_pool_states.is_empty() {
+                        tracing::debug!(
+                            "[solver-st] path_id={pid} hops=[{}]",
+                            solve_result.solver_pool_states.join(";")
+                        );
+                    }
+                    self.merge_one_result(
+                        policy.solve_block,
+                        &policy.metadata,
+                        pid,
+                        solve_result,
+                        worker_clamp_twins,
+                        payload,
+                    );
+                    counts.solved += 1;
                 }
-                hotpath::gauge!("detached_solve_in_flight").set(f64::from(
-                    u32::try_from(outstanding_now).unwrap_or(u32::MAX),
-                ));
-                // MQUKB6-T2: re-enter the enqueue-time cycle span for the
-                // whole merge (Q1a drop/apply events + any profit emit
-                // parent there). Inert without a subscriber or for
-                // `Span::none()` test items.
-                let _merge_ctx = solve_span.enter();
-                let age_cycles = self.detached_issued_seq.saturating_sub(cycle_seq);
-                // Q1a deregister: nothing to merge into — drop, never
-                // re-create.
-                let Some(registered) = self.path_pools.get(&pid) else {
+                LaneOutcome::Suppressed { pid } => {
+                    // CONTRACT 4, exactness law as data: claim only the
+                    // carrier-keyed witness; the detached pid-only witness
+                    // NEVER claims (a proxy (seq, pid) key could collide
+                    // with a same-pid Solved of a LATER cycle and either
+                    // false-trip the fuse or mask a duplicate).
+                    if policy.claim_all_lanes
+                        && self
+                            .outcome_ledger
+                            .lock()
+                            .claim((policy.ledger_seq, pid))
+                            .is_err()
+                    {
+                        self.duplicate_outcomes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(
+                            target: crate::telemetry::DIAGNOSTIC_TARGET,
+                            path_id = pid,
+                            ledger_seq = policy.ledger_seq,
+                            "[solve-merge] duplicate suppressed outcome for path — exactness fuse tripped (QR3NUS)"
+                        );
+                        continue;
+                    }
+                    if !policy.claim_all_lanes {
+                        tracing::debug!(
+                            target: crate::telemetry::DIAGNOSTIC_TARGET,
+                            path_id = pid,
+                            "[detached] suppressed outcome delivered by the lane witness — no merge, no claim"
+                        );
+                    }
+                    counts.suppressed += 1;
+                }
+                LaneOutcome::Failed { pid, failure } => {
+                    // CONTRACT 4, same witness rule as Suppressed: the
+                    // detached Failed record is keyless (pid-only).
+                    if policy.claim_all_lanes
+                        && self
+                            .outcome_ledger
+                            .lock()
+                            .claim((policy.ledger_seq, pid))
+                            .is_err()
+                    {
+                        self.duplicate_outcomes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::error!(
+                            target: crate::telemetry::DIAGNOSTIC_TARGET,
+                            path_id = pid,
+                            ledger_seq = policy.ledger_seq,
+                            "[solve-merge] duplicate failed outcome for path — exactness fuse tripped (QR3NUS)"
+                        );
+                        continue;
+                    }
+                    // The envelope's per-item accounting (the ancestral
+                    // sidecar's Failed arm — the deregistered bucket: the
+                    // panic record is a genuine final drop, NOT the stale
+                    // bucket, which the Q1a stale gate alone owns); the
+                    // in-cycle arm simply never reads this counter.
                     self.detached_dropped_deregistered
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(p) = crate::instruments::pipeline() {
                         p.count_detached_stale_dropped();
                     }
-                    tracing::debug!(
-                        target: crate::telemetry::DIAGNOSTIC_TARGET,
-                        path_id = pid,
-                        detached_seq = cycle_seq,
-                        "[detached] straggler dropped (path deregistered)"
-                    );
-                    return;
-                };
-                // Q1a stale: re-read the LIVE per-hop clocks; any advance
-                // since the enqueue resolve invalidates the straggler's
-                // intake.
-                let live_stamp: Vec<u64> = {
-                    let core = self.core.read();
-                    registered
-                        .pools
-                        .iter()
-                        .map(|pool_ref| core.pool_update_block(pool_ref.pool_key))
-                        .collect()
-                };
-                if live_stamp != update_stamp {
-                    self.detached_dropped_stale
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(p) = crate::instruments::pipeline() {
-                        p.count_detached_stale_dropped();
-                    }
-                    tracing::info!(
-                        target: crate::telemetry::DIAGNOSTIC_TARGET,
-                        path_id = pid,
-                        detached_seq = cycle_seq,
-                        detached_age_cycles = age_cycles,
-                        "[detached] straggler dropped (stale: pools moved during the solve)"
-                    );
-                    return;
-                }
-                // QR3NUS exactness fuse carried to the DETACHED sidecar
-                // (LW-T9 note (a) carry; now THE ONE ledger, 43E3H3): the
-                // in-cycle drain claims the same engine-side ledger keyed
-                // (solve_seq, pid) — this sidecar claims (cycle_seq, pid)
-                // with the cycle_seq its enqueue stamped. A duplicate
-                // delivery is a bin/pipe bug (an outcome emitted twice):
-                // merge-twice would double-apply the Q1a policy and
-                // double-emit, so the fuse trips loudly and the item is
-                // refused. The ledger keeps recent cycles only (the
-                // in-flight cap bounds meaningful straggler age); older
-                // cycle keys are pruned. The claim follows the Q1a gates
-                // and precedes the applied increment — the ledger records
-                // exactly what reached the merge (an item Q1a dropped was
-                // never a merge attempt; its flags stay fireable).
-                if self.outcome_ledger.lock().claim((cycle_seq, pid)).is_err() {
-                    self.duplicate_outcomes
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::error!(
                         target: crate::telemetry::DIAGNOSTIC_TARGET,
                         path_id = pid,
-                        detached_seq = cycle_seq,
-                        "[detached] duplicate merge delivery for path — exactness fuse tripped (QR3NUS carried by LW-T9)"
+                        failure = ?failure,
+                        "[solve-merge] path outcome lost to a seat panic — typed failure record (QR3NUS)"
                     );
-                    return;
+                    counts.failed += 1;
                 }
-                self.detached_applied
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(p) = crate::instruments::pipeline() {
-                    p.count_detached_applied();
-                }
-                tracing::debug!(
-                    target: crate::telemetry::DIAGNOSTIC_TARGET,
-                    path_id = pid,
-                    detached_seq = cycle_seq,
-                    detached_age_cycles = age_cycles,
-                    "[detached] straggler merged (unchanged intake)"
-                );
-                self.merge_one_result(
-                    solve_block,
-                    &metadata,
-                    pid,
-                    result,
-                    worker_clamp_twins,
-                    payload,
-                );
-                // ADR-021 publish-verifier scoping retired (task 2UVG3E): the
-                // solver-state verifier (and its publish change set) is gone
-                // — merges apply the Q1a stale policy only.
-            }
-            LaneOutcome::Suppressed { pid } => {
-                // A lane-witnessed detached bin's None arm (QR3NUS): never
-                // merged, never gauge-touched (it never bumped). No
-                // dedicated counter today — the witness itself guarantees
-                // the delivery, and no faithful ledger key exists (the
-                // record names only its pid; claiming against a proxy seq
-                // could false-trip the fuse against a same-pid Solved of
-                // the current cycle).
-                tracing::debug!(
-                    target: crate::telemetry::DIAGNOSTIC_TARGET,
-                    path_id = pid,
-                    "[detached] suppressed outcome delivered by the lane witness — no merge, no claim"
-                );
-            }
-            LaneOutcome::Failed { pid, failure } => {
-                // The lane witness's post-panic patch (QR3NUS decision A,
-                // adopted by the detached arm in 43E3H3 §5.2): the outcome
-                // was LOST to a seat panic. Counted as a non-merge drop
-                // (the deregistered-path bucket — a genuine final drop;
-                // NOT the stale bucket, which the Q1a stale gate alone
-                // owns), never merged, never gauge-touched (it never
-                // bumped), and NOT claimed on the one ledger (the record
-                // carries no faithful cycle_seq; see the Suppressed arm).
-                self.detached_dropped_deregistered
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if let Some(p) = crate::instruments::pipeline() {
-                    p.count_detached_stale_dropped();
-                }
-                tracing::error!(
-                    target: crate::telemetry::DIAGNOSTIC_TARGET,
-                    path_id = pid,
-                    failure = ?failure,
-                    "[detached] path outcome lost to a seat panic — typed failure record (QR3NUS witness carry)"
-                );
             }
         }
     }
+}
 
-    /// Hand the parked merge-pipe Receiver to the spawner (epic SRQEK5
-    /// WV62TX): `EngineStages::solve_dirty` takes it ONCE, at the FIRST
+/// The drain's counter aggregate (fold of the in-cycle drain's locals +
+/// the sidecar's per-item consumption).
+#[derive(Default)]
+struct LaneDrainCounts {
+    solved: usize,
+    suppressed: usize,
+    failed: usize,
+}
+
+impl ArbitrageEngine {
+    /// THE ONE LANE WALK (WNH5OL): the shared body of the two former `run_bin`
+    /// closures (the ~64-common-line fold). Arm differences are the two
+    /// parameters: the bin's items (`Arc<Vec>` indexed by the bin plan)
+    /// and the policy value.
+    fn drive_lane_walk(
+        shared: &std::sync::Arc<SolveCycleShared>,
+        solve_span: &tracing::Span,
+        bin_plan: &LaneWalkBinPlan,
+        policy: &LaneArmPolicy,
+        ws_ctx: &WalkSubmitCtx,
+        lane: &mut SolveLane,
+    ) -> LaneWalkReads {
+        // 7LV6VN T5 (pipelined arm): results park until their sim lands;
+        // the walk never waits on a sim. Sims pace on the fleet
+        // SimDriver seat pool (the budget's sim slot cap), so walk + sim
+        // demand never exceeds the CPU quota by construction.
+        let mut held: Vec<(u64, Option<SolveOutcome>)> = Vec::new();
+        let mut pending = PipelinedSims::default();
+        let mut suppressed_but_unsent: Vec<u64> = Vec::new();
+        for &i in &bin_plan.indices {
+            let (pid, resolved) = &bin_plan.items[i];
+            let outcome =
+                solve_one_path(shared, solve_span, *pid, resolved).map(|(pid, mut result)| {
+                    // SIMPIPE2 T2: clamp in the worker (stance-gated) BEFORE
+                    // the profitless filter — the clamp recompute can zero a
+                    // candidate, and the filter must see the commit-ready
+                    // values.
+                    let twins = clamp_result_in_worker(shared, i, pid, &mut result);
+                    (pid, result, twins)
+                });
+            {
+                // The profitless filter runs BEFORE the sim is scheduled —
+                // a clamp-zeroed candidate never needs its payload.
+                // WNH5OL ACCEPTANCE NOTE (arm-as-data): the pre-fold arms
+                // DIFFERED here by delivery-shape only (the detached arm
+                // suppressed pre-filter `continue` skips; the in-cycle arm
+                // suppressed post-solve `None` arms). Both reductions
+                // converge at the same exact delivery contract: exactly one
+                // outcome per submitted pid.
+                if let Some((pid, result, twins)) = outcome {
+                    if result.optimal_input.is_zero() || result.profit.is_zero() {
+                        if !result.solver_pool_states.is_empty() {
+                            tracing::debug!(
+                                "[solver-st] path_id={pid} hops=[{}]",
+                                result.solver_pool_states.join(";")
+                            );
+                        }
+                        // The pre-filter skip IS one delivered outcome
+                        // (this IS the detached arm's live record —
+                        // QR3NUS): no gauge (contract 1's pairing — it
+                        // never bumped), keyless → no claim (contract 4).
+                        lane.suppressed(pid);
+                        continue;
+                    }
+                    if !pending.schedule_one(shared, i, pid, &result, solve_span) {
+                        // No sim rides this item (no hook / clamp
+                        // off) — flush immediately.
+                        held.push((
+                            pid,
+                            Some(stamp_outcome(pid, result, twins, None, policy, ws_ctx)),
+                        ));
+                        flush_solved_item(&mut held, &mut |o| lane.solved(o), pid, None);
+                        continue;
+                    }
+                    if !result.solver_pool_states.is_empty() {
+                        tracing::debug!(
+                            "[solver-st] path_id={pid} hops=[{}]",
+                            result.solver_pool_states.join(";")
+                        );
+                    }
+                    held.push((
+                        pid,
+                        Some(stamp_outcome(pid, result, twins, None, policy, ws_ctx)),
+                    ));
+                    // Fan while walking: send every sim that landed
+                    // during this iteration's solve.
+                    for (done_pid, payload) in pending.drain_ready() {
+                        flush_solved_item(&mut held, &mut |o| lane.solved(o), done_pid, payload);
+                    }
+                } else {
+                    // A None IS an outcome (QR3NUS): exactly one
+                    // Suppressed record through the LANE (both arms
+                    // delivered this arm on the lane in the unfused
+                    // code; the reads vector is the walk's silent
+                    // label — no gauge, no claim, no merge).
+                    lane.suppressed(*pid);
+                    suppressed_but_unsent.push(*pid);
+                }
+            }
+        }
+        // Tail: join every outstanding sim and send.
+        if !pending.is_empty() {
+            for (done_pid, payload) in pending.join_all() {
+                flush_solved_item(&mut held, &mut |o| lane.solved(o), done_pid, payload);
+            }
+        }
+        LaneWalkReads {
+            suppressed_unsent: suppressed_but_unsent,
+            held_unflushed: held.len(),
+        }
+    }
+}
+
+/// The walk's per-bin plan: the items eligible for solving (aligned to
+/// cycle order) and the bin's index window into them (the LPT bin's owned
+/// indices). Same byte shape both arms compute today.
+struct LaneWalkBinPlan {
+    items: std::sync::Arc<Vec<(u64, std::sync::Arc<ResolvedMixedPath>)>>,
+    indices: Vec<usize>,
+}
+
+/// The walk's stamp context (contract 2's 'static carry): the detached
+/// arm hands the enqueue-time stamping halves — the issuing `cycle_seq`,
+/// the Q1a per-hop resolve snapshot, and the cycle span — so `stamp_outcome`
+/// can fill the envelopes inside the 'static bin. The in-cycle arm passes
+/// the inert carrier defaults (seq 0 / no stamps / no span) its drain has
+/// always expected. The Solved DELIVERY itself never rides here: both
+/// arms submit through the ONE lane (`SolveLane::solved`), so contract 1's
+/// gauge hook (a detached-lane setting) stays lane-borne.
+struct WalkSubmitCtx {
+    /// The issuing cycle's seq (`0` = the in-cycle arm's inert stamp).
+    cycle_seq: u64,
+    /// The enqueue resolve's per-hop `pool_update_block` snapshot (the
+    /// Q1a oracle); `None` on the inert in-cycle stamps.
+    update_stamps: Option<std::sync::Arc<HashMap<u64, Vec<u64>>>>,
+    /// The enqueue cycle span; `None` on the in-cycle arm.
+    solve_span: Option<tracing::Span>,
+}
+
+/// What the walk reports to the arm that drove it:
+/// - `suppressed_unsent`: the post-solve None arms (the CONVERGENT
+///   ancestral shape — the DETACHED arm delivered its profitless skips ON
+///   the lane instead, per the in-walk record comment; Suppressed never
+///   claims/bumps in either arm).
+/// - `held_unflushed`: Solved envelopes pushed but not yet handed to the
+///   lane (always 0 — the tail flush drains every sim; both arms debug-
+///   assert it).
+struct LaneWalkReads {
+    #[expect(
+        dead_code,
+        reason = "consumed per-arm by tests asserting which arm delivered a skipped solve"
+    )]
+    suppressed_unsent: Vec<u64>,
+    held_unflushed: usize,
+}
+
+/// Stamp ONE outcome from the policy (the carrier-stamp half of the arm
+/// difference). The detached arm fills `cycle_seq`/`update_stamp`/
+/// `solve_span` from the enqueue; the in-cycle arm fills the inert
+/// values its drain never reads (unchanged semantics).
+fn stamp_outcome(
+    pid: u64,
+    result: SolvePathResult,
+    worker_clamp_twins: u64,
+    payload: Option<SimulatedPathResult>,
+    policy: &LaneArmPolicy,
+    ws_ctx: &WalkSubmitCtx,
+) -> SolveOutcome {
+    SolveOutcome {
+        pid,
+        result,
+        worker_clamp_twins,
+        payload,
+        solve_block: policy.solve_block,
+        metadata: policy.metadata,
+        cycle_seq: ws_ctx.cycle_seq,
+        update_stamp: ws_ctx
+            .update_stamps
+            .as_ref()
+            .and_then(|s| s.get(&pid).cloned())
+            .unwrap_or_default(),
+        solve_span: ws_ctx
+            .solve_span
+            .clone()
+            .unwrap_or_else(tracing::Span::none),
+    }
+}
+
+impl ArbitrageEngine {
     /// Hand the parked merge-pipe Receiver to the spawner (epic SRQEK5
     /// WV62TX): `EngineStages::solve_dirty` takes it ONCE, at the FIRST
     /// detached enqueue, and owns it inside the sidecar thread. `None` = the
@@ -2288,124 +2717,41 @@ impl ArbitrageEngine {
                     // is unchanged; same 'static + Send move semantics, and
                     // concurrent detached cycles share the persistent
                     // worker set instead of forking one thread per bin.
+                    // WNH5OL (epic BPZUCM, card 1): the ONE lane walk —
+                    // the old detached run_bin body is the shared walk
+                    // below; arm differences ride the policy + stamp ctx.
                     let run_bin = move |lane: &mut SolveLane| {
-                        // 7LV6VN T5 (pipelined arm): results park until
-                        // their sim lands; the walk never waits on a
-                        // sim. Sims pace on the fleet SimDriver seat pool
-                        // (the budget's sim slot cap), so walk + sim
-                        // demand never exceeds the CPU quota by construction.
-                        let mut held: Vec<(u64, Option<SolveOutcome>)> = Vec::new();
-                        let mut pending = PipelinedSims::default();
-                        for &idx in &bin {
-                            let (pid, resolved) = &to_solve_bin[idx];
-                            // SIMPIPE2 T2: clamp in the bin thread
-                            // (stance-gated; BEFORE the profitless filter
-                            // — the profit-clamp recompute can zero a
-                            // candidate) so the committed inputs are
-                            // merge-ready with no sidecar round-trip.
-                            let Some((pid, result, worker_clamp_twins)) =
-                                solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved).map(
-                                    |(pid, mut r)| {
-                                        let twins =
-                                            clamp_result_in_worker(&shared_bin, idx, pid, &mut r);
-                                        (pid, r, twins)
-                                    },
-                                )
-                            else {
-                                // A None IS an outcome (QR3NUS): the lane
-                                // patches exactly one Suppressed record for
-                                // it (no gauge bump — see the pairing rule).
-                                lane.suppressed(*pid);
-                                continue;
-                            };
-                            {
-                                // The profitless filter runs BEFORE the
-                                // sim is scheduled - a clamp-zeroed
-                                // candidate never needs its payload.
-                                // the sim is scheduled — a clamp-zeroed
-                                // candidate never needs its payload (the
-                                // legacy path simmed first, then filtered).
-                                if result.optimal_input.is_zero() || result.profit.is_zero() {
-                                    continue;
-                                }
-                                if !pending.schedule_one(
-                                    &shared_bin,
-                                    idx,
-                                    pid,
-                                    &result,
-                                    &solve_span_bin,
-                                ) {
-                                    // No sim rides this item (no hook /
-                                    // clamp off) — flush immediately.
-                                    let update_stamp =
-                                        stamps_bin.get(&pid).cloned().unwrap_or_default();
-                                    held.push((
-                                        pid,
-                                        Some(SolveOutcome {
-                                            pid,
-                                            result,
-                                            worker_clamp_twins,
-                                            payload: None,
-                                            solve_block,
-                                            metadata: cycle_metadata,
-                                            cycle_seq,
-                                            update_stamp,
-                                            solve_span: solve_span_bin.clone(),
-                                        }),
-                                    ));
-                                    flush_solved_item(
-                                        &mut held,
-                                        &mut |o| lane.solved(o),
-                                        pid,
-                                        None,
-                                    );
-                                    continue;
-                                }
-                                if !result.solver_pool_states.is_empty() {
-                                    tracing::debug!(
-                                        "[solver-st] path_id={pid} hops=[{}]",
-                                        result.solver_pool_states.join(";")
-                                    );
-                                }
-                                let update_stamp =
-                                    stamps_bin.get(&pid).cloned().unwrap_or_default();
-                                held.push((
-                                    pid,
-                                    Some(SolveOutcome {
-                                        pid,
-                                        result,
-                                        worker_clamp_twins,
-                                        payload: None,
-                                        solve_block,
-                                        metadata: cycle_metadata,
-                                        cycle_seq,
-                                        update_stamp,
-                                        solve_span: solve_span_bin.clone(),
-                                    }),
-                                ));
-                                // Fan while walking: send every sim that
-                                // landed during this iteration's solve.
-                                for (done_pid, payload) in pending.drain_ready() {
-                                    flush_solved_item(
-                                        &mut held,
-                                        &mut |o| lane.solved(o),
-                                        done_pid,
-                                        payload,
-                                    );
-                                }
-                            }
-                        }
-                        // Tail: join every outstanding sim and send.
-                        if !pending.is_empty() {
-                            for (done_pid, payload) in pending.join_all() {
-                                flush_solved_item(
-                                    &mut held,
-                                    &mut |o| lane.solved(o),
-                                    done_pid,
-                                    payload,
-                                );
-                            }
-                        }
+                        let walk_plan = LaneWalkBinPlan {
+                            items: std::sync::Arc::clone(&to_solve_bin),
+                            indices: bin,
+                        };
+                        // THE ARM POLICY (detached enqueue): stamped
+                        // envelopes ride the walk; Suppressed/Failed keep
+                        // the keyless no-claim witness (contract 4).
+                        let lane_policy = LaneArmPolicy {
+                            ledger_seq: cycle_seq,
+                            lock: LaneDrainLockContext::SidecarPerItemHold,
+                            claim_all_lanes: false,
+                            solve_block,
+                            metadata: cycle_metadata,
+                        };
+                        let stamp_ctx = WalkSubmitCtx {
+                            cycle_seq,
+                            update_stamps: Some(std::sync::Arc::clone(&stamps_bin)),
+                            solve_span: Some(solve_span_bin.clone()),
+                        };
+                        let reads = Self::drive_lane_walk(
+                            &shared_bin,
+                            &solve_span_bin,
+                            &walk_plan,
+                            &lane_policy,
+                            &stamp_ctx,
+                            lane,
+                        );
+                        debug_assert_eq!(
+                            reads.held_unflushed, 0,
+                            "detached walk must flush every Solved item before the bin body returns"
+                        );
                     };
                     // 43E3H3 (design §5.2, REV 2 Defect 3): the detached arm
                     // adopts the SAME lane witness the in-cycle arm seals its
@@ -2525,121 +2871,36 @@ impl ArbitrageEngine {
                 // dispatch — the lane witness uses it to keep outcome
                 // accounting exact even when a unit panics mid-bin.
                 let lane_pids: Vec<u64> = bin.iter().map(|&i| to_solve[i].0).collect();
+                // WNH5OL (epic BPZUCM, card 1): the ONE lane walk — the
+                // old in-cycle run_bin body is the shared walk; arm
+                // differences ride the policy + stamp ctx (inert stamps:
+                // its drain always ignored them and re-keys the ledger
+                // from the cycle seq below).
                 let run_bin = move |lane: &mut SolveLane| {
-                    // 7LV6VN T5 (pipelined arm): outcomes park until
-                    // their sim lands; the walk never waits on a sim.
-                    let mut held: Vec<(u64, Option<SolveOutcome>)> = Vec::new();
-                    let mut pending = PipelinedSims::default();
-                    for &i in &bin {
-                        let (pid, resolved) = &to_solve_bin[i];
-                        let outcome = solve_one_path(&shared_bin, &solve_span_bin, *pid, resolved)
-                            .map(|(pid, mut result)| {
-                                // SIMPIPE2 T2: clamp in the worker
-                                // (stance-gated) BEFORE the
-                                // profitless filter — the
-                                // profit-clamp recompute can zero a
-                                // candidate, and the filter must see
-                                // the commit-ready values.
-                                let twins =
-                                    clamp_result_in_worker(&shared_bin, i, pid, &mut result);
-                                (pid, result, twins)
-                            });
-                        {
-                            // The profitless filter runs BEFORE the sim
-                            // is scheduled - a clamp-zeroed candidate
-                            // never needs its payload.
-                            match outcome {
-                                Some((pid, result, twins)) => {
-                                    if result.optimal_input.is_zero() || result.profit.is_zero() {
-                                        if !result.solver_pool_states.is_empty() {
-                                            tracing::debug!(
-                                                "[solver-st] path_id={pid} hops=[{}]",
-                                                result.solver_pool_states.join(";")
-                                            );
-                                        }
-                                        continue;
-                                    }
-                                    if !pending.schedule_one(
-                                        &shared_bin,
-                                        i,
-                                        pid,
-                                        &result,
-                                        &solve_span_bin,
-                                    ) {
-                                        // No sim rides this item — flush
-                                        // immediately.
-                                        held.push((
-                                            pid,
-                                            Some(SolveOutcome {
-                                                pid,
-                                                result,
-                                                worker_clamp_twins: twins,
-                                                payload: None,
-                                                cycle_seq: 0,
-                                                solve_block,
-                                                metadata: cycle_metadata,
-                                                update_stamp: vec![],
-                                                solve_span: tracing::Span::none(),
-                                            }),
-                                        ));
-                                        flush_solved_item(
-                                            &mut held,
-                                            &mut |o| lane.solved(o),
-                                            pid,
-                                            None,
-                                        );
-                                        continue;
-                                    }
-                                    if !result.solver_pool_states.is_empty() {
-                                        tracing::debug!(
-                                            "[solver-st] path_id={pid} hops=[{}]",
-                                            result.solver_pool_states.join(";")
-                                        );
-                                    }
-                                    held.push((
-                                        pid,
-                                        Some(SolveOutcome {
-                                            pid,
-                                            result,
-                                            worker_clamp_twins: twins,
-                                            payload: None,
-                                            cycle_seq: 0,
-                                            solve_block,
-                                            metadata: cycle_metadata,
-                                            update_stamp: vec![],
-                                            solve_span: tracing::Span::none(),
-                                        }),
-                                    ));
-                                    // Fan: flush sims that landed mid-walk.
-                                    for (done_pid, payload) in pending.drain_ready() {
-                                        flush_solved_item(
-                                            &mut held,
-                                            &mut |o| lane.solved(o),
-                                            done_pid,
-                                            payload,
-                                        );
-                                    }
-                                }
-                                // Same failed-solve stream the legacy arm
-                                // sends — a None IS an outcome (QR3NUS):
-                                // counted at the drain, never merged; it
-                                // carries its pid so accounting stays exact.
-                                None => {
-                                    lane.suppressed(*pid);
-                                }
-                            }
-                        }
-                    }
-                    if !pending.is_empty() {
-                        for (done_pid, payload) in pending.join_all() {
-                            flush_solved_item(
-                                &mut held,
-                                &mut |o| lane.solved(o),
-                                done_pid,
-                                payload,
-                            );
-                        }
-                    }
+                    let walk_plan = LaneWalkBinPlan {
+                        items: std::sync::Arc::clone(&to_solve_bin),
+                        indices: bin.clone(),
+                    };
+                    let lane_policy = LaneArmPolicy {
+                        ledger_seq: in_cycle_seq,
+                        lock: LaneDrainLockContext::InCycleHold,
+                        claim_all_lanes: true,
+                        solve_block,
+                        metadata: cycle_metadata,
+                    };
+                    let stamp_ctx = WalkSubmitCtx {
+                        cycle_seq: 0,
+                        update_stamps: None,
+                        solve_span: None,
+                    };
+                    Self::drive_lane_walk(
+                        &shared_bin,
+                        &solve_span_bin,
+                        &walk_plan,
+                        &lane_policy,
+                        &stamp_ctx,
+                        lane,
+                    );
                 };
                 let lane_key =
                     SOLVE_BIN_KEY_BASE.saturating_add(u64::try_from(bin_idx).unwrap_or(u64::MAX));
@@ -2680,99 +2941,38 @@ impl ArbitrageEngine {
                 // path outcome — solved paths merge; a `Suppressed` None IS
                 // an outcome (counted, never merged); a `Failed` arrives
                 // typed with its unit + seat payload. No item is ever
-                // silently skipped. 43E3H3: the fuse now claims the ONE
+                // silently skipped. 43E3H3: the fuse claims the ONE
                 // engine-side ledger keyed (in_cycle_seq, pid) — the same
                 // one the sidecar claims — and a duplicate is REFUSED
                 // (skip the merge, drop the item; the tightened policy per
                 // design §4.4 REV 2, Risk 5 decision). The fan-in assert
                 // below stays the second tripwire on any real undercount.
-                match item {
-                    LaneOutcome::Solved(o) => {
-                        let pid = o.pid;
-                        if self
-                            .outcome_ledger
-                            .lock()
-                            .claim((in_cycle_seq, pid))
-                            .is_err()
-                        {
-                            self.duplicate_outcomes
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::error!(
-                                target: "degenbot::solver",
-                                path_id = pid,
-                                "[solve-merge] duplicate lane outcome for path — exactness fuse tripped (QR3NUS)"
-                            );
-                            continue;
-                        }
-                        debug_assert_eq!(
-                            o.solve_block, solve_block,
-                            "carrier/drain solve_block mismatch — wrong-arm delivery"
-                        );
-                        let SolveOutcome {
-                            result: solve_result,
-                            worker_clamp_twins,
-                            payload,
-                            ..
-                        } = o;
-                        if !solve_result.solver_pool_states.is_empty() {
-                            tracing::debug!(
-                                "[solver-st] path_id={pid} hops=[{}]",
-                                solve_result.solver_pool_states.join(";")
-                            );
-                        }
-                        clamp_twin_count += self.merge_one_result(
-                            solve_block,
-                            metadata,
-                            pid,
-                            solve_result,
-                            worker_clamp_twins,
-                            payload,
-                        );
-                        solved_count += 1;
-                    }
-                    LaneOutcome::Suppressed { pid } => {
-                        if self
-                            .outcome_ledger
-                            .lock()
-                            .claim((in_cycle_seq, pid))
-                            .is_err()
-                        {
-                            self.duplicate_outcomes
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::error!(
-                                target: "degenbot::solver",
-                                path_id = pid,
-                                "[solve-merge] duplicate suppressed outcome for path — exactness fuse tripped (QR3NUS)"
-                            );
-                            continue;
-                        }
-                        suppressed_count += 1;
-                    }
-                    LaneOutcome::Failed { pid, failure } => {
-                        if self
-                            .outcome_ledger
-                            .lock()
-                            .claim((in_cycle_seq, pid))
-                            .is_err()
-                        {
-                            self.duplicate_outcomes
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            tracing::error!(
-                                target: "degenbot::solver",
-                                path_id = pid,
-                                "[solve-merge] duplicate failed outcome for path — exactness fuse tripped (QR3NUS)"
-                            );
-                            continue;
-                        }
-                        tracing::error!(
-                            target: "degenbot::solver",
-                            path_id = pid,
-                            failure = ?failure,
-                            "[solve-merge] path outcome lost to a seat panic — typed failure record (QR3NUS)"
-                        );
-                        failed_count += 1;
-                    }
-                }
+                // WNH5OL: the per-variant table itself (fuse claims, per-path
+                // debug logs, the merge) folds into `drain_lane_outcomes`
+                // below; this loop keeps the arm's per-cycle observability.
+                // THE DRAIN (WNH5OL): the three-variant disposition table
+                // fused into `drain_lane_outcomes` — called ONCE per item
+                // under THIS cycle's engine-Mutex hold (contract 3's
+                // InCycleHold — the drain never locks for itself), claiming
+                // the carrier-keyed rows via the policy's ledger_seq.
+                let policy = LaneArmPolicy {
+                    ledger_seq: in_cycle_seq,
+                    lock: LaneDrainLockContext::InCycleHold,
+                    claim_all_lanes: true,
+                    solve_block,
+                    metadata: *metadata,
+                };
+                let mut drain_counts = LaneDrainCounts::default();
+                self.drain_lane_outcomes(std::iter::once(item), &policy, &mut drain_counts);
+                let LaneDrainCounts {
+                    solved: n_solved,
+                    suppressed: n_suppressed,
+                    failed: n_failed,
+                } = drain_counts;
+                clamp_twin_count += u64::try_from(n_solved).unwrap_or(u64::MAX);
+                solved_count += n_solved;
+                suppressed_count += n_suppressed;
+                failed_count += n_failed;
             }
             drop(merge_ctx);
             merge_span.record("merge.paths", solved_count);
