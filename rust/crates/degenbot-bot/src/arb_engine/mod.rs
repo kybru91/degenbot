@@ -78,6 +78,11 @@ pub mod inline_sim;
 pub mod lifecycle;
 pub mod path_info;
 mod path_lifecycle;
+// RZEWTX: the ONE pooled-seat host for the WorkQueue fleet roles (sim +
+// registration) — the executors are thin role descriptors over it; the
+// solve executor's exclusion (per-seat channel model + posture-invariant
+// typed-submit admission) is documented in the module doc.
+mod seat_host;
 mod snapshot_verify;
 mod solver_dispatch;
 #[cfg(test)]

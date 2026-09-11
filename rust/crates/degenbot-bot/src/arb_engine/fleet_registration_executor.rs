@@ -14,6 +14,14 @@
 //! HOLDS intake entirely (Deferrable cordon class — `enqueue` refuses
 //! while cordoned) and in-flight units are never cancelled.
 //!
+//! RZEWTX: the pooled-seat machinery (`WorkQueue`, `seat_loop`,
+//! `host_loop`, `apply_host_msg`/`pump` admission, the boot install/global
+//! boilerplate) is SHARED with the sim executor — ONE seat host
+//! (`arb_engine::seat_host`) parameterized by this module's [`REG_ROLE`]
+//! descriptor. The solve executor is deliberately NOT hosted there
+//! (per-seat channel model + posture-invariant typed-submit admission —
+//! the design gate lives in `seat_host`'s module doc).
+//!
 //! Unit bodies are the crawl's pool-build callables: they ride the FFI at
 //! the seat boundary (`Python::attach` in the closure), release the GIL
 //! through the existing `py.detach` seams inside the Rust builders, and
@@ -28,56 +36,42 @@
 //! caveat (ADR-042 §8) is unchanged: build callables already enter the
 //! installed hooks via the existing seams.
 
-use std::collections::VecDeque;
-use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::OnceLock;
 
 use crate::arb_engine::boot_stamp::{BootRole, BootStamp};
-use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, GrantKind, Unit};
-use degenbot_workers::lane::LaneCtx;
+use degenbot_workers::budget::FleetBudget;
+use degenbot_workers::dispatcher::{BootError, FleetBoot, GrantKind};
 use degenbot_workers::role::WorkerRole;
 
 use crate::arb_engine::fleet_intake::{FleetIntake, InnerWork};
+use crate::arb_engine::seat_host::{self, CordonAdmission, SeatHost, SeatRoleDesc};
 
-/// Loud, unrecoverable executor failure (mirror of the fleet sim/solve
-/// executors' abort discipline): a dead host would strand in-flight build
-/// receipts — the crawl worker awaiting one parks forever (stranded pipe,
-/// design doc §10) — so swallowing the error is never an option.
-#[expect(
-    clippy::print_stderr,
-    reason = "the abort path must stay legible with no tracing subscriber installed (test harnesses drop the tracing event); stderr is the process's last message"
-)]
-fn abort_executor(context: &str, err: &str) -> ! {
-    tracing::error!(
-        context = %context,
-        error = %err,
-        "[fleet-reg] unrecoverable — aborting (stranded intake receipt pipe)"
-    );
-    eprintln!(
-        "[fleet-reg] UNRECOVERABLE, aborting (stranded intake receipt pipe): {context}: {err}"
-    );
-    std::process::abort();
-}
+/// The intake executor's seat-host role descriptor — this module IS the
+/// role now; the machinery lives once in `seat_host`. `PoolStateUpdater`
+/// pooled seats granted `GrantKind::PoolStateUpdate` units, the budget's
+/// `pool_state_updater_slots` as the seat count, and the design-gate
+/// admission policy `Hold`: a Cordoned posture HOLDS Deferrable intake —
+/// held units wait in the unbounded backlog (never dropped), in-flight
+/// units are never cancelled.
+static REG_ROLE: SeatRoleDesc = SeatRoleDesc {
+    role: WorkerRole::PoolStateUpdater,
+    grant: GrantKind::PoolStateUpdate,
+    cordon: CordonAdmission::Hold,
+    boot_role: BootRole::Registration,
+    abort_tag: "[fleet-reg]",
+    noun: "intake",
+    host_thread: "work-fleet-poolupd-host",
+    stamp_missing:
+        "fleet registration boot stamp missing: an engine must construct before the first fleet submit (YI5NGB)",
+    seats: reg_seats_of,
+};
 
-/// Host-bound message: a submitted intake unit, or a seat reporting its
-/// unit done (completion drives T5 — the pooled slot returns to idle).
-enum HostMsg {
-    Enqueue(Unit),
-    SeatDone { seat: u64 },
-}
-
-/// One granted intake unit handed to whichever pooled seat takes it next
-/// (the role is pooled — seats contend, no pin affinity).
-struct SeatJob {
-    /// The host-tracked slot the unit was granted to (completion carries it
-    /// back so T5 applies to the right slot).
-    slot: u64,
-    /// The work payload (`Send + 'static` — the `c_api` closure carries the
-    /// Python callable handle and its receipt channel). Takes the seat's
-    /// `LaneCtx` (LW-T2); pooled seats hand the detached stub (LW-T8
-    /// landed: the executors submit through ONE seam).
-    work: Box<dyn FnOnce(&LaneCtx) + Send>,
+/// The queue-cap source: the budget's `pool_state_updater_slots` (default
+/// 4, `fleet.pool_state_updater_slots` terminal override — the `SimDriver`
+/// billing model exactly: duty-counted, spendable from the fractional
+/// remainder, never part of the declared integer sum).
+fn reg_seats_of(budget: &FleetBudget) -> usize {
+    budget.pool_state_updater_slots
 }
 
 /// The fleet-hosted registration intake executor. Shared by the whole
@@ -85,8 +79,9 @@ struct SeatJob {
 /// sim/solve executors' construction-once contract: warm pooled seats for
 /// the process lifetime).
 pub struct FleetRegistrationExecutor {
-    tx: mpsc::Sender<HostMsg>,
-    unit_seq: AtomicU64,
+    /// The shared pooled-seat host (the channel submit end + the unit
+    /// sequence).
+    host: SeatHost,
     /// The budget's `PoolStateUpdater` slot cap (the pooled seat count).
     #[cfg(test)]
     seats: usize,
@@ -102,47 +97,11 @@ impl FleetRegistrationExecutor {
     /// # Errors
     /// [`BootError`] — the fleet budget sum check or a boot invariant.
     pub fn boot(boot: FleetBoot) -> Result<Self, BootError> {
-        let host = FleetHost::boot(boot)?;
-        let seats = host.budget().pool_state_updater_slots;
-        let (tx, rx) = mpsc::channel::<HostMsg>();
-        // Pooled seats contend on ONE shared work queue: a grant lands a
-        // unit there, any idle seat takes it, and the completion reports
-        // the GRANTED slot id so the host applies T5 to the right slot.
-        // Grants never exceed the station slot cap, which never exceeds the
-        // seat count, so every granted unit is picked up without delay.
-        let work = Arc::new(WorkQueue::new());
-        for seat in 0..seats {
-            let done = tx.clone();
-            let work = Arc::clone(&work);
-            let spawned = std::thread::Builder::new()
-                .name(
-                    WorkerRole::PoolStateUpdater
-                        .thread_name()
-                        .replace("{n}", &seat.to_string()),
-                )
-                .spawn(move || seat_loop(&work, &done));
-            if let Err(err) = spawned {
-                // A missing seat strands the receipts of every unit that
-                // would have run on it — loud (§10).
-                abort_executor("intake seat spawn", &format!("{err:?}"));
-            }
-        }
-        let spawned = std::thread::Builder::new()
-            .name("work-fleet-poolupd-host".to_string())
-            .spawn(move || {
-                host_loop(rx, host, Arc::clone(&work));
-                // Process teardown: the submission channel closed. Retire
-                // the seats so no worker parks forever on an empty queue.
-                work.close();
-            });
-        if let Err(err) = spawned {
-            abort_executor("fleet intake host thread spawn", &format!("{err:?}"));
-        }
+        let host = SeatHost::boot(&REG_ROLE, boot)?;
         Ok(Self {
-            tx,
-            unit_seq: AtomicU64::new(0),
             #[cfg(test)]
-            seats,
+            seats: host.seat_count(),
+            host,
         })
     }
 
@@ -161,26 +120,13 @@ impl FleetRegistrationExecutor {
     /// send VALUE carries the close arm; the abort lives in the trait impl
     /// (reg:173-175's `abort_executor` - today's "intake submission" /
     /// "fleet intake host channel closed" - moved there; same process-exit
-    /// semantics, one owner of the abort). `pub(crate)` fn, in-crate (T3's
+    /// semantics, one owner of the abort — now the shared seat host's
+    /// `intake_spawn`). `pub(crate)` fn, in-crate (T3's
     /// cross-module pin in `fleet_intake`'s tests binds the `Result<(), ()>`
     /// shape by calling it - the surface stays crate-internal, invisible to
     /// the §4.3 pub-surface grep).
     pub(crate) fn try_send(&self, work: InnerWork) -> Result<(), ()> {
-        let unit = Unit::new(
-            self.unit_seq.fetch_add(1, Ordering::Relaxed),
-            WorkerRole::PoolStateUpdater,
-            None,
-            // The unit's receipt feeds the awaiting crawl worker — a
-            // stranded pipe if abandoned.
-            true,
-            Box::new(move |_ctx| work()),
-        );
-        // The close arm, typed to the port's unit vocabulary: the send
-        // value carries the close arm; the abort lives in the trait impl.
-        match self.tx.send(HostMsg::Enqueue(unit)) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(()),
-        }
+        self.host.try_send(work)
     }
 
     /// Test-venue shim: the OLD name `spawn`, `#[cfg(test)]`-only, so the
@@ -197,184 +143,7 @@ impl FleetRegistrationExecutor {
 impl FleetIntake for FleetRegistrationExecutor {
     fn spawn(&self, work: InnerWork) {
         if self.try_send(work).is_err() {
-            abort_executor("intake submission", "fleet intake host channel closed");
-        }
-    }
-}
-
-/// The shared pooled-seat work queue (std `mpsc` receivers are not
-/// `Clone`, so the contended seat pool rides a condvar deque).
-#[derive(Default)]
-struct WorkQueue {
-    queue: parking_lot::Mutex<VecDeque<SeatJob>>,
-    shutdown: parking_lot::Mutex<bool>,
-    work_available: parking_lot::Condvar,
-}
-
-impl WorkQueue {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Take one granted unit, parking the seat until one arrives or the
-    /// queue shuts down (host retired — process teardown).
-    fn take(&self) -> Option<SeatJob> {
-        if let Some(job) = self.queue.lock().pop_front() {
-            return Some(job);
-        }
-        let mut shutdown = self.shutdown.lock();
-        loop {
-            if *shutdown {
-                return None;
-            }
-            {
-                let mut q = self.queue.lock();
-                if let Some(job) = q.pop_front() {
-                    return Some(job);
-                }
-            }
-            // Park until a grant lands or the host retires the pool. The
-            // shutdown mutex doubles as the re-check serialization point.
-            self.work_available
-                .wait_for(&mut shutdown, std::time::Duration::from_millis(50));
-        }
-    }
-
-    fn push(&self, job: SeatJob) {
-        self.queue.lock().push_back(job);
-        self.work_available.notify_one();
-    }
-
-    /// Retire the pool (host thread done): every parked seat drains out.
-    fn close(&self) {
-        *self.shutdown.lock() = true;
-        self.work_available.notify_all();
-    }
-}
-
-/// One pooled `PoolStateUpdater` seat: take granted units from the shared
-/// work queue, run them one at a time, and report the granted slot's
-/// completion so the host applies T5 (run → idle).
-fn seat_loop(work: &WorkQueue, done: &mpsc::Sender<HostMsg>) {
-    while let Some(job) = work.take() {
-        // A panicking build closure must not kill the seat (its pool would
-        // strand receipts): keep the seat alive, log loudly, report done.
-        let ctx = LaneCtx::detached();
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| (job.work)(&ctx)));
-        if outcome.is_err() {
-            tracing::error!(
-                target: "degenbot::fleet",
-                seat = job.slot,
-                "[fleet-reg] intake unit panicked — the seat survives, the failure is loud"
-            );
-        }
-        if done.send(HostMsg::SeatDone { seat: job.slot }).is_err() {
-            // The host is gone (executor dropped — tests): the seat retires.
-            break;
-        }
-    }
-}
-
-/// The dispatch loop (design doc §4): enqueue → precedence-grant →
-/// execute. Owns the `FleetHost` exclusively; every FSM transition runs
-/// here. Exits when the submission channel closes (all executor handles
-/// dropped — process teardown).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "the host Receiver's ownership moves into the spawned host thread — a borrow cannot cross the thread boundary"
-)]
-fn host_loop(rx: mpsc::Receiver<HostMsg>, mut host: FleetHost, queue: Arc<WorkQueue>) {
-    let mut backlog: VecDeque<Unit> = VecDeque::new();
-    while let Ok(msg) = rx.recv() {
-        apply_host_msg(&mut host, &mut backlog, msg);
-        pump(&mut host, &mut backlog, &queue);
-    }
-}
-
-/// Apply one submission or completion (both arrive on the single host
-/// channel — completions can never starve behind a blocking recv).
-fn apply_host_msg(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, msg: HostMsg) {
-    match msg {
-        HostMsg::Enqueue(unit) => {
-            // Pre-check capacity INSTEAD of failing enqueue: the host
-            // thread owns every queue mutation, so the check is exact.
-            // Units that do not fit spill to the backlog (unbounded, like
-            // the legacy receipt pipeline) and drain FIRST on the next
-            // pump — never dropped (§10 ledger).
-            if host.queue_len(WorkerRole::PoolStateUpdater)
-                >= host.queue_cap(WorkerRole::PoolStateUpdater)
-            {
-                backlog.push_back(unit);
-            } else if host.posture() == degenbot_workers::posture::FleetPosture::Cordoned {
-                // A cordon HOLDs Deferrable intake (unlike the sim arm):
-                // the unit waits in the backlog and re-queues when the
-                // fleet exits the cordon (the legacy crawl threads were
-                // never cancelled either; this is the deferrable stance,
-                // §6). The posture machine is host-owned (single host
-                // thread), so the check cannot race a cordon onset.
-                backlog.push_back(unit);
-            } else if let Err(err) = host.enqueue(unit) {
-                abort_executor("intake enqueue", &err.to_string());
-            }
-        }
-        HostMsg::SeatDone { seat } => {
-            if let Err(err) = host.complete(seat) {
-                abort_executor("seat completion (T5)", &err.to_string());
-            }
-        }
-    }
-}
-
-/// The one precedence grant loop pass (design doc §4): backlog first, then
-/// dispatch grants onto the pooled seats. Grants apply T2 (start) at grant
-/// time — the work-queue push IS the claim — and completion arrives via
-/// [`HostMsg::SeatDone`] (T5).
-fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, queue: &Arc<WorkQueue>) {
-    // Backlog drains FIRST (FIFO across the loud-overflow seam). A backed
-    // backlog that cannot enqueue (cordon holds intake, full per-role
-    // queue) parks here until the next host message — the awaiting
-    // callers already submitted, and retrying on every wake matches the
-    // legacy worker semantics (work waits, never drops).
-    while backlog.front().is_some() {
-        let next_role = backlog
-            .front()
-            .map_or(WorkerRole::PoolStateUpdater, |u| u.role);
-        if host.queue_len(next_role) >= host.queue_cap(next_role) {
-            break;
-        }
-        // Still cordoned — the backlog head stays; retrying on the next
-        // host message (submissions keep arriving; no busy-spin — pump
-        // only runs on a message). The posture machine is host-owned
-        // (single host thread), so the check cannot race a cordon onset.
-        if host.posture() == degenbot_workers::posture::FleetPosture::Cordoned {
-            break;
-        }
-        let Some(unit) = backlog.pop_front() else {
-            break;
-        };
-        if let Err(err) = host.enqueue(unit) {
-            abort_executor("backlog drain", &err.to_string());
-        }
-    }
-    loop {
-        let grants = host.dispatch();
-        if grants.is_empty() {
-            break;
-        }
-        for (grant, unit) in grants {
-            // Invariant: this executor only enqueues `PoolStateUpdater`
-            // units, so every grant is a pooled intake grant. Anything else
-            // is a broken host contract, not a drop.
-            if !matches!(grant.kind, GrantKind::PoolStateUpdate) {
-                abort_executor("dispatch grant", "non-intake grant in the intake executor");
-            }
-            if let Err(err) = host.start(grant.slot, &unit) {
-                abort_executor("grant start (T2)", &err.to_string());
-            }
-            queue.push(SeatJob {
-                slot: grant.slot,
-                work: unit.work,
-            });
+            seat_host::intake_close_abort(&self.host);
         }
     }
 }
@@ -388,10 +157,11 @@ static FLEET_REGISTRATION_EXECUTOR: OnceLock<FleetRegistrationExecutor> = OnceLo
 /// deterministic cfg hash. Never overrides an installed value (first
 /// engine wins, like the other stance statics) — every construction after
 /// the first RIDES, and the ride is ledgered (a divergent-cfg rider is
-/// counted + warned in prod, ILLEGAL in tests).
+/// counted + warned in prod, ILLEGAL in tests) on the
+/// `BootRole::Registration` row (the shared installer:
+/// `seat_host::install_boot`).
 pub fn install_boot(stamp: BootStamp) {
-    crate::arb_engine::boot_stamp::record_ride(BootRole::Registration, &stamp);
-    let _ = FLEET_REGISTRATION_BOOT.set(stamp);
+    seat_host::install_boot(&FLEET_REGISTRATION_BOOT, &REG_ROLE, stamp);
 }
 
 /// Whether an engine installed a fleet boot STAMP (YI5NGB: the stamp is
@@ -409,29 +179,16 @@ pub fn boot_installed() -> bool {
 /// first fleet-stance intake submission and persisting for the process
 /// lifetime. Crate-internal (LNQDOA §4.2): its only callers are the
 /// `fleet_intake` facade hand-outs — the executor TYPE crosses a boundary
-/// exactly once, as an anonymous trait object.
+/// exactly once, as an anonymous trait object (the shared materializer:
+/// `seat_host::global_executor` — the YI5NGB absence window stays closed
+/// by construction).
 pub(crate) fn global_fleet_registration_executor() -> &'static FleetRegistrationExecutor {
-    FLEET_REGISTRATION_EXECUTOR.get_or_init(|| {
-        // YI5NGB: the absence window is CLOSED BY CONSTRUCTION — every
-        // dispatch path builds on a constructed engine, and construction
-        // (with_core_cfg) installs the stamp BEFORE any dispatch can
-        // exist. A missing stamp means a caller skipped the construction
-        // contract: LOUD abort (never a silent fallback boot of a boot
-        // nobody chose).
-        #[expect(
-            clippy::expect_used,
-            reason = "the loud construction-contract abort IS the YI5NGB design: a stamp-less materialization must abort, never fall back silently"
-        )]
-        let stamp = FLEET_REGISTRATION_BOOT
-            .get()
-            .expect(
-                "fleet registration boot stamp missing: an engine must construct before the first fleet submit (YI5NGB)",
-            );
-        match FleetRegistrationExecutor::boot(stamp.boot()) {
-            Ok(executor) => executor,
-            Err(err) => abort_executor("fleet intake budget boot", &err.to_string()),
-        }
-    })
+    seat_host::global_executor(
+        &REG_ROLE,
+        &FLEET_REGISTRATION_BOOT,
+        &FLEET_REGISTRATION_EXECUTOR,
+        FleetRegistrationExecutor::boot,
+    )
 }
 
 #[cfg(test)]
@@ -611,6 +368,19 @@ mod tests {
             got.len() as u64,
             want,
             "no unit dropped across the backlog spill"
+        );
+    }
+
+    /// The role descriptor's design-gate admission arm (RZEWTX):
+    /// `PoolStateUpdater` is Deferrable cordon class — a Cordoned posture
+    /// HOLDS intake; the unbounded backlog preserves the held units (never
+    /// dropped). The shared host applies the arm in `apply_host_msg`/`pump`
+    /// (see `seat_host`).
+    #[test]
+    fn the_intake_role_descriptor_holds_under_cordon() {
+        assert_eq!(
+            super::REG_ROLE.cordon,
+            crate::arb_engine::seat_host::CordonAdmission::Hold
         );
     }
 }

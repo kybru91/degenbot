@@ -20,6 +20,14 @@
 //! the unbounded part of the burst); submission over the never-drop
 //! host channel is the pacing seam now.
 //!
+//! RZEWTX: the pooled-seat machinery (`WorkQueue`, `seat_loop`,
+//! `host_loop`, `apply_host_msg`/`pump` admission, the boot install/global
+//! boilerplate) is SHARED with the registration executor — ONE seat host
+//! (`arb_engine::seat_host`) parameterized by this module's [`SIM_ROLE`]
+//! descriptor. The solve executor is deliberately NOT hosted there
+//! (per-seat channel model + posture-invariant typed-submit admission —
+//! the design gate lives in `seat_host`'s module doc).
+//!
 //! Sim units carry no pin key (the `SimDriver` role is pooled, T5: run →
 //! back-to-idle); the merge pin / Solver-pin lanes of the shared host FSM
 //! never fire here because this executor only enqueues `SimDriver` units.
@@ -33,54 +41,40 @@
 //! fleet seats crosses the FFI only at the existing install/delivery
 //! seams (design doc §8: simulation never round-trips Python).
 
-use std::collections::VecDeque;
-use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::OnceLock;
 
 use crate::arb_engine::boot_stamp::{BootRole, BootStamp};
-use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, GrantKind, Unit};
-use degenbot_workers::lane::LaneCtx;
+use degenbot_workers::budget::FleetBudget;
+use degenbot_workers::dispatcher::{BootError, FleetBoot, GrantKind};
 use degenbot_workers::role::WorkerRole;
 
 use crate::arb_engine::fleet_intake::{FleetIntake, InnerWork};
+use crate::arb_engine::seat_host::{self, CordonAdmission, SeatHost, SeatRoleDesc};
 
-/// Loud, unrecoverable executor failure (mirror of the fleet solve
-/// executor's abort discipline): a dead host would strand in-flight sim
-/// receipts — a scheduling bin waiting on a receipt parks forever (stranded
-/// pipe, design doc §10) — so swallowing the error is never an option.
-#[expect(
-    clippy::print_stderr,
-    reason = "the abort path must stay legible with no tracing subscriber installed (test harnesses drop the tracing event); stderr is the process's last message"
-)]
-fn abort_executor(context: &str, err: &str) -> ! {
-    tracing::error!(
-        context = %context,
-        error = %err,
-        "[fleet-sim] unrecoverable — aborting (stranded sim receipt pipe)"
-    );
-    eprintln!("[fleet-sim] UNRECOVERABLE, aborting (stranded sim receipt pipe): {context}: {err}");
-    std::process::abort();
-}
+/// The sim executor's seat-host role descriptor — this module IS the role
+/// now; the machinery lives once in `seat_host`. `SimDriver` pooled seats
+/// granted `GrantKind::Sim` units, the budget's `sim_slot_cap` as the seat
+/// count, and the design-gate admission policy `Admit`: a Cordoned posture
+/// still admits sim leases (`SimPool` class — floored, not held; the floor
+/// is the host FSM's sim-intake lane, dispatcher-side). The seat pool is
+/// the pacing contract: a seat IS the granted slot.
+static SIM_ROLE: SeatRoleDesc = SeatRoleDesc {
+    role: WorkerRole::SimDriver,
+    grant: GrantKind::Sim,
+    cordon: CordonAdmission::Admit,
+    boot_role: BootRole::Sim,
+    abort_tag: "[fleet-sim]",
+    noun: "sim",
+    host_thread: "work-fleet-sim-host",
+    stamp_missing:
+        "fleet sim boot stamp missing: an engine must construct before the first fleet submit (YI5NGB)",
+    seats: sim_seats_of,
+};
 
-/// Host-bound message: a submitted sim unit, or a seat reporting its unit
-/// done (completion drives T5 — the pooled slot returns to idle).
-enum HostMsg {
-    Enqueue(Unit),
-    SeatDone { seat: u64 },
-}
-
-/// One granted sim unit handed to whichever pooled seat takes it next
-/// (`SimDriver` is a pooled role — seats contend, no pin affinity).
-struct SeatJob {
-    /// The host-tracked slot the unit was granted to (completion carries it
-    /// back so T5 applies to the right slot).
-    slot: u64,
-    /// The work payload (the 'static + Send sim closure — the fleet crate
-    /// has no pyo3 and simulation never round-trips Python, design doc §8).
-    /// Takes the seat's `LaneCtx` (LW-T2); pooled seats hand the detached
-    /// stub (LW-T8 landed: the executors submit through ONE seam).
-    work: Box<dyn FnOnce(&LaneCtx) + Send>,
+/// The queue-cap source: the budget's `SimDriver` slot cap (design doc §5 —
+/// today's `SimSlots` cap, `fleet.sim_slot_cap` terminal override).
+fn sim_seats_of(budget: &FleetBudget) -> usize {
+    budget.sim_slot_cap
 }
 
 /// The fleet-hosted inline-sim executor. Shared by all engine cycles (the
@@ -88,8 +82,9 @@ struct SeatJob {
 /// executor's construction-once contract: warm pooled seats across
 /// cycles).
 pub(crate) struct FleetSimExecutor {
-    tx: mpsc::Sender<HostMsg>,
-    unit_seq: AtomicU64,
+    /// The shared pooled-seat host (the channel submit end + the unit
+    /// sequence).
+    host: SeatHost,
     /// Test-facing seat count (the budget's `SimDriver` slot cap).
     #[cfg(test)]
     sim_seats: usize,
@@ -105,47 +100,11 @@ impl FleetSimExecutor {
     /// # Errors
     /// [`BootError`] — the fleet budget sum check or a boot invariant.
     pub(crate) fn boot(boot: FleetBoot) -> Result<Self, BootError> {
-        let host = FleetHost::boot(boot)?;
-        let sim_seats = host.budget().sim_slot_cap;
-        let (tx, rx) = mpsc::channel::<HostMsg>();
-        // Pooled seats contend on ONE shared work queue: a grant lands a
-        // unit there, any idle seat takes it, and the completion reports
-        // the GRANTED slot id so the host applies T5 to the right slot.
-        // Grants never exceed the sim intake cap, which never exceeds the
-        // seat count, so every granted unit is picked up without delay.
-        let work = Arc::new(WorkQueue::new());
-        for seat in 0..sim_seats {
-            let done = tx.clone();
-            let work = Arc::clone(&work);
-            let spawned = std::thread::Builder::new()
-                .name(
-                    WorkerRole::SimDriver
-                        .thread_name()
-                        .replace("{n}", &seat.to_string()),
-                )
-                .spawn(move || seat_loop(&work, &done));
-            if let Err(err) = spawned {
-                // A missing seat strands the receipts of every unit that
-                // would have run on it — loud (§10).
-                abort_executor("sim seat spawn", &format!("{err:?}"));
-            }
-        }
-        let spawned = std::thread::Builder::new()
-            .name("work-fleet-sim-host".to_string())
-            .spawn(move || {
-                host_loop(rx, host, Arc::clone(&work));
-                // Process teardown: the submission channel closed. Retire
-                // the seats so no worker parks forever on an empty queue.
-                work.close();
-            });
-        if let Err(err) = spawned {
-            abort_executor("fleet sim host thread spawn", &format!("{err:?}"));
-        }
+        let host = SeatHost::boot(&SIM_ROLE, boot)?;
         Ok(Self {
-            tx,
-            unit_seq: AtomicU64::new(0),
             #[cfg(test)]
-            sim_seats,
+            sim_seats: host.seat_count(),
+            host,
         })
     }
 
@@ -158,27 +117,12 @@ impl FleetSimExecutor {
 
     /// The pre-existing submit body, RENAMED (was the inherent `spawn`,
     /// sim:158-174): wraps into `Unit::new(.., Box::new(move |_ctx| work()))`
-    /// (:166) and `tx.send(HostMsg::Enqueue(unit))` (:173, `map_err`-typed
-    /// to `Err(())` on a closed channel — the send VALUE carries the close
-    /// arm; the abort lives in the trait impl). The OLD close arm
-    /// (sim:171-173's `abort_executor`) MOVES to the trait impl below — same
-    /// process-exit semantics, one owner of the abort. Private fn, in-crate.
+    /// and `tx.send(HostMsg::Enqueue(unit))`, typed to `Err(())` on a closed
+    /// channel — the send VALUE carries the close arm; the abort lives in
+    /// the trait impl below — same process-exit semantics, one owner of the
+    /// abort (the shared seat host's `intake_spawn`). Private fn, in-crate.
     fn try_send(&self, work: InnerWork) -> Result<(), ()> {
-        let unit = Unit::new(
-            self.unit_seq.fetch_add(1, Ordering::Relaxed),
-            WorkerRole::SimDriver,
-            None,
-            // The unit's receipt feeds the scheduling bin's join — a
-            // stranded pipe if abandoned.
-            true,
-            Box::new(move |_ctx| work()),
-        );
-        // The close arm, typed to the port's unit vocabulary: the send
-        // value carries the close arm; the abort lives in the trait impl.
-        match self.tx.send(HostMsg::Enqueue(unit)) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(()),
-        }
+        self.host.try_send(work)
     }
 
     /// Test-venue shim: the OLD name `spawn`, `#[cfg(test)]`-only, so the
@@ -195,165 +139,7 @@ impl FleetSimExecutor {
 impl FleetIntake for FleetSimExecutor {
     fn spawn(&self, work: InnerWork) {
         if self.try_send(work).is_err() {
-            abort_executor("sim submission", "fleet sim host channel closed");
-        }
-    }
-}
-
-/// The shared pooled-seat work queue (std `mpsc` receivers are not
-/// `Clone`, so the contended seat pool rides a condvar deque).
-#[derive(Default)]
-struct WorkQueue {
-    queue: parking_lot::Mutex<VecDeque<SeatJob>>,
-    shutdown: parking_lot::Mutex<bool>,
-    work_available: parking_lot::Condvar,
-}
-
-impl WorkQueue {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Take one granted unit, parking the seat until one arrives or the
-    /// queue shuts down (host retired — process teardown).
-    fn take(&self) -> Option<SeatJob> {
-        if let Some(job) = self.queue.lock().pop_front() {
-            return Some(job);
-        }
-        let mut shutdown = self.shutdown.lock();
-        loop {
-            if *shutdown {
-                return None;
-            }
-            {
-                let mut q = self.queue.lock();
-                if let Some(job) = q.pop_front() {
-                    return Some(job);
-                }
-            }
-            // Park until a grant lands or the host retires the pool. The
-            // shutdown mutex doubles as the re-check serialization point.
-            self.work_available
-                .wait_for(&mut shutdown, std::time::Duration::from_millis(50));
-        }
-    }
-
-    fn push(&self, job: SeatJob) {
-        self.queue.lock().push_back(job);
-        self.work_available.notify_one();
-    }
-
-    /// Retire the pool (host thread done): every parked seat drains out.
-    fn close(&self) {
-        *self.shutdown.lock() = true;
-        self.work_available.notify_all();
-    }
-}
-
-/// One pooled `SimDriver` seat: take granted units from the shared work
-/// queue, run them one at a time, and report the granted slot's completion
-/// so the host applies T5 (run → idle).
-fn seat_loop(work: &WorkQueue, done: &mpsc::Sender<HostMsg>) {
-    while let Some(job) = work.take() {
-        // A panicking sim closure must not kill the seat (its pool would
-        // strand receipts): keep the seat alive, log loudly, report done.
-        let ctx = LaneCtx::detached();
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| (job.work)(&ctx)));
-        if outcome.is_err() {
-            tracing::error!(
-                target: "degenbot::fleet",
-                seat = job.slot,
-                "[fleet-sim] sim unit panicked — the seat survives, the failure is loud"
-            );
-        }
-        if done.send(HostMsg::SeatDone { seat: job.slot }).is_err() {
-            // The host is gone (executor dropped — tests): the seat retires.
-            break;
-        }
-    }
-}
-
-/// The dispatch loop (design doc §4): enqueue → precedence-grant →
-/// execute. Owns the `FleetHost` exclusively; every FSM transition runs
-/// here. Exits when the submission channel closes (all executor handles
-/// dropped — process teardown).
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "the host Receiver's ownership moves into the spawned host thread — a borrow cannot cross the thread boundary"
-)]
-fn host_loop(rx: mpsc::Receiver<HostMsg>, mut host: FleetHost, queue: Arc<WorkQueue>) {
-    let mut backlog: VecDeque<Unit> = VecDeque::new();
-    while let Ok(msg) = rx.recv() {
-        apply_host_msg(&mut host, &mut backlog, msg);
-        pump(&mut host, &mut backlog, &queue);
-    }
-}
-
-/// Apply one submission or completion (both arrive on the single host
-/// channel — completions can never starve behind a blocking recv).
-fn apply_host_msg(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, msg: HostMsg) {
-    match msg {
-        HostMsg::Enqueue(unit) => {
-            // Pre-check capacity INSTEAD of failing enqueue: the host
-            // thread owns every queue mutation, so the check is exact.
-            // Units that do not fit spill to the backlog (unbounded, like
-            // the legacy receipt pipeline) and drain FIRST on the next
-            // pump — never dropped (§10 ledger).
-            if host.queue_len(WorkerRole::SimDriver) >= host.queue_cap(WorkerRole::SimDriver) {
-                backlog.push_back(unit);
-            } else if let Err(err) = host.enqueue(unit) {
-                // v1-active, non-merge `SimDriver` units cannot hit
-                // RoleNotActive / MergeNeverQueued; PostureHeld cannot fire
-                // here — `SimDriver` is a SimPool-class role, so a cordon
-                // still ADMITS its leases (floored, not held). Any such
-                // error is a broken invariant, not a drop.
-                abort_executor("sim enqueue", &err.to_string());
-            }
-        }
-        HostMsg::SeatDone { seat } => {
-            if let Err(err) = host.complete(seat) {
-                abort_executor("seat completion (T5)", &err.to_string());
-            }
-        }
-    }
-}
-
-/// The one precedence grant loop pass (design doc §4): backlog first, then
-/// dispatch grants onto the pooled seats. Grants apply T2 (start) at grant
-/// time — the work-queue push IS the claim — and completion arrives via
-/// [`HostMsg::SeatDone`] (T5).
-fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, queue: &Arc<WorkQueue>) {
-    // Backlog drains FIRST (FIFO across the loud-overflow seam).
-    while backlog.front().is_some() {
-        if host.queue_len(WorkerRole::SimDriver) >= host.queue_cap(WorkerRole::SimDriver) {
-            break;
-        }
-        let Some(unit) = backlog.pop_front() else {
-            break;
-        };
-        if let Err(err) = host.enqueue(unit) {
-            abort_executor("backlog drain", &err.to_string());
-        }
-    }
-    loop {
-        let grants = host.dispatch();
-        if grants.is_empty() {
-            break;
-        }
-        for (grant, unit) in grants {
-            // Invariant: this executor only enqueues `SimDriver` units, so
-            // every grant is a pooled sim grant. Anything else is a broken
-            // host contract, not a drop.
-            if !matches!(grant.kind, GrantKind::Sim) {
-                abort_executor("dispatch grant", "non-sim grant in the sim executor");
-            }
-            if let Err(err) = host.start(grant.slot, &unit) {
-                abort_executor("grant start (T2)", &err.to_string());
-            }
-            queue.push(SeatJob {
-                slot: grant.slot,
-                work: unit.work,
-            });
+            seat_host::intake_close_abort(&self.host);
         }
     }
 }
@@ -367,34 +153,23 @@ static FLEET_SIM_EXECUTOR: OnceLock<FleetSimExecutor> = OnceLock::new();
 /// deterministic cfg hash. Never overrides an installed value (first
 /// engine wins, like the other stance statics) — every construction after
 /// the first RIDES, and the ride is ledgered (a divergent-cfg rider is
-/// counted + warned in prod, ILLEGAL in tests).
+/// counted + warned in prod, ILLEGAL in tests) on the `BootRole::Sim` row
+/// (the shared installer: `seat_host::install_boot`).
 pub(crate) fn install_boot(stamp: BootStamp) {
-    crate::arb_engine::boot_stamp::record_ride(BootRole::Sim, &stamp);
-    let _ = FLEET_SIM_BOOT.set(stamp);
+    seat_host::install_boot(&FLEET_SIM_BOOT, &SIM_ROLE, stamp);
 }
 
 /// The process-wide fleet sim executor, built lazily on the first
-/// fleet-stance sim submission and persisting for the process lifetime.
+/// fleet-stance sim submission and persisting for the process lifetime
+/// (the shared materializer: `seat_host::global_executor` — the YI5NGB
+/// absence window stays closed by construction).
 pub(crate) fn global_fleet_sim_executor() -> &'static FleetSimExecutor {
-    FLEET_SIM_EXECUTOR.get_or_init(|| {
-        // YI5NGB: the absence window is CLOSED BY CONSTRUCTION — every
-        // dispatch path builds on a constructed engine, and construction
-        // (with_core_cfg) installs the stamp BEFORE any dispatch can
-        // exist. A missing stamp means a caller skipped the construction
-        // contract: LOUD abort (never a silent fallback boot of a boot
-        // nobody chose).
-        #[expect(
-            clippy::expect_used,
-            reason = "the loud construction-contract abort IS the YI5NGB design: a stamp-less materialization must abort, never fall back silently"
-        )]
-        let stamp = FLEET_SIM_BOOT.get().expect(
-            "fleet sim boot stamp missing: an engine must construct before the first fleet submit (YI5NGB)",
-        );
-        match FleetSimExecutor::boot(stamp.boot()) {
-            Ok(executor) => executor,
-            Err(err) => abort_executor("fleet sim budget boot", &err.to_string()),
-        }
-    })
+    seat_host::global_executor(
+        &SIM_ROLE,
+        &FLEET_SIM_BOOT,
+        &FLEET_SIM_EXECUTOR,
+        FleetSimExecutor::boot,
+    )
 }
 
 #[cfg(test)]
@@ -623,6 +398,18 @@ mod tests {
         assert!(
             FleetSimExecutor::boot(boot).is_err(),
             "4.5-core quota below the pinned-role floor must refuse to boot"
+        );
+    }
+
+    /// The role descriptor's design-gate admission arm (RZEWTX): `SimDriver`
+    /// is `SimPool` cordon class — a Cordoned posture still ADMITS sim leases
+    /// (floored, not held). The shared host applies the arm in
+    /// `apply_host_msg`/`pump` (see `seat_host`).
+    #[test]
+    fn the_sim_role_descriptor_admits_under_cordon() {
+        assert_eq!(
+            super::SIM_ROLE.cordon,
+            crate::arb_engine::seat_host::CordonAdmission::Admit
         );
     }
 }
