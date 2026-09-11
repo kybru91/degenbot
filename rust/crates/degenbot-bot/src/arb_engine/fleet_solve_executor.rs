@@ -146,13 +146,31 @@ impl FleetSolveExecutor {
         // typed pending refusal (never a silent narrow).
         match host.plan().binding {
             degenbot_workers::plan::Binding::Pinned => Ok(Self::boot_pinned(host)),
-            degenbot_workers::plan::Binding::Serial => Err(host.plan().pending_serial_refusal()),
+            // FF-T4 (Z6XTDX): the serial arm BOOTS — the serial
+            // projection's ONE solver seat is the named serial-0 cycle
+            // thread: one persistent keyed mailbox (bin 0) over the ONE
+            // HostPump, the §10 never-drop shape unchanged.
+            degenbot_workers::plan::Binding::Serial => Ok(Self::boot_serial(host)),
         }
     }
 
     /// The PINNED binding's instantiation (today's topology, verbatim: one
     /// persistent keyed mailbox per Solver pin over the ONE `HostPump`).
     fn boot_pinned(host: FleetHost) -> Self {
+        Self::boot_seats(host, WorkerRole::Solver.thread_name())
+    }
+
+    /// The SERIAL binding's instantiation (FF-T4): the projection's
+    /// ONE solver seat is the named `serial-0` cycle thread — the same
+    /// keyed-mailbox construction, one seat, the §10 shape unchanged.
+    fn boot_serial(host: FleetHost) -> Self {
+        Self::boot_seats(host, crate::arb_engine::seat_host::SERIAL_SEAT_NAME)
+    }
+
+    /// The shared seat construction: `seat_name_pattern` is the
+    /// `{n}`-templated thread name (pinned: the solver seats; serial:
+    /// the ONE serial-0 cycle seat).
+    fn boot_seats(host: FleetHost, seat_name_pattern: &'static str) -> Self {
         let solver_seats = host.budget().solver_pin_count;
 
         let (tx, rx) = mpsc::channel::<HostMsg>();
@@ -201,11 +219,7 @@ impl FleetSolveExecutor {
         for (seat, srx) in seat_mailboxes.into_iter().enumerate() {
             let done = tx.clone();
             let spawned = std::thread::Builder::new()
-                .name(
-                    WorkerRole::Solver
-                        .thread_name()
-                        .replace("{n}", &seat.to_string()),
-                )
+                .name(seat_name_pattern.replace("{n}", &seat.to_string()))
                 .spawn(move || seat_loop(u64::try_from(seat).unwrap_or(u64::MAX), srx, &done));
             if let Err(err) = spawned {
                 // A missing seat strands its pinned bins' results — loud.

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use super::*;
-use crate::budget::{BudgetError, BudgetOverrides};
+use crate::budget::BudgetOverrides;
 use crate::gauges::RoleGaugeSample;
 use crate::posture::{PostureOwner, PosturePolicy};
 use crate::role::{WorkerRole, ALL_ROLES};
@@ -520,16 +520,22 @@ fn declared_roles_gate_in_dispatch_until_their_migration_step() {
 /// start on over-subscription — never a runtime throttle storm).
 #[test]
 fn overly_small_quotas_never_boot() {
-    let err = FleetHost::boot(FleetBoot {
+    // FF-T4 (Z6XTDX): the 2-5-core tier BOOTS the serial plan; the loud
+    // refusal moved below the serial floor (HOST_FLOOR_CORES).
+    let host = FleetHost::boot(FleetBoot {
         profile: degenbot_config::FleetProfile::Auto,
         quota_cpus: 4.5,
         ..boot()
     })
-    .expect_err("pinned-role floor");
-    assert!(matches!(
-        err,
-        BootError::Budget(BudgetError::QuotaTooSmallForPinnedRoles { .. })
-    ));
+    .expect("a 4.5-core auto host boots the serial tier (FF-T4)");
+    assert_eq!(host.plan().binding, crate::plan::Binding::Serial);
+    let err = FleetHost::boot(FleetBoot {
+        profile: degenbot_config::FleetProfile::Auto,
+        quota_cpus: 1.5,
+        ..boot()
+    })
+    .expect_err("below the serial floor");
+    assert!(matches!(err, BootError::Budget(_)));
 }
 
 mod pin_derive {

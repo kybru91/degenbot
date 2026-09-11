@@ -523,10 +523,11 @@ impl FleetHost {
             oversubscribed = plan.oversubscribed,
             "[fleet] boot plan resolved"
         );
-        let budget = match plan.binding {
-            crate::plan::Binding::Pinned => plan.projected_budget(&boot.overrides)?,
-            crate::plan::Binding::Serial => return Err(plan.pending_serial_refusal()),
-        };
+        // FF-T4 (Z6XTDX): BOTH bindings boot — the projection is
+        // binding-derived (pinned: the floor-checked budget; serial: the
+        // one-solver-seat tier) and the executors' binding seam
+        // instantiates the seat model over the SAME slot FSM.
+        let budget = plan.projected_budget(&boot.overrides)?;
         // ONE process-level fleet posture owner (JCI2FW Part A): the
         // boot's policy installs the process owner first-wins; hermetic
         // boots inject their own owner and never touch the global.

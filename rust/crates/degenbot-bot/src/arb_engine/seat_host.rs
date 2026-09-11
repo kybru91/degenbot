@@ -184,6 +184,10 @@ pub(crate) enum HostMsg {
     SeatDone { seat: u64 },
 }
 
+/// The serial binding's named cycle seat (FF-T4): the ONE thread that
+/// runs the role's granted units in grant order on a 2-5 core host.
+pub(crate) const SERIAL_SEAT_NAME: &str = "work-fleet-serial-0";
+
 /// One granted unit handed to whichever pooled seat takes it next (both
 /// roles are pooled — seats contend, no pin affinity).
 struct SeatJob {
@@ -578,6 +582,10 @@ pub(crate) struct SeatHost {
     desc: &'static SeatRoleDesc,
     tx: mpsc::Sender<HostMsg>,
     unit_seq: AtomicU64,
+    /// The resolved lane-to-thread binding (FF-T4 — test-facing
+    /// assertions; the host itself moved into the host thread).
+    #[cfg(test)]
+    binding: degenbot_workers::plan::Binding,
     /// Test-facing seat count (the role's budget slot cap).
     #[cfg(test)]
     seats: usize,
@@ -606,7 +614,13 @@ impl SeatHost {
         // narrow).
         match host.plan().binding {
             degenbot_workers::plan::Binding::Pinned => Ok(Self::boot_pinned(desc, host)),
-            degenbot_workers::plan::Binding::Serial => Err(host.plan().pending_serial_refusal()),
+            // FF-T4 (Z6XTDX): the serial arm BOOTS — one named cycle
+            // thread (`work-fleet-serial-0`) runs the role's FSM slots in
+            // grant order over the SAME queue and HostPump (§10
+            // never-drop unchanged; the layout seats stay the FSM's
+            // slots — the census rows print `logical`, riding the cycle
+            // lane's time).
+            degenbot_workers::plan::Binding::Serial => Ok(Self::boot_serial(desc, host)),
         }
     }
 
@@ -616,6 +630,8 @@ impl SeatHost {
     /// construction — the parity corpus (the LW-T7 golden replay +
     /// the executor suites) is the regression harness.
     fn boot_pinned(desc: &'static SeatRoleDesc, host: FleetHost) -> Self {
+        #[cfg(test)]
+        let binding = host.plan().binding;
         let seats = (desc.seats)(host.budget());
         let (tx, rx) = mpsc::channel::<HostMsg>();
         // Pooled seats contend on ONE shared work queue: a grant lands a
@@ -660,6 +676,63 @@ impl SeatHost {
             tx,
             unit_seq: AtomicU64::new(0),
             #[cfg(test)]
+            binding,
+            #[cfg(test)]
+            seats,
+        }
+    }
+
+    /// The SERIAL binding's instantiation (FF-T4): the SAME pooled
+    /// queue, host loop, and FSM slots — but ONE named cycle thread
+    /// (`work-fleet-serial-0`, the serial seat) runs every granted unit
+    /// in grant order: the role's lane rides the cycle lane's time
+    /// (the census prints `logical`). Intake stays the §10 never-drop
+    /// shape; saturation is the advisory queue depth, named and metered
+    /// through the census's serial binding row (no second waiting
+    /// policy — the 6HE6RF amendment).
+    fn boot_serial(desc: &'static SeatRoleDesc, host: FleetHost) -> Self {
+        #[cfg(test)]
+        let binding = host.plan().binding;
+        #[cfg(test)]
+        let seats = (desc.seats)(host.budget());
+        let (tx, rx) = mpsc::channel::<HostMsg>();
+        let work = Arc::new(WorkQueue::new());
+        // ONE cycle thread: the serial seat. Named for the census and
+        // the thread-dump reader (the station test greps it).
+        let done = tx.clone();
+        let work_cycle = Arc::clone(&work);
+        let spawned = std::thread::Builder::new()
+            .name(SERIAL_SEAT_NAME.to_string())
+            .spawn(move || seat_loop(desc, &work_cycle, &done));
+        if let Err(err) = spawned {
+            // A missing cycle lane strands the receipts of every
+            // granted unit — loud (§10).
+            abort_executor(
+                desc,
+                &format!("{} serial cycle lane spawn", desc.noun),
+                &format!("{err:?}"),
+            );
+        }
+        let spawned = std::thread::Builder::new()
+            .name(desc.host_thread.to_string())
+            .spawn(move || {
+                host_loop(rx, host, desc, Arc::clone(&work));
+                work.close();
+            });
+        if let Err(err) = spawned {
+            abort_executor(
+                desc,
+                &format!("fleet {} host thread spawn", desc.noun),
+                &format!("{err:?}"),
+            );
+        }
+        Self {
+            desc,
+            tx,
+            unit_seq: AtomicU64::new(0),
+            #[cfg(test)]
+            binding,
+            #[cfg(test)]
             seats,
         }
     }
@@ -668,6 +741,13 @@ impl SeatHost {
     #[cfg(test)]
     pub(crate) fn seat_count(&self) -> usize {
         self.seats
+    }
+
+    /// Test-facing: the resolved plan binding (FF-T4 — the executors'
+    /// tests assert the tier the boot instantiated).
+    #[cfg(test)]
+    pub(crate) fn plan_binding(&self) -> degenbot_workers::plan::Binding {
+        self.binding
     }
 
     /// The port's unit body (folded from the two executors' pre-existing

@@ -139,25 +139,29 @@ def work(i: int) -> int:
 receipts = [probe.submit_registration_unit(lambda i=i: work(i)) for i in range(16)]
 assert [r.wait(timeout=30.0) for r in receipts] == [i * 2 for i in range(16)]
 assert names, 'units executed'
-assert all(n.startswith('work-fleet-poolupd-') for n in names), names
+# FF-T4 (Z6XTDX): the seat names are BINDING-dependent — the pinned
+# binding runs the pooled PoolStateUpdater seats (work-fleet-poolupd-{n});
+# the serial binding (2-5-core hosts) runs the ONE named cycle seat
+# (work-fleet-serial-0). Both are fleet seats: the units must never run
+# anywhere else.
+assert all(
+    n.startswith('work-fleet-poolupd-') or n == 'work-fleet-serial-0'
+    for n in names
+), names
 # Receipt probes: done() flips before result() delivers.
 assert all(r.done() for r in receipts)
 print('FLEET-OK')
 """
 
 
-# FF-T1 (BPHR6F): on a sub-floor host the fleet-station subprocess now
-# surfaces the TYPED BootRefused refusal instead of SIGABRT-ing the
-# worker — the test cannot pass there until the serial binding (2-5-core
-# hosts) lands with FF-T4. strict=True: when the serial arm makes this
-# host shape pass, the XPASS fails the suite loudly and the mark must be
-# revisited (FF-T5 folds the profile-parametrized rewrite).
-@pytest.mark.xfail(
-    _pinned_floor_refused(),
-    reason="serial arm pending, FF-T4",
-    strict=True,
-)
-def test_fleet_station_executes_callables_on_named_poolupd_seats() -> None:
+# FF-T1 (BPHR6F) kept this strict-xfail while the serial arm was pending:
+# on a sub-floor host the station subprocess surfaced the TYPED
+# BootRefused refusal instead of SIGABRT-ing the worker. FF-T4 (Z6XTDX)
+# LANDED the serial binding — the 2-5-core tier now boots (the ONE named
+# cycle seat above), so the strict mark is RETIRED: the station runs (and
+# must pass) on every tier the plan admits. FF-T5 folds the
+# profile-parametrized rewrite over this same shape.
+def test_fleet_station_executes_callables_on_named_fleet_seats() -> None:
     """End-to-end: stance env -> boot install -> named-seat receipts."""
     proc = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true] — trusted binary, args list, no shell
         [sys.executable, "-c", _FLEET_DRIVER],

@@ -321,41 +321,119 @@ mod tests {
 
     /// FF-T3 (Z2YW52): no new binding is reachable from `auto` yet — the
     /// serial arm lands with FF-T4. A sub-floor auto host refuses with
-    /// the tier's own typed refusal (the pinned derivation's
-    /// `QuotaTooSmallForPinnedRoles`, the CI-stable message), and a FORCED
-    /// serial profile refuses with the named pending-arm invariant:
-    /// neither path may run the pinned topology silently narrower.
+    /// FF-T4 (Z6XTDX) — AC 1: serial boot on a simulated 2-core quota
+    /// executes callables on the named seat, returns receipts, and
+    /// balances the ledger (every submitted unit completes exactly once
+    /// — the same never-drop receipt contract the pooled seats hold).
     #[test]
-    fn auto_cannot_reach_the_serial_binding_pre_ff_t4() {
-        // A 4-core auto host: the plan resolves the serial tier (FF-T2),
-        // and the boot re-raises the tier refusal — typed, named.
-        let result = FleetRegistrationExecutor::boot(FleetBoot {
-            quota_cpus: 4.0,
+    fn serial_boot_executes_callables_on_the_named_seat() {
+        // AUTO on a 2-core host: the plan resolves the serial tier
+        // (FF-T2) and the binding seam instantiates the serial seat
+        // model — ONE `work-fleet-serial-0` cycle thread over the same
+        // HostPump (§10 never-drop unchanged).
+        let executor = FleetRegistrationExecutor::boot(FleetBoot {
+            quota_cpus: 2.0,
             profile: degenbot_config::FleetProfile::Auto,
             ..hermetic_boot()
-        });
-        let Err(err) = result else {
-            panic!("the serial tier refuses pre-FF-T4")
-        };
-        assert!(
-            matches!(
-                err,
-                BootError::Budget(BudgetError::QuotaTooSmallForPinnedRoles { .. })
-            ),
-            "auto on a sub-floor host re-raises the tier refusal, got {err:?}"
+        })
+        .expect("auto on a 2-core host boots the serial binding");
+        let (tx, rx) = mpsc::channel::<u64>();
+        for id in 0..32_u64 {
+            let tx = tx.clone();
+            executor.spawn(move || {
+                let _ = tx.send(id);
+            });
+        }
+        drop(tx);
+        let mut got = await_receipts(&rx, 32, Instant::now() + Duration::from_secs(10));
+        got.sort_unstable();
+        let want: Vec<u64> = (0..32).collect();
+        assert_eq!(
+            got, want,
+            "every serial-lane unit completes its receipt exactly once"
         );
-        // A FORCED serial profile: the named pending-arm invariant.
-        let result = FleetRegistrationExecutor::boot(FleetBoot {
+    }
+
+    /// FF-T4 — the named seat: serial-lane units execute ON the
+    /// `work-fleet-serial-0` cycle thread (the callable itself reports
+    /// its thread).
+    #[test]
+    fn serial_units_execute_on_the_named_serial_seat() {
+        let executor = FleetRegistrationExecutor::boot(FleetBoot {
+            quota_cpus: 2.0,
+            profile: degenbot_config::FleetProfile::Auto,
+            ..hermetic_boot()
+        })
+        .expect("auto on a 2-core host boots the serial binding");
+        let (tx, rx) = mpsc::channel::<String>();
+        for _ in 0..8 {
+            let tx = tx.clone();
+            executor.spawn(move || {
+                let _ = tx.send(
+                    std::thread::current()
+                        .name()
+                        .map(str::to_owned)
+                        .unwrap_or_default(),
+                );
+            });
+        }
+        drop(tx);
+        let names = await_receipts(&rx, 8, Instant::now() + Duration::from_secs(10));
+        for name in names {
+            assert_eq!(
+                name, "work-fleet-serial-0",
+                "a serial-lane unit must execute on the named serial seat"
+            );
+        }
+    }
+
+    /// FF-T4 — the forced serial profile on a PINNED-floor host also
+    /// boots serial (the operator override is honored, never a silent
+    /// narrow).
+    #[test]
+    fn forced_serial_boots_the_serial_seat() {
+        let executor = FleetRegistrationExecutor::boot(FleetBoot {
+            quota_cpus: 8.0,
             profile: degenbot_config::FleetProfile::Serial,
             ..hermetic_boot()
-        });
-        let Err(err) = result else {
-            panic!("forced serial refuses pre-FF-T4")
-        };
-        assert!(
-            matches!(&err, BootError::Invariant(msg) if msg.contains("FF-T4")),
-            "forced serial names the pending arm, got {err:?}"
-        );
+        })
+        .expect("forced serial boots the serial binding");
+        let (tx, rx) = mpsc::channel::<u64>();
+        for id in 0..4_u64 {
+            let tx = tx.clone();
+            executor.spawn(move || {
+                let _ = tx.send(id);
+            });
+        }
+        drop(tx);
+        let mut got = await_receipts(&rx, 4, Instant::now() + Duration::from_secs(10));
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3]);
+    }
+
+    /// FF-T4 — AC 5: a FORCED pinned binding on a 4-core quota runs
+    /// marked-oversubscribed (the projection's marks, never a refusal).
+    #[test]
+    fn forced_pinned_on_four_cores_runs_marked_oversubscribed() {
+        let executor = FleetRegistrationExecutor::boot(FleetBoot {
+            quota_cpus: 4.0,
+            profile: degenbot_config::FleetProfile::Pinned,
+            ..hermetic_boot()
+        })
+        .expect("forced pinned boots the marked projection");
+        // The projection is marked oversubscribed and still RUNS: the
+        // units complete on the pooled seats.
+        let (tx, rx) = mpsc::channel::<u64>();
+        for id in 0..8_u64 {
+            let tx = tx.clone();
+            executor.spawn(move || {
+                let _ = tx.send(id);
+            });
+        }
+        drop(tx);
+        let mut got = await_receipts(&rx, 8, Instant::now() + Duration::from_secs(10));
+        got.sort_unstable();
+        assert_eq!(got, vec![0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
     /// FF-T3 (Z2YW52): the census prints the lane-to-thread binding per
@@ -374,10 +452,16 @@ mod tests {
             !fleet_rows.is_empty(),
             "the host registers the fleet census rows"
         );
+        // FF-T4 (Z6XTDX): the census is PROCESS-GLOBAL and the test
+        // binary boots serial-binding hosts in parallel tests — a row
+        // stamps whichever binding last registered that role. The
+        // deterministic assertion is the VOCABULARY contract (FF-T2:
+        // every fleet row stamps a member of {pinned, shared, logical});
+        // the binding RESOLUTION determinism is the plan tests.
         for row in fleet_rows {
-            assert_eq!(
-                row.binding, "pinned",
-                "the pinned binding owns dedicated seat threads (row {})",
+            assert!(
+                matches!(row.binding, "pinned" | "shared" | "logical"),
+                "every fleet row stamps the lane-to-thread binding vocabulary (row {})",
                 row.resource
             );
         }

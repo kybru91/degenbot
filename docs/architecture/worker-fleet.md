@@ -391,10 +391,16 @@ rule holds until a forcing function demands one):
 - **pinned** — today's topology, exactly: one dedicated thread per seat
   (`work-fleet-sim-{n}` / `work-fleet-poolupd-{n}` / the keyed solver seats),
   6+ core hosts (the pinned-role floor), the boot-frozen `SlotLayout`.
-- **serial** — the 2-5 core arm (lands with FF-T4): one ambient I/O lane plus
-  one cycle thread running reserve -> resolve -> solve -> merge in order,
-  exactly one solve seat (`serial-0`). It is a `SeatSink` + ONE grant lane
-  over the SAME `HostPump` — not a new lane interface.
+- **serial** — the 2-5 core arm (FF-T4, `Z6XTDX`): one cycle thread per
+  host over the SAME queue and `HostPump` — the named seat
+  `work-fleet-serial-0` runs every granted unit of the host's role in
+  grant order (reserve -> resolve -> solve -> merge in order), and the
+  solve host's keyed-mailbox construction runs the projection's ONE
+  solver seat (`serial-0`). It is a `SeatSink` + ONE grant lane over the
+  SAME `HostPump` — not a new lane interface. Intake stays the §10
+  never-drop shape (no second waiting policy — the 6HE6RF amendment);
+  saturation is the advisory queue depth, named and metered through the
+  census's `logical` rows.
 
 The lane-to-thread seam lives in two pieces, both already ONE shape
 (`seat_host.rs`): `HostPump` (admission + backlog drain + grant loop — the
@@ -403,7 +409,9 @@ seat model: the pooled `WorkQueue` vs the solve host's per-seat keyed
 mailboxes). A binding *instantiates* these seams per the boot plan
 (`degenbot-workers` `plan.rs`, `fleetplan/1`): the executor boots gate on
 `host.plan().binding` — `Pinned` runs today's instantiation verbatim, and the
-serial arm refuses with the plan's typed pending refusal until FF-T4 lands.
+`Serial` arm instantiates the one-cycle-thread seat model (FF-T4). A
+forced pinned profile on a sub-floor host runs the marked oversubscription
+(`plan.oversubscribed`), never a silent narrow.
 
 **Lane ownership (receipts and ledger writes):**
 
@@ -421,7 +429,8 @@ The outcome ledger, intake receipts, and the exactness fuse are
 **binding-independent by construction**: a binding changes which threads run
 the lanes, never the ownership. Parity across bindings is the promotion gate
 (the pinned path is pinned by the executor suites + the LW-T7 golden replay
-in CI; the serial arm rides the same corpus when it lands).
+in CI; the serial arm rides the same corpus — FF-T5 folds the
+profile-parametrized replay).
 
 The worker census prints the lane-to-thread binding per entry (`binding`
 field, FF-T2): `pinned` = dedicated seat threads (the fleet roles under the

@@ -50,14 +50,26 @@ fn host() -> FleetHost {
 
 #[test]
 fn boot_fails_loudly_on_an_unhostable_quota() {
-    let err = FleetHost::boot(FleetBoot {
+    // FF-T4 (Z6XTDX): the 2-5-core tier BOOTS the serial plan — the
+    // loud refusal moved below the serial floor (HOST_FLOOR_CORES: a
+    // 1.5-core host cannot host ANY tier).
+    let host = FleetHost::boot(FleetBoot {
         profile: degenbot_config::FleetProfile::Auto,
         quota_cpus: 4.5,
         overrides: BudgetOverrides::default(),
         posture: policy(),
         owner: Some(hermetic_owner()),
     })
-    .expect_err("H+A+R+M+2 > 4");
+    .expect("a 4.5-core auto host boots the serial tier (FF-T4)");
+    assert_eq!(host.plan().binding, crate::plan::Binding::Serial);
+    let err = FleetHost::boot(FleetBoot {
+        profile: degenbot_config::FleetProfile::Auto,
+        quota_cpus: 1.5,
+        overrides: BudgetOverrides::default(),
+        posture: policy(),
+        owner: Some(hermetic_owner()),
+    })
+    .expect_err("H+A+R+M+2 > 1");
     assert!(matches!(err, BootError::Budget(_)));
 }
 

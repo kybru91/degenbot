@@ -6,9 +6,11 @@ aborts the host process ([fleet-reg] unrecoverable — aborting, the
 contract: the child process must survive the refusal and surface a typed
 error instead.
 
-The child shrinks its own affinity to 2 CPUs — the fleet quota is
-min(cgroup quota, affinity), floored at 1.0 — simulating the sub-floor
-condition. The intake station boot is lazy: the first submit is what
+The child shrinks its own affinity to 1 CPU — the fleet quota is
+min(cgroup quota, affinity), floored at 1.0 — simulating the
+sub-SERIAL-floor condition (FF-T4, Z6XTDX: the 2-5-core tier now boots the
+serial binding, so the typed refusal fires only below the tier floor).
+The intake station boot is lazy: the first submit is what
 triggers the fleet budget check.
 """
 
@@ -34,8 +36,10 @@ import sys
 # the child seam).
 os.environ.pop("DEGENBOT_FLEET", None)
 
-# Simulate a sub-floor host: the fleet quota is min(cgroup quota, affinity).
-os.sched_setaffinity(0, {0, 1})
+# Simulate a sub-SERIAL-floor host (FF-T4, Z6XTDX): the 2-5-core tier
+# now boots the serial binding, so the typed refusal fires only below
+# the tier floor — one CPU floors the quota at 1.0 (< HOST_FLOOR_CORES).
+os.sched_setaffinity(0, {0})
 
 from degenbot._ffi import ArbitrageEngine, Bot
 

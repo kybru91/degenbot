@@ -117,6 +117,13 @@ impl FleetSimExecutor {
         self.sim_seats
     }
 
+    /// Test-facing: the resolved plan binding (FF-T4 — the tier the boot
+    /// instantiated for this host).
+    #[cfg(test)]
+    pub(crate) fn host_plan_binding(&self) -> degenbot_workers::plan::Binding {
+        self.host.plan_binding()
+    }
+
     /// The pre-existing submit body, RENAMED (was the inherent `spawn`,
     /// sim:158-174): wraps into `Unit::new(.., Box::new(move |_ctx| work()))`
     /// and `tx.send(HostMsg::Enqueue(unit))`, typed to `Err(())` on a closed
@@ -413,16 +420,36 @@ mod tests {
     /// fail-fast — never a runtime throttle storm).
     #[test]
     fn a_budget_refusal_fails_loudly_at_boot() {
-        let boot = FleetBoot {
+        // FF-T4 (Z6XTDX): the 2-5-core tier BOOTS the serial binding
+        // now (the loud refusal moved below the serial floor — a
+        // sub-2-core host cannot host the tier at all).
+        let serial = FleetBoot {
             profile: degenbot_config::FleetProfile::Auto,
             quota_cpus: 4.5,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),
             owner: Some(hermetic_owner()),
         };
+        let executor = FleetSimExecutor::boot(serial)
+            .expect("a 4.5-core auto host boots the serial tier (FF-T4)");
+        assert_eq!(
+            executor.host_plan_binding(),
+            degenbot_workers::plan::Binding::Serial,
+            "the 4.5-core auto host resolves the serial tier"
+        );
+        drop(executor);
+        // The loud refusal: a sub-serial-floor host (below
+        // HOST_FLOOR_CORES) never boots a narrower topology silently.
+        let refused = FleetBoot {
+            profile: degenbot_config::FleetProfile::Auto,
+            quota_cpus: 1.5,
+            overrides: BudgetOverrides::default(),
+            posture: PosturePolicy::doc_defaults(),
+            owner: Some(hermetic_owner()),
+        };
         assert!(
-            FleetSimExecutor::boot(boot).is_err(),
-            "4.5-core quota below the pinned-role floor must refuse to boot"
+            FleetSimExecutor::boot(refused).is_err(),
+            "a sub-serial-floor quota must refuse to boot loudly"
         );
     }
 
