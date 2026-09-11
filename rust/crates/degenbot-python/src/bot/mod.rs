@@ -508,13 +508,18 @@ impl PyBot {
     /// intake executor. Returns a receipt whose `.wait()` joins the unit.
     /// Refuses loudly under the legacy stance — the driver must keep the
     /// incumbent worker pool there.
+    ///
+    /// FF-T1 (BPHR6F): a refused fleet boot raises the TYPED `BootRefused`
+    /// (detected budget + floor + one operator hint) at this submit and at
+    /// every submit after it (the sticky materializer); the host process
+    /// survives — the library never aborts on the boot-refusal arm.
     fn submit_registration_unit(&self, fn_work: Py<PyAny>) -> PyResult<intake::PyIntakeReceipt> {
         if !self.registration_fleet_hosted() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "registration intake is not fleet-hosted (fleet.stance != fleet)",
             ));
         }
-        Ok(intake::submit(fn_work))
+        intake::submit(fn_work)
     }
 
     /// Return a fresh async iterator over `newHeads` block notifications —

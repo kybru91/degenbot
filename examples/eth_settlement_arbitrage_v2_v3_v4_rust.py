@@ -29,6 +29,7 @@ import time
 import dotenv
 
 from degenbot._ffi.diagnostics import mark_progress, start_gil_probe
+from degenbot.exceptions import BootRefused
 from degenbot.logging import logger as bot_logger
 from degenbot.runner import BotRunner
 from degenbot.runner.cli import build_arbitrage_arg_parser
@@ -225,6 +226,14 @@ async def main() -> None:
                     with contextlib.suppress(asyncio.CancelledError):
                         await operator_task
                     await operator.close()
+    except BootRefused as exc:
+        # FF-T1 (BPHR6F): the library surfaced the TYPED fleet boot
+        # refusal (it never aborts the host process); the BINARY owns the
+        # loud fail-fast exit — one named line, non-zero status, the same
+        # message discipline the process abort used to carry. 78 is
+        # sysexits EX_CONFIG: the host cannot host the fleet configuration.
+        bot_logger.error(f"[fleet-boot] REFUSED — {exc}")
+        sys.exit(78)
     except (KeyboardInterrupt, asyncio.CancelledError):
         bot_logger.info("[shutdown] interrupted — Rust pump stopped, exiting.")
 

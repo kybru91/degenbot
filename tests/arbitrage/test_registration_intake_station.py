@@ -17,6 +17,7 @@ a private `ThreadPoolExecutor`. These tests prove the surfaces:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,93 @@ from types import SimpleNamespace
 import pytest
 
 from degenbot._ffi import Bot
+
+
+@pytest.fixture(autouse=True)
+def _no_leaked_fleet_stance_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Kill the retired DEGENBOT_FLEET stance env before any child boots.
+
+    Pre-approved determinism fix (FF-T5 addendum, folded at FF-T1's xfail
+    gating): the key is RETIRED and fails the config load loudly if
+    exported, but the suite can still leak it across test orderings under
+    pytest-randomly/xdist — the child subprocesses here inherit whatever
+    the worker carries. Pop it so the fleet-station family is deterministic
+    regardless of which test ran before it in this process.
+    """
+    monkeypatch.delenv("DEGENBOT_FLEET", raising=False)
+
+
+def _cgroup_v2_quota() -> float | None:
+    """The tightest cgroup v2 cpu.max ratio on this process's path, or None."""
+    try:
+        cgroup_text = Path("/proc/self/cgroup").read_text()
+        mounts_text = Path("/proc/self/mounts").read_text()
+    except OSError:
+        return None
+    rel = next(
+        (line.removeprefix("0::").strip() for line in cgroup_text.splitlines()
+         if line.startswith("0::")),
+        None,
+    )
+    root = next(
+        (line.split()[1] for line in mounts_text.splitlines()
+         if len(line.split()) > 2 and line.split()[2] == "cgroup2"),
+        None,
+    )
+    if rel is None or root is None:
+        return None
+    start = Path(root) / rel.lstrip("/")
+    tightest: float | None = None
+    node = start if rel.strip("/") else Path(root)
+    while True:
+        try:
+            parts = (node / "cpu.max").read_text().split()
+        except OSError:
+            parts = []
+        if parts and parts[0] != "max":
+            try:
+                quota = float(parts[0])
+                period = float(parts[1]) if len(parts) > 1 else 100_000.0
+            except ValueError:
+                period = 0.0
+                quota = 0.0
+            if period > 0 and quota > 0:
+                ratio = quota / period
+                tightest = ratio if tightest is None or ratio < tightest else tightest
+        if node == Path(root) or Path(root) not in node.parents:
+            break
+        node = node.parent
+    return tightest
+
+
+def _fractional_quota_cpus() -> float:
+    """Mirror of degenbot-workers quota.rs fractional_cpu_budget (read-only).
+
+    The fleet budget's sole sizing authority: min(tightest cgroup quota,
+    affinity), floored at 1.0. Used only to predict, from the parent,
+    whether the pinned-role floor would refuse this host — the child
+    subprocess stays the authority for what actually boots.
+    """
+    cgroup = _cgroup_v2_quota()
+    affinity = float(len(os.sched_getaffinity(0))) if hasattr(os, "sched_getaffinity") else None
+    candidates = [q for q in (cgroup, affinity) if q is not None]
+    return max(min(candidates), 1.0) if candidates else 1.0
+
+
+def _pinned_floor_refused() -> bool:
+    """Would the DEFAULT-override pinned-role floor refuse this host?
+
+    Mirrors budget.rs derive_table with default overrides: H=1,
+    A=max(1, (floor(Q)-H)//4), R=1, M=1, and the 2-core Solver minimum —
+    refused iff base + 2 > floor(Q). True on sub-floor hosts (the 4-vCPU
+    CI runners); False on the 8-core devcontainers. The station test
+    xfails under this condition (strict) until the serial arm lands.
+    """
+    quota_floor = max(int(_fractional_quota_cpus() // 1), 1)
+    reserve = 1
+    ambient = max(1, (quota_floor - reserve) // 4)
+    base = reserve + ambient + 1 + 1
+    return base + 2 > quota_floor
 
 _FLEET_DRIVER = """
 import threading
@@ -58,6 +146,17 @@ print('FLEET-OK')
 """
 
 
+# FF-T1 (BPHR6F): on a sub-floor host the fleet-station subprocess now
+# surfaces the TYPED BootRefused refusal instead of SIGABRT-ing the
+# worker — the test cannot pass there until the serial binding (2-5-core
+# hosts) lands with FF-T4. strict=True: when the serial arm makes this
+# host shape pass, the XPASS fails the suite loudly and the mark must be
+# revisited (FF-T5 folds the profile-parametrized rewrite).
+@pytest.mark.xfail(
+    _pinned_floor_refused(),
+    reason="serial arm pending, FF-T4",
+    strict=True,
+)
 def test_fleet_station_executes_callables_on_named_poolupd_seats() -> None:
     """End-to-end: stance env -> boot install -> named-seat receipts."""
     proc = subprocess.run(  # ruff: ignore[subprocess-without-shell-equals-true] — trusted binary, args list, no shell

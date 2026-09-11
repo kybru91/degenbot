@@ -1275,6 +1275,19 @@ class VerificationRpcError(RuntimeError):
     retry/backoff vs abort. Subclasses ``RuntimeError``.
     """
 
+class BootRefused(RuntimeError):
+    """The fleet host refused to boot (FF-T1, BPHR6F).
+
+    Raised when the detected CPU budget is below the pinned-role floor
+    or a fleet boot invariant failed: the message carries the detected
+    budget, the floor, and one operator hint. The library NEVER aborts
+    the host process on this arm — the refusal is typed and sticky
+    (every submit re-surfaces it); the ``degenbot`` binary maps it to
+    its loud named fail-fast exit (exit code 78, EX_CONFIG). Subclasses
+    ``RuntimeError`` so broad handlers keep working; classify by
+    ``isinstance`` for the fail-fast path.
+    """
+
 class PathRegistryFullError(ValueError):
     """The engine path registry is at its configured registered-path cap.
 
@@ -1478,6 +1491,7 @@ __all__ = [
     "ArbitrageEngine",
     "BalanceVectorView",
     "BlockStream",
+    "BootRefused",
     "Bot",
     "BotIo",
     "ConcentratedLiquidityView",

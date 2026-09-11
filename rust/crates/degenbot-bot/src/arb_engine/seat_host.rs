@@ -749,27 +749,54 @@ pub(crate) fn install_boot(courier: &OnceLock<BootStamp>, desc: &SeatRoleDesc, s
 /// installs the stamp BEFORE any dispatch can exist. A missing stamp means
 /// a caller skipped the construction contract: LOUD abort (never a silent
 /// fallback boot of a boot nobody chose).
+///
+/// FF-T1 (BPHR6F): the BOOT-REFUSAL arm is TYPED and STICKY — never a
+/// process abort. A refused boot parks its `BootError` in the executor
+/// slot's `OnceLock`: the first caller surfaces the typed error and every
+/// later caller re-surfaces the SAME refusal. The refusal resolves
+/// before any lane, thread, or pipe is created (`FleetHost::boot` derives
+/// the budget FIRST — before any slot table, thread, or channel exists),
+/// so a submit can never enqueue into a pipe that will not be drained.
+/// The loud fail-fast exit stays BINARY-only: the degenbot binary maps
+/// the surfaced `BootRefused` to its named exit. The RUNTIME strand
+/// aborts (seat/host thread spawn, enqueue refusal, completion refusal,
+/// the closed-channel close arm) keep `abort_executor` and their
+/// byte-pinned wording — ADR-040 fatal bucket, BY DESIGN.
 pub(crate) fn global_executor<T>(
     desc: &'static SeatRoleDesc,
     courier: &'static OnceLock<BootStamp>,
-    slot: &'static OnceLock<T>,
+    slot: &'static OnceLock<Result<T, BootError>>,
     boot: fn(FleetBoot) -> Result<T, BootError>,
-) -> &'static T {
+) -> Result<&'static T, BootError> {
     slot.get_or_init(|| {
         #[expect(
             clippy::expect_used,
             reason = "the loud construction-contract abort IS the YI5NGB design: a stamp-less materialization must abort, never fall back silently"
         )]
         let stamp = courier.get().expect(desc.stamp_missing);
-        match boot(stamp.boot()) {
-            Ok(executor) => executor,
-            Err(err) => abort_executor(
-                desc,
-                &format!("fleet {} budget boot", desc.noun),
-                &err.to_string(),
-            ),
-        }
+        boot(stamp.boot()).inspect_err(|err| {
+            // FF-T1 (BPHR6F): the BOOT-REFUSAL family is typed and sticky,
+            // never a process abort — the library must never abort the host
+            // process on this arm (the 2026-09-11 CI failures: the fleet
+            // budget refusal SIGABRT'd pytest-xdist workers inside the
+            // extension). ONE loud refusal line per process (the operator
+            // record); the CALLER-facing contract is the typed BootError the
+            // OnceLock hands every later submitter. Because FleetHost::boot
+            // derives the budget FIRST — before any slot table, thread, or
+            // channel exists — a refused boot created NOTHING: no pipe that
+            // will not be drained, no lane, no thread. Same message
+            // discipline as the abort family (tag + context), minus the
+            // abort: the process survives; the binary owns the loud exit.
+            tracing::error!(
+                context = "fleet budget boot",
+                error = %err,
+                "{} fleet boot refused — typed error surfaces to the caller (FF-T1); the process survives",
+                desc.abort_tag
+            );
+        })
     })
+    .as_ref()
+    .map_err(Clone::clone)
 }
 
 // ---------------------------------------------------------------------------

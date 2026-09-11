@@ -87,7 +87,11 @@ toml = "1.1.5"
 default = ["auto-initialize", "bot", "rpc", "price", "submission", "simulation", "abi", "concentrated-liquidity-math", "balancer-math", "curve-math", "solidly-math", "v2-math", "uniswap", "pathfinding", "async", "db", "executor", "execution", "pool", "aave-updater", "fork"]
 extension-module = ["pyo3/extension-module"]
 auto-initialize = ["pyo3/auto-initialize"]
-bot = ["dep:degenbot-bot", "dep:degenbot-ingestion", "dep:degenbot-solvers", "rpc", "decoders", "uniswap"]
+# FF-T1 (BPHR6F): `bot` also names degenbot-workers — the intake seam maps
+# the workers' typed BootError family onto the BootRefused exception at
+# the pyo3 leaf (the simulation feature already pulled the dep; bot-only
+# builds now name the type too).
+bot = ["dep:degenbot-bot", "dep:degenbot-ingestion", "dep:degenbot-solvers", "dep:degenbot-workers", "rpc", "decoders", "uniswap"]
 price = ["dep:degenbot-price", "rpc"]
 submission = ["dep:degenbot-submission", "rpc"]
 simulation = ["dep:degenbot-simulation", "dep:degenbot-arbitrage", "dep:degenbot-workers", "rpc", "executor", "submission"]

@@ -153,7 +153,11 @@ impl FleetIntake for FleetRegistrationExecutor {
 }
 
 static FLEET_REGISTRATION_BOOT: OnceLock<BootStamp> = OnceLock::new();
-static FLEET_REGISTRATION_EXECUTOR: OnceLock<FleetRegistrationExecutor> = OnceLock::new();
+// FF-T1 (BPHR6F): the slot parks the sticky boot OUTCOME — a refused
+// boot stores its typed BootError and every later submission re-surfaces
+// it (never a process abort, never a retry loop).
+static FLEET_REGISTRATION_EXECUTOR: OnceLock<Result<FleetRegistrationExecutor, BootError>> =
+    OnceLock::new();
 
 /// Install the CONSTRUCTION-STAMPED boot (YI5NGB): the engine's own typed
 /// boot descriptor (fleet quota + overrides + posture) parsed at ITS
@@ -186,7 +190,13 @@ pub fn boot_installed() -> bool {
 /// exactly once, as an anonymous trait object (the shared materializer:
 /// `seat_host::global_executor` — the YI5NGB absence window stays closed
 /// by construction).
-pub(crate) fn global_fleet_registration_executor() -> &'static FleetRegistrationExecutor {
+///
+/// FF-T1 (BPHR6F): a refused boot surfaces the TYPED, STICKY `BootError`
+/// (every submission re-surfaces the same refusal) — the library never
+/// aborts the host process on the boot-refusal arm; the pyo3 leaf maps
+/// it onto the `BootRefused` exception and the binary owns the loud exit.
+pub(crate) fn global_fleet_registration_executor(
+) -> Result<&'static FleetRegistrationExecutor, BootError> {
     seat_host::global_executor(
         &REG_ROLE,
         &FLEET_REGISTRATION_BOOT,
@@ -241,8 +251,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use degenbot_workers::budget::BudgetOverrides;
-    use degenbot_workers::dispatcher::FleetBoot;
+    use degenbot_workers::budget::{BudgetError, BudgetOverrides};
+    use degenbot_workers::dispatcher::{BootError, FleetBoot};
     use degenbot_workers::posture::{FleetPosture, PostureOwner, PosturePolicy, ThrottleSample};
 
     use super::FleetRegistrationExecutor;
@@ -255,6 +265,55 @@ mod tests {
         )))
     }
 
+    /// FF-T1 (BPHR6F): a refused fleet boot is a TYPED, STICKY error at
+    /// the process materializer — never a process abort. A sub-floor
+    /// stamp (quota 2.0, the CI 4-vCPU shape shrunk one step further) is
+    /// installed directly; the FIRST materialization surfaces the typed
+    /// `BootError`, the SECOND re-surfaces the SAME refusal (the sticky
+    /// `OnceLock` — “at every submit”), and the test process is alive
+    /// throughout (reaching the asserts IS the survival proof). Skips if
+    /// another test already installed the stamp (the F1 race discipline).
+    #[expect(
+        clippy::print_stderr,
+        reason = "the self-skip channel when a parallel test won the stamp race (the documented F1 skip semantics)"
+    )]
+    #[test]
+    fn a_refused_boot_is_typed_and_sticky_never_an_abort() {
+        if super::FLEET_REGISTRATION_BOOT.get().is_some() {
+            eprintln!(
+                "skipping: another test already installed the registration boot stamp in this process"
+            );
+            return;
+        }
+        let stamp = crate::arb_engine::boot_stamp::BootStamp::of(FleetBoot {
+            quota_cpus: 2.0,
+            overrides: BudgetOverrides::default(),
+            posture: PosturePolicy::doc_defaults(),
+            owner: None,
+        });
+        let _ = super::FLEET_REGISTRATION_BOOT.set(stamp);
+        let first = super::global_fleet_registration_executor();
+        let Err(err) = first else {
+            panic!("a sub-floor boot must refuse, typed")
+        };
+        assert!(
+            matches!(
+                &err,
+                BootError::Budget(BudgetError::QuotaTooSmallForPinnedRoles { quota, required })
+                    if (*quota - 2.0).abs() < f64::EPSILON && *required == 6
+            ),
+            "the refusal must be the pinned-role floor family (budget + floor), got {err:?}"
+        );
+        // Sticky: the second call re-surfaces the SAME typed refusal —
+        // every later submit sees it, no retry loop, no abort.
+        let second = super::global_fleet_registration_executor();
+        assert!(
+            second.is_err(),
+            "the boot refusal is sticky at every submit (FF-T1)"
+        );
+        // The process survived; the budget derivation is the FIRST boot
+        // step, so nothing (lane, thread, pipe) was created to refuse on.
+    }
     fn hermetic_boot() -> FleetBoot {
         hermetic_boot_with_owner(hermetic_owner())
     }

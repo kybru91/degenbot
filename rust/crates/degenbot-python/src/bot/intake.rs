@@ -153,8 +153,16 @@ impl PyIntakeReceipt {
 /// grant is bounded by the budget's `pool_state_updater_slots` and its
 /// admission rides the Deferrable cordon class. Never drops: a full
 /// per-role queue spills to the executor's FIFO backlog.
-#[must_use]
-pub fn submit(fn_work: Py<PyAny>) -> PyIntakeReceipt {
+///
+/// FF-T1 (BPHR6F): a refused fleet boot raises the TYPED `BootRefused`
+/// exception (detected budget + floor + one operator hint) BEFORE any
+/// unit is built or enqueued — the sticky materializer re-surfaces the
+/// same refusal on every submit, and the host process survives.
+///
+/// # Errors
+/// `BootRefused` when the fleet host refused to boot (the typed, sticky
+/// boot-refusal family; the library never aborts the host process).
+pub fn submit(fn_work: Py<PyAny>) -> PyResult<PyIntakeReceipt> {
     let (sig_tx, sig_rx) = std::sync::mpsc::channel::<()>();
     let receipt = PyIntakeReceipt {
         outcome: Arc::new(Mutex::new(None)),
@@ -163,7 +171,12 @@ pub fn submit(fn_work: Py<PyAny>) -> PyIntakeReceipt {
     };
     let done = Arc::clone(&receipt.done);
     let outcome_slot = Arc::clone(&receipt.outcome);
-    degenbot_bot::fleet_intake::registration_intake().spawn(Box::new(move || {
+    // FF-T1 (BPHR6F): submit checks the boot state FIRST — a refused boot
+    // raises the typed BootRefused before any unit, channel, or receipt is
+    // created (never an enqueue into a pipe that will not be drained).
+    let intake = degenbot_bot::fleet_intake::registration_intake()
+        .map_err(crate::bot::engine::boot_refused)?;
+    intake.spawn(Box::new(move || {
         let outcome = Python::attach(|py| {
             // GOQWCL: propagate the seat's Rust thread name into Python —
             // an anonymous C thread registers as `Dummy-N`, hiding which
@@ -191,5 +204,5 @@ pub fn submit(fn_work: Py<PyAny>) -> PyIntakeReceipt {
             );
         }
     }));
-    receipt
+    Ok(receipt)
 }

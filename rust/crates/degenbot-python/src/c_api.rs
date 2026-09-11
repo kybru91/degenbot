@@ -185,6 +185,16 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
             .get_type::<crate::bot::engine::VerificationRpcError>(),
     )?;
 
+    // FF-T1 (BPHR6F): the fleet boot refusal surfaces as the typed
+    // BootRefused exception — the library never aborts the host process
+    // on the boot-refusal arm; the degenbot binary maps it to its loud
+    // named fail-fast exit.
+    #[cfg(feature = "bot")]
+    m.add(
+        "BootRefused",
+        m.py().get_type::<crate::bot::engine::BootRefused>(),
+    )?;
+
     // Typed pool-admission exceptions (Plan 102, F2EVV6): a unified
     // `PoolRegistrationError` hierarchy so `build_paths` can classify
     // V2/V3/V4 admission refusals by type instead of fragile string

@@ -48,6 +48,12 @@ const SLOWEST_PATHS_K: usize = 5;
 static WALK_DENSE_ALERTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// FF-T1 (BPHR6F): one loud line for the sticky sim-fleet boot refusal — the
+// materializer surfaces the typed Err on EVERY dispatch; the log rides a
+// once-flag so a refused boot cannot spam the per-block cadence.
+static SIM_BOOT_REFUSAL_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 // ---------------------------------------------------------------------------
 // RAYPAR T3: LPT-pre-balanced scoped-thread partition
 // ---------------------------------------------------------------------------
@@ -776,7 +782,27 @@ impl PipelinedSims {
         // and FleetIntake (pooled sim/intake, fire-and-dispatch). Pooled SimDriver
         // unit, lane-2 dispatch precedence; receipts stay on the caller's
         // per-request channel (unchanged contract).
-        crate::arb_engine::executor::global_sim_executor().spawn(Box::new(run_sim_body));
+        // FF-T1 (BPHR6F): a refused fleet boot surfaces the TYPED, sticky
+        // BootError here — never a process abort, and never a submit into a
+        // pipe that will not be drained. The walker's existing “no sim can
+        // ever land” arm (the same one a missing hook/clamp takes above)
+        // flushes the item immediately with a None payload: the outcome
+        // ledger counts it, the caller never parks. The refusal logs ONCE
+        // per process — every later dispatch re-derives the same sticky Err
+        // from the materializer without spamming the per-block cadence.
+        match crate::arb_engine::executor::global_sim_executor() {
+            Ok(intake) => intake.spawn(Box::new(run_sim_body)),
+            Err(err) => {
+                if !SIM_BOOT_REFUSAL_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::error!(
+                        target: "degenbot::fleet",
+                        error = %err,
+                        "[fleet-sim] sim dispatch skipped — the fleet boot was refused (typed, FF-T1); the item flushes un-simulated (None payload)"
+                    );
+                }
+                return false;
+            }
+        }
         self.pending.push((pid, PendingSim::new(rx)));
         true
     }

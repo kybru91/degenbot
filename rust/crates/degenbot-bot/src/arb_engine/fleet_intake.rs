@@ -5,6 +5,15 @@
 //! `Box<dyn FnOnce() + Send + 'static>` — the `Python::attach` rides
 //! degenbot-python's closure body, never a port item. HARD RATCHET: the
 //! surface is this port + (after commit 2) 2 pub fns — add nothing.
+//!
+//! FF-T1 (BPHR6F) AMENDMENT: the two hand-outs went fallible — a refused
+//! fleet boot surfaces the typed, sticky workers `BootError` instead of
+//! aborting the host process (the pyo3 leaf maps it onto the
+//! `BootRefused` exception). No new fn, no new type: the SAME two
+//! hand-outs, one honest `Result` arm (the library never aborts on the
+//! boot-refusal arm).
+
+use degenbot_workers::dispatcher::BootError;
 
 /// The pooled work unit: the seat threads' existing box shape, pinned as
 /// an alias (concrete, object-safe — never a generic on the port).
@@ -29,9 +38,13 @@ pub trait FleetIntake: Send + Sync {
 /// first call — from the construction-STAMPED boot the first engine
 /// construction installed (`with_core_cfg`). No fallback exists: a caller
 /// that reaches this seam BEFORE any engine construction aborts LOUD.
-#[must_use]
-pub(crate) fn sim_intake() -> &'static dyn FleetIntake {
+///
+/// # Errors
+/// FF-T1 (BPHR6F): the typed, sticky fleet boot refusal — the sticky
+/// `BootError` the materializer parked (never a process abort).
+pub(crate) fn sim_intake() -> Result<&'static dyn FleetIntake, BootError> {
     crate::arb_engine::fleet_sim_executor::global_fleet_sim_executor()
+        .map(|exec| exec as &'static dyn FleetIntake)
 }
 
 /// The ONLY surface `degenbot-python` names: the pooled registration intake.
@@ -43,9 +56,14 @@ pub(crate) fn sim_intake() -> &'static dyn FleetIntake {
 /// PRG-5 probe's pre-engine `False` / post-engine `True` latch rides this
 /// exact install moment. No fallback exists: a caller that reaches this
 /// seam BEFORE any engine construction aborts LOUD.
-#[must_use]
-pub fn registration_intake() -> &'static dyn FleetIntake {
+///
+/// # Errors
+/// FF-T1 (BPHR6F): the typed, sticky fleet boot refusal — surfaced at
+/// the submit seam BEFORE any unit is enqueued (never a process abort;
+/// the pyo3 leaf maps it onto the `BootRefused` exception).
+pub fn registration_intake() -> Result<&'static dyn FleetIntake, BootError> {
     crate::arb_engine::fleet_registration_executor::global_fleet_registration_executor()
+        .map(|exec| exec as &'static dyn FleetIntake)
 }
 
 /// Whether an engine installed the fleet registration boot descriptor (the

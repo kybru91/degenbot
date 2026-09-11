@@ -104,7 +104,11 @@ impl Unit {
 }
 
 /// Why the fleet refused to boot.
-#[derive(Debug, thiserror::Error)]
+///
+/// Clone (FF-T1, BPHR6F): the boot-refusal parks in the executors'
+/// process materializers and every later caller surfaces a CLONE of the
+/// same sticky refusal — the typed error is cheap to hand out forever.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum BootError {
     /// Budget sum check failed (fail-loud over-subscription).
     #[error("fleet budget refused: {0}")]

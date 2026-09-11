@@ -342,6 +342,13 @@ class Bot:
         lifecycles + path registration) ride the fleet's duty-counted
         ``PoolStateUpdater`` seats through this seam (PRG-5).
 
+        FF-T1 (BPHR6F): on a host whose fleet boot was refused (detected
+        CPU budget below the pinned-role floor, or a boot invariant), this
+        submit — and every submit after it — raises the typed, sticky
+        ``BootRefused`` from the FFI seam: the library never aborts the host
+        process on the boot-refusal arm, and nothing is enqueued into a
+        pipe that will not be drained.
+
         Returns:
             The unit's receipt (``IntakeReceipt``).
 

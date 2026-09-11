@@ -5,7 +5,7 @@
 //! (`crate::bot::engine::errors`); `engine::mod` re-exports them so `c_api`
 //! and the sibling concern files reference them as `crate::bot::engine::*`.
 
-use pyo3::create_exception;
+use pyo3::{create_exception, PyErr};
 
 // Distinct Python exception types for the two verification failure
 // categories (TODO-53b7453b / 7SSOJX). Both subclass `RuntimeError` so existing
@@ -132,3 +132,54 @@ create_exception!(
     pyo3::exceptions::PyValueError,
     "The engine path registry is at its configured registered-path cap. Benign stop: discovery must stop offering new candidate paths."
 );
+
+// FF-T1 (BPHR6F, FLEETFLOOR): the fleet boot refusal is a TYPED error —
+// the library never aborts the host process on the boot-refusal arm. The
+// 2026-09-11 CI failures made the gap concrete: on 4-vCPU runners the
+// fleet budget refusal (fractional quota below the pinned-role floor)
+// reached the seat-host materializer's abort and SIGABRT'd pytest-xdist
+// workers inside the extension. Both refusal families surface HERE as
+// the same exception: the budget floor family (BudgetError's
+// QuotaTooSmallForPinnedRoles / Oversubscribed / TooFewSolverCpus) and
+// the boot invariants (SlotLayout's dead-station refusals). Reuse, not a
+// new mechanism: the Rust carriers are the workers' existing BootError
+// family; this is the pyo3 surface. The message carries the detected
+// budget, the floor, and ONE operator hint. The degenbot binary maps
+// this exception to its loud named fail-fast exit — fail-fast stays
+// BINARY-only, never a library abort.
+create_exception!(
+    degenbot._ffi,
+    BootRefused,
+    pyo3::exceptions::PyRuntimeError,
+    "The fleet host refused to boot: the detected CPU budget is below the pinned-role floor, or a boot invariant failed. The library never aborts the host process on this arm; the message carries the detected budget, the floor, and one operator hint."
+);
+
+/// FF-T1 (BPHR6F): map the workers' typed `BootError` family onto the
+/// `BootRefused` exception — the ONE owner of the message shape (detected
+/// budget + floor + one operator hint), so the wording cannot drift per
+/// seam. Every pyo3 surface that can surface a fleet boot refusal maps
+/// through here.
+pub(crate) fn boot_refused(err: degenbot_workers::dispatcher::BootError) -> PyErr {
+    use degenbot_workers::budget::BudgetError;
+    use degenbot_workers::dispatcher::BootError;
+    match err {
+        BootError::Budget(BudgetError::QuotaTooSmallForPinnedRoles { quota, required }) => {
+            BootRefused::new_err(format!(
+                "fleet boot refused: detected CPU budget {quota:.2} cores is below the pinned-role floor of {required} cores — give the host at least {required} usable cores (cgroup quota / CPU affinity); the serial binding for 2-5-core hosts is pending (FF-T4, FLEETFLOOR)"
+            ))
+        }
+        BootError::Budget(BudgetError::Oversubscribed { quota, floor, declared }) => {
+            BootRefused::new_err(format!(
+                "fleet boot refused: declared peak shares {declared} cores exceed floor(quota {quota:.2}) = {floor} — lower the fleet.* share overrides; oversubscription is a configuration bug, refused at boot"
+            ))
+        }
+        BootError::Budget(BudgetError::TooFewSolverCpus { solver, min }) => {
+            BootRefused::new_err(format!(
+                "fleet boot refused: the Solver share derives to {solver} cores, below the {min}-core minimum — raise the quota or lower the other fleet.* shares"
+            ))
+        }
+        other => BootRefused::new_err(format!(
+            "fleet boot refused: {other} — the fleet cannot host this configuration; check the fleet.* overrides"
+        )),
+    }
+}

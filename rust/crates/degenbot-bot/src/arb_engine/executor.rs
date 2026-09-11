@@ -9,7 +9,7 @@
 //! seam types (mirroring the degenbot-workers placement of shared types —
 //! no pyo3 in any signature).
 
-use degenbot_workers::dispatcher::SubmitError;
+use degenbot_workers::dispatcher::{BootError, SubmitError};
 use degenbot_workers::lane::LaneCtx;
 
 pub(crate) use degenbot_workers::dispatcher::SubmitReceipt;
@@ -56,7 +56,8 @@ pub(crate) fn global_executor() -> &'static dyn Executor {
 /// The pooled SIM intake delegate (LNQDOA): hands out `fleet_intake`'s
 /// `FleetIntake` port over the fleet sim executor, so the sim dispatch
 /// route reads through ONE module (the trait object flows in-crate only).
-pub(crate) fn global_sim_executor() -> &'static dyn crate::arb_engine::fleet_intake::FleetIntake {
+pub(crate) fn global_sim_executor(
+) -> Result<&'static dyn crate::arb_engine::fleet_intake::FleetIntake, BootError> {
     crate::arb_engine::fleet_intake::sim_intake()
 }
 // ---------------------------------------------------------------------------

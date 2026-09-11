@@ -147,7 +147,10 @@ impl FleetIntake for FleetSimExecutor {
 }
 
 static FLEET_SIM_BOOT: OnceLock<BootStamp> = OnceLock::new();
-static FLEET_SIM_EXECUTOR: OnceLock<FleetSimExecutor> = OnceLock::new();
+// FF-T1 (BPHR6F): the slot parks the sticky boot OUTCOME — a refused
+// boot stores its typed BootError and every later submission re-surfaces
+// it (never a process abort, never a retry loop).
+static FLEET_SIM_EXECUTOR: OnceLock<Result<FleetSimExecutor, BootError>> = OnceLock::new();
 
 /// Install the CONSTRUCTION-STAMPED boot (YI5NGB): the engine's own typed
 /// boot descriptor (fleet quota + overrides + posture) parsed at ITS
@@ -165,7 +168,11 @@ pub(crate) fn install_boot(stamp: BootStamp) {
 /// fleet-stance sim submission and persisting for the process lifetime
 /// (the shared materializer: `seat_host::global_executor` — the YI5NGB
 /// absence window stays closed by construction).
-pub(crate) fn global_fleet_sim_executor() -> &'static FleetSimExecutor {
+///
+/// FF-T1 (BPHR6F): a refused boot surfaces the TYPED, STICKY `BootError`
+/// (every submission re-surfaces the same refusal) — the library never
+/// aborts the host process on the boot-refusal arm.
+pub(crate) fn global_fleet_sim_executor() -> Result<&'static FleetSimExecutor, BootError> {
     seat_host::global_executor(
         &SIM_ROLE,
         &FLEET_SIM_BOOT,
