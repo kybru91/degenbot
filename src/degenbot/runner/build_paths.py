@@ -15,14 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import os
-import threading
 import time
 from collections import Counter, deque
 from collections.abc import AsyncIterable, AsyncIterator, Callable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from degenbot import Bot, UniswapV2Pool, UniswapV3Pool, UniswapV4Pool, get_checksum_address
+from degenbot.arbitrage._claims import ThreadEventWake, VerifyClaims
 from degenbot.arbitrage.engine_registry import EngineRegistry
 from degenbot.arbitrage.verification_retry import (
     VerificationRetryPolicy,
@@ -57,6 +57,9 @@ from degenbot.uniswap.v3_snapshot import UniswapV3LiquiditySnapshot
 from degenbot.uniswap.v4_liquidity_pool import NATIVE_CURRENCY_ADDRESS
 from degenbot.uniswap.v4_snapshot import UniswapV4LiquiditySnapshot
 from degenbot.utils.bytes import to_0x_hex
+
+if TYPE_CHECKING:
+    import threading
 
 # ──────────────────────────────────────────────────────────────────
 # Permutation filter helpers
@@ -205,46 +208,26 @@ class _SeatVerifyClaims:
     The asyncio in-flight claims in ``EngineRegistry.register_v3/v4_pool``
     are single-loop state (they are the OPERATOR surface's dedup); the crawl
     units run on fleet seats — plain threads — so the same check-then-act
-    window needs thread primitives: the first unit to claim a pool's verify
-    runs the lifecycle; a concurrent peer parks on the claim's event and
-    re-raises the leader's exact exception (a failed lifecycle stays
-    retriable: the failed claim is released, a LATER unit re-runs it).
+    window needs thread primitives. NRHEAC: the claim record + the
+    leader/peer/release-on-failure policy (first unit claims, peers park,
+    a failed claim is released for a LATER unit to re-run) live ONCE in
+    ``degenbot.arbitrage._claims`` (:class:`VerifyClaims`); this class is
+    the thin ``threading.Event`` adapter shell — seat-thread construction
+    plus the ``run_exclusive`` name the pipeline call sites use. The first unit
+    to claim a pool's verify runs the lifecycle; a concurrent peer parks
+    on the claim's event and re-raises the leader's exact exception (a
+    failed lifecycle stays retriable: the failed claim is released, a
+    LATER unit re-runs it).
     """
 
-    @dataclass
-    class _Claim:
-        done: threading.Event
-        error: BaseException | None = None
-
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._claims: dict[str, _SeatVerifyClaims._Claim] = {}
+        self._claims: VerifyClaims[threading.Event, None] = VerifyClaims(
+            ThreadEventWake(),
+        )
 
     def run_exclusive(self, key: str, run: Callable[[], object]) -> None:
         """Run ``run()`` at most once per live claim window; peers wait it."""
-        with self._lock:
-            claim = self._claims.get(key)
-            if claim is None:
-                claim = self._Claim(done=threading.Event())
-                self._claims[key] = claim
-                leader = True
-            else:
-                leader = False
-        if leader:
-            try:
-                run()
-            except BaseException as exc:
-                claim.error = exc
-                raise
-            finally:
-                claim.done.set()
-                with self._lock:
-                    if self._claims.get(key) is claim:
-                        del self._claims[key]
-        else:
-            claim.done.wait()
-            if claim.error is not None:
-                raise claim.error
+        self._claims.run_sync(key, run)
 
 
 def resolve_directions(

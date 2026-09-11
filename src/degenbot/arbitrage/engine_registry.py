@@ -14,7 +14,6 @@ simulation overrides) stays example-side (B-mid scope).
 
 from __future__ import annotations
 
-import asyncio
 from typing import TYPE_CHECKING
 
 from degenbot import Bot, UniswapV2Pool
@@ -30,10 +29,12 @@ from degenbot.logging import logger as bot_logger
 from degenbot.uniswap.v4_liquidity_pool import UniswapV4Pool
 from degenbot.utils.bytes import to_0x_hex
 
+from ._claims import AsyncioFutureWake, ClaimRecord, VerifyClaims
 from .policy import NoOpPathPredicate, PathCompositionPredicate
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    import asyncio
+    from collections.abc import Awaitable, Callable, Sequence
 
     from degenbot.uniswap.v3_liquidity_pool import UniswapV3Pool
     from degenbot.uniswap.v3_snapshot import UniswapV3LiquiditySnapshot
@@ -82,18 +83,29 @@ class EngineRegistry:
         self._v3_keys: dict[str, int] = {}
         # V4 pools keyed by pool_id hex — for event routing from PoolManager logs
         self._v4_keys: dict[str, int] = {}  # pool_id_hex → pool_id
-        # DMZ3DD: per-pool in-flight claims that close the register_v3/v4_pool
-        # check-then-act TOCTOU under concurrent registration workers. A worker
-        # claims the map entry (address → Future / pool_id_hex → Future) BEFORE
-        # the blocking-RPC verify awaits; a worker that sees the claim awaits the
-        # SAME future instead of re-running the verify, so a pool is verified at
-        # most once. These are loop-bound (all access is on the single event
-        # loop); the claim+check are contiguous (no await between) so they are
-        # atomic on the loop. V2 is intentionally not covered: `register_v2_pool`
+        # DMZ3DD (NRHEAC): per-pool in-flight claims that close the
+        # register_v3/v4_pool check-then-act TOCTOU under concurrent
+        # registration workers. The claim record + the leader/peer/
+        # release-on-failure policy live ONCE in `arbitrage._claims`
+        # (VerifyClaims); these are the loop-bound asyncio claim tables — one
+        # per family (address → record for V3, pool_id_hex → record for V4),
+        # read directly by the racing-sibling observers (each record awaits
+        # as its wrapped Future). A worker claims the entry BEFORE the
+        # blocking-RPC verify awaits; a worker that sees the claim awaits the
+        # SAME record instead of re-running the verify, so a pool is verified
+        # at most once. V2 is intentionally not covered: `register_v2_pool`
         # is SYNC with no await between check and cache-set, so it is already
         # atomic on the single loop.
-        self._v3_inflight: dict[str, asyncio.Future[int]] = {}
-        self._v4_inflight: dict[str, asyncio.Future[int]] = {}
+        self._v3_inflight: dict[str, ClaimRecord[asyncio.Future[int]]] = {}
+        self._v4_inflight: dict[str, ClaimRecord[asyncio.Future[int]]] = {}
+        self._v3_claims: VerifyClaims[asyncio.Future[int], int] = VerifyClaims(
+            AsyncioFutureWake(),
+            self._v3_inflight,
+        )
+        self._v4_claims: VerifyClaims[asyncio.Future[int], int] = VerifyClaims(
+            AsyncioFutureWake(),
+            self._v4_inflight,
+        )
         # NXM2BF: the Python `PathInfo` relay is retired. `register_path`
         # returns the Rust `path_id`; `DispatchCandidate` resolves the
         # encoder's `composers::PathInfo` from that `path_id` via
@@ -262,9 +274,6 @@ class EngineRegistry:
             The registered pool's engine ``pool_id``.
 
         """
-        if pool.address in self._v3_keys:
-            return self._v3_keys[pool.address]
-
         # ADR-006 slice 9 / D1: the engine shares the Bot's BotState, so the V3
         # pool is ALREADY registered there by `bot.build_pool` (the V3 builder
         # calls `py_bot.register_v3_pool` + hands back the LiquidityPool
@@ -272,49 +281,16 @@ class EngineRegistry:
         # Rust core on the duplicate address — taking the process down. Mirror
         # the V2 path: read the shared-core pool_id off the handle and cache it
         # so subsequent paths short-circuit.
-        #
-        # DMZ3DD: a sibling worker may already be verifying this pool. Claim the
-        # in-flight entry (contiguous check+set, no await between) so the verify
-        # lifecycle runs at most once; a worker that sees the claim awaits the
-        # SAME shared future instead of re-running it. Released in `finally` so a
-        # failed lifecycle can be retried. This matters because the lifecycle
-        # (IKGQ6F / ADR-022 D1, core-owned) sequences quarantine (6N7XVR) →
-        # seed-verify @ snapshot block → drain+pin (single core.write() hold) →
-        # post-drain-verify @ the pin's own block → set_live, with the mismatch
-        # tripwire as the final gate; double-running it is wasted RPC and, on a
-        # tight post-drain-verify, can false-trip the tripwire if the first run's
-        # pin moved the anchor (sparse pools are immediate no-ops; tracked pools
-        # are Live only after verification).
-        if pool.address in self._v3_inflight:
-            return await self._v3_inflight[pool.address]
-
-        key = pool._py_pool.pool_id  # ruff:ignore[private-member-access]
-        claim = asyncio.get_running_loop().create_future()
-        self._v3_inflight[pool.address] = claim
-        try:
-            await self.engine.run_v3_registration_lifecycle(
+        return await self._register_with_claim(
+            claims=self._v3_claims,
+            keys=self._v3_keys,
+            cache_key=pool.address,
+            key_of=lambda: pool._py_pool.pool_id,  # ruff:ignore[private-member-access]
+            lifecycle=lambda: self.engine.run_v3_registration_lifecycle(
                 pool.address,
                 self._verify_snapshot_block,
-            )
-        except BaseException as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                claim.cancel()
-            else:
-                claim.set_exception(exc)
-                # Mark the exception retrieved: the claim below is released so
-                # a failed lifecycle can be retried, and with no sibling
-                # waiter the future is discarded — an unretrieved exception
-                # would log 'Future exception was never retrieved' at GC. A
-                # sibling that already awaited this claim still receives the
-                # exception regardless.
-                claim.exception()
-            raise
-        finally:
-            if self._v3_inflight.get(pool.address) is claim:
-                del self._v3_inflight[pool.address]
-        self._v3_keys[pool.address] = key
-        claim.set_result(key)
-        return key
+            ),
+        )
 
     async def register_v4_pool(
         self,
@@ -337,55 +313,82 @@ class EngineRegistry:
             The registered pool's engine ``pool_id``.
 
         """
-        pool_id_hex = to_0x_hex(pool.pool_id)
-
-        if pool_id_hex in self._v4_keys:
-            return self._v4_keys[pool_id_hex]
-
         # ADR-006 slice 9 / D1: the engine shares the Bot's BotState, so the V4
         # pool is ALREADY registered there by `bot.build_managed_pool` (the V4
         # builder calls `py_bot.register_v4_pool` + hands back the
         # LiquidityPool handle). Re-registering via `engine.register_v4_pool`
         # would raise ValueError("V4 pool already registered") for every V4 hop
-        # in every discovered path — and, since the cache below is only set on
+        # in every discovered path — and, since the cache is only set on
         # success, the same pool would trip it repeatedly. Mirror the V2 path:
         # read the shared-core pool_id and cache it. V4 hook/dynamic-fee
         # admission is enforced at `bot.build_managed_pool` time — BEFORE this
         # method is ever called — so it surfaces from the builder, not here.
-        #
-        # DMZ3DD: sibling-worker claim, mirroring register_v3_pool — the verify
-        # lifecycle (IKGQ6F / ADR-022 D1) runs at most once per pool under
-        # concurrent workers: quarantine → seed-verify @ snapshot block →
-        # drain+pin → post-drain-verify @ the pin's own block → set_live, with
-        # the mismatch tripwire as the final gate (a missing StateView for
-        # tracked V4 fails fast — D-C).
-        if pool_id_hex in self._v4_inflight:
-            return await self._v4_inflight[pool_id_hex]
-
-        key = pool._py_pool.pool_id  # ruff:ignore[private-member-access]
-        claim = asyncio.get_running_loop().create_future()
-        self._v4_inflight[pool_id_hex] = claim
-        try:
-            await self.engine.run_v4_registration_lifecycle(
+        pool_id_hex = to_0x_hex(pool.pool_id)
+        return await self._register_with_claim(
+            claims=self._v4_claims,
+            keys=self._v4_keys,
+            cache_key=pool_id_hex,
+            key_of=lambda: pool._py_pool.pool_id,  # ruff:ignore[private-member-access]
+            lifecycle=lambda: self.engine.run_v4_registration_lifecycle(
                 pool.address,
                 pool_id_hex,
                 self._verify_snapshot_block,
-            )
-        except BaseException as exc:
-            if isinstance(exc, asyncio.CancelledError):
-                claim.cancel()
-            else:
-                claim.set_exception(exc)
-                # Mark the exception retrieved (see register_v3_pool) — the
-                # claim is discarded after release with no waiter unless a
-                # sibling is already awaiting it.
-                claim.exception()
-            raise
-        finally:
-            if self._v4_inflight.get(pool_id_hex) is claim:
-                del self._v4_inflight[pool_id_hex]
-        self._v4_keys[pool_id_hex] = key
-        claim.set_result(key)
+            ),
+        )
+
+    @staticmethod
+    async def _register_with_claim(
+        *,
+        claims: VerifyClaims[asyncio.Future[int], int],
+        keys: dict[str, int],
+        cache_key: str,
+        key_of: Callable[[], int],
+        lifecycle: Callable[[], Awaitable[object]],
+    ) -> int:
+        """Run ONE family's DMZ3DD registration dance (the V3/V4 twins, NRHEAC).
+
+        The key-cache short-circuit leads; everything after it is the
+        at-most-once claim dance of `arbitrage._claims` (claim-if-absent /
+        await-if-present / release-on-failure + the unretrieved-exception
+        hygiene band) driven over the asyncio adapter — stated once there,
+        not per family. Family differences are parameters: the claim key
+        shape (``cache_key`` — address for V3, pool_id hex for V4), the key
+        map, and the core-owned lifecycle call.
+
+        The at-most-once claim matters because the lifecycle (IKGQ6F /
+        ADR-022 D1, core-owned) sequences quarantine (6N7XVR) → seed-verify
+        @ snapshot block → drain+pin (single core.write() hold) →
+        post-drain-verify @ the pin's own block → set_live, with the
+        mismatch tripwire as the final gate; double-running it is wasted RPC
+        and, on a tight post-drain-verify, can false-trip the tripwire if
+        the first run's pin moved the anchor (sparse pools are immediate
+        no-ops; tracked pools are Live only after verification).
+
+        The leader settles the claim with the family key exactly where the
+        retired twins called `claim.set_result(key)` (after the lifecycle);
+        the key-cache set now lands after the claim settles — both it and
+        the retired pre-`set_result` cache set sit in the same no-await tail
+        on the loop, so no peer or fresh worker can observe the swap. The
+        family key is read inside the claim window, before the lifecycle (a
+        plain int property read — a dead `_py_pool` handle would surface as
+        a failed, retriable claim instead of a pre-claim raise;
+        pathological only).
+
+        Returns:
+            The registered pool's engine `pool_id` (peers receive the
+            leader's settled key from the shared claim).
+
+        """
+        if cache_key in keys:
+            return keys[cache_key]
+
+        async def _lifecycle_then_key() -> int:
+            key = key_of()
+            await lifecycle()
+            return key
+
+        key = await claims.run(cache_key, _lifecycle_then_key)
+        keys[cache_key] = key
         return key
 
     def knows_pool(self, address: str) -> bool:
