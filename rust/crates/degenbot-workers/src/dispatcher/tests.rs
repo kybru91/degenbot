@@ -5,26 +5,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::posture::PosturePolicy;
-
-fn boot() -> FleetBoot {
-    FleetBoot {
-        quota_cpus: 8.0,
-        overrides: BudgetOverrides::default(),
-        posture: PosturePolicy {
-            enter_events: 2,
-            enter_window_ms: 1_000,
-            duty_percent: 2.0,
-            duty_window_ms: 5_000,
-            exit_clean_ms: 10_000,
-            sim_intake_floor_override: None,
-        },
-    }
-}
-
-fn host() -> FleetHost {
-    FleetHost::boot(boot()).expect("8-core boot")
-}
+use crate::posture::{FleetPosture, PostureOwner, PosturePolicy};
 
 fn policy() -> PosturePolicy {
     PosturePolicy {
@@ -37,12 +18,41 @@ fn policy() -> PosturePolicy {
     }
 }
 
+/// A FRESH hermetic posture owner (leaked to `'static`): every test host
+/// gets its own owner, never the process global (7KAPBB isolation).
+fn hermetic_owner() -> &'static PostureOwner {
+    std::boxed::Box::leak(std::boxed::Box::new(PostureOwner::new(policy())))
+}
+
+fn boot() -> FleetBoot {
+    FleetBoot {
+        quota_cpus: 8.0,
+        overrides: BudgetOverrides::default(),
+        posture: policy(),
+        owner: Some(hermetic_owner()),
+    }
+}
+
+fn boot_with_owner(owner: &'static PostureOwner) -> FleetBoot {
+    FleetBoot {
+        quota_cpus: 8.0,
+        overrides: BudgetOverrides::default(),
+        posture: policy(),
+        owner: Some(owner),
+    }
+}
+
+fn host() -> FleetHost {
+    FleetHost::boot(boot()).expect("8-core boot")
+}
+
 #[test]
 fn boot_fails_loudly_on_an_unhostable_quota() {
     let err = FleetHost::boot(FleetBoot {
         quota_cpus: 4.5,
         overrides: BudgetOverrides::default(),
         posture: policy(),
+        owner: Some(hermetic_owner()),
     })
     .expect_err("H+A+R+M+2 > 4");
     assert!(matches!(err, BootError::Budget(_)));
@@ -338,7 +348,7 @@ fn cordon_floors_sim_intake_but_never_cancels_in_flight() {
         host.complete(g.slot).expect("T5");
     }
     // The floor is half the cap: queue two more sims; only the floor grants.
-    let floor = host.posture_machine().sim_intake_cap(cap);
+    let floor = host.sim_intake_cap(cap);
     for i in 0..cap {
         host.enqueue(Unit::noop(
             200 + u64::try_from(i).unwrap_or(0),
@@ -529,5 +539,131 @@ fn the_intake_queue_is_bounded_per_role() {
         host.queue_cap(WorkerRole::PoolStateUpdater),
         slots * 2,
         "the per-role bound is 2x the slot cap (same rule as sim)"
+    );
+}
+
+/// The first idle `PoolStateUpdater` home slot (boot layout:
+/// [solver pins][sim][resolve][poolupd][merge] — poolupd slots boot Idle).
+fn idle_intake_slot(host: &FleetHost) -> u64 {
+    let pins = host.budget().solver_pin_count;
+    let sims = host.budget().sim_slot_cap;
+    let resolves = usize::try_from(host.budget().resolve_cpus).unwrap_or(1);
+    u64::try_from(pins + sims + resolves).unwrap_or(u64::MAX)
+}
+
+/// JCI2FW Part A: the T7 shed is driven by the SHARED owner's transition
+/// feed — the host drains its boot-time watch (the transition edge) and,
+/// at every grant pass, the live posture (check-before-each-grant), so a
+/// cordon published by ANY feeder sheds this host's deferrable in-flight
+/// units promptly (they always complete, T8; pins/merge never shed).
+#[test]
+fn the_t7_shed_is_driven_by_the_shared_owner_transition_feed() {
+    let owner = hermetic_owner();
+    let mut host = FleetHost::boot(boot_with_owner(owner)).expect("8-core boot");
+    let slot = idle_intake_slot(&host);
+    host.lease_claim(slot, WorkerRole::PoolStateUpdater, None)
+        .expect("T1");
+    host.start(slot, &Unit::noop(1, WorkerRole::PoolStateUpdater, None))
+        .expect("T2");
+
+    // The owner's watch carries the transition; the host's shed loop
+    // drained the deferrable in-flight unit on the same feed.
+    let watch = owner.subscribe();
+    let change = host.observe_throttle(
+        0,
+        crate::posture::ThrottleSample {
+            events: 3,
+            throttled_usec: 0,
+            elapsed_usec: 100_000,
+        },
+    );
+    assert!(matches!(change, crate::posture::PostureChange::Entered(_)));
+    assert_eq!(watch.take_if_changed(), Some(FleetPosture::Cordoned));
+    assert_eq!(watch.take_if_changed(), None, "one edge per transition");
+    assert_eq!(host.posture(), FleetPosture::Cordoned);
+    assert!(matches!(
+        host.slot_state(slot),
+        Some(SlotState::Draining {
+            role: WorkerRole::PoolStateUpdater
+        })
+    ));
+    host.drain_done(slot)
+        .expect("T8: the shed unit always completes back to idle");
+
+    // A SECOND host sharing the owner: admission consults the SAME owner
+    // LIVE — mid-cordon it cannot even enqueue a deferrable unit (the gate
+    // reads the owner; no per-host machine to drift), and its grant pass
+    // drains the transition feed without incident (check-before-each-
+    // grant; nothing deferrable can be in flight under cordon — the T2
+    // ctx blocks the lease — so the pass is a no-op).
+    let mut host2 = FleetHost::boot(boot_with_owner(owner)).expect("8-core boot");
+    assert_eq!(host2.posture(), FleetPosture::Cordoned);
+    assert_eq!(
+        host2.enqueue(Unit::noop(2, WorkerRole::PoolStateUpdater, None)),
+        Err(EnqueueError::PostureHeld(WorkerRole::PoolStateUpdater)),
+        "admission consults the shared owner — mid-cordon deferrable intake is held"
+    );
+    let _ = host2.dispatch();
+    // Lift the cordon on the shared owner; host2's admission follows
+    // immediately (the exit edge lands on its watch and the gate reads
+    // the owner live).
+    let mut now = 1_000;
+    loop {
+        owner.observe_throttle(
+            now,
+            crate::posture::ThrottleSample {
+                events: 0,
+                throttled_usec: 0,
+                elapsed_usec: 1_000,
+            },
+        );
+        if owner.current() == FleetPosture::Nominal {
+            break;
+        }
+        now += 1_000;
+        assert!(now <= 60_000, "the cordon never lifted");
+    }
+    host2
+        .enqueue(Unit::noop(3, WorkerRole::PoolStateUpdater, None))
+        .expect("nominal admission the moment the shared cordon lifts");
+    let grants = host2.dispatch();
+    assert_eq!(
+        grants
+            .iter()
+            .filter(|(g, _)| g.kind == GrantKind::PoolStateUpdate)
+            .count(),
+        1,
+        "the held-back unit is granted once the shared posture admits"
+    );
+}
+
+#[test]
+fn hermetic_owners_are_injected_never_the_process_global() {
+    // Two hosts booted from DIFFERENT fresh owners hold independent
+    // postures: cordoning one never moves the other (7KAPBB isolation).
+    let owner_a = hermetic_owner();
+    let owner_b = hermetic_owner();
+    let mut host_a = FleetHost::boot(boot_with_owner(owner_a)).expect("8-core boot");
+    let host_b = FleetHost::boot(boot_with_owner(owner_b)).expect("8-core boot");
+    assert_ne!(
+        std::ptr::from_ref(owner_a),
+        std::ptr::from_ref(owner_b),
+        "each hermetic boot carries its own owner"
+    );
+    let change = host_a.observe_throttle(
+        0,
+        crate::posture::ThrottleSample {
+            events: 3,
+            throttled_usec: 0,
+            elapsed_usec: 100_000,
+        },
+    );
+    assert!(matches!(change, crate::posture::PostureChange::Entered(_)));
+    assert_eq!(host_a.posture(), FleetPosture::Cordoned);
+    assert_eq!(host_b.posture(), FleetPosture::Nominal);
+    assert_eq!(
+        host_b.posture(),
+        owner_b.current(),
+        "host b consults ITS owner, not host a's"
     );
 }

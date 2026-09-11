@@ -110,7 +110,7 @@ consumers (sim slots, ambient I/O), whose measured duty is partial.
 `degenbot.cgroup.throttled` gets a consumer: on throttle onset the fleet
 cordons (no *new* leases for deferrable/background roles, sim-slot intake
 throttled), never sheds a running unit, never strands a result pipe, and
-hysteresis-exits after a clean window. Full policy in the design doc. **Threshold tuning (sign-off amendment 2026-09-09):** the enter/exit thresholds and hysteresis windows are typed config keys, runtime-adjustable through the operator channel, and calibrated from captured soak data — the posture feeds back into its own thresholds; share arithmetic (design doc section 5) is outside this authority.
+hysteresis-exits after a clean window. Full policy in the design doc. **Threshold tuning (sign-off amendment 2026-09-09):** the enter/exit thresholds and hysteresis windows are typed config keys, runtime-adjustable through the operator channel (wired: op `set_fleet_posture` + `degenbot fleet posture set`, design doc §6), and calibrated from captured soak data — the posture feeds back into its own thresholds; share arithmetic (design doc section 5) is outside this authority.
 
 ### 5. RAYPAR T3 and the deadlock ledger carry over
 

@@ -45,6 +45,12 @@ from . import diagnostics as diagnostics
 from . import eip_1559 as eip_1559
 from . import execution as execution
 from . import executor as executor
+
+# ------------------------------------------------------------------
+# ── Fleet operator seam (feature = "simulation", JCI2FW Part B). ──
+# The runtime re-tune channel over the process posture owner; see
+# `fleet.pyi` for the two pyfunctions + the typed refusal exception.
+from . import fleet as fleet
 from . import fork as fork
 from . import pool as pool
 from . import price as price
@@ -1510,6 +1516,7 @@ __all__ = [
     "execution",
     "executor",
     "find_paths_rust",
+    "fleet",
     "fork",
     "pool",
     "price",

@@ -170,6 +170,9 @@ allow-star-arg-any = true
 "src/degenbot/registry/deployment_loader.py" = [
     "import-outside-top-level",  # lazy imports avoid circular dependency (pool classes → uniswap → this module)
 ]
+"src/degenbot/operator/operator_channel.py" = [
+    "import-outside-top-level",  # the fleet mirror home is lazy: the transport module stays independent of the compiled extension and the home mints on the first fleet-posture op
+]
 "src/degenbot/build_info/__init__.py" = [
     "import-outside-top-level",  # the _ffi import is lazy so the receipt helpers work (and the module imports) even where the extension is stale/broken
     "print",     # python -m degenbot.build_info prints its summary to stdout/stderr by design

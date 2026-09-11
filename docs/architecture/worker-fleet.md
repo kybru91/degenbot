@@ -215,7 +215,7 @@ Nominal ⇄ Cordoned
   window; or throttled-time duty > 2% over a trailing 5 s window. Entering is
   loud: posture transition span + counter increment (not a silent degrade).
 - **Exit:** 10 s of clean windows — hysteresis prevents flapping.
-- **Threshold tuning & runtime feedback (sign-off amendment 2026-09-09):** the enter triggers (event count/window, duty percent), exit window, and cordon effects (e.g. the sim-intake floor) are typed config keys at boot, runtime-adjustable via the operator channel, and calibrated from captured soak data; posture-transition metrics (enter/exit counts, cordoned dwell, intake suppression) are exported so thresholds are tuned against measurements rather than heuristics. This authority never touches share arithmetic (section 5).
+- **Threshold tuning & runtime feedback (sign-off amendment 2026-09-09):** the enter triggers (event count/window, duty percent), exit window, and cordon effects (e.g. the sim-intake floor) are typed config keys at boot, runtime-adjustable via the operator channel (wired — the re-tune channel below), and calibrated from captured soak data; posture-transition metrics (enter/exit counts, cordoned dwell, intake suppression) are exported so thresholds are tuned against measurements rather than heuristics. This authority never touches share arithmetic (section 5).
 - **Cordon effects (v1):** (a) no *new* leases for cordon-deferrable roles —
   in v1 that set is empty among the four active roles, so the operative
   effects are (b) sim-slot *intake* throttled (new leases floored at half the
@@ -239,6 +239,26 @@ admission, and the submit-seam posture mirror retired with it.
 
 Posture transitions are metrics, not behavior changes to the engine: stages,
 priority, and correctness are posture-invariant; only lease intake changes.
+
+**Runtime re-tune channel (JCI2FW Part B, wired):** the six typed keys are
+adjustable on a LIVE process through the operator channel — op
+`set_fleet_posture` (a partial patch over `cordon_enter_events`,
+`cordon_enter_window_ms`, `cordon_duty_percent`, `cordon_duty_window_ms`,
+`cordon_exit_clean_ms`, `cordon_sim_intake_floor`; at least one key required,
+absent keys keep the live value, `cordon_sim_intake_floor: null` restores
+half the slot cap) and the read-only `get_fleet_posture`, both behind the
+`degenbot fleet posture set|show` CLI. Validation lives ONCE in the Rust
+core (`PosturePolicyPatch::validate`: windows > 0 ms, duty percent in
+(0.0, 100.0], enter events >= 1, floor >= 1 when set) and REJECTS with the
+typed `degenbot.fleet.PostureRetuneError` — never clamps; the op layer adds
+the unknown-key/empty-patch wire checks in front of it. The write path is
+the PyO3 verb -> `PostureOwner::retune` (the atomic policy swap that keeps
+posture state and the trailing sample window); the response echoes the
+EFFECTIVE policy (all six fields + the current `Nominal|Cordoned` posture),
+and every change emits ONE loud `tracing::warn!`
+`[fleet-posture] operator retune` line listing old -> new per changed key.
+Boot config stays the default source: the re-tune applies to the running
+process only.
 
 ## 7. Instrumentation: bin spans + the census registry
 

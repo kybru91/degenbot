@@ -271,7 +271,7 @@ crate::config_schema! {
         pool_state_updater_slots [opt usize] = None, env = "DEGENBOT_FLEET_POOL_STATE_UPDATER_SLOTS", def = "(unset; default 4)",
             doc = "PoolStateUpdater slot cap (the registration intake station: duty-counted, spendable from the fractional-quota remainder, Deferrable cordon class); default 4.";
         cordon_enter_events [usize] = 2, env = "DEGENBOT_FLEET_CORDON_ENTER_EVENTS", def = "2",
-            doc = "Throttle events within the enter window that cordon the fleet (design doc §6 enter trigger; Q5 amendment: runtime-tunable via the operator channel).";
+            doc = "Throttle events within the enter window that cordon the fleet (design doc §6 enter trigger; Q5 amendment delivered: runtime-tunable via the operator channel — `degenbot fleet posture set --cordon-enter-events N` on a live process).";
         cordon_enter_window_ms [ms] = 1000, env = "DEGENBOT_FLEET_CORDON_ENTER_WINDOW_MS", def = "1000",
             doc = "Rolling window (ms) for the throttle-event burst enter trigger.";
         cordon_duty_percent [f64] = 2.0, env = "DEGENBOT_FLEET_CORDON_DUTY_PERCENT", def = "2.0",

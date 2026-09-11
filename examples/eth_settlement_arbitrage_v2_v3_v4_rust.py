@@ -193,6 +193,7 @@ async def main() -> None:
             if args.operator_socket:
                 from degenbot.operator.operator_channel import (
                     OperatorServer,
+                    handle_fleet_posture_op,
                     step_from_wire,
                 )
 
@@ -206,6 +207,11 @@ async def main() -> None:
                         bound = payload.get("bound")
                         n = await session.trigger_discovery(bound=bound)
                         return {"detail": f"discovery processed {n} paths"}
+                    if op in ("set_fleet_posture", "get_fleet_posture"):
+                        # JCI2FW Part B: the live cordon-threshold re-tune
+                        # + read, routed through the shared helper (the
+                        # degenbot.fleet mirror home mints on first use).
+                        return handle_fleet_posture_op(op, payload)
                     return {"error": f"unknown op {op!r}"}
 
                 operator = OperatorServer(operator_handler, socket_path=args.operator_socket)

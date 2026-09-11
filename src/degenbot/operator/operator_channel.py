@@ -18,10 +18,22 @@ Wire protocol (one JSON object per line, newline-terminated). Request lines::
         "directions": [true, false],
     }  # optional; auto-resolved if absent
     {"op": "discover", "bound": 5}  # bounded on-demand discovery
+    {
+        "op": "set_fleet_posture",
+        "cordon_enter_events": 2,  # ANY subset of the six cordon_* keys
+        "cordon_enter_window_ms": 1000,  # (the typed DEGENBOT_FLEET_CORDON_*
+        "cordon_duty_percent": 2.0,  # keys); at least one is required;
+        "cordon_duty_window_ms": 5000,  # absent keys keep the live value;
+        "cordon_exit_clean_ms": 10000,  # cordon_sim_intake_floor also takes
+        "cordon_sim_intake_floor": 2,  # null = restore half the slot cap
+    }
+    {"op": "get_fleet_posture"}  # read the live thresholds + posture
 
 Response lines::
 
     {"ok": true, "detail": "..."}
+    {"ok": true, "detail": "", "effective": {...}}  # fleet posture ops:
+    #   the six cordon_* values + "posture"
     {"ok": false, "error": "..."}
 
 The server maps a ``family`` string to the pool-table base class the
@@ -30,6 +42,17 @@ the wire. The handler (supplied by the host) turns an ``(op, payload)`` pair
 into a response dict; the server guards the wire (JSON decode, op dispatch,
 exception -> ``{"ok": false}``) so a malformed or failing command never crashes
 the host.
+
+The fleet-posture ops (`set_fleet_posture` / `get_fleet_posture`,
+JCI2FW Part B) re-tune the LIVE cordon thresholds of the process posture
+owner through the `degenbot.fleet` mirror home; :func:`handle_fleet_posture_op`
+is the host-side helper both the runner's handler and the tests route them
+through. Validation of the six values lives ONCE in the Rust core
+(`PosturePolicyPatch::validate`) and is surfaced as the typed
+`degenbot.fleet.PostureRetuneError`; this layer adds the wire-hygiene
+checks (unknown key, empty patch) in front of it — defense-in-depth, not a
+second validator. Boot config stays the default source: the op re-tunes the
+live policy only.
 
 The protocol is a plain request/response: the host processes each command
 concurrently with the pump and replies once the registration pipeline has
@@ -109,6 +132,63 @@ def step_from_wire(step: dict[str, Any]) -> StepSpec:
     return StepSpec(type=table, address=address, hash=step.get("hash"))
 
 
+#: The six fleet-posture threshold key names `set_fleet_posture` accepts
+#: (the degenbot-config typed keys, env `DEGENBOT_FLEET_CORDON_*`). Anything
+#: else is refused at the wire before it reaches the Rust validator —
+#: defense-in-depth over layer 2, not a second validator.
+FLEET_POSTURE_THRESHOLD_KEYS = frozenset({
+    "cordon_enter_events",
+    "cordon_enter_window_ms",
+    "cordon_duty_percent",
+    "cordon_duty_window_ms",
+    "cordon_exit_clean_ms",
+    "cordon_sim_intake_floor",
+})
+
+
+def handle_fleet_posture_op(op: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Handle the two fleet-posture ops through the `degenbot.fleet` mirror.
+
+    The host-side helper the runner's operator handler routes
+    `set_fleet_posture` / `get_fleet_posture` through (and the round-trip
+    tests exercise over a real socket). Sync by design — the channel body
+    is two cheap FFI round-trips; the host's async handler calls it
+    directly from its async body. The mirror home is imported lazily: the
+    transport module stays independent of the compiled extension, and the
+    home mints on the first op that actually runs (the ADR-013 barrier).
+
+    Args:
+        op: The command op (`set_fleet_posture` or `get_fleet_posture`).
+        payload: The command payload — a partial patch over
+            :data:`FLEET_POSTURE_THRESHOLD_KEYS` for the set op (at least
+            one key; `cordon_sim_intake_floor` also takes `None` =
+            restore half the slot cap); ignored for the get op.
+
+    Returns:
+        A handler-shaped response: ``{"effective": {...}}`` on success (the
+        effective policy echoed — all six fields + the current posture), or
+        ``{"error": "..."}`` on an unknown op/key, an empty patch, or a
+        refused patch (the typed ``PostureRetuneError`` surfaces verbatim).
+
+    """
+    from degenbot import fleet  # lazy: the home mints on the first fleet-posture op
+
+    if op == "get_fleet_posture":
+        return {"effective": fleet.current_posture()}
+    if op == "set_fleet_posture":
+        unknown = sorted(set(payload) - FLEET_POSTURE_THRESHOLD_KEYS)
+        if unknown:
+            return {"error": f"unknown fleet-posture threshold key(s): {', '.join(unknown)}"}
+        if not payload:
+            return {"error": "set_fleet_posture needs at least one threshold key (empty patch)"}
+        try:
+            effective = fleet.set_posture_thresholds(payload)
+        except fleet.PostureRetuneError as exc:
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        return {"effective": effective}
+    return {"error": f"unknown op {op!r}"}
+
+
 def wrap_handler(
     handler: OperatorHandler,
 ) -> OperatorHandler:
@@ -135,7 +215,13 @@ def wrap_handler(
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         if resp.get("error"):
             return {"ok": False, "error": resp["error"]}
-        return {"ok": True, "detail": resp.get("detail", "")}
+        ok: dict[str, Any] = {"ok": True, "detail": resp.get("detail", "")}
+        # The fleet-posture ops echo the effective policy: pass the
+        # "effective" key through (handlers that don't return one are
+        # unchanged — the wire gains no empty key).
+        if "effective" in resp:
+            ok["effective"] = resp["effective"]
+        return ok
 
     return wrapped
 

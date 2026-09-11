@@ -226,7 +226,7 @@ mod tests {
     use degenbot_config::BotConfigLoader;
     use degenbot_workers::budget::BudgetOverrides;
     use degenbot_workers::dispatcher::FleetBoot;
-    use degenbot_workers::posture::PosturePolicy;
+    use degenbot_workers::posture::{PostureOwner, PosturePolicy};
     use hashbrown::HashSet;
 
     const GAMMA_03_TEST: u64 = 997;
@@ -250,6 +250,11 @@ mod tests {
                 ..BudgetOverrides::default()
             },
             posture: PosturePolicy::doc_defaults(),
+            // A fresh hermetic owner per boot — never the process global
+            // (7KAPBB isolation; these tests never boot a host anyway).
+            owner: Some(std::boxed::Box::leak(std::boxed::Box::new(
+                PostureOwner::new(PosturePolicy::doc_defaults()),
+            ))),
         }
     }
 

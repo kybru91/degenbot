@@ -49,7 +49,7 @@ use degenbot_workers::dispatcher::{BootError, FleetBoot, GrantKind};
 use degenbot_workers::role::WorkerRole;
 
 use crate::arb_engine::fleet_intake::{FleetIntake, InnerWork};
-use crate::arb_engine::seat_host::{self, CordonAdmission, SeatHost, SeatRoleDesc};
+use crate::arb_engine::seat_host::{self, SeatHost, SeatRoleDesc};
 
 /// The sim executor's seat-host role descriptor — this module IS the role
 /// now; the machinery lives once in `seat_host`. `SimDriver` pooled seats
@@ -61,7 +61,6 @@ use crate::arb_engine::seat_host::{self, CordonAdmission, SeatHost, SeatRoleDesc
 static SIM_ROLE: SeatRoleDesc = SeatRoleDesc {
     role: WorkerRole::SimDriver,
     grant: GrantKind::Sim,
-    cordon: CordonAdmission::Admit,
     boot_role: BootRole::Sim,
     abort_tag: "[fleet-sim]",
     noun: "sim",
@@ -220,15 +219,28 @@ mod tests {
 
     use degenbot_workers::budget::BudgetOverrides;
     use degenbot_workers::dispatcher::FleetBoot;
-    use degenbot_workers::posture::PosturePolicy;
+    use degenbot_workers::posture::{FleetPosture, PostureOwner, PosturePolicy, ThrottleSample};
 
     use super::FleetSimExecutor;
 
+    /// A FRESH hermetic posture owner (leaked to `'static`): every test
+    /// boot gets its own owner, never the process global (7KAPBB isolation).
+    fn hermetic_owner() -> &'static PostureOwner {
+        std::boxed::Box::leak(std::boxed::Box::new(PostureOwner::new(
+            PosturePolicy::doc_defaults(),
+        )))
+    }
+
     fn hermetic_boot() -> FleetBoot {
+        hermetic_boot_with_owner(hermetic_owner())
+    }
+
+    fn hermetic_boot_with_owner(owner: &'static PostureOwner) -> FleetBoot {
         FleetBoot {
             quota_cpus: 8.0,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),
+            owner: Some(owner),
         }
     }
 
@@ -394,6 +406,7 @@ mod tests {
             quota_cpus: 4.5,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),
+            owner: Some(hermetic_owner()),
         };
         assert!(
             FleetSimExecutor::boot(boot).is_err(),
@@ -401,15 +414,42 @@ mod tests {
         );
     }
 
-    /// The role descriptor's design-gate admission arm (RZEWTX): `SimDriver`
-    /// is `SimPool` cordon class — a Cordoned posture still ADMITS sim leases
-    /// (floored, not held). The shared host applies the arm in
-    /// `apply_host_msg`/`pump` (see `seat_host`).
+    /// The design-gate admission policy, BEHAVIORAL under the shared
+    /// posture owner (RZEWTX; JCI2FW Part A dissolved the
+    /// `CordonAdmission::Admit` descriptor arm — the role's `SimPool`
+    /// cordon class + the ONE shared owner ARE the policy): a Cordoned
+    /// posture still ADMITS sim intake — units submitted under cordon run
+    /// to completion (the dispatcher-side sim-intake floor paces grants;
+    /// it never holds a submission, never drops one).
     #[test]
-    fn the_sim_role_descriptor_admits_under_cordon() {
+    fn a_cordoned_posture_still_admits_sim_intake() {
+        let owner = hermetic_owner();
+        let executor =
+            FleetSimExecutor::boot(hermetic_boot_with_owner(owner)).expect("fleet sim boot");
+        // Force the shared owner Cordoned (the event-burst trigger the
+        // dispatcher fixtures use).
+        owner.observe_throttle(
+            0,
+            ThrottleSample {
+                events: 3,
+                throttled_usec: 0,
+                elapsed_usec: 100_000,
+            },
+        );
+        assert_eq!(owner.current(), FleetPosture::Cordoned);
+        let (tx, rx) = mpsc::channel::<u64>();
+        for id in 0..4_u64 {
+            let tx = tx.clone();
+            executor.spawn(move || {
+                let _ = tx.send(id);
+            });
+        }
+        drop(tx);
+        let got = await_receipts(&rx, 4, Instant::now() + Duration::from_secs(10));
         assert_eq!(
-            super::SIM_ROLE.cordon,
-            crate::arb_engine::seat_host::CordonAdmission::Admit
+            got.len(),
+            4,
+            "a Cordoned posture still admits (floors, never holds) SimPool sim intake"
         );
     }
 }

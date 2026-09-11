@@ -24,7 +24,7 @@ use crate::budget::{BudgetError, BudgetOverrides, FleetBudget};
 use crate::gauges::{self as gauges_mod, RoleGaugeSample};
 use crate::lane::LaneCtx;
 use crate::posture::{
-    FleetPosture, PostureChange, PosturePolicy, PostureStateMachine, ThrottleSample,
+    FleetPosture, PostureChange, PostureOwner, PosturePolicy, PostureWatch, ThrottleSample,
 };
 use crate::role::{CordonClass, WorkerRole, V1_ACTIVE_ROLES};
 use crate::slot::{
@@ -243,7 +243,15 @@ struct SlotCell {
 /// the real engines is F3–F5).
 pub struct FleetHost {
     budget: FleetBudget,
-    posture: PostureStateMachine,
+    /// THE shared fleet posture owner (JCI2FW Part A): the host consults it
+    /// everywhere it used to consult a host-local machine (enqueue gate,
+    /// admission thresholds, the T7 shed trigger) so every host — and the
+    /// process throttle feed — see ONE posture.
+    posture: &'static PostureOwner,
+    /// The host's subscription to the owner's transition feed: the T7 shed
+    /// trigger (a transition INTO Cordoned — or a Cordoned snapshot at a
+    /// grant-pass boundary — drains the deferrable in-flight units).
+    posture_watch: PostureWatch,
     slots: Vec<SlotCell>,
     queues: [VecDeque<Unit>; 8],
     merge_pin: Option<SlotId>,
@@ -260,14 +268,14 @@ impl std::fmt::Debug for FleetHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FleetHost")
             .field("budget", &self.budget)
-            .field("posture", &self.posture.state())
+            .field("posture", &self.posture.current())
             .field("slots", &self.slots.len())
             .finish_non_exhaustive()
     }
 }
 
 /// Boot description for [`FleetHost::boot`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub struct FleetBoot {
     /// Fractional cgroup quota (cores), from
     /// [`crate::quota::fractional_cpu_budget`].
@@ -276,6 +284,13 @@ pub struct FleetBoot {
     pub overrides: BudgetOverrides,
     /// Posture thresholds (typed config).
     pub posture: PosturePolicy,
+    /// The shared fleet posture owner (JCI2FW Part A). `None` (production)
+    /// installs `posture` into the PROCESS owner first-wins at boot and
+    /// consults that — exactly one posture per process. Hermetic tests
+    /// MUST inject a fresh [`PostureOwner::new`] owner here (leaked to
+    /// `'static`): posture leaking across tests is a failure class
+    /// (7KAPBB).
+    pub owner: Option<&'static PostureOwner>,
 }
 
 impl FleetBoot {
@@ -287,7 +302,18 @@ impl FleetBoot {
             quota_cpus: crate::budget::detected_quota_cpus(&cfg.fleet),
             overrides: BudgetOverrides::from_config(cfg),
             posture: PosturePolicy::from_config(&cfg.fleet),
+            owner: None,
         }
+    }
+}
+
+impl PartialEq for FleetBoot {
+    fn eq(&self, other: &Self) -> bool {
+        // CONFIG equality only (the boot-stamp ledger's key, R2/R3): the
+        // owner handle is runtime plumbing, never config.
+        self.quota_cpus == other.quota_cpus
+            && self.overrides == other.overrides
+            && self.posture == other.posture
     }
 }
 
@@ -300,7 +326,13 @@ impl FleetHost {
     /// [`BudgetError`] fail-fasts on over-subscription / pinned-role floor.
     pub fn boot(boot: FleetBoot) -> Result<Self, BootError> {
         let budget = FleetBudget::derive(boot.quota_cpus, &boot.overrides)?;
-        let posture = PostureStateMachine::new(boot.posture);
+        // ONE process-level fleet posture owner (JCI2FW Part A): the
+        // boot's policy installs the process owner first-wins; hermetic
+        // boots inject their own owner and never touch the global.
+        let posture: &'static PostureOwner = boot
+            .owner
+            .unwrap_or_else(|| crate::posture::install_process_owner(boot.posture));
+        let posture_watch = posture.subscribe();
 
         // Slot layout: solver pins, sim slots, resolve, then the merge
         // sidecar (its dedicated slot, pinned below before anything else
@@ -346,6 +378,7 @@ impl FleetHost {
         let mut host = Self {
             budget,
             posture,
+            posture_watch,
             slots,
             queues: Default::default(),
             merge_pin: None,
@@ -410,16 +443,25 @@ impl FleetHost {
         &self.budget
     }
 
-    /// Current posture.
+    /// Current posture (read through the shared owner).
     #[must_use]
-    pub const fn posture(&self) -> FleetPosture {
-        self.posture.state()
+    pub fn posture(&self) -> FleetPosture {
+        self.posture.current()
     }
 
-    /// The posture machine (thresholds + counters for the tuning loop).
+    /// Whether the shared posture admits lease intake for `role` right
+    /// now (the same `admits_lease` predicate the enqueue gate and the
+    /// T-table ctx consult — one source of truth, no hand mirrors).
     #[must_use]
-    pub const fn posture_machine(&self) -> &PostureStateMachine {
-        &self.posture
+    pub fn posture_admits_role(&self, role: WorkerRole) -> bool {
+        self.posture.admits_lease(role.cordon_class())
+    }
+
+    /// The sim intake cap in the current posture (read through the shared
+    /// owner — cordon floors it per §6 effect (b)).
+    #[must_use]
+    pub fn sim_intake_cap(&self, slot_cap: usize) -> usize {
+        self.posture.sim_intake_cap(slot_cap)
     }
 
     /// The full slot state map.
@@ -507,12 +549,32 @@ impl FleetHost {
 
     // ---- posture feed -----------------------------------------------------------
 
-    /// Feed a throttle delta to the posture. Cordon onset immediately sheds
-    /// cordon-deferrable in-flight units to Draining (T7) — they always
-    /// complete (T8); pinned walks and the merge pin are never shed.
+    /// Feed a throttle delta to the SHARED posture owner (JCI2FW Part A —
+    /// the host owns no machine anymore). A transition INTO Cordoned
+    /// immediately sheds cordon-deferrable in-flight units to Draining
+    /// (T7) — they always complete (T8); pinned walks and the merge pin
+    /// are never shed. The shed is driven by the owner's transition feed
+    /// (the boot-time [`PostureWatch` subscription]), so a transition
+    /// published by ANY feeder (this host, the process throttle feed, a
+    /// future retune) sheds this host promptly.
     pub fn observe_throttle(&mut self, now_ms: u64, sample: ThrottleSample) -> PostureChange {
-        let change = self.posture.observe(now_ms, sample);
-        if matches!(change, PostureChange::Entered(_)) {
+        let change = self.posture.observe_throttle(now_ms, sample);
+        self.shed_if_cordoned();
+        change
+    }
+
+    /// The T7 shed trigger, driven by the shared owner: drain the watch
+    /// (a transition INTO Cordoned) OR honor a Cordoned snapshot at a
+    /// grant-pass boundary (check-before-each-grant — covers transitions
+    /// fed by other hosts / the process feed between this host's own
+    /// feeds). Idempotent: Draining/pinned/merge units are never touched,
+    /// and the scan is a no-op while Nominal.
+    fn shed_if_cordoned(&mut self) {
+        let posture = self
+            .posture_watch
+            .take_if_changed()
+            .unwrap_or_else(|| self.posture.current());
+        if matches!(posture, FleetPosture::Cordoned) {
             for slot in 0..self.slots.len() {
                 let slot = u64::try_from(slot).unwrap_or(SlotId::MAX);
                 let Some(state) = self.slot_state(slot) else {
@@ -527,7 +589,6 @@ impl FleetHost {
                 }
             }
         }
-        change
     }
 
     // ---- epoch / quota lifecycle -----------------------------------------------
@@ -604,17 +665,31 @@ impl FleetHost {
     /// # Errors
     /// [`EnqueueError`] — every variant is a loud refusal, never a drop.
     pub fn enqueue(&mut self, unit: Unit) -> Result<(), EnqueueError> {
+        self.try_enqueue(unit).map_err(|(err, _)| err)
+    }
+
+    /// The lossless refusal seam (§10 never-drop): like [`FleetHost::
+    /// enqueue`], but a refusal returns the unit BACK next to the typed
+    /// error. The pooled-intake hosts need this under the SHARED posture
+    /// owner (JCI2FW Part A): the owner is fed from the throttle-poller
+    /// thread, so a cordon can onset between a caller's admission check
+    /// and this gate — the refusing gate must not swallow the payload
+    /// (the caller parks it in its unbounded backlog instead).
+    ///
+    /// # Errors
+    /// `(EnqueueError, Unit)` — the loud refusal PLUS the unit back.
+    pub fn try_enqueue(&mut self, unit: Unit) -> Result<(), (EnqueueError, Unit)> {
         if !unit.role.v1_active() {
-            return Err(EnqueueError::RoleNotActive(unit.role));
+            return Err((EnqueueError::RoleNotActive(unit.role), unit));
         }
         if unit.role == WorkerRole::Merge {
-            return Err(EnqueueError::MergeNeverQueued);
+            return Err((EnqueueError::MergeNeverQueued, unit));
         }
         if unit.role.cordon_class() == CordonClass::Deferrable
             && !self.posture.admits_lease(unit.role.cordon_class())
         {
             self.posture.note_intake_suppressed();
-            return Err(EnqueueError::PostureHeld(unit.role));
+            return Err((EnqueueError::PostureHeld(unit.role), unit));
         }
         let cap = self.queue_cap(unit.role);
         let len = self
@@ -631,11 +706,14 @@ impl FleetHost {
                 overflows = self.overflow_count,
                 "[fleet-dispatch] queue FULL — loud overflow (ADR-021: classify, stop, never silently drop)"
             );
-            return Err(EnqueueError::QueueFull {
-                role: unit.role,
-                len,
-                cap,
-            });
+            return Err((
+                EnqueueError::QueueFull {
+                    role: unit.role,
+                    len,
+                    cap,
+                },
+                unit,
+            ));
         }
         if let Some(queue) = self.role_queue_mut(unit.role) {
             queue.push_back(unit);
@@ -682,6 +760,12 @@ impl FleetHost {
     /// / [`FleetHost::shed`]. A pinned continuation's `start` applies T6.
     #[must_use]
     pub fn dispatch(&mut self) -> Vec<(Grant, Unit)> {
+        // Check-before-each-grant: drain the shared owner's transition
+        // feed (shed if the fleet is Cordoned) BEFORE granting — a cordon
+        // that onsets between this host's feeds still holds intake (the
+        // gate below reads the owner live) and sheds deferrable
+        // in-flight units on this pass (T7).
+        self.shed_if_cordoned();
         let mut grants = Vec::new();
 
         // 1. Pinned continuations (T6): cycle-critical, keyed to their pin.

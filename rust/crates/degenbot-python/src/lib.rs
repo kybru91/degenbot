@@ -78,6 +78,11 @@ pub mod eip_1559;
 pub mod execution;
 #[cfg(feature = "executor")]
 pub mod executor;
+/// The fleet operator seam (JCI2FW Part B): the runtime re-tune channel
+/// over the process posture owner. Gated on `simulation` — the feature
+/// that carries the `degenbot-workers` dependency.
+#[cfg(feature = "simulation")]
+pub mod fleet;
 #[cfg(feature = "fork")]
 pub mod fork;
 #[cfg(feature = "pathfinding")]

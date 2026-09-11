@@ -44,19 +44,20 @@ use degenbot_workers::dispatcher::{BootError, FleetBoot, GrantKind};
 use degenbot_workers::role::WorkerRole;
 
 use crate::arb_engine::fleet_intake::{FleetIntake, InnerWork};
-use crate::arb_engine::seat_host::{self, CordonAdmission, SeatHost, SeatRoleDesc};
+use crate::arb_engine::seat_host::{self, SeatHost, SeatRoleDesc};
 
 /// The intake executor's seat-host role descriptor — this module IS the
 /// role now; the machinery lives once in `seat_host`. `PoolStateUpdater`
-/// pooled seats granted `GrantKind::PoolStateUpdate` units, the budget's
-/// `pool_state_updater_slots` as the seat count, and the design-gate
-/// admission policy `Hold`: a Cordoned posture HOLDS Deferrable intake —
-/// held units wait in the unbounded backlog (never dropped), in-flight
-/// units are never cancelled.
+/// pooled seats granted `GrantKind::PoolStateUpdate` units and the
+/// budget's `pool_state_updater_slots` as the seat count. Admission is
+/// the role's own cordon class through the ONE shared posture owner
+/// (JCI2FW Part A — the dissolved `CordonAdmission::Hold` descriptor
+/// arm): a Cordoned posture HOLDS Deferrable intake — held units wait in
+/// the unbounded backlog (never dropped), in-flight units are never
+/// cancelled.
 static REG_ROLE: SeatRoleDesc = SeatRoleDesc {
     role: WorkerRole::PoolStateUpdater,
     grant: GrantKind::PoolStateUpdate,
-    cordon: CordonAdmission::Hold,
     boot_role: BootRole::Registration,
     abort_tag: "[fleet-reg]",
     noun: "intake",
@@ -239,15 +240,28 @@ mod tests {
 
     use degenbot_workers::budget::BudgetOverrides;
     use degenbot_workers::dispatcher::FleetBoot;
-    use degenbot_workers::posture::PosturePolicy;
+    use degenbot_workers::posture::{FleetPosture, PostureOwner, PosturePolicy, ThrottleSample};
 
     use super::FleetRegistrationExecutor;
 
+    /// A FRESH hermetic posture owner (leaked to `'static`): every test
+    /// boot gets its own owner, never the process global (7KAPBB isolation).
+    fn hermetic_owner() -> &'static PostureOwner {
+        std::boxed::Box::leak(std::boxed::Box::new(PostureOwner::new(
+            PosturePolicy::doc_defaults(),
+        )))
+    }
+
     fn hermetic_boot() -> FleetBoot {
+        hermetic_boot_with_owner(hermetic_owner())
+    }
+
+    fn hermetic_boot_with_owner(owner: &'static PostureOwner) -> FleetBoot {
         FleetBoot {
             quota_cpus: 8.0,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),
+            owner: Some(owner),
         }
     }
 
@@ -371,16 +385,66 @@ mod tests {
         );
     }
 
-    /// The role descriptor's design-gate admission arm (RZEWTX):
-    /// `PoolStateUpdater` is Deferrable cordon class — a Cordoned posture
-    /// HOLDS intake; the unbounded backlog preserves the held units (never
-    /// dropped). The shared host applies the arm in `apply_host_msg`/`pump`
-    /// (see `seat_host`).
+    /// The design-gate admission policy, BEHAVIORAL and REACHED (RZEWTX;
+    /// JCI2FW Part A dissolved the `CordonAdmission::Hold` descriptor arm
+    /// and made the Cordoned arm reachable): `PoolStateUpdater` is
+    /// Deferrable cordon class — a forced-Cordoned hermetic owner HOLDS
+    /// intake (the unit waits in the unbounded backlog, no receipt), and
+    /// the held unit COMPLETES once the clean hysteresis lifts the cordon
+    /// (never dropped; in-flight units are never cancelled).
     #[test]
-    fn the_intake_role_descriptor_holds_under_cordon() {
-        assert_eq!(
-            super::REG_ROLE.cordon,
-            crate::arb_engine::seat_host::CordonAdmission::Hold
+    fn a_cordoned_posture_holds_registration_intake_until_the_cordon_lifts() {
+        let owner = hermetic_owner();
+        let executor =
+            FleetRegistrationExecutor::boot(hermetic_boot_with_owner(owner)).expect("fleet boot");
+        // Force the shared owner Cordoned (the event-burst trigger the
+        // dispatcher fixtures use) — previously unreachable at this seam.
+        owner.observe_throttle(
+            0,
+            ThrottleSample {
+                events: 3,
+                throttled_usec: 0,
+                elapsed_usec: 100_000,
+            },
         );
+        assert_eq!(owner.current(), FleetPosture::Cordoned);
+        let (tx, rx) = mpsc::channel::<u64>();
+        let tx1 = tx.clone();
+        executor.spawn(move || {
+            let _ = tx1.send(1);
+        });
+        // The Hold arm: no receipt while the cordon holds (the unit waits
+        // in the backlog; admission consulted the shared owner directly).
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            rx.try_recv().is_err(),
+            "a Cordoned posture HOLDS Deferrable registration intake"
+        );
+        // Lift: feed the full clean hysteresis (10 s of virtual clean
+        // ticks since the dirty sample at now = 0).
+        let mut now = 1_000;
+        loop {
+            owner.observe_throttle(
+                now,
+                ThrottleSample {
+                    events: 0,
+                    throttled_usec: 0,
+                    elapsed_usec: 1_000,
+                },
+            );
+            if owner.current() == FleetPosture::Nominal {
+                break;
+            }
+            now += 1_000;
+            assert!(now <= 60_000, "the cordon never lifted");
+        }
+        // A fresh submission wakes the host loop: the backlog head (the
+        // held unit) drains FIRST, then the new unit — both complete.
+        executor.spawn(move || {
+            let _ = tx.send(2);
+        });
+        let mut got = await_receipts(&rx, 2, Instant::now() + Duration::from_secs(10));
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2], "the held unit completed (never dropped)");
     }
 }

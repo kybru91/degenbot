@@ -11,7 +11,6 @@
 
 use degenbot_workers::dispatcher::SubmitError;
 use degenbot_workers::lane::LaneCtx;
-use degenbot_workers::posture::ThrottleSample;
 
 pub(crate) use degenbot_workers::dispatcher::SubmitReceipt;
 
@@ -19,9 +18,11 @@ pub(crate) use degenbot_workers::dispatcher::SubmitReceipt;
 pub(crate) type SubmitWork = Box<dyn FnOnce(&LaneCtx) + Send + 'static>;
 
 /// The ONE executor seam (LW-T8): `boot/bin_count/submit` + the
-/// `LaneCtx`/`EscalationPort` contracts. Non-posture executors ABSORB
-/// throttle samples by contract (the default no-op body below); the
-/// posture-refusal surface lives on `submit` of posture-capable executors.
+/// `LaneCtx`/`EscalationPort` contracts. (JCI2FW Part A: the retired
+/// `observe_throttle` absorb-by-contract default is dissolved — the ONE
+/// process posture owner (`degenbot_workers::posture::process`) is fed
+/// by the block pump directly, and every fleet host consults the same
+/// owner; the seam carries no posture channel anymore.)
 pub(crate) trait Executor: Send + Sync {
     /// The structural seat count bins bind at (P6YXA6).
     fn bin_count(&self) -> usize;
@@ -33,12 +34,6 @@ pub(crate) trait Executor: Send + Sync {
     /// (units ride one of the solved-arm lanes; receipts are tracked per
     /// lane).
     fn submit(&self, bin: usize, work: SubmitWork) -> Result<SubmitReceipt, SubmitError>;
-
-    /// Posture observation (the production poller feed). Absorbed by
-    /// non-posture executors.
-    fn observe_throttle(&self, now_ms: u64, sample: ThrottleSample) {
-        let _ = (now_ms, sample);
-    }
 }
 
 /// The solve-arm global token (LW-T8): every SOLVE call site submits

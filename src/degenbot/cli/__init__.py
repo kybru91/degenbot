@@ -48,6 +48,7 @@ from . import (  # ruff:ignore[unused-import, module-import-not-at-top-of-file]
     aave,
     database,
     exchange,
+    fleet,
     path,
     pool,
 )

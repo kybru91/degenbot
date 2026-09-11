@@ -65,17 +65,22 @@ mod tests {
 
     use degenbot_workers::budget::BudgetOverrides;
     use degenbot_workers::dispatcher::FleetBoot;
-    use degenbot_workers::posture::PosturePolicy;
+    use degenbot_workers::posture::{PostureOwner, PosturePolicy};
 
     use super::{FleetIntake, InnerWork};
 
     // Copied from fleet_registration_executor.rs — the module's existing
     // fixture kit, module-local (no new helpers; the design's fixture note).
+    // JCI2FW Part A: a fresh hermetic posture owner per boot — never the
+    // process global (7KAPBB isolation).
     fn hermetic_boot() -> FleetBoot {
         FleetBoot {
             quota_cpus: 8.0,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),
+            owner: Some(std::boxed::Box::leak(std::boxed::Box::new(
+                PostureOwner::new(PosturePolicy::doc_defaults()),
+            ))),
         }
     }
 

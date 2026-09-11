@@ -24,7 +24,7 @@ use std::sync::Arc;
 use super::*;
 use crate::budget::{BudgetError, BudgetOverrides};
 use crate::gauges::RoleGaugeSample;
-use crate::posture::PosturePolicy;
+use crate::posture::{PostureOwner, PosturePolicy};
 use crate::role::{WorkerRole, ALL_ROLES};
 use crate::slot::{SlotState, Transition, TransitionContext, MERGE_PIN_KEY};
 
@@ -39,18 +39,29 @@ fn role_index(role: WorkerRole) -> u8 {
         .expect("scripted role must be in ALL_ROLES")
 }
 
+fn policy() -> PosturePolicy {
+    PosturePolicy {
+        enter_events: 2,
+        enter_window_ms: 1_000,
+        duty_percent: 2.0,
+        duty_window_ms: 5_000,
+        exit_clean_ms: 10_000,
+        sim_intake_floor_override: None,
+    }
+}
+
+/// A FRESH hermetic posture owner (leaked to `'static`): every scripted
+/// host gets its own owner, never the process global (7KAPBB isolation).
+fn hermetic_owner() -> &'static PostureOwner {
+    std::boxed::Box::leak(std::boxed::Box::new(PostureOwner::new(policy())))
+}
+
 fn boot() -> FleetBoot {
     FleetBoot {
         quota_cpus: 8.0,
         overrides: BudgetOverrides::default(),
-        posture: PosturePolicy {
-            enter_events: 2,
-            enter_window_ms: 1_000,
-            duty_percent: 2.0,
-            duty_window_ms: 5_000,
-            exit_clean_ms: 10_000,
-            sim_intake_floor_override: None,
-        },
+        posture: policy(),
+        owner: Some(hermetic_owner()),
     }
 }
 

@@ -58,7 +58,6 @@ use std::time::Duration;
 // LW-T5 (Seam E): the pump feeds the cgroup throttle sample straight
 // through the Executor seam (block_pump no longer reaches into the
 // engine's internal solve-executor module).
-use crate::arb_engine::executor::global_executor;
 use crate::bot_core::stage_machine::QuiesceParams;
 use crate::bot_core::stance;
 use crate::bot_core::{CompletenessDecision, StageDecision, StageMachine};
@@ -100,12 +99,13 @@ fn us_to_secs(us: u64) -> f64 {
 /// header cadence, so the delta accounting lives here with the sampler.
 static LAST_HEADER_SAMPLE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Feed ONE per-header cgroup throttle sample through the Executor seam.
-/// The pump owns the header sample cadence: `elapsed_usec` is the time
-/// since the previous sample (0 for the first sample, the `last_ms == 0`
-/// sentinel). LW-T9: always fed — the fleet executor is the sole
-/// executor, so a header sample may boot it (the stance gate is deleted
-/// with the stance).
+/// Feed ONE per-header cgroup throttle sample to the ONE process-level
+/// fleet posture owner (JCI2FW Part A — the Executor seam's
+/// `observe_throttle` channel is dissolved; the pump feeds
+/// `degenbot_workers::posture::process()` directly and every fleet host
+/// consults that same owner). The pump owns the header sample cadence:
+/// `elapsed_usec` is the time since the previous sample (0 for the first
+/// sample, the `last_ms == 0` sentinel). Always fed.
 fn feed_executor_throttle_sample(now_ms: u64, events: u64, throttled_usec: u64) {
     let last_ms = LAST_HEADER_SAMPLE_MS.swap(now_ms, Ordering::Relaxed);
     let elapsed_usec = if last_ms == 0 {
@@ -113,7 +113,7 @@ fn feed_executor_throttle_sample(now_ms: u64, events: u64, throttled_usec: u64) 
     } else {
         now_ms.saturating_sub(last_ms).saturating_mul(1_000)
     };
-    global_executor().observe_throttle(
+    degenbot_workers::posture::process().observe_throttle(
         now_ms,
         ThrottleSample {
             events,
@@ -1147,16 +1147,14 @@ impl BlockPump {
                                     stats.nr_throttled,
                                     stats.throttled_usec,
                                 );
-                                // LW-T5 (Seam E): the SAME per-block sample
-                                // feeds the fleet submit posture — through
-                                // the Executor seam now
-                                // (`crate::arb_engine::executor::
-                                // global_executor().observe_throttle`); the
-                                // pump owns the header-cadence delta
-                                // (LAST_HEADER_SAMPLE_MS moved with the
-                                // sampler). LW-T9: always fed (a header
-                                // sample may boot the fleet; the stance gate
-                                // is deleted).
+                                // LW-T5 (Seam E), re-routed by JCI2FW
+                                // Part A: the SAME per-block sample feeds
+                                // the ONE process fleet posture owner
+                                // (`degenbot_workers::posture::process()`
+                                // — the Executor seam channel is
+                                // dissolved). The pump owns the
+                                // header-cadence delta
+                                // (LAST_HEADER_SAMPLE_MS). Always fed.
                                 feed_executor_throttle_sample(
                                     wall_ms(),
                                     stats.nr_throttled,

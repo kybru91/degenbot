@@ -19,7 +19,10 @@
 //!   never-drop flood with unbounded backlog; a `Cordoned` posture HOLDS
 //!   new intake — held units wait in the backlog, never dropped
 //!   (`fleet_intake.rs`; test
-//!   `fleet_intake_facade_preserves_the_never_drop_flood`).
+//!   `fleet_intake_facade_preserves_the_never_drop_flood`, and JCI2FW
+//!   Part A's reached-Cordoned test
+//!   `a_cordoned_posture_holds_registration_intake_until_the_cordon_
+//!   lifts`).
 //! - sim (`SimDriver`, `SimPool` cordon class): seat-pool pacing — the seat
 //!   pool IS the grant lane, capping concurrent executing sims at the
 //!   budget's sim slot cap; a `Cordoned` posture still ADMITS sim leases
@@ -36,16 +39,21 @@
 //! pair (sim + registration) ONLY — the solve executor does NOT join.
 //! Solve is excluded on structure, not convenience: its seat model is
 //! per-seat mpsc mailboxes keyed by the Solver pin (T3/T6 warm arenas,
-//! `seat_loop(seat, rx, done)`), its host channel carries a
-//! `HostMsg::Throttle` posture-feed arm, and its admission lives at the
-//! typed submit seam (`Result<SubmitReceipt, SubmitError>`) — a different
-//! seam from this host's fire-and-forget `FleetIntake` port. Folding it in
-//! would demand a sum-type seat model, a sum-type host message, and a
-//! sum-type admission policy to unify two shapes that share no code path
-//! (the card's "do not force-misfit the third"). Correspondingly the
-//! admission policy here is the honest TWO-arm [`CordonAdmission`] — a
-//! descriptor field spanning all three roles would be a sum type in data
-//! clothing (one arm dead in every host). Solve follows the same never-drop
+//! `seat_loop(seat, rx, done)`) and its admission lives at the typed
+//! submit seam (`Result<SubmitReceipt, SubmitError>`) — a different seam
+//! from this host's fire-and-forget `FleetIntake` port. Folding it in
+//! would demand a sum-type seat model and a sum-type host message to
+//! unify two shapes that share no code path (the card's "do not
+//! force-misfit the third"). JCI2FW Part A dissolved the TWO-arm
+//! `CordonAdmission` descriptor field entirely: admission consults the
+//! ONE shared posture owner directly and derives the policy from the
+//! role's own cordon class — `FleetHost::posture_admits_role` is the
+//! SAME `admits_lease` predicate the dispatcher's gates consult, so
+//! Deferrable (registration) intake holds while cordoned and `SimPool`
+//! (sim) leases are floored-never-held, with no per-role enum arm and no
+//! hand mirror to drift. (Solve's retired `HostMsg::Throttle` arm went
+//! with it — the process posture owner is fed by the block pump; every
+//! host consults the same owner.) Solve follows the same never-drop
 //! PRINCIPLE (unbounded backlog, §10) with its own mechanism (the queue-len
 //! mirror + typed submit receipt), owned by `fleet_solve_executor.rs`.
 //!
@@ -73,33 +81,21 @@ use std::sync::{mpsc, Arc, OnceLock};
 
 use crate::arb_engine::boot_stamp::{BootRole, BootStamp};
 use degenbot_workers::budget::FleetBudget;
-use degenbot_workers::dispatcher::{BootError, FleetBoot, FleetHost, GrantKind, Unit};
+use degenbot_workers::dispatcher::{
+    BootError, EnqueueError, FleetBoot, FleetHost, GrantKind, Unit,
+};
 use degenbot_workers::lane::LaneCtx;
-use degenbot_workers::posture::FleetPosture;
 use degenbot_workers::role::WorkerRole;
 
 use crate::arb_engine::fleet_intake::InnerWork;
 
-/// The cordon effect at admission — the design-gate policy arm (RZEWTX).
-/// TWO arms, both live: this host serves the `WorkQueue` pair only (sim +
-/// registration; solve's posture-invariant typed-submit admission is out —
-/// see the module doc).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CordonAdmission {
-    /// `SimPool` class (sim): a `Cordoned` posture still admits — sim leases
-    /// are floored, not held; the floor is the host FSM's sim-intake lane,
-    /// dispatcher-side (the `PostureHeld` enqueue error cannot fire here).
-    Admit,
-    /// Deferrable class (registration): a `Cordoned` posture holds new
-    /// intake — the unit waits in the unbounded backlog and re-queues when
-    /// the fleet exits the cordon (in-flight units are never cancelled).
-    Hold,
-}
-
 /// The role descriptor: everything that differs between the two pooled
 /// `WorkQueue` executors, and nothing else. The executors are THIN over
 /// this — the machinery (queue, seat loop, host loop, admission, boot
-/// boilerplate) lives once, here.
+/// boilerplate) lives once, here. (JCI2FW Part A: the old `cordon`
+/// descriptor arm — `CordonAdmission::Admit`/`Hold` — is dissolved; the
+/// role's own cordon class + the ONE shared posture owner ARE the
+/// admission policy, read through `FleetHost::posture_admits_role`.)
 pub(crate) struct SeatRoleDesc {
     /// The pooled [`WorkerRole`] — drives the seat thread names
     /// (`thread_name()`), the per-role queue len/cap keys, and the
@@ -109,8 +105,6 @@ pub(crate) struct SeatRoleDesc {
     /// grant-shape invariant check in [`pump`] (anything else is a broken
     /// host contract, not a drop).
     pub grant: GrantKind,
-    /// The admission policy under a Cordoned posture (the design-gate arm).
-    pub cordon: CordonAdmission,
     /// The [`BootRole`] ledger row this executor's boot rides
     /// (`boot_stamp::record_ride`).
     pub boot_role: BootRole,
@@ -379,27 +373,38 @@ fn apply_host_msg(
             // Units that do not fit spill to the backlog (unbounded, like
             // the legacy pipelines) and drain FIRST on the next pump —
             // never dropped (§10 ledger).
-            if host.queue_len(desc.role) >= host.queue_cap(desc.role) {
-                backlog.push_back(unit);
-            } else if desc.cordon == CordonAdmission::Hold
-                && host.posture() == FleetPosture::Cordoned
+            //
+            // Admission consults the ONE shared posture owner directly
+            // (JCI2FW Part A): `posture_admits_role` is the same
+            // `admits_lease` predicate the dispatcher's enqueue gate
+            // consults, keyed by the role's own cordon class — a Cordoned
+            // posture HOLDS Deferrable (registration) intake in the
+            // backlog (re-queued when the fleet exits the cordon; the
+            // legacy crawl threads were never cancelled either) and still
+            // ADMITS SimPool (sim) leases (floored, not held — the floor
+            // is the dispatcher's sim-intake lane). No hand mirror to
+            // drift from the machine.
+            if host.queue_len(desc.role) >= host.queue_cap(desc.role)
+                || !host.posture_admits_role(desc.role)
             {
-                // The `Hold` admission arm (Deferrable class —
-                // registration): a cordon HOLDS intake — the unit waits in
-                // the backlog and re-queues when the fleet exits the
-                // cordon (the legacy crawl threads were never cancelled
-                // either; this is the deferrable stance, §6). The
-                // `Admit` arm (SimPool class — sim) skips this check: a
-                // cordon still ADMITS its leases (floored, not held). The
-                // posture machine is host-owned (single host thread), so
-                // the check cannot race a cordon onset.
                 backlog.push_back(unit);
-            } else if let Err(err) = host.enqueue(unit) {
-                // v1-active, non-merge pooled units cannot hit
-                // RoleNotActive / MergeNeverQueued; with the `Admit` arm
-                // PostureHeld cannot fire either. Any such error is a
-                // broken invariant, not a drop.
-                abort_executor(desc, &format!("{} enqueue", desc.noun), &err.to_string());
+            } else if let Err((err, unit)) = host.try_enqueue(unit) {
+                if matches!(err, EnqueueError::PostureHeld(_)) {
+                    // The shared owner is fed from the throttle-poller
+                    // thread (the block pump), NOT this host thread — a
+                    // cordon can onset between the check and the enqueue.
+                    // Hold, never drop, never abort (§10): the gate handed
+                    // the unit BACK (`try_enqueue`), so it waits in the
+                    // backlog and re-queues on the next pump.
+                    backlog.push_back(unit);
+                } else {
+                    // v1-active, non-merge pooled units cannot hit
+                    // RoleNotActive / MergeNeverQueued, and QueueFull
+                    // cannot fire behind the exact same-thread capacity
+                    // check. Any such error is a broken invariant, not a
+                    // drop.
+                    abort_executor(desc, &format!("{} enqueue", desc.noun), &err.to_string());
+                }
             }
         }
         HostMsg::SeatDone { seat } => {
@@ -421,29 +426,37 @@ fn pump(
     queue: &Arc<WorkQueue>,
 ) {
     // Backlog drains FIRST (FIFO across the loud-overflow seam). A backed
-    // backlog that cannot enqueue (the `Hold` arm's cordon hold, or a
-    // full per-role queue) parks here until the next host message — the
-    // awaiting callers already submitted, and retrying on every wake
+    // backlog that cannot enqueue (the cordon hold of Deferrable intake,
+    // or a full per-role queue) parks here until the next host message —
+    // the awaiting callers already submitted, and retrying on every wake
     // matches the legacy worker semantics (work waits, never drops).
     while backlog.front().is_some() {
         // Every unit in this host's backlog carries the descriptor's role
         // by construction (try_send stamps it), so the role check is the
-        // descriptor's role.
-        if host.queue_len(desc.role) >= host.queue_cap(desc.role) {
-            break;
-        }
-        // The `Hold` arm: still cordoned — the backlog head stays;
-        // retrying on the next host message (submissions keep arriving;
-        // no busy-spin — pump only runs on a message). The posture
-        // machine is host-owned (single host thread), so the check cannot
-        // race a cordon onset.
-        if desc.cordon == CordonAdmission::Hold && host.posture() == FleetPosture::Cordoned {
+        // descriptor's role. The cordon hold reads the ONE shared posture
+        // owner (JCI2FW Part A — the dissolved `CordonAdmission` arm):
+        // still cordoned for this Deferrable role — the backlog head
+        // stays; retrying on the next host message (submissions keep
+        // arriving; no busy-spin — pump only runs on a message).
+        if host.queue_len(desc.role) >= host.queue_cap(desc.role)
+            || !host.posture_admits_role(desc.role)
+        {
             break;
         }
         let Some(unit) = backlog.pop_front() else {
             break;
         };
-        if let Err(err) = host.enqueue(unit) {
+        if let Err((err, unit)) = host.try_enqueue(unit) {
+            if matches!(err, EnqueueError::PostureHeld(_)) {
+                // The shared owner is fed from the throttle-poller thread
+                // — a cordon can onset between the check and the enqueue.
+                // The gate handed the unit BACK (`try_enqueue`): the head
+                // goes back (FIFO order preserved) and the drain parks
+                // until the next host message — hold, never drop, never
+                // abort (§10).
+                backlog.push_front(unit);
+                break;
+            }
             abort_executor(desc, "backlog drain", &err.to_string());
         }
     }

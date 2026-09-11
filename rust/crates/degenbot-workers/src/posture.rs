@@ -12,8 +12,11 @@
 //! feed `Instant::now()` deltas from their throttle poller.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use degenbot_config::FleetConfig;
+use parking_lot::{Mutex, RwLock};
 
 use crate::role::CordonClass;
 
@@ -113,6 +116,142 @@ impl PosturePolicy {
             .min(slot_cap)
             .max(1)
     }
+
+    /// Apply a validated [`PosturePolicyPatch`] to `self`, producing the
+    /// effective policy (the JCI2FW Part B re-tune channel's only write
+    /// path: current policy + supplied fields). Pure — the caller feeds the
+    /// result to [`PostureOwner::retune`]. Call [`PosturePolicyPatch::validate`]
+    /// FIRST; this projection never checks semantics.
+    #[must_use]
+    pub fn patched_with(self, patch: PosturePolicyPatch) -> Self {
+        Self {
+            enter_events: patch.enter_events.unwrap_or(self.enter_events),
+            enter_window_ms: patch.enter_window_ms.unwrap_or(self.enter_window_ms),
+            duty_percent: patch.duty_percent.unwrap_or(self.duty_percent),
+            duty_window_ms: patch.duty_window_ms.unwrap_or(self.duty_window_ms),
+            exit_clean_ms: patch.exit_clean_ms.unwrap_or(self.exit_clean_ms),
+            sim_intake_floor_override: match patch.sim_intake_floor_override {
+                // Key absent: keep the current override.
+                None => self.sim_intake_floor_override,
+                // Key present: set it — `Some(v)` = explicit floor,
+                // `None` = cleared (back to half the slot cap).
+                Some(floor) => floor,
+            },
+        }
+    }
+}
+
+/// A partial re-tune request over the six typed thresholds (JCI2FW Part B,
+/// the operator channel's wire shape): every field is `None` = "key not
+/// supplied — keep the current value". `sim_intake_floor_override` is
+/// doubly-`Option`: the OUTER `None` is key-absent, and the inner
+/// `Some(None)` is the operator supplying the key's `None` value (clear the
+/// override, back to half the slot cap — the typed key itself is
+/// `opt usize`).
+///
+/// The semantic rules (windows > 0, duty percent in range, floors >= 1,
+/// non-empty patch) are encoded ONCE, in [`Self::validate`] — callers
+/// REJECT, never clamp silently.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PosturePolicyPatch {
+    /// `cordon_enter_events`: the burst trigger count.
+    pub enter_events: Option<usize>,
+    /// `cordon_enter_window_ms`: the burst window.
+    pub enter_window_ms: Option<u64>,
+    /// `cordon_duty_percent`: the duty trigger percent.
+    pub duty_percent: Option<f64>,
+    /// `cordon_duty_window_ms`: the duty window.
+    pub duty_window_ms: Option<u64>,
+    /// `cordon_exit_clean_ms`: the exit hysteresis.
+    pub exit_clean_ms: Option<u64>,
+    /// `cordon_sim_intake_floor`: outer `None` = key absent; inner
+    /// `Some(None)` = clear the override; `Some(Some(n))` = explicit floor.
+    pub sim_intake_floor_override: Option<Option<usize>>,
+}
+
+impl PosturePolicyPatch {
+    /// Whether NO key was supplied (an empty patch — rejected by
+    /// [`Self::validate`]; a re-tune that changes nothing must never look
+    /// like a successful one).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.enter_events.is_none()
+            && self.enter_window_ms.is_none()
+            && self.duty_percent.is_none()
+            && self.duty_window_ms.is_none()
+            && self.exit_clean_ms.is_none()
+            && self.sim_intake_floor_override.is_none()
+    }
+
+    /// The ONE encoding of the re-tune's semantic rules. Every violation is
+    /// a typed [`PostureRetuneError`] naming the offending key and value —
+    /// the channel rejects, it never clamps.
+    ///
+    /// # Errors
+    ///
+    /// [`PostureRetuneError::EmptyPatch`] when no key was supplied, or the
+    /// per-key range error for the first offending value.
+    pub fn validate(&self) -> Result<(), PostureRetuneError> {
+        if self.is_empty() {
+            return Err(PostureRetuneError::EmptyPatch);
+        }
+        if self.enter_events.is_some_and(|v| v < 1) {
+            return Err(PostureRetuneError::EnterEvents(
+                self.enter_events.unwrap_or_default(),
+            ));
+        }
+        if self.enter_window_ms.is_some_and(|v| v == 0) {
+            return Err(PostureRetuneError::EnterWindow(0));
+        }
+        if let Some(duty) = self.duty_percent {
+            // The sane inclusive range: a measured duty percent is a
+            // (0.0, 100.0] quantity — 0 would cordon on ANY throttled
+            // microsecond and >100 or non-finite cannot be a duty.
+            if !(duty > 0.0 && duty <= 100.0) {
+                return Err(PostureRetuneError::DutyPercent(duty));
+            }
+        }
+        if self.duty_window_ms.is_some_and(|v| v == 0) {
+            return Err(PostureRetuneError::DutyWindow(0));
+        }
+        if self.exit_clean_ms.is_some_and(|v| v == 0) {
+            return Err(PostureRetuneError::ExitClean(0));
+        }
+        if let Some(Some(floor)) = self.sim_intake_floor_override {
+            if floor < 1 {
+                return Err(PostureRetuneError::SimIntakeFloor(floor));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why the re-tune channel refused a [`PosturePolicyPatch`] (JCI2FW Part
+/// B). The rules live once, in [`PosturePolicyPatch::validate`]; the wire
+/// layer maps these to its typed channel error verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum PostureRetuneError {
+    /// No threshold key was supplied — an empty patch is refused.
+    #[error("at least one cordon threshold key is required (empty patch)")]
+    EmptyPatch,
+    /// `cordon_enter_events` below the floor of 1.
+    #[error("cordon_enter_events must be >= 1, got {0}")]
+    EnterEvents(usize),
+    /// `cordon_enter_window_ms` must be a positive window.
+    #[error("cordon_enter_window_ms must be > 0 ms, got {0} ms")]
+    EnterWindow(u64),
+    /// `cordon_duty_percent` outside the sane (0.0, 100.0] range.
+    #[error("cordon_duty_percent must be in (0.0, 100.0], got {0}")]
+    DutyPercent(f64),
+    /// `cordon_duty_window_ms` must be a positive window.
+    #[error("cordon_duty_window_ms must be > 0 ms, got {0} ms")]
+    DutyWindow(u64),
+    /// `cordon_exit_clean_ms` must be a positive window.
+    #[error("cordon_exit_clean_ms must be > 0 ms, got {0} ms")]
+    ExitClean(u64),
+    /// `cordon_sim_intake_floor` below the floor of 1.
+    #[error("cordon_sim_intake_floor must be >= 1, got {0}")]
+    SimIntakeFloor(usize),
 }
 
 /// One throttle-poll delta: `cgroup_throttle_delta()`'s counters plus the
@@ -194,6 +333,15 @@ impl PostureStateMachine {
     #[must_use]
     pub const fn policy(&self) -> &PosturePolicy {
         &self.policy
+    }
+
+    /// Swap the policy (the operator channel's re-tune). Pure: the state
+    /// and the trailing sample window are KEPT — a retune never fabricates
+    /// samples, so the next [`Self::observe`] re-derives the posture under
+    /// the new thresholds. Semantic validation of the new policy is the
+    /// re-tune caller's job (the JCI2FW Part B channel).
+    pub fn set_policy(&mut self, policy: PosturePolicy) {
+        self.policy = policy;
     }
 
     /// Feed one throttle-poll delta at `now_ms`. Returns whether the
@@ -318,6 +466,220 @@ impl PostureStateMachine {
         );
         PostureChange::Exited
     }
+}
+
+// ---- the ONE process-level fleet posture owner (JCI2FW Part A) ------------
+
+/// Watch-style subscription to the fleet posture feed — the workers-crate
+/// equivalent of a `tokio::sync::watch` receiver (the crate carries no
+/// tokio; this is the `parking_lot` pattern its other feeds use). One
+/// producer (the [`PostureOwner`]), many independent consumers: every
+/// `FleetHost` subscribes at boot for the T7 shed trigger, tests subscribe
+/// to observe transitions, and the Part B operator channel will drive the
+/// owner directly. A consumer sees the latest posture and REAL transitions
+/// only — a `Held` tick or a no-effect retune never raises an edge.
+#[derive(Debug)]
+pub struct PostureWatch {
+    shared: Arc<FeedShared>,
+    seen: AtomicU64,
+}
+
+impl PostureWatch {
+    /// The latest posture (reads through — never consumes the edge).
+    #[must_use]
+    pub fn current(&self) -> FleetPosture {
+        self.shared.state.read().posture
+    }
+
+    /// Did a transition occur since the last drain? (Does not consume.)
+    #[must_use]
+    pub fn has_changed(&self) -> bool {
+        self.shared.state.read().seq != self.seen.load(Ordering::Relaxed)
+    }
+
+    /// Drain: the posture if a transition occurred since the last drain,
+    /// else `None` (consuming the edge — exactly-once per transition).
+    #[must_use]
+    pub fn take_if_changed(&self) -> Option<FleetPosture> {
+        let state = self.shared.state.read();
+        if state.seq == self.seen.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.seen.store(state.seq, Ordering::Relaxed);
+        Some(state.posture)
+    }
+}
+
+/// The broadcast cell behind the feed: the posture plus a monotonic
+/// transition sequence (the edge counter the watches diff against).
+#[derive(Debug)]
+struct FeedShared {
+    state: RwLock<FeedState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FeedState {
+    posture: FleetPosture,
+    seq: u64,
+}
+
+/// The ONE owner of a fleet posture state machine — a shared, thread-safe
+/// shell around the pure [`PostureStateMachine`]. Every consumer (every
+/// `FleetHost`, the block pump's throttle feed, tests) consults THE SAME
+/// instance, so there is exactly one posture per process (per hermetic
+/// test scope) and no host-local mirrors to drift apart.
+///
+/// Sync: the machine sits behind a `parking_lot::Mutex` — every consult is
+/// a short read-through critical section, never held across an await
+/// (the crate has none); the transition feed is the [`PostureWatch`]
+/// broadcast above.
+#[derive(Debug)]
+pub struct PostureOwner {
+    machine: Mutex<PostureStateMachine>,
+    broadcast: Arc<FeedShared>,
+}
+
+impl PostureOwner {
+    /// A fresh owner in [`FleetPosture::Nominal`]. Hermetic tests build
+    /// their own owner and inject it via `FleetBoot::owner` — NEVER the
+    /// process global ([`process`]/[`install_process_owner`]); posture
+    /// leaking across tests is a failure class (7KAPBB).
+    #[must_use]
+    pub fn new(policy: PosturePolicy) -> Self {
+        Self {
+            machine: Mutex::new(PostureStateMachine::new(policy)),
+            broadcast: Arc::new(FeedShared {
+                state: RwLock::new(FeedState {
+                    posture: FleetPosture::Nominal,
+                    seq: 0,
+                }),
+            }),
+        }
+    }
+
+    /// Feed one throttle-poll delta. Publishes to the feed ONLY on a real
+    /// transition (`Held` ticks are silent — a subscriber never sees a
+    /// spurious edge).
+    pub fn observe_throttle(&self, now_ms: u64, sample: ThrottleSample) -> PostureChange {
+        let (change, posture) = {
+            let mut machine = self.machine.lock();
+            let change = machine.observe(now_ms, sample);
+            (change, machine.state())
+        };
+        if !matches!(change, PostureChange::Held) {
+            self.publish(posture);
+        }
+        change
+    }
+
+    /// The current posture.
+    #[must_use]
+    pub fn current(&self) -> FleetPosture {
+        self.machine.lock().state()
+    }
+
+    /// The active policy (read-through; the Part B operator channel reads
+    /// and re-tunes through here).
+    #[must_use]
+    pub fn policy(&self) -> PosturePolicy {
+        *self.machine.lock().policy()
+    }
+
+    /// Subscribe a watch: the receiver starts at the CURRENT posture with
+    /// no pending edge (it observes only transitions from here on).
+    #[must_use]
+    pub fn subscribe(&self) -> PostureWatch {
+        let seen = self.broadcast.state.read().seq;
+        PostureWatch {
+            shared: Arc::clone(&self.broadcast),
+            seen: AtomicU64::new(seen),
+        }
+    }
+
+    /// Swap the policy (the Part B operator channel's entry point). The
+    /// swap is atomic under the machine lock and keeps the state + the
+    /// trailing sample window; the feed re-publishes the current posture
+    /// so it mirrors the machine post-swap (a no-op unless the posture
+    /// itself changed — the feed carries only real transitions, and the
+    /// next `observe_throttle` re-derives the posture under the new
+    /// thresholds). Semantic validation of the new policy is the caller's
+    /// job.
+    pub fn retune(&self, new_policy: PosturePolicy) {
+        let posture = {
+            let mut machine = self.machine.lock();
+            machine.set_policy(new_policy);
+            machine.state()
+        };
+        self.publish(posture);
+    }
+
+    /// Whether the posture admits new lease intake for `class` right now
+    /// (read-through — the dispatcher's enqueue/T-table gates and the seat
+    /// hosts' admission all consult this).
+    #[must_use]
+    pub fn admits_lease(&self, class: CordonClass) -> bool {
+        self.machine.lock().admits_lease(class)
+    }
+
+    /// Count a lease grant denied because of the posture (read-through —
+    /// the tuning loop's suppression metric).
+    pub fn note_intake_suppressed(&self) {
+        self.machine.lock().note_intake_suppressed();
+    }
+
+    /// The sim intake cap in the current posture (read-through).
+    #[must_use]
+    pub fn sim_intake_cap(&self, slot_cap: usize) -> usize {
+        self.machine.lock().sim_intake_cap(slot_cap)
+    }
+
+    /// Loud-transition counters snapshot (the tuning loop's metrics).
+    #[must_use]
+    pub fn counters(&self) -> PostureCounters {
+        *self.machine.lock().counters()
+    }
+
+    /// Mirror the machine's state into the feed — compare-then-publish, so
+    /// the sequence (and every subscriber's edge) moves ONLY on a real
+    /// posture change.
+    fn publish(&self, posture: FleetPosture) {
+        let mut state = self.broadcast.state.write();
+        if state.posture != posture {
+            state.posture = posture;
+            state.seq = state.seq.wrapping_add(1);
+        }
+    }
+}
+
+/// The process-level posture owner (the KAHU5W holder pattern): ONE
+/// instance per process, installed by the FIRST fleet boot (first-wins —
+/// later installs log at debug and return the existing owner).
+static PROCESS_OWNER: OnceLock<PostureOwner> = OnceLock::new();
+
+/// Install the process-level owner with `policy` (first-wins: the first
+/// fleet boot wins; later calls log at debug and return the existing
+/// owner). Production installs happen at `FleetHost::boot` — BEFORE the
+/// first throttle feed reaches [`process`]. Hermetic tests never call
+/// this: they inject fresh owners via `FleetBoot::owner`.
+#[must_use]
+pub fn install_process_owner(policy: PosturePolicy) -> &'static PostureOwner {
+    if PROCESS_OWNER.set(PostureOwner::new(policy)).is_err() {
+        tracing::debug!(
+            target: "degenbot::fleet",
+            "[fleet-posture] process owner already installed — first-wins, keeping the existing owner"
+        );
+    }
+    process()
+}
+
+/// The process-level owner, or a doc-default owner when nothing was
+/// installed yet (the holder's default stance: tests and standalone
+/// constructions observe schema defaults). `FleetBoot` without an injected
+/// owner installs its policy here first-wins at boot time, which is why a
+/// production feed never lands on the doc-default stance.
+#[must_use]
+pub fn process() -> &'static PostureOwner {
+    PROCESS_OWNER.get_or_init(|| PostureOwner::new(PosturePolicy::doc_defaults()))
 }
 
 #[cfg(test)]
@@ -524,5 +886,302 @@ mod tests {
         assert_eq!(p.duty_window_ms, 5_000);
         assert_eq!(p.exit_clean_ms, 10_000);
         assert_eq!(p.sim_intake_floor_override, None);
+    }
+
+    // ---- PostureOwner (JCI2FW Part A) -------------------------------------
+
+    #[test]
+    fn owner_transitions_publish_only_on_change() {
+        let owner = PostureOwner::new(policy());
+        let watch = owner.subscribe();
+        // A clean sample: no transition, no publication.
+        owner.observe_throttle(0, sample(0, 0, 1_000));
+        assert!(!watch.has_changed());
+        assert_eq!(watch.current(), FleetPosture::Nominal);
+        // One lone event below the threshold: still no edge.
+        owner.observe_throttle(100, sample(1, 0, 1_000));
+        assert!(!watch.has_changed());
+        // The bursting event crosses: exactly one edge, and the drain
+        // consumes it (exactly-once per transition).
+        owner.observe_throttle(600, sample(1, 0, 500_000));
+        assert!(watch.has_changed());
+        assert_eq!(watch.take_if_changed(), Some(FleetPosture::Cordoned));
+        assert_eq!(watch.take_if_changed(), None, "one edge per transition");
+        // Already cordoned: dirty ticks are Held — never re-published.
+        owner.observe_throttle(700, sample(1, 0, 100_000));
+        assert!(!watch.has_changed());
+        assert_eq!(watch.current(), FleetPosture::Cordoned);
+    }
+
+    #[test]
+    fn owner_current_reflects_the_machine_including_exit_hysteresis() {
+        let owner = PostureOwner::new(policy());
+        assert_eq!(owner.current(), FleetPosture::Nominal);
+        owner.observe_throttle(0, sample(3, 0, 1_000));
+        assert_eq!(owner.current(), FleetPosture::Cordoned);
+        assert_eq!(owner.counters().entered, 1);
+        // The full clean hysteresis lifts the cordon (10 s of clean ticks).
+        let mut now = 1_000;
+        loop {
+            owner.observe_throttle(now, sample(0, 0, 1_000));
+            if owner.current() == FleetPosture::Nominal {
+                break;
+            }
+            now += 1_000;
+            assert!(now <= 60_000, "the cordon never lifted");
+        }
+        assert_eq!(owner.counters().exited, 1);
+    }
+
+    #[test]
+    fn first_wins_process_install_keeps_the_existing_owner() {
+        let first = install_process_owner(policy());
+        let second = install_process_owner(PosturePolicy {
+            enter_events: 99,
+            ..policy()
+        });
+        assert!(
+            std::ptr::eq(first, second),
+            "first-wins: a later install returns the existing owner"
+        );
+        assert!(std::ptr::eq(first, process()));
+        assert_eq!(
+            second.policy().enter_events,
+            first.policy().enter_events,
+            "the losing install's policy never landed"
+        );
+    }
+
+    #[test]
+    fn retune_swaps_thresholds_and_the_next_observe_rederives() {
+        let owner = PostureOwner::new(policy());
+        let watch = owner.subscribe();
+        // One lone event: sub-threshold under the boot policy.
+        owner.observe_throttle(0, sample(1, 0, 1_000_000));
+        assert_eq!(owner.current(), FleetPosture::Nominal);
+        // Retune to a 1-event trigger: no posture change, no edge — but
+        // the next lone (clean) sample cordons under the new thresholds.
+        owner.retune(PosturePolicy {
+            enter_events: 1,
+            ..policy()
+        });
+        assert_eq!(owner.policy().enter_events, 1, "the retune swapped");
+        assert!(!watch.has_changed(), "a no-effect retune is not an edge");
+        owner.observe_throttle(2_000, sample(1, 0, 100_000));
+        assert_eq!(owner.current(), FleetPosture::Cordoned);
+        assert_eq!(watch.take_if_changed(), Some(FleetPosture::Cordoned));
+    }
+
+    #[test]
+    fn two_owners_are_fully_independent_hermetic_isolation() {
+        let a = PostureOwner::new(policy());
+        let b = PostureOwner::new(policy());
+        let watch_a = a.subscribe();
+        let watch_b = b.subscribe();
+        // A cordons; b never hears about it.
+        a.observe_throttle(0, sample(3, 0, 1_000));
+        assert_eq!(a.current(), FleetPosture::Cordoned);
+        assert_eq!(b.current(), FleetPosture::Nominal);
+        assert_eq!(watch_a.take_if_changed(), Some(FleetPosture::Cordoned));
+        assert_eq!(
+            watch_b.take_if_changed(),
+            None,
+            "no posture leaks across owners"
+        );
+        // b's own feed stays silent on a clean tick, and the feeds stay
+        // independent in both directions.
+        b.observe_throttle(1_000, sample(0, 0, 1_000));
+        assert_eq!(watch_b.take_if_changed(), None);
+        assert_eq!(watch_a.take_if_changed(), None);
+    }
+
+    #[test]
+    fn owner_read_throughs_match_the_machine_semantics() {
+        let owner = PostureOwner::new(PosturePolicy {
+            sim_intake_floor_override: Some(1),
+            ..policy()
+        });
+        assert!(owner.admits_lease(CordonClass::Deferrable));
+        assert_eq!(owner.sim_intake_cap(8), 8, "nominal intake is the cap");
+        owner.observe_throttle(0, sample(3, 0, 1_000));
+        assert!(!owner.admits_lease(CordonClass::Deferrable));
+        assert!(owner.admits_lease(CordonClass::Never));
+        assert!(owner.admits_lease(CordonClass::SimPool));
+        assert_eq!(owner.sim_intake_cap(8), 1, "the cordon floor override");
+        assert_eq!(owner.counters().entered, 1);
+    }
+
+    // ---- the operator re-tune patch (JCI2FW Part B) -----------------------
+
+    #[test]
+    fn an_empty_patch_is_rejected() {
+        assert!(PosturePolicyPatch::default().validate().is_err());
+        assert!(PosturePolicyPatch::default().is_empty());
+        assert_eq!(
+            PosturePolicyPatch::default().validate(),
+            Err(PostureRetuneError::EmptyPatch),
+            "the empty-patch refusal is its own typed error"
+        );
+    }
+
+    #[test]
+    fn every_threshold_rule_is_a_typed_rejection() {
+        assert_eq!(
+            PosturePolicyPatch {
+                enter_events: Some(0),
+                ..PosturePolicyPatch::default()
+            }
+            .validate(),
+            Err(PostureRetuneError::EnterEvents(0)),
+            "enter_events >= 1"
+        );
+        assert_eq!(
+            PosturePolicyPatch {
+                enter_window_ms: Some(0),
+                ..PosturePolicyPatch::default()
+            }
+            .validate(),
+            Err(PostureRetuneError::EnterWindow(0)),
+            "windows must be > 0 ms"
+        );
+        assert_eq!(
+            PosturePolicyPatch {
+                duty_window_ms: Some(0),
+                ..PosturePolicyPatch::default()
+            }
+            .validate(),
+            Err(PostureRetuneError::DutyWindow(0))
+        );
+        assert_eq!(
+            PosturePolicyPatch {
+                exit_clean_ms: Some(0),
+                ..PosturePolicyPatch::default()
+            }
+            .validate(),
+            Err(PostureRetuneError::ExitClean(0))
+        );
+        // The sane inclusive duty range (0.0, 100.0]: 0, negatives, >100,
+        // and non-finite values are all refused, never clamped.
+        for duty in [0.0, -1.0, 100.5, f64::NAN, f64::INFINITY] {
+            let rejected = PosturePolicyPatch {
+                duty_percent: Some(duty),
+                ..PosturePolicyPatch::default()
+            }
+            .validate();
+            assert!(
+                matches!(rejected, Err(PostureRetuneError::DutyPercent(_))),
+                "duty {duty} must be refused as DutyPercent, got {rejected:?}"
+            );
+        }
+        assert_eq!(
+            PosturePolicyPatch {
+                sim_intake_floor_override: Some(Some(0)),
+                ..PosturePolicyPatch::default()
+            }
+            .validate(),
+            Err(PostureRetuneError::SimIntakeFloor(0)),
+            "an explicit floor must be >= 1"
+        );
+    }
+
+    #[test]
+    fn boundary_values_are_admitted() {
+        // The inclusive edges pass: 1 event, 1 ms windows, the 100.0% duty
+        // ceiling, a floor of exactly 1, and a CLEARED floor.
+        let validated = PosturePolicyPatch {
+            enter_events: Some(1),
+            enter_window_ms: Some(1),
+            duty_percent: Some(100.0),
+            duty_window_ms: Some(1),
+            exit_clean_ms: Some(1),
+            sim_intake_floor_override: Some(Some(1)),
+        }
+        .validate();
+        assert_eq!(
+            validated,
+            Ok(()),
+            "inclusive bounds are legal (1 event, 1 ms windows, 100.0% duty, floor 1)"
+        );
+        let cleared = PosturePolicyPatch {
+            sim_intake_floor_override: Some(None),
+            ..PosturePolicyPatch::default()
+        }
+        .validate();
+        assert_eq!(
+            cleared,
+            Ok(()),
+            "clearing the floor is a legal one-key patch"
+        );
+    }
+
+    #[test]
+    fn patched_with_touches_only_supplied_keys() {
+        let base = policy();
+        let patched = base.patched_with(PosturePolicyPatch {
+            enter_events: Some(7),
+            ..PosturePolicyPatch::default()
+        });
+        assert_eq!(patched.enter_events, 7, "the supplied key landed");
+        assert_eq!(patched.enter_window_ms, base.enter_window_ms);
+        assert!(
+            (patched.duty_percent - base.duty_percent).abs() < f64::EPSILON,
+            "an absent key keeps the current duty percent"
+        );
+        assert_eq!(patched.duty_window_ms, base.duty_window_ms);
+        assert_eq!(patched.exit_clean_ms, base.exit_clean_ms);
+        assert_eq!(
+            patched.sim_intake_floor_override, base.sim_intake_floor_override,
+            "an absent key keeps the current value"
+        );
+    }
+
+    #[test]
+    fn patched_with_distinguishes_floor_set_clear_and_absent() {
+        let base = PosturePolicy {
+            sim_intake_floor_override: Some(3),
+            ..policy()
+        };
+        // Key absent: the current override is kept.
+        assert_eq!(
+            base.patched_with(PosturePolicyPatch::default())
+                .sim_intake_floor_override,
+            Some(3)
+        );
+        // Key present with a value: the override is set.
+        assert_eq!(
+            base.patched_with(PosturePolicyPatch {
+                sim_intake_floor_override: Some(Some(1)),
+                ..PosturePolicyPatch::default()
+            })
+            .sim_intake_floor_override,
+            Some(1)
+        );
+        // Key present with the key's None value: the override is CLEARED
+        // (back to half the slot cap at read time).
+        assert_eq!(
+            base.patched_with(PosturePolicyPatch {
+                sim_intake_floor_override: Some(None),
+                ..PosturePolicyPatch::default()
+            })
+            .sim_intake_floor_override,
+            None
+        );
+    }
+
+    #[test]
+    fn a_validated_patch_retunes_the_owner_end_to_end() {
+        let owner = PostureOwner::new(policy());
+        let patch = PosturePolicyPatch {
+            duty_percent: Some(5.0),
+            ..PosturePolicyPatch::default()
+        };
+        assert_eq!(patch.validate(), Ok(()), "the channel validated the patch");
+        let effective = owner.policy().patched_with(patch);
+        owner.retune(effective);
+        assert!(
+            (owner.policy().duty_percent - 5.0).abs() < f64::EPSILON,
+            "the retuned duty percent is live"
+        );
+        assert_eq!(owner.policy().enter_events, policy().enter_events);
     }
 }

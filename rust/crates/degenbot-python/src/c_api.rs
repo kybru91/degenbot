@@ -292,6 +292,13 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "simulation")]
     crate::simulation::add_simulation_module(m)?;
 
+    // Fleet operator seam (feature = "simulation") — the JCI2FW Part B
+    // runtime re-tune channel over the process posture owner. Registered on
+    // a real Python submodule `degenbot._ffi.fleet` (the mirror home is
+    // `degenbot.fleet`; the operator op is `set_fleet_posture`).
+    #[cfg(feature = "simulation")]
+    crate::fleet::add_fleet_module(m)?;
+
     // Pub/sub seam: register a Python callback as a `PoolStateSubscriber`
     // against the Rust `LogDispatcher` fan-out (ZBD4MS) (feature = "bot")
     #[cfg(feature = "bot")]

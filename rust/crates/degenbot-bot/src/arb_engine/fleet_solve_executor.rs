@@ -28,7 +28,6 @@ use degenbot_workers::dispatcher::{
     BootError, FleetBoot, FleetHost, SubmitError, SubmitReceipt, Unit,
 };
 use degenbot_workers::lane::{LaneCtx, QuitSig};
-use degenbot_workers::posture::ThrottleSample;
 use degenbot_workers::role::WorkerRole;
 use degenbot_workers::slot::PinKey;
 
@@ -90,18 +89,12 @@ struct SeatJob {
 
 /// Host-bound message: a submitted bin unit, or a seat reporting its unit
 /// done (completion drives T3 — the seat re-pins warm for the next cycle).
+/// (JCI2FW Part A: the retired `HostMsg::Throttle` posture-feed arm is
+/// dissolved — the ONE process posture owner is fed by the block pump and
+/// this host consults it through `FleetHost`'s read-throughs.)
 enum HostMsg {
     Enqueue(Unit),
-    SeatDone {
-        seat: u64,
-    },
-    /// Posture observation feed (LW-T5, Seam E): a cgroup throttle sample
-    /// — the host's FSM applies it; the submit-seam MIRROR updates from
-    /// the verdict (the FSM itself is never re-worked from the surface).
-    Throttle {
-        now_ms: u64,
-        sample: ThrottleSample,
-    },
+    SeatDone { seat: u64 },
 }
 
 /// The fleet-hosted solve executor. Shared by all engine cycles (the
@@ -134,10 +127,6 @@ impl crate::arb_engine::executor::Executor for FleetSolveExecutor {
         degenbot_workers::dispatcher::SubmitError,
     > {
         self.submit_solve_bin(bin, work)
-    }
-
-    fn observe_throttle(&self, now_ms: u64, sample: ThrottleSample) {
-        self.observe_throttle(now_ms, sample);
     }
 }
 
@@ -250,8 +239,9 @@ impl FleetSolveExecutor {
         // Solver is CordonClass::Never in workers::role). The LW-T5-era
         // seam-side refusal was backed out — the soak showed it stranded the
         // bin's result pipe and aborted the bot on routine cgroup throttling.
-        // The posture mirror still feeds the Deferrable hold + sim floor
-        // downstream (observe_throttle → the dispatcher's own gates).
+        // The ONE process posture owner (JCI2FW Part A) feeds the Deferrable
+        // hold + sim floor downstream (the dispatcher's own gates consult it
+        // live; the host sheds on the owner's transition feed).
         if self.tx.send(HostMsg::Enqueue(unit)).is_err() {
             return Err(SubmitError::PortClosed);
         }
@@ -263,15 +253,6 @@ impl FleetSolveExecutor {
             accepted_with_backlog: self.solver_queue_len.load(Ordering::Relaxed)
                 >= self.solver_seats.saturating_mul(2),
         })
-    }
-
-    /// Feed a throttle sample to the host posture (LW-T5, Seam E): the
-    /// production throttle poller and tests drive the SAME seam — the
-    /// verdict lands in the submit mirror on the host thread.
-    pub(crate) fn observe_throttle(&self, now_ms: u64, sample: ThrottleSample) {
-        if self.tx.send(HostMsg::Throttle { now_ms, sample }).is_err() {
-            abort_executor("posture observation", "fleet host channel closed");
-        }
     }
 }
 
@@ -355,12 +336,6 @@ fn apply_host_msg(
                 abort_executor("seat completion (T3)", &err.to_string());
             }
             solver_queue_len.store(host.queue_len(WorkerRole::Solver), Ordering::Relaxed);
-        }
-        HostMsg::Throttle { now_ms, sample } => {
-            // The host FSM OWNS the posture end to end (7OGY5V): the
-            // submit-seam MIRROR was retired when the posture-invariant
-            // Solver ruling (worker-fleet.md §6) removed its only reader.
-            let _ = host.observe_throttle(now_ms, sample);
         }
     }
 }
@@ -496,8 +471,7 @@ mod tests {
     use degenbot_workers::lane::{
         install_default_escalation_port, EscalationError, EscalationPort, EscalationWork, LaneCtx,
     };
-    use degenbot_workers::posture::PosturePolicy;
-    use degenbot_workers::posture::ThrottleSample;
+    use degenbot_workers::posture::{FleetPosture, PostureOwner, PosturePolicy, ThrottleSample};
 
     use super::super::solver_dispatch::executor_ab_probe::{
         load_corpus_fixture, probe_ctx, prod_lpt_bins,
@@ -509,11 +483,24 @@ mod tests {
         run_solve_lane, LaneFailure, LaneOutcome, SolveLane, SolveOutcome,
     };
 
+    /// A FRESH hermetic posture owner (leaked to `'static`): every test
+    /// boot gets its own owner, never the process global (7KAPBB isolation).
+    fn hermetic_owner() -> &'static PostureOwner {
+        std::boxed::Box::leak(std::boxed::Box::new(PostureOwner::new(
+            PosturePolicy::doc_defaults(),
+        )))
+    }
+
     fn hermetic_boot() -> FleetBoot {
+        hermetic_boot_with_owner(hermetic_owner())
+    }
+
+    fn hermetic_boot_with_owner(owner: &'static PostureOwner) -> FleetBoot {
         FleetBoot {
             quota_cpus: 8.0,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),
+            owner: Some(owner),
         }
     }
 
@@ -906,7 +893,12 @@ mod tests {
     /// spec and the soak found the refusal stranded the bin's result pipe).
     #[test]
     fn submit_in_cordoned_posture_still_admits_solver_units_and_running_units_complete() {
-        let executor = FleetSolveExecutor::boot(hermetic_boot()).expect("fleet boot");
+        // JCI2FW Part A: the hermetic owner is INJECTED at boot, and the
+        // cordon is forced through that shared owner (the executor's host
+        // consults it; there is no per-executor feed seam anymore).
+        let owner = hermetic_owner();
+        let executor =
+            FleetSolveExecutor::boot(hermetic_boot_with_owner(owner)).expect("fleet boot");
         let long_unit_done: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         let cordoned_done: Arc<std::sync::atomic::AtomicBool> = Arc::default();
         let done = Arc::clone(&long_unit_done);
@@ -919,8 +911,10 @@ mod tests {
                 })),
             )
             .expect("the nominal submit is accepted");
-        // Flip the posture to Cordoned through the executor own seam.
-        executor.observe_throttle(
+        // Flip the posture to Cordoned through the SHARED owner (7OGY5V:
+        // Solver is CordonClass::Never — the cordon must never refuse the
+        // bin, and the already-running unit is never shed).
+        owner.observe_throttle(
             100,
             ThrottleSample {
                 events: 3,
@@ -928,6 +922,7 @@ mod tests {
                 elapsed_usec: 1_000,
             },
         );
+        assert_eq!(owner.current(), FleetPosture::Cordoned);
         std::thread::sleep(std::time::Duration::from_millis(50));
         let done2 = Arc::clone(&cordoned_done);
         executor
