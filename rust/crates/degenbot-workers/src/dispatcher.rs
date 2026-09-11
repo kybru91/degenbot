@@ -1302,7 +1302,8 @@ impl FleetHost {
     }
 
     /// Complete the in-flight unit: T3/T4 (pinnable roles convert to a warm
-    /// pin, minting/reusing its arena) or T5 (pooled roles return to idle).
+    /// pin, minting/reusing its arena), T5 (pooled roles return to idle), or
+    /// T8 (a shed unit's `SeatDone` retires the drain back to idle).
     ///
     /// # Errors
     /// [`HostError::Transition`] off the table.
@@ -1317,6 +1318,11 @@ impl FleetHost {
                 role: WorkerRole::Solver | WorkerRole::Merge,
                 ..
             } => self.apply_transition(slot, Transition::CompleteToPinned)?,
+            // T8: a shed in-flight unit's SeatDone lands here (the seat
+            // always finishes — T7's "the unit always completes" contract);
+            // the drain retires the slot to Idle. Routing it anywhere else
+            // is a loud completion refusal → stranded receipt pipe abort.
+            SlotState::Draining { .. } => self.apply_transition(slot, Transition::DrainComplete)?,
             _ => {
                 return Err(HostError::Transition(RejectedTransition {
                     from: state,

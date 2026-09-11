@@ -120,8 +120,8 @@ pub struct RejectedTransition {
 /// Why a transition left the legal table (design doc §3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum RejectionReason {
-    /// T1/T2/T6 grant edge denied by the posture (cordon blocks deferrable
-    /// role intake).
+    /// T1 grant edge denied by the posture (cordon holds deferrable lease
+    /// intake; already-granted units always complete — T2/T6 are unguarded).
     #[error("posture blocks new lease intake for this role")]
     PostureBlocksIntake,
     /// T9 outside an epoch boundary: mid-cycle pin mutation.
@@ -161,9 +161,12 @@ pub fn transition(
             reason,
         })
     };
-    // Posture guard shared by the grant edges (T1/T2/T6): §3.3 — any
-    // `→ Leased/Running` under cordon for a cordon-deferrable role is
-    // illegal (sim-pool roles only floor their intake, so they pass).
+    // Posture guard on the T1 INTAKE edge: §3.3 — leasing a cordon-
+    // deferrable role under cordon is illegal (sim-pool roles only floor
+    // their intake, so they pass). The START edges (T2/T6) are
+    // deliberately unguarded: intake admitted before the cordon always
+    // completes (the §3.3 invariant T7 encodes) — it just takes nothing
+    // new while the fleet is cordoned.
     let posture_guards_role = |role: WorkerRole| {
         (role.cordon_class() == CordonClass::Deferrable && !ctx.posture_admits_role)
             .then_some(RejectionReason::PostureBlocksIntake)
@@ -184,23 +187,22 @@ pub fn transition(
             Ok(SlotState::Leased { role, key })
         }
         // T2: Leased(r) → Running(r, unit); the claim key carries through.
+        // No posture re-check: the posture gates INTAKE (T1) and sheds
+        // mid-cycle (T7). A grant admitted before a cordon ALWAYS starts
+        // and completes — rejecting Start here would strand the Leased
+        // slot (no exit but the shed) and trip the loud stranded-pipe
+        // abort (prod flap-window regression, unit 1316).
         (SlotState::Leased { role, key }, Transition::Start { .. }) => {
-            if let Some(reason) = posture_guards_role(role) {
-                return reject(reason);
-            }
             Ok(SlotState::Running { role, key })
         }
         // T6 (same Start constructor): Pinned(r, k) → Running(r, k) — the
-        // pin IS the key, the host only dispatches that key here.
-        (SlotState::Pinned { role, key }, Transition::Start { .. }) => {
-            if let Some(reason) = posture_guards_role(role) {
-                return reject(reason);
-            }
-            Ok(SlotState::Running {
-                role,
-                key: Some(key),
-            })
-        }
+        // pin IS the key, the host only dispatches that key here. No
+        // posture re-check (cordon never sheds a pin; the continuation
+        // runs — §6: cited pins are cycle-critical work).
+        (SlotState::Pinned { role, key }, Transition::Start { .. }) => Ok(SlotState::Running {
+            role,
+            key: Some(key),
+        }),
         // T3/T4: unit complete; pinnable roles convert to a warm pin.
         (SlotState::Running { role, key }, Transition::CompleteToPinned) => {
             match role {
@@ -421,10 +423,13 @@ mod tests {
     }
 
     #[test]
-    fn t2_under_cordon_rejects_a_deferrable_running_entry() {
-        // §3.3: any `→ Running` under cordon for a deferrable role is
-        // illegal (the unit is shed to Draining instead).
-        let rejected = transition(
+    fn t2_starts_a_granted_unit_even_under_cordon() {
+        // The posture gates INTAKE (T1), never the start of an already-
+        // granted unit: a cordon publishing between the T1 lease and the
+        // T2 start must not strand the grant (its only other exit is the
+        // T7 shed). Flap-window regression (prod: `grant start (T2)`
+        // PostureBlocksIntake → stranded intake receipt pipe → abort).
+        let running = transition(
             SlotState::Leased {
                 role: WorkerRole::Registrar,
                 key: None,
@@ -432,8 +437,14 @@ mod tests {
             Transition::Start { unit: 1 },
             BLOCKS,
         )
-        .expect_err("deferrable cannot enter Running under cordon");
-        assert_eq!(rejected.reason, RejectionReason::PostureBlocksIntake);
+        .expect("a granted unit always starts — cordon sheds, never strands");
+        assert_eq!(
+            running,
+            SlotState::Running {
+                role: WorkerRole::Registrar,
+                key: None
+            }
+        );
     }
 
     #[test]

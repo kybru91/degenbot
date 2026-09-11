@@ -735,6 +735,38 @@ fn idle_intake_slot(host: &FleetHost) -> u64 {
     u64::try_from(host.layout().poolupd.start).unwrap_or(u64::MAX)
 }
 
+/// The flap window's completion end (JCI2FW Part A + the T7/T8 contract):
+/// a Running deferrable unit shed at cordon onset reports `SeatDone` like
+/// any other — `complete` must route the `DrainComplete` row (T8). A
+/// rejected completion is a loud abort in production ("seat completion
+/// (T5)" → stranded receipt pipe).
+#[test]
+fn the_seatdone_of_a_shed_running_unit_lands_on_t8() {
+    let mut host = host();
+    let slot = idle_intake_slot(&host);
+    host.lease_claim(slot, WorkerRole::PoolStateUpdater, None)
+        .expect("T1");
+    host.start(slot, &Unit::noop(1, WorkerRole::PoolStateUpdater, None))
+        .expect("T2");
+
+    // Cordon onset sheds the in-flight deferrable unit; the seat keeps
+    // executing it ("the unit always completes").
+    host.shed(slot).expect("T7");
+    assert!(matches!(
+        host.slot_state(slot),
+        Some(SlotState::Draining {
+            role: WorkerRole::PoolStateUpdater
+        })
+    ));
+
+    // The seat's completion (SeatDone) must retire the slot: T8 → Idle.
+    let completion = host
+        .complete(slot)
+        .expect("a shed unit's SeatDone completes — never a completion refusal");
+    assert!(matches!(completion, Completion::BackToIdle));
+    assert_eq!(host.slot_state(slot), Some(SlotState::Idle));
+}
+
 /// JCI2FW Part A: the T7 shed is driven by the SHARED owner's transition
 /// feed — the host drains its boot-time watch (the transition edge) and,
 /// at every grant pass, the live posture (check-before-each-grant), so a
@@ -778,8 +810,8 @@ fn the_t7_shed_is_driven_by_the_shared_owner_transition_feed() {
     // LIVE — mid-cordon it cannot even enqueue a deferrable unit (the gate
     // reads the owner; no per-host machine to drift), and its grant pass
     // drains the transition feed without incident (check-before-each-
-    // grant; nothing deferrable can be in flight under cordon — the T2
-    // ctx blocks the lease — so the pass is a no-op).
+    // grant; nothing deferrable is ADMITTED under cordon — the T1
+    // ctx already blocks the lease — so the pass is a no-op).
     let mut host2 = FleetHost::boot(boot_with_owner(owner)).expect("8-core boot");
     assert_eq!(host2.posture(), FleetPosture::Cordoned);
     assert_eq!(
