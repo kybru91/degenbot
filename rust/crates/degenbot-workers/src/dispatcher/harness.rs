@@ -84,7 +84,10 @@ fn every_v1_active_role_walks_its_legal_transition_path() {
         let mut host = stub_host();
         match role {
             WorkerRole::Solver => {
-                let slot = first_idle_home_slot(&host, role);
+                // The SlotLayout owns the home geometry (2SIOHJ); the fresh
+                // scripted host's first solver seat is idle.
+                let slot = u64::try_from(host.layout().solver.start)
+                    .expect("the layout hosts a Solver seat");
                 // T1 Idle→Leased(key) → T2 → T3 Pinned(k).
                 host.lease_claim(slot, role, Some(7)).expect("T1");
                 assert_eq!(
@@ -116,7 +119,7 @@ fn every_v1_active_role_walks_its_legal_transition_path() {
             }
             WorkerRole::Merge => {
                 // Pinned at boot (T4); T6 continuation then T9 release.
-                let slot = host.merge_slot().expect("boot pin");
+                let slot = host.merge_slot();
                 assert_eq!(
                     host.slot_state(slot),
                     Some(SlotState::Pinned {
@@ -129,7 +132,15 @@ fn every_v1_active_role_walks_its_legal_transition_path() {
                 host.complete(slot).expect("T4 again");
             }
             WorkerRole::SimDriver | WorkerRole::Resolve | WorkerRole::PoolStateUpdater => {
-                let slot = first_idle_home_slot(&host, role);
+                // The SlotLayout owns the home geometry (2SIOHJ); the fresh
+                // scripted host's first home seat is idle.
+                let seat = match role {
+                    WorkerRole::SimDriver => host.layout().sim.start,
+                    WorkerRole::Resolve => host.layout().resolve.start,
+                    WorkerRole::PoolStateUpdater => host.layout().poolupd.start,
+                    _ => unreachable!("pooled v1 roles exhausted above"),
+                };
+                let slot = u64::try_from(seat).expect("the layout hosts the pooled seat");
                 host.lease_claim(slot, role, None).expect("T1");
                 host.start(slot, &Unit::noop(1, role, None)).expect("T2");
                 assert_eq!(
@@ -145,40 +156,8 @@ fn every_v1_active_role_walks_its_legal_transition_path() {
     }
 }
 
-fn first_idle_home_slot(host: &FleetHost, role: WorkerRole) -> crate::dispatcher::SlotId {
-    // Boot layout: [solver pins][sim slots][resolve slots][poolupd slots][merge].
-    let pins = host.budget().solver_pin_count;
-    let sims = host.budget().sim_slot_cap;
-    let resolves = usize::try_from(host.budget().resolve_cpus).unwrap_or(1);
-    let poolupd = host.budget().pool_state_updater_slots;
-    let (start, end) = match role {
-        WorkerRole::Solver => (0_usize, pins),
-        WorkerRole::SimDriver => (pins, pins + sims),
-        WorkerRole::Resolve => (pins + sims, pins + sims + resolves),
-        WorkerRole::PoolStateUpdater => (pins + sims + resolves, pins + sims + resolves + poolupd),
-        _ => (
-            pins + sims + resolves + poolupd,
-            pins + sims + resolves + poolupd + 1,
-        ),
-    };
-    for slot in start..end {
-        if host.slot_state(u64::try_from(slot).unwrap_or(SlotId::MAX)) == Some(SlotState::Idle) {
-            return u64::try_from(slot).unwrap_or(SlotId::MAX);
-        }
-    }
-    // A scripted role without an idle home slot is a boot-layout bug; fail
-    // via assertion, never a process-level panic.
-    let idle = host
-        .slot_states()
-        .iter()
-        .find(|(_, s)| *s == SlotState::Idle)
-        .map(|(s, _)| *s);
-    assert!(
-        idle.is_some(),
-        "scripted role {role:?} has no idle slot in the boot layout"
-    );
-    idle.unwrap_or(SlotId::MAX)
-}
+// (2SIOHJ deleted the first_idle_home_slot budget re-derivation: every
+// scripted-seat read now goes through the boot-frozen SlotLayout.)
 
 /// §3.3's illegal table, asserted on the pure FSM for EVERY role in
 /// `ALL_ROLES` (declared roles included — the table is role-complete).
@@ -311,7 +290,17 @@ fn budget_sum_invariant_holds_across_a_scripted_quota_resize() {
 
     // Pin two bins across the resize:
     for key in [1_u64, 2] {
-        let slot = first_idle_home_slot(&host, WorkerRole::Solver);
+        // The first IDLE solver seat: the previous iteration's pin holds
+        // its seat warm, so the scan walks the SlotLayout's solver range
+        // (the layout owns the geometry — 2SIOHJ, no budget re-derivation).
+        let seat = host
+            .layout()
+            .solver
+            .find(|&s| {
+                host.slot_state(u64::try_from(s).unwrap_or(SlotId::MAX)) == Some(SlotState::Idle)
+            })
+            .expect("an idle solver seat in the layout range");
+        let slot = u64::try_from(seat).expect("solver seat id");
         host.lease_claim(slot, WorkerRole::Solver, Some(key))
             .expect("T1");
         host.start(slot, &Unit::noop(key, WorkerRole::Solver, Some(key)))
@@ -364,7 +353,7 @@ fn budget_sum_invariant_holds_across_a_scripted_quota_resize() {
 fn pin_and_arena_are_stable_across_synthetic_cycles() {
     const N: u64 = 25;
     let mut host = stub_host();
-    let slot = first_idle_home_slot(&host, WorkerRole::Solver);
+    let slot = u64::try_from(host.layout().solver.start).expect("solver home seat");
     host.lease_claim(slot, WorkerRole::Solver, Some(5))
         .expect("T1");
     host.start(slot, &Unit::noop(1, WorkerRole::Solver, Some(5)))
@@ -411,7 +400,7 @@ fn the_stranded_pipe_tripwire_fires_on_host_death_mid_drain() {
             observer.fetch_add(1, Ordering::SeqCst);
         }));
     // A merge unit with in-flight result sends "dies" mid-drain.
-    let merge = host.merge_slot().expect("boot pin");
+    let merge = host.merge_slot();
     host.start(
         merge,
         &Unit::new(
@@ -491,8 +480,8 @@ fn per_role_busy_idle_gauges_exist_for_the_activation_dashboard() {
             "busy/idle pair complete: {row:?}"
         );
     }
-    // Churn moves the gauge, not the row set.
-    let slot = first_idle_home_slot(&host, WorkerRole::SimDriver);
+    // Churn moves the gauge, not the row set (the layout's first sim seat).
+    let slot = u64::try_from(host.layout().sim.start).expect("sim home seat");
     host.lease_claim(slot, WorkerRole::SimDriver, None)
         .expect("T1");
     host.start(slot, &Unit::noop(9, WorkerRole::SimDriver, None))
@@ -809,7 +798,7 @@ mod pin_derive {
 #[test]
 fn lane_ctx_arena_is_minted_at_grant_time_warm_across_cycles_and_fresh_after_t9() {
     let mut host = stub_host();
-    let slot = first_idle_home_slot(&host, WorkerRole::Solver);
+    let slot = u64::try_from(host.layout().solver.start).expect("solver home seat");
 
     // Cycle 1: the ctx at grant time carries an arena ALREADY (mint at T2,
     // NOT silently deferred to the first completion).

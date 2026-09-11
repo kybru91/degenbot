@@ -154,6 +154,27 @@ impl FleetSolveExecutor {
             seat_senders.push(stx);
             seat_mailboxes.push(srx);
         }
+        // 2SIOHJ seat<->slot bijection, explicit at build time: the pump's
+        // `seats.get(grant.slot)` is a POSITIONAL map — mailbox i serves
+        // the unit granted to the FleetHost slot `SlotLayout::solver
+        // .start + i` (degenbot-workers' boot-frozen table geometry; this
+        // crate cannot name the `pub(crate)` layout, so the invariant is
+        // pinned HERE, citing it). `SlotLayout::of` asserts the solver
+        // range to be exactly `budget.solver_pin_count` seats (pins ==
+        // bins, P6YXA6) cut from index 0, so this vec is the identity map
+        // over the solver home range; any non-solver grant (sim/resolve/
+        // poolupd/merge seats have no mailbox) misses the `get` and aborts
+        // loudly below.
+        if seat_senders.len() != solver_seats {
+            // Loud CONSTRUCTION abort, not a Result path: a seat array that
+            // does not tile the SlotLayout solver range exactly would
+            // misroute bins positionally (2SIOHJ) — the executor discipline
+            // aborts, never returns a degraded handle.
+            abort_executor(
+                "solver seat construction",
+                "seat mailboxes must tile the SlotLayout solver range exactly",
+            );
+        }
         // The submit mirror (LW-T5, Seam E) lives with the host thread and
         // every executor handle shares the same cells.
         // 7OGY5V: no posture MIRROR — posture-invariant Solver admission
@@ -366,8 +387,18 @@ fn pump(host: &mut FleetHost, backlog: &mut VecDeque<Unit>, seats: &[mpsc::Sende
             if let Err(err) = host.start(grant.slot, &unit) {
                 abort_executor("grant start (T2)", &err.to_string());
             }
+            // Positional seat map (2SIOHJ): seat i <-> FleetHost slot
+            // `SlotLayout::solver.start + i` — the solver home range is cut
+            // from index 0 at exactly this vec's length (pinned at the
+            // executor's construction), so the get is the identity map over
+            // the solver seats; any non-solver grant has no mailbox and is
+            // a loud abort, never a silent re-seat.
             let Some(seat_tx) = seats.get(usize::try_from(grant.slot).unwrap_or(usize::MAX)) else {
-                abort_executor("dispatch grant", "unknown seat");
+                abort_executor(
+                    "dispatch grant",
+                    "unknown seat (seat i <-> SlotLayout solver_range.start + i — \
+                     a non-solver grant has no mailbox)",
+                );
             };
             // LW-T2 (Seam B): mint the warm arena at the grant seam — the
             // ctx handed to the unit at dispatch time ALWAYS carries the

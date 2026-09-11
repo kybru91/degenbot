@@ -62,7 +62,7 @@ fn boot_fails_loudly_on_an_unhostable_quota() {
 fn boot_pins_exactly_one_merge_and_registers_the_census() {
     let host = host();
     assert_eq!(host.budget().declared_sum(), host.budget().quota_floor);
-    let merge = host.merge_slot().expect("merge pinned at boot");
+    let merge = host.merge_slot();
     assert_eq!(
         host.slot_state(merge),
         Some(SlotState::Pinned {
@@ -157,13 +157,13 @@ fn exactly_one_pin_per_key_is_representable() {
     assert_eq!(host.pin_slot(7), Some(slot));
 }
 
-/// DNZQ5G (Q1) shim: `merge_slot()` reads the LAST boot slot (the boot
-/// construction pins it there T1→T2→T4); 2SIOHJ's `SlotLayout` owns this
-/// read next.
+/// 2SIOHJ done: `merge_slot()` reads the boot-frozen `SlotLayout`'s merge
+/// index — the LAST boot slot (the boot construction pins it there
+/// T1→T2→T4).
 #[test]
 fn merge_slot_reads_the_boot_layout() {
     let host = host();
-    let merge = host.merge_slot().expect("merge pinned at boot");
+    let merge = host.merge_slot();
     let (last, last_state) = *host.slot_states().last().expect("non-empty table");
     assert_eq!(
         merge, last,
@@ -194,6 +194,122 @@ fn merge_slot_reads_the_boot_layout() {
     );
 }
 
+/// 2SIOHJ: the boot geometry oracle. The Q=8 production shape (VERIFIED
+/// against the real derive: pins = floor(8) − 2 solve headroom = 6, sim =
+/// today's `SimSlots` cap 4, resolve fixed 1, the PRG-3 station 4, the merge
+/// sidecar last) tiles the table contiguously.
+#[test]
+fn slot_layout_matches_the_production_q8_shape() {
+    let host = host();
+    let layout = host.layout();
+    assert_eq!(layout.solver.clone(), 0..6, "solver = the LPT bin count");
+    assert_eq!(layout.sim.clone(), 6..10, "sim = today's SimSlots cap");
+    assert_eq!(
+        layout.resolve.clone(),
+        10..11,
+        "resolve = the fixed v1 seat"
+    );
+    assert_eq!(
+        layout.poolupd.clone(),
+        11..15,
+        "the registration intake station"
+    );
+    assert_eq!(layout.merge, 15, "the merge sidecar is the LAST index");
+    assert_eq!(host.slot_states().len(), 16, "the ranges tile the table");
+    assert_eq!(layout.solver.end, layout.sim.start);
+    assert_eq!(layout.sim.end, layout.resolve.start);
+    assert_eq!(layout.resolve.end, layout.poolupd.start);
+    assert_eq!(layout.poolupd.end, layout.merge);
+}
+
+/// 2SIOHJ RED story, pinned BEFORE the `first_idle_of` replica died: the
+/// layout oracle says the merge sidecar is the LAST index (15 at Q=8);
+/// the replica — asked for the Merge home — returned the first
+/// `PoolStateUpdater` seat (11), its else-arm misclassifying every poolupd
+/// slot as Merge. The replica died instead of the layout.
+#[test]
+fn slot_layout_pins_the_merge_sidecar_to_the_last_index() {
+    let host = host();
+    let layout = host.layout();
+    let (last, last_state) = *host.slot_states().last().expect("non-empty table");
+    assert_eq!(
+        u64::try_from(layout.merge).unwrap_or(SlotId::MAX),
+        last,
+        "layout.merge IS the last table index"
+    );
+    assert_eq!(last, 15, "production Q=8: merge is the 16th slot");
+    assert_eq!(
+        last_state,
+        SlotState::Pinned {
+            role: WorkerRole::Merge,
+            key: MERGE_PIN_KEY,
+        }
+    );
+    // RED evidence (2SIOHJ, captured before the replica died): the stale
+    // `first_idle_of` replica returned 11 — the first PoolStateUpdater
+    // seat, misclassified as Merge by its else-arm — against this
+    // oracle's 15. The replica died; the layout stands.
+}
+
+/// 2SIOHJ: the 1-bin edge — `solve_headroom` 5 at Q=6 sizes exactly one
+/// LPT pin (`max(1, floor(Q) − headroom)`); the layout still boots with
+/// every other hosted range intact and merge last.
+#[test]
+fn slot_layout_of_accepts_the_one_bin_edge() {
+    let host = FleetHost::boot(FleetBoot {
+        quota_cpus: 6.0,
+        overrides: BudgetOverrides {
+            solve_headroom: Some(5),
+            ..BudgetOverrides::default()
+        },
+        posture: policy(),
+        owner: Some(hermetic_owner()),
+    })
+    .expect("the one-bin edge boots");
+    let layout = host.layout();
+    assert_eq!(layout.solver.clone(), 0..1, "exactly one LPT bin seat");
+    assert_eq!(layout.sim.clone(), 1..5);
+    assert_eq!(layout.resolve.clone(), 5..6);
+    assert_eq!(layout.poolupd.clone(), 6..10);
+    assert_eq!(layout.merge, 10, "merge is still the LAST index");
+    assert_eq!(host.slot_states().len(), 11);
+}
+
+/// 2SIOHJ: a dead station — a v1-hosted role sized to ZERO slots — is a
+/// loud `BootError::Invariant` at boot, never a silently unhostable
+/// station.
+#[test]
+fn a_dead_station_boot_is_a_loud_invariant() {
+    for (name, overrides) in [
+        (
+            "pool_state_updater_slots = 0",
+            BudgetOverrides {
+                pool_state_updater_slots: Some(0),
+                ..BudgetOverrides::default()
+            },
+        ),
+        (
+            "sim_slot_cap = 0",
+            BudgetOverrides {
+                sim_slot_cap: Some(0),
+                ..BudgetOverrides::default()
+            },
+        ),
+    ] {
+        let err = FleetHost::boot(FleetBoot {
+            quota_cpus: 8.0,
+            overrides,
+            posture: policy(),
+            owner: Some(hermetic_owner()),
+        })
+        .expect_err(name);
+        assert!(
+            matches!(err, BootError::Invariant(_)),
+            "{name} must refuse as a boot invariant: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn merge_is_never_queued_and_declared_roles_are_gated() {
     let mut host = host();
@@ -218,7 +334,8 @@ fn merge_is_never_queued_and_declared_roles_are_gated() {
 fn a_busy_pinned_key_never_grants_a_second_seat() {
     let mut host = host();
     // Claim the key-1 pin and leave it RUNNING (no T3 completion yet).
-    let solver_slot = first_idle_of(&host, WorkerRole::Solver);
+    let solver_slot =
+        u64::try_from(host.layout().solver.start).expect("the layout's first Solver seat");
     host.lease_claim(solver_slot, WorkerRole::Solver, Some(1))
         .expect("T1 claim");
     host.start(solver_slot, &Unit::noop(1, WorkerRole::Solver, Some(1)))
@@ -305,7 +422,8 @@ fn submitting_sims_and_solves_together_grants_all_sims_before_any_solve() {
 fn sim_before_solve_at_lease_time_and_solver_pins_first_via_continuations() {
     let mut host = host();
     // Claim one solver pin (cycle-critical): T1→T2→T3 by hand.
-    let solver_slot = first_idle_of(&host, WorkerRole::Solver);
+    let solver_slot =
+        u64::try_from(host.layout().solver.start).expect("the layout's first Solver seat");
     host.lease_claim(solver_slot, WorkerRole::Solver, Some(1))
         .expect("T1 claim");
     host.start(solver_slot, &Unit::noop(1, WorkerRole::Solver, Some(1)))
@@ -338,43 +456,10 @@ fn sim_before_solve_at_lease_time_and_solver_pins_first_via_continuations() {
     assert_eq!(continuation.0.slot, solver_slot, "the pin IS the key");
 }
 
-fn first_idle_of(host: &FleetHost, role: WorkerRole) -> crate::dispatcher::SlotId {
-    // Boot layout: [solver pins][sim slots][resolve][merge]. Find the first
-    // idle slot of the requested home by probing an idle state.
-    let slot_total = u64::try_from(host.slot_states().len()).unwrap_or(0);
-    for slot in 0..slot_total {
-        if host.slot_state(slot) == Some(SlotState::Idle) {
-            // Home is encoded by position: derive from budget layout.
-            let pins = host.budget().solver_pin_count;
-            let sims = host.budget().sim_slot_cap;
-            let idx = usize::try_from(slot).unwrap_or(usize::MAX);
-            let expected = if idx < pins {
-                WorkerRole::Solver
-            } else if idx < pins + sims {
-                WorkerRole::SimDriver
-            } else if idx < pins + sims + 1 {
-                WorkerRole::Resolve
-            } else {
-                WorkerRole::Merge
-            };
-            if expected == role {
-                return slot;
-            }
-        }
-    }
-    // A scripted role without an idle home slot is a boot-layout bug: the
-    // harness fails loudly without a process-level panic (lspec)
-    let idle = host
-        .slot_states()
-        .iter()
-        .find(|(_, s)| *s == SlotState::Idle)
-        .map(|(s, _)| *s);
-    assert!(
-        idle.is_some(),
-        "no idle {role:?} slot in the boot layout (no idle slot at all)"
-    );
-    idle.unwrap_or(0)
-}
+// (2SIOHJ deleted the first_idle_of replica: PROVEN drifted against the
+// boot-frozen SlotLayout — its else-arm misclassified every poolupd seat
+// as Merge (RED: Merge home ⇒ 11, oracle ⇒ 15 at Q=8). Callers read the
+// layout directly.)
 
 #[test]
 fn cordon_floors_sim_intake_but_never_cancels_in_flight() {
@@ -511,7 +596,8 @@ fn the_stranded_pipe_trips_the_loud_abort_path() {
             observer.fetch_add(1, Ordering::SeqCst);
         }));
     let mut host = host;
-    let sim_slot = first_idle_of(&host, WorkerRole::SimDriver);
+    let sim_slot =
+        u64::try_from(host.layout().sim.start).expect("the layout's first SimDriver seat");
     host.lease_claim(sim_slot, WorkerRole::SimDriver, None)
         .expect("T1");
     let unit = Unit::new(1, WorkerRole::SimDriver, None, true, Box::new(|_ctx| {}));
@@ -625,13 +711,10 @@ fn the_intake_queue_is_bounded_per_role() {
     );
 }
 
-/// The first idle `PoolStateUpdater` home slot (boot layout:
-/// [solver pins][sim][resolve][poolupd][merge] — poolupd slots boot Idle).
+/// The `PoolStateUpdater` home range start (the boot-frozen `SlotLayout`
+/// owns the geometry, 2SIOHJ — poolupd seats boot Idle).
 fn idle_intake_slot(host: &FleetHost) -> u64 {
-    let pins = host.budget().solver_pin_count;
-    let sims = host.budget().sim_slot_cap;
-    let resolves = usize::try_from(host.budget().resolve_cpus).unwrap_or(1);
-    u64::try_from(pins + sims + resolves).unwrap_or(u64::MAX)
+    u64::try_from(host.layout().poolupd.start).unwrap_or(u64::MAX)
 }
 
 /// JCI2FW Part A: the T7 shed is driven by the SHARED owner's transition

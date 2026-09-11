@@ -26,7 +26,7 @@ use crate::lane::LaneCtx;
 use crate::posture::{
     FleetPosture, PostureChange, PostureOwner, PosturePolicy, PostureWatch, ThrottleSample,
 };
-use crate::role::{CordonClass, WorkerRole, V1_ACTIVE_ROLES};
+use crate::role::{CordonClass, WorkerRole, ALL_ROLES, V1_ACTIVE_ROLES};
 use crate::slot::{
     transition, PinKey, RejectedTransition, RejectionReason, SlotState, Transition,
     TransitionContext, UnitId, MERGE_PIN_KEY,
@@ -112,6 +112,137 @@ pub enum BootError {
     /// A boot invariant (slot layout / the merge pin) did not hold.
     #[error("fleet boot invariant violated: {0}")]
     Invariant(&'static str),
+}
+
+/// The boot-frozen slot table geometry (2SIOHJ): ONE derivation behind the
+/// fleet boot ordering — solver pin seats, sim seats, resolve seats, the
+/// registration-intake station, then the merge sidecar at the LAST index.
+/// Derived FIRST at boot from [`FleetBudget`] (before any slot cell,
+/// per-role queue, or census row exists) and stored on the host; every
+/// reader consumes this instead of re-deriving ranges from budget fields.
+///
+/// Frozen by design: [`FleetHost::resize_quota`] re-declares the LIVE
+/// budget (queue bounds, admission shares) but never re-derives the table
+/// — slot cells move only at an epoch boundary's T9 re-key — so a layout
+/// read is always the boot truth and a budget read is always the live
+/// admission truth. See the asymmetry note on [`FleetHost::queue_cap`].
+// (`Copy` is unreachable here: the fields are `Range<usize>`, which is
+// Clone-only — readers go through `FleetHost::layout()`, which hands out
+// the small struct by clone.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlotLayout {
+    /// The LPT-bin Solver pin seats: one per structural bin (P6YXA6) —
+    /// [`SlotLayout::of`] asserts this range's length equals the budget's
+    /// `solver_pin_count` (pins == bins by construction).
+    solver: std::ops::Range<usize>,
+    /// The pooled `SimDriver` seats (duty-counted; fractional-remainder
+    /// spenders).
+    sim: std::ops::Range<usize>,
+    /// The pooled `Resolve` seats (the fixed v1 seat).
+    resolve: std::ops::Range<usize>,
+    /// The registration intake station's `PoolStateUpdater` seats (PRG-3).
+    poolupd: std::ops::Range<usize>,
+    /// The merge sidecar's slot index — structurally the LAST index of
+    /// the boot table (asserted in [`SlotLayout::of`]; boot pins it
+    /// T1→T2→T4 immediately after construction).
+    merge: usize,
+}
+
+impl SlotLayout {
+    /// Derive the boot geometry from the budget — the FIRST boot step.
+    ///
+    /// # Errors
+    /// [`BootError::Invariant`] when a v1-hosted role's range is EMPTY (a
+    /// dead station — e.g. `pool_state_updater_slots = 0` — refuses to
+    /// boot loudly, never hosts a station nobody can reach), when the
+    /// merge sidecar would not land on the LAST index, or when the solver
+    /// range drifts from the structural LPT bin count the budget sized.
+    fn of(budget: &FleetBudget) -> Result<Self, BootError> {
+        let solver_len = budget.solver_pin_count;
+        let sim_len = budget.sim_slot_cap;
+        let resolve_len = usize::try_from(budget.resolve_cpus).unwrap_or(1);
+        let poolupd_len = budget.pool_state_updater_slots;
+        if solver_len == 0 {
+            return Err(BootError::Invariant(
+                "the Solver pin range is empty — no LPT bin seat was sized",
+            ));
+        }
+        if sim_len == 0 {
+            return Err(BootError::Invariant(
+                "the SimDriver slot range is empty — a dead station cannot host",
+            ));
+        }
+        if resolve_len == 0 {
+            return Err(BootError::Invariant(
+                "the Resolve slot range is empty — a dead station cannot host",
+            ));
+        }
+        if poolupd_len == 0 {
+            return Err(BootError::Invariant(
+                "the PoolStateUpdater slot range is empty — the registration \
+                 intake station (PRG-3) is a dead station",
+            ));
+        }
+        // pins == bins BY CONSTRUCTION (P6YXA6): the solver range is cut at
+        // exactly the structural LPT bin count — the authority boot (and
+        // the solve executor's seat array) sizes by. If a future edit ever
+        // cuts the range from anything else, this refuses the boot instead
+        // of seating bins on phantom seats.
+        if solver_len != budget.solver_pin_count {
+            return Err(BootError::Invariant(
+                "solver seats must equal the structural LPT bin count (pins == bins, P6YXA6)",
+            ));
+        }
+        let solver = 0..solver_len;
+        let sim = solver.end..solver.end + sim_len;
+        let resolve = sim.end..sim.end + resolve_len;
+        let poolupd = resolve.end..resolve.end + poolupd_len;
+        let total = poolupd.end + 1; // every hosted range + ONE sidecar slot
+        let merge = total - 1; // the sidecar is structurally the LAST index
+        if merge != poolupd.end
+            || solver.contains(&merge)
+            || sim.contains(&merge)
+            || resolve.contains(&merge)
+            || poolupd.contains(&merge)
+        {
+            return Err(BootError::Invariant(
+                "the merge sidecar must be the LAST slot index, outside every hosted range",
+            ));
+        }
+        Ok(Self {
+            solver,
+            sim,
+            resolve,
+            poolupd,
+            merge,
+        })
+    }
+
+    /// The layout's seat count for `role` (the census's per-role slot
+    /// budget; the merge sidecar is the single `merge` seat).
+    fn seats(&self, role: WorkerRole) -> usize {
+        match role {
+            WorkerRole::Solver => self.solver.len(),
+            WorkerRole::SimDriver => self.sim.len(),
+            WorkerRole::Resolve => self.resolve.len(),
+            WorkerRole::PoolStateUpdater => self.poolupd.len(),
+            WorkerRole::Merge => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// The per-role queue bound rule: 2× the role's seats (pipelining depth),
+/// 4× for the chunked Resolve role; Merge is unbounded-by-type because it
+/// is never queued (and declared-not-active roles hold nothing). ONE rule
+/// for both readers: boot (layout seats) and [`FleetHost::queue_cap`]
+/// (LIVE budget seats).
+fn queue_cap_for(role: WorkerRole, seats: usize) -> usize {
+    match role {
+        WorkerRole::Solver | WorkerRole::SimDriver | WorkerRole::PoolStateUpdater => seats * 2,
+        WorkerRole::Resolve => seats * 4,
+        _ => 0,
+    }
 }
 
 /// Why a queue enqueue was refused (all loud: ADR-021 classify-and-stop).
@@ -275,6 +406,9 @@ fn take_solver_unit_for(queue: &mut VecDeque<Unit>, key: PinKey) -> Option<Unit>
 /// the real engines is F3–F5).
 pub struct FleetHost {
     budget: FleetBudget,
+    /// The boot-frozen slot table geometry (2SIOHJ): derived FIRST at
+    /// boot, before any cell/queue/census row; see [`SlotLayout`].
+    layout: SlotLayout,
     /// THE shared fleet posture owner (JCI2FW Part A): the host consults it
     /// everywhere it used to consult a host-local machine (enqueue gate,
     /// admission thresholds, the T7 shed trigger) so every host — and the
@@ -296,6 +430,7 @@ impl std::fmt::Debug for FleetHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FleetHost")
             .field("budget", &self.budget)
+            .field("layout", &self.layout)
             .field("posture", &self.posture.current())
             .field("slots", &self.slots.len())
             .finish_non_exhaustive()
@@ -346,12 +481,18 @@ impl PartialEq for FleetBoot {
 }
 
 impl FleetHost {
-    /// Boot the fleet host: derive the budget (fail-fast), size the slot
-    /// table, pin the merge sidecar (T1→T2→T4, exactly one), and
-    /// self-register every hosted role into the worker census (§7).
+    /// Boot the fleet host: derive the budget (fail-fast), derive the
+    /// boot-frozen [`SlotLayout`] from it FIRST (2SIOHJ — the ONE boot
+    /// ordering authority: every hosted range non-empty, the merge sidecar
+    /// pinned to the LAST index, solver seats == LPT bins), then build the
+    /// slot table / per-role queues / census rows FROM that layout, pin
+    /// the merge sidecar (T1→T2→T4, exactly one), and self-register every
+    /// hosted role into the worker census (§7).
     ///
     /// # Errors
-    /// [`BudgetError`] fail-fasts on over-subscription / pinned-role floor.
+    /// [`BudgetError`] fail-fasts on over-subscription / pinned-role floor;
+    /// [`BootError::Invariant`] on a dead hosted station or a broken
+    /// layout invariant.
     pub fn boot(boot: FleetBoot) -> Result<Self, BootError> {
         let budget = FleetBudget::derive(boot.quota_cpus, &boot.overrides)?;
         // ONE process-level fleet posture owner (JCI2FW Part A): the
@@ -362,35 +503,38 @@ impl FleetHost {
             .unwrap_or_else(|| crate::posture::install_process_owner(boot.posture));
         let posture_watch = posture.subscribe();
 
-        // Slot layout: solver pins, sim slots, resolve, then the merge
-        // sidecar (its dedicated slot, pinned below before anything else
-        // can claim it).
-        let mut slots = Vec::new();
-        for _ in 0..budget.solver_pin_count {
+        // THE boot ordering (2SIOHJ): the SlotLayout is derived FIRST —
+        // every v1-hosted range is checked non-empty (a dead station
+        // refuses the boot loudly) and the merge sidecar is pinned to the
+        // LAST index HERE, before anything is built.
+        let layout = SlotLayout::of(&budget)?;
+
+        // Slot cells FROM the layout: solver pins, sim slots, resolve, the
+        // registration intake station (PRG-3), then the merge sidecar (its
+        // dedicated slot, pinned below before anything else can claim it).
+        let mut slots = Vec::with_capacity(layout.merge + 1);
+        for _ in layout.solver.clone() {
             slots.push(SlotCell {
                 home: WorkerRole::Solver,
                 state: SlotState::Idle,
                 arena: None,
             });
         }
-        for _ in 0..budget.sim_slot_cap {
+        for _ in layout.sim.clone() {
             slots.push(SlotCell {
                 home: WorkerRole::SimDriver,
                 state: SlotState::Idle,
                 arena: None,
             });
         }
-        for _ in 0..usize::try_from(budget.resolve_cpus).unwrap_or(1) {
+        for _ in layout.resolve.clone() {
             slots.push(SlotCell {
                 home: WorkerRole::Resolve,
                 state: SlotState::Idle,
                 arena: None,
             });
         }
-        // The registration intake station (PRG-3): duty-counted
-        // PoolStateUpdater slots, BEFORE the merge pin (the merge pin is
-        // structurally the LAST slot — merge_slot_id() indexes from the end).
-        for _ in 0..budget.pool_state_updater_slots {
+        for _ in layout.poolupd.clone() {
             slots.push(SlotCell {
                 home: WorkerRole::PoolStateUpdater,
                 state: SlotState::Idle,
@@ -403,12 +547,25 @@ impl FleetHost {
             arena: None,
         });
 
+        // Per-role queues FROM the layout: pre-sized by the same bound rule
+        // `queue_cap` states over the LIVE budget (at boot the live budget
+        // IS the layout's budget) — capacity only, never a second bound.
+        let mut queues: [VecDeque<Unit>; 8] = Default::default();
+        for role in ALL_ROLES {
+            if let Some(idx) = role.index_in_all_roles().map(usize::from) {
+                if let Some(queue) = queues.get_mut(idx) {
+                    *queue = VecDeque::with_capacity(queue_cap_for(role, layout.seats(role)));
+                }
+            }
+        }
+
         let mut host = Self {
             budget,
+            layout,
             posture,
             posture_watch,
             slots,
-            queues: Default::default(),
+            queues,
             epoch_boundary: false,
             next_arena: 1,
             overflow_count: 0,
@@ -418,10 +575,9 @@ impl FleetHost {
         host.register_census();
 
         // The merge pin: exactly one, pinned at boot (T4) — per-path sends
-        // land in a pipe somebody drinks from.
-        let Some(merge_slot) = host.merge_slot_id() else {
-            return Err(BootError::Invariant("boot did not size a merge slot"));
-        };
+        // land in a pipe somebody drinks from. The slot is the layout's
+        // merge index — the LAST table slot (2SIOHJ).
+        let merge_slot = host.merge_slot_id();
         let merge_claim = || Unit::noop(0, WorkerRole::Merge, Some(MERGE_PIN_KEY));
         host.lease_claim(merge_slot, WorkerRole::Merge, Some(MERGE_PIN_KEY))
             .map_err(|_| BootError::Invariant("the fresh merge slot rejected its claim (T1)"))?;
@@ -432,14 +588,13 @@ impl FleetHost {
         Ok(host)
     }
 
-    /// The merge sidecar's slot: structurally the LAST slot of the boot
-    /// table (the pin itself is claimed T1→T2→T4 immediately after boot
-    /// construction — that conversion is the standing proof of the cell's
-    /// state).
-    // 2SIOHJ: SlotLayout owns this read next task
-    fn merge_slot_id(&self) -> Option<SlotId> {
-        let last = self.slots.len().checked_sub(1)?;
-        u64::try_from(last).ok()
+    /// The merge sidecar's slot: the boot-frozen [`SlotLayout`] merge
+    /// index — structurally the LAST slot of the boot table (the pin
+    /// itself is claimed T1→T2→T4 immediately after boot construction —
+    /// that conversion is the standing proof of the cell's state). 2SIOHJ:
+    /// the layout owns this read; no re-derivation from the table length.
+    fn merge_slot_id(&self) -> SlotId {
+        u64::try_from(self.layout().merge).unwrap_or(SlotId::MAX)
     }
 
     fn register_census(&self) {
@@ -455,15 +610,12 @@ impl FleetHost {
         }
     }
 
+    /// The per-role slot budget, read FROM the boot-frozen [`SlotLayout`]
+    /// (2SIOHJ) — the census rows are layout-built and byte-identical to
+    /// the old budget reads (the merge sidecar is the single `merge`
+    /// seat, which the derive fixes at one `merge_cpus`).
     fn role_slot_budget(&self, role: WorkerRole) -> usize {
-        match role {
-            WorkerRole::Solver => self.budget.solver_pin_count,
-            WorkerRole::SimDriver => self.budget.sim_slot_cap,
-            WorkerRole::Resolve => usize::try_from(self.budget.resolve_cpus).unwrap_or(1),
-            WorkerRole::Merge => usize::try_from(self.budget.merge_cpus).unwrap_or(1),
-            WorkerRole::PoolStateUpdater => self.budget.pool_state_updater_slots,
-            _ => 0,
-        }
+        self.layout.seats(role)
     }
 
     // ---- observation surface --------------------------------------------------
@@ -472,6 +624,13 @@ impl FleetHost {
     #[must_use]
     pub const fn budget(&self) -> &FleetBudget {
         &self.budget
+    }
+
+    /// The boot-frozen slot table geometry (2SIOHJ): derived once at boot
+    /// and never re-derived by [`FleetHost::resize_quota`].
+    #[must_use]
+    pub(crate) fn layout(&self) -> SlotLayout {
+        self.layout.clone()
     }
 
     /// Current posture (read through the shared owner).
@@ -539,11 +698,13 @@ impl FleetHost {
         cell.arena
     }
 
-    /// Slot id of the (unique) merge pin: structurally the LAST boot slot
-    /// (boot pins it T1→T2→T4 before anything else can claim it).
-    // 2SIOHJ: SlotLayout owns this read next task
+    /// Slot id of the (unique) merge pin: the boot-frozen layout's LAST
+    /// index (boot pins it T1→T2→T4 before anything else can claim it).
+    /// Post-boot this is infallible — the table was built FROM this same
+    /// layout — so the `checked_sub`/`Option` dance is gone (2SIOHJ) and
+    /// callers read a plain `SlotId`.
     #[must_use]
-    pub fn merge_slot(&self) -> Option<SlotId> {
+    pub fn merge_slot(&self) -> SlotId {
         self.merge_slot_id()
     }
 
@@ -670,6 +831,12 @@ impl FleetHost {
     ) -> Result<(), BudgetError> {
         let next = self.budget.resize(new_quota_cpus, new_overrides)?;
         self.budget = next;
+        // 2SIOHJ: `self.layout` stays INTENTIONALLY frozen here — the slot
+        // table does not resize under a live quota (cells move only at the
+        // epoch-boundary T9 re-key). The new budget drives the LIVE
+        // admission arithmetic (`queue_cap`, intake caps) while the layout
+        // keeps serving the boot table geometry; see the asymmetry note on
+        // [`FleetHost::queue_cap`] before "unifying" the two.
         tracing::info!(
             target: "degenbot::fleet",
             quota = new_quota_cpus,
@@ -768,15 +935,28 @@ impl FleetHost {
 
     /// The per-role queue bound: 2× the role's slot budget (pipelining
     /// depth); Merge is unbounded-by-type because it is never queued.
+    ///
+    /// RESIZE-QUOTA ASYMMETRY (2SIOHJ — read before "fixing" this to read
+    /// `self.layout`): this bound INTENTIONALLY reads the LIVE budget,
+    /// not the boot-frozen [`SlotLayout`]. [`FleetHost::resize_quota`]
+    /// re-declares the budget under a new quota while the slot table (and
+    /// its layout) stays boot-frozen — cells move only at an epoch
+    /// boundary's T9 re-key — so a layout-sourced bound would keep
+    /// enforcing the BOOT quota's queue depth after a resize while
+    /// admission must follow the LIVE shares. The split is the design:
+    /// layout = table geometry (seat identity, lease targets), live
+    /// budget = admission arithmetic (queue bounds, intake caps, the
+    /// solver admission share).
     #[must_use]
     pub fn queue_cap(&self, role: WorkerRole) -> usize {
-        match role {
-            WorkerRole::Solver => self.budget.solver_pin_count * 2,
-            WorkerRole::SimDriver => self.budget.sim_slot_cap * 2,
-            WorkerRole::Resolve => usize::try_from(self.budget.resolve_cpus).unwrap_or(1) * 4,
-            WorkerRole::PoolStateUpdater => self.budget.pool_state_updater_slots * 2,
+        let seats = match role {
+            WorkerRole::Solver => self.budget.solver_pin_count,
+            WorkerRole::SimDriver => self.budget.sim_slot_cap,
+            WorkerRole::Resolve => usize::try_from(self.budget.resolve_cpus).unwrap_or(1),
+            WorkerRole::PoolStateUpdater => self.budget.pool_state_updater_slots,
             _ => 0,
-        }
+        };
+        queue_cap_for(role, seats)
     }
 
     /// The one precedence grant loop (design doc §4). Returns granted
