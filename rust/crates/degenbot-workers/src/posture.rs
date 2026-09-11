@@ -45,6 +45,26 @@ pub enum EnterReason {
         /// Measured duty percent.
         duty_percent: f64,
     },
+    /// A lane died mid-flight (FF-T4, Z6XTDX — the DECIDED option (a)
+    /// input). Entered with its OWN exit discipline: see
+    /// [`PostureCause::LaneDeath`].
+    LaneDeath,
+}
+
+/// A typed non-throttle posture cause (FF-T4, Z6XTDX — the DECIDED
+/// option (a): the input is typed AT the posture owner, not a sample
+/// it has to infer from; the failure taxonomy stays CLOSED per
+/// ADR-040's per-bucket reactions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostureCause {
+    /// A lane died mid-flight: enter the cordon IMMEDIATELY (no sample
+    /// hysteresis — the fleet is degraded NOW) with its OWN exit
+    /// discipline: the clean window NEVER lifts a lane-death cordon
+    /// (the lane is still dead) — the cordon is STICKY until a fresh
+    /// process. In-flight paths get terminal receipts; the process
+    /// stays alive (the cordoned posture holds deferrable intake and
+    /// floors sim intake — the §6 cordon effects).
+    LaneDeath,
 }
 
 /// The posture change a [`PostureStateMachine::observe`] tick produced.
@@ -285,6 +305,9 @@ pub struct PostureCounters {
     /// Lease grants denied while cordoned (deferrable intake held + sim
     /// intake suppression above the floor).
     pub intake_suppressed: u64,
+    /// Lane-death causes observed (FF-T4 — the sticky cordons, incl.
+    /// upgrades of an existing throttle cordon).
+    pub lane_deaths: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -302,6 +325,13 @@ pub struct PostureStateMachine {
     samples: VecDeque<Sample>,
     last_unclean_ms: Option<u64>,
     counters: PostureCounters,
+    /// A lane-death cordon is STICKY (FF-T4): once set, the clean-window
+    /// exit refuses to lift the cordon — the lane is still dead. Only
+    /// a fresh process clears it (the operator restart path); there is
+    /// deliberately no in-process clear API (a sticky cordon that
+    /// silently un-sticks is exactly the silent-narrow class §10
+    /// forbids).
+    lane_death_hold: bool,
 }
 
 impl PostureStateMachine {
@@ -314,6 +344,7 @@ impl PostureStateMachine {
             samples: VecDeque::new(),
             last_unclean_ms: None,
             counters: PostureCounters::default(),
+            lane_death_hold: false,
         }
     }
 
@@ -356,6 +387,38 @@ impl PostureStateMachine {
         match self.state {
             FleetPosture::Nominal => self.maybe_enter(now_ms),
             FleetPosture::Cordoned => self.maybe_exit(now_ms),
+        }
+    }
+
+    /// Feed one typed non-throttle cause (FF-T4, Z6XTDX — the DECIDED
+    /// option (a) input). A [`PostureCause::LaneDeath`] enters the
+    /// cordon from ANY state with its OWN exit discipline: the cordon
+    /// is sticky (the clean window never lifts it — see
+    /// [`Self::maybe_exit`]), in-flight paths get terminal receipts at
+    /// the detection site, and the process stays alive under the §6
+    /// cordon effects. Idempotent while the hold is already set (the
+    /// counter still counts every cause).
+    pub fn observe_cause(&mut self, cause: PostureCause) -> PostureChange {
+        match cause {
+            PostureCause::LaneDeath => {
+                self.counters.lane_deaths += 1;
+                if self.lane_death_hold {
+                    return PostureChange::Held;
+                }
+                self.lane_death_hold = true;
+                if self.state == FleetPosture::Cordoned {
+                    // An existing (throttle) cordon UPGRADES to the
+                    // sticky hold: no state transition, but the cause
+                    // is new and loud.
+                    tracing::warn!(
+                        target: "degenbot::fleet",
+                        lane_deaths = self.counters.lane_deaths,
+                        "[fleet-posture] lane-death HOLD upgrades an existing cordon — sticky, clean-window exit disabled"
+                    );
+                    return PostureChange::Held;
+                }
+                self.enter(EnterReason::LaneDeath)
+            }
         }
     }
 
@@ -448,6 +511,13 @@ impl PostureStateMachine {
     }
 
     fn maybe_exit(&mut self, now_ms: u64) -> PostureChange {
+        // The lane-death hold is STICKY (FF-T4): the clean window never
+        // lifts it — the lane is still dead. Throttle samples keep
+        // feeding the machine (harmless bookkeeping); only a fresh
+        // process clears the hold.
+        if self.lane_death_hold {
+            return PostureChange::Held;
+        }
         // Exit: `exit_clean_ms` of clean time since the last dirty sample
         // (hysteresis; §6: 10 s of clean windows).
         let dirty_recently = self
@@ -564,6 +634,22 @@ impl PostureOwner {
         let (change, posture) = {
             let mut machine = self.machine.lock();
             let change = machine.observe(now_ms, sample);
+            (change, machine.state())
+        };
+        if !matches!(change, PostureChange::Held) {
+            self.publish(posture);
+        }
+        change
+    }
+
+    /// Feed one typed non-throttle cause (FF-T4, Z6XTDX). Publishes to
+    /// the feed on a real transition like [`Self::observe_throttle`]
+    /// (an idempotent hold-upgrade returns `Held` and stays silent —
+    /// the detection site owns the loud lane-death log).
+    pub fn observe_cause(&self, cause: PostureCause) -> PostureChange {
+        let (change, posture) = {
+            let mut machine = self.machine.lock();
+            let change = machine.observe_cause(cause);
             (change, machine.state())
         };
         if !matches!(change, PostureChange::Held) {
@@ -712,6 +798,109 @@ mod tests {
     #[test]
     fn nominal_is_the_boot_state() {
         assert_eq!(sm().state(), FleetPosture::Nominal);
+    }
+
+    /// FF-T4 (Z6XTDX) — the DECIDED option (a): a typed `PostureCause`
+    /// enters the cordon IMMEDIATELY (no sample hysteresis).
+    #[test]
+    fn a_lane_death_cordons_immediately() {
+        let mut m = sm();
+        assert_eq!(
+            m.observe_cause(PostureCause::LaneDeath),
+            PostureChange::Entered(EnterReason::LaneDeath)
+        );
+        assert_eq!(m.state(), FleetPosture::Cordoned);
+        assert_eq!(m.counters().lane_deaths, 1);
+        assert_eq!(m.counters().entered, 1);
+    }
+
+    /// The lane-death cordon is STICKY: the clean window never lifts it
+    /// (the lane is still dead) — its own exit discipline, deliberately
+    /// different from the throttle hysteresis.
+    #[test]
+    fn the_lane_death_cordon_is_sticky_across_clean_windows() {
+        let mut m = sm();
+        m.observe_cause(PostureCause::LaneDeath);
+        // A long run of clean samples past the full exit window: the
+        // throttle hysteresis would EXIT here — the lane-death hold
+        // refuses (never a silent un-cordon).
+        for t in (0..30_u64).map(|i| 10_000 + i * 1_000) {
+            assert_eq!(
+                m.observe(t, sample(0, 0, 1_000_000)),
+                PostureChange::Held,
+                "a clean window must never lift a lane-death cordon"
+            );
+        }
+        assert_eq!(m.state(), FleetPosture::Cordoned);
+        assert_eq!(m.counters().exited, 0, "the sticky cordon never exits");
+    }
+
+    /// A lane death UPGRADES an existing throttle cordon: no state
+    /// transition (already Cordoned), but the hold turns sticky and the
+    /// cause is counted — loud, never silent.
+    #[test]
+    fn a_lane_death_upgrades_a_throttle_cordon_to_sticky() {
+        let mut m = sm();
+        // Enter via the throttle hysteresis first.
+        m.observe(100, sample(2, 0, 1_000_000));
+        assert_eq!(m.state(), FleetPosture::Cordoned);
+        assert_eq!(m.counters().entered, 1);
+        // The lane death upgrades the hold.
+        assert_eq!(
+            m.observe_cause(PostureCause::LaneDeath),
+            PostureChange::Held,
+            "no state transition — the cordon was already up"
+        );
+        assert_eq!(m.counters().lane_deaths, 1);
+        assert_eq!(m.counters().entered, 1, "no second enter counted");
+        // And the upgrade is sticky: clean windows no longer lift it.
+        for t in (0..30_u64).map(|i| 10_000 + i * 1_000) {
+            m.observe(t, sample(0, 0, 1_000_000));
+        }
+        assert_eq!(m.state(), FleetPosture::Cordoned);
+        assert_eq!(m.counters().exited, 0);
+    }
+
+    /// Idempotent while the hold is already set (every cause counts).
+    #[test]
+    fn repeated_lane_deaths_count_but_do_not_re_enter() {
+        let mut m = sm();
+        m.observe_cause(PostureCause::LaneDeath);
+        for _ in 0..3 {
+            assert_eq!(
+                m.observe_cause(PostureCause::LaneDeath),
+                PostureChange::Held
+            );
+        }
+        assert_eq!(m.counters().lane_deaths, 4);
+        assert_eq!(m.counters().entered, 1);
+    }
+
+    /// The cordon effects hold under a lane-death cause exactly as under
+    /// a throttle cause (the §6 vocabulary: deferrable intake held,
+    /// sim intake floored, in-flight units complete).
+    #[test]
+    fn lane_death_cordon_effects_match_the_throttle_vocabulary() {
+        let mut m = sm();
+        m.observe_cause(PostureCause::LaneDeath);
+        assert!(!m.admits_lease(CordonClass::Deferrable));
+        assert!(m.admits_lease(CordonClass::Never));
+        assert!(m.admits_lease(CordonClass::SimPool));
+        // The sim intake floor (a Cordoned cap of 4 slots -> 2, the
+        // same shape a throttle cordon produces).
+        assert_eq!(m.sim_intake_cap(4), 2);
+    }
+
+    /// The owner publishes the lane-death transition to the feed (a
+    /// subscriber sees the Cordoned edge exactly once).
+    #[test]
+    fn the_owner_publishes_the_lane_death_transition() {
+        let owner = PostureOwner::new(policy());
+        let watch = owner.subscribe();
+        assert_eq!(watch.current(), FleetPosture::Nominal);
+        owner.observe_cause(PostureCause::LaneDeath);
+        assert_eq!(watch.current(), FleetPosture::Cordoned);
+        assert_eq!(owner.current(), FleetPosture::Cordoned);
     }
 
     #[test]
