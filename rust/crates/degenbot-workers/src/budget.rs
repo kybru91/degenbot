@@ -167,6 +167,23 @@ pub enum BudgetError {
     },
 }
 
+impl BudgetError {
+    /// The typed variant NAME (the closed, greppable refusal vocabulary).
+    /// `runtime_status()`'s `tier_refused` string names the family the plan
+    /// fell from (FF-T5 addendum, 452GZC); the Display wording stays the
+    /// operator sentence with the quota, the floor, and the hint.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Oversubscribed { .. } => "Oversubscribed",
+            Self::QuotaTooSmallForPinnedRoles { .. } => "QuotaTooSmallForPinnedRoles",
+            Self::TooFewSolverCpus { .. } => "TooFewSolverCpus",
+            Self::BelowHostFloor { .. } => "BelowHostFloor",
+            Self::IoWorkersOutOfBounds { .. } => "IoWorkersOutOfBounds",
+        }
+    }
+}
+
 /// One consumer row of the boot allocation table (design doc §5) — declared
 /// `(peak_cpus, thread_count)` per the ADR's sum-bounding contract.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -454,6 +471,55 @@ mod tests {
             err,
             BudgetError::QuotaTooSmallForPinnedRoles { .. }
         ));
+    }
+
+    /// FF-T5 addendum (452GZC): the typed refusal family carries a closed,
+    /// greppable NAME vocabulary — the runtime status names the family it
+    /// fell from (never a free-text parse); the wording stays the operator
+    /// sentence.
+    #[test]
+    fn the_refusal_family_names_its_typed_variants() {
+        let cases: [(BudgetError, &str); 5] = [
+            (
+                BudgetError::Oversubscribed {
+                    quota: 4.0,
+                    floor: 4,
+                    declared: 7,
+                },
+                "Oversubscribed",
+            ),
+            (
+                BudgetError::QuotaTooSmallForPinnedRoles {
+                    quota: 4.0,
+                    required: 6,
+                },
+                "QuotaTooSmallForPinnedRoles",
+            ),
+            (
+                BudgetError::TooFewSolverCpus {
+                    solver: 1,
+                    min: MIN_SOLVER_CPUS,
+                },
+                "TooFewSolverCpus",
+            ),
+            (BudgetError::BelowHostFloor { quota: 1.5 }, "BelowHostFloor"),
+            (
+                BudgetError::IoWorkersOutOfBounds {
+                    requested: 0,
+                    binding: "pinned",
+                },
+                "IoWorkersOutOfBounds",
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(err.name(), expected, "{expected} names itself");
+            // The Display sentence never doubles as the family name — the
+            // tier_refused string composes them ("Name: message").
+            assert!(
+                !err.to_string().contains(expected),
+                "the wording stays the sentence; the name rides explicitly: {err}"
+            );
+        }
     }
 
     #[test]

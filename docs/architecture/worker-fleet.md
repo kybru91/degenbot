@@ -449,7 +449,7 @@ decides a tier on its own). The tiers:
 | < 2 | refused | nothing | BelowHostFloor - no tier can host the fleet sum; a typed boot error, the process survives (FF-T1) |
 | 2 - 5 | serial | one named cycle seat per host (work-fleet-serial-0) over the same queue and HostPump; the solve host's keyed-mailbox construction runs the projection's ONE solver seat (serial-0) | the census rows print logical; carries the QuotaTooSmallForPinnedRoles it fell from (tier_refused); the production alert fires (degenbot_fleet_profile{binding="serial"}) |
 | >= 6 | pinned | today's topology: one dedicated thread per seat (work-fleet-sim-{n} / work-fleet-poolupd-{n} / the keyed solver seats) | the boot-frozen SlotLayout; the promotion gate |
-| forced pinned (any >= 2) | pinned | the pinned seats and fan-out, **marked oversubscribed** on sub-floor hosts (plan.oversubscribed) | the operator override is honored, never a silent narrow |
+| forced pinned (any >= 2) | pinned | the pinned seats and fan-out, **marked oversubscribed** on sub-floor hosts (plan.oversubscribed) | the operator override is honored, never a silent narrow; on sub-floor hosts tier_refused names the overridden pinned floor (QuotaTooSmallForPinnedRoles) |
 | forced serial (any >= 2) | serial | the serial seats | ditto |
 
 **"degenbot.runtime_status()"** returns the live view: the plan

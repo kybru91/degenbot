@@ -140,9 +140,13 @@ def runtime_status() -> dict[str, Any]:
 
     Returns a dict with the resolved plan (``fleet_booted``, ``profile``,
     ``quota_cpus``, ``binding`` (pinned/serial), ``oversubscribed``,
-    ``tier_refused``), the projected budget (``budget``: the seat/share
-    table), and the worker census rows (``census``: one dict per
-    resource, with the lane-to-thread ``binding`` per row).
+    ``tier_refused``: the typed refusal the plan fell from, rendered
+    ``NAME: message`` — an auto/serial host carries the
+    ``QuotaTooSmallForPinnedRoles`` that placed it there, a forced-pinned
+    oversubscribed host carries the pinned-floor refusal it overrode;
+    ``None`` when nothing was refused), the projected budget (``budget``:
+    the seat/share table), and the worker census rows (``census``: one
+    dict per resource, with the lane-to-thread ``binding`` per row).
     """
 
 def build_path_graph(

@@ -41,9 +41,14 @@ pub struct FleetRuntimeStatus {
     /// Whether the projection runs marked-oversubscribed (a forced
     /// pinned profile on a sub-floor host).
     pub oversubscribed: bool,
-    /// The tier refusal the plan fell from (a serial-tier host carries
-    /// the `QuotaTooSmallForPinnedRoles` that placed it there); on a
-    /// refused boot this is the refusal itself.
+    /// The tier refusal the plan fell from, rendered `NAME: message` — the
+    /// closed family name (`BudgetError::name()`) is the greppable
+    /// vocabulary, the Display sentence keeps the detected quota, the
+    /// floor, and the hint. A serial-tier host carries the
+    /// `QuotaTooSmallForPinnedRoles` that placed it there; a forced-pinned
+    /// oversubscribed host carries the pinned-floor refusal it overrode
+    /// (FF-T5 addendum, 452GZC). None when the plan refused nothing — or
+    /// the boot plan itself refused (binding None).
     pub tier_refused: Option<String>,
     /// The projected budget the fleet runs (the plan's projection).
     /// None on a refused boot.
@@ -84,9 +89,7 @@ pub fn fleet_runtime_status() -> FleetRuntimeStatus {
         Some((plan, budget)) => (
             Some(plan.binding),
             plan.oversubscribed,
-            plan.tier_refusal
-                .as_ref()
-                .map(std::string::ToString::to_string),
+            tier_refused_string(&plan),
             Some(budget),
         ),
         None => (None, false, None, None),
@@ -101,6 +104,16 @@ pub fn fleet_runtime_status() -> FleetRuntimeStatus {
         budget,
         census: degenbot_core::worker_census::snapshot(),
     }
+}
+
+/// The `tier_refused` string (FF-T5 addendum, 452GZC): the typed refusal's
+/// closed family NAME plus its Display sentence — an operator (and the
+/// test gates) greps the family; the sentence keeps the detected quota,
+/// the floor, and the hint.
+fn tier_refused_string(plan: &FleetPlan) -> Option<String> {
+    plan.tier_refusal
+        .as_ref()
+        .map(|refusal| format!("{}: {refusal}", refusal.name()))
 }
 
 /// The pre-construction view: the LIVE-detected quota with the default
@@ -181,5 +194,44 @@ fn profile_label(profile: FleetProfile) -> &'static str {
         FleetProfile::Auto => "auto",
         FleetProfile::Pinned => "pinned",
         FleetProfile::Serial => "serial",
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use degenbot_workers::budget::BudgetError;
+
+    /// The `tier_refused` string composes the family NAME with the floor
+    /// sentence: greppable (`QuotaTooSmallForPinnedRoles ...`) AND
+    /// explanatory (the detected quota and the floor ride). No refusal, no
+    /// string.
+    #[test]
+    fn the_tier_refused_string_names_the_family_it_fell_from() {
+        let refused = FleetPlan {
+            id: degenbot_workers::plan::PLAN_ID,
+            binding: Binding::Pinned,
+            oversubscribed: true,
+            budget_cpus: 4.0,
+            tier_refusal: Some(BudgetError::QuotaTooSmallForPinnedRoles {
+                quota: 4.0,
+                required: 6,
+            }),
+        };
+        let rendered = tier_refused_string(&refused).expect("the refusal renders");
+        assert!(
+            rendered.contains("QuotaTooSmallForPinnedRoles"),
+            "the string names the typed family: {rendered}"
+        );
+        assert!(
+            rendered.contains("pinned-role floor"),
+            "the string keeps the floor sentence: {rendered}"
+        );
+        let clean = FleetPlan {
+            tier_refusal: None,
+            ..refused
+        };
+        assert!(tier_refused_string(&clean).is_none());
     }
 }

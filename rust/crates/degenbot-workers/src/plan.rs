@@ -115,10 +115,15 @@ pub struct FleetPlan {
     pub oversubscribed: bool,
     /// The detected budget the plan decided on (cores, fractional).
     pub budget_cpus: f64,
-    /// Under `auto`, the pinned-budget refusal that placed this host in
-    /// the serial tier (`None` for forced serial): the boot re-raises
-    /// it while the serial arm is pending (FF-T4), so the refusal stays
-    /// the typed, named budget error the pinned derivation produced.
+    /// The typed budget refusal the resolved plan overrode or fell from
+    /// (`None` when nothing was refused): under `auto`, the pinned-budget
+    /// refusal that placed this host in the serial tier (the boot re-raises
+    /// it while the serial arm is pending — FF-T4 — so the refusal stays
+    /// the typed, named budget error the pinned derivation produced); under
+    /// a FORCED pinned profile below the pinned-role floor, the overridden
+    /// `QuotaTooSmallForPinnedRoles` the marked plan runs past (the runtime
+    /// status names the floor it fell from — FF-T5 addendum, 452GZC);
+    /// `None` for forced serial and every unrefused boot.
     pub tier_refusal: Option<BudgetError>,
 }
 
@@ -228,13 +233,20 @@ pub fn plan(
             validate_io_workers(Binding::Pinned, overrides)?;
             // Forced pinned runs on any host with 2 or more cores; below
             // the pinned-role floor the latency contract is void (marked).
-            let oversubscribed = FleetBudget::derive(quota_cpus, overrides).is_err();
+            // The typed refusal the operator overrode RIDES the plan — like
+            // the auto serial tier carries its placing refusal — so the
+            // runtime status names the pinned floor it fell from (FF-T5
+            // addendum, 452GZC).
+            let (oversubscribed, tier_refusal) = match FleetBudget::derive(quota_cpus, overrides) {
+                Ok(_) => (false, None),
+                Err(refusal) => (true, Some(refusal)),
+            };
             Ok(FleetPlan {
                 id: PLAN_ID,
                 binding: Binding::Pinned,
                 oversubscribed,
                 budget_cpus: quota_cpus,
-                tier_refusal: None,
+                tier_refusal,
             })
         }
         FleetProfile::Serial => {
@@ -449,6 +461,35 @@ mod tests {
             forced.pending_serial_refusal(),
             BootError::Invariant(_)
         ));
+    }
+
+    /// FF-T5 addendum (452GZC): a forced pinned binding below the
+    /// pinned-role floor is MARKED and KEEPS the typed refusal it overrode —
+    /// the runtime status names the pinned floor it fell from, exactly like
+    /// the auto serial tier carries its placing refusal. At/above the floor
+    /// nothing was refused.
+    #[test]
+    fn the_forced_pinned_oversubscription_carries_the_pinned_floor_refusal() {
+        let p = plan(4.0, FleetProfile::Pinned, &overrides()).expect("forced pinned plans");
+        assert_eq!(p.binding, Binding::Pinned);
+        assert!(p.oversubscribed);
+        let refusal = p
+            .tier_refusal
+            .as_ref()
+            .expect("the overridden refusal rides");
+        assert!(
+            matches!(
+                refusal,
+                BudgetError::QuotaTooSmallForPinnedRoles { quota, required }
+                    if (*quota - 4.0).abs() < f64::EPSILON && *required == 6
+            ),
+            "the carried refusal is the pinned derivation's own, got {refusal:?}"
+        );
+        for quota in [6.0_f64, 8.0, 24.0] {
+            let p = plan(quota, FleetProfile::Pinned, &overrides()).expect("eligible host plans");
+            assert!(!p.oversubscribed);
+            assert!(p.tier_refusal.is_none());
+        }
     }
 
     /// `runtime.io_workers` is validated against the plan bounds: an
