@@ -26,6 +26,7 @@ fn hermetic_owner() -> &'static PostureOwner {
 
 fn boot() -> FleetBoot {
     FleetBoot {
+        profile: degenbot_config::FleetProfile::Auto,
         quota_cpus: 8.0,
         overrides: BudgetOverrides::default(),
         posture: policy(),
@@ -35,6 +36,7 @@ fn boot() -> FleetBoot {
 
 fn boot_with_owner(owner: &'static PostureOwner) -> FleetBoot {
     FleetBoot {
+        profile: degenbot_config::FleetProfile::Auto,
         quota_cpus: 8.0,
         overrides: BudgetOverrides::default(),
         posture: policy(),
@@ -49,6 +51,7 @@ fn host() -> FleetHost {
 #[test]
 fn boot_fails_loudly_on_an_unhostable_quota() {
     let err = FleetHost::boot(FleetBoot {
+        profile: degenbot_config::FleetProfile::Auto,
         quota_cpus: 4.5,
         overrides: BudgetOverrides::default(),
         posture: policy(),
@@ -105,6 +108,7 @@ fn boot_pins_exactly_one_merge_and_registers_the_census() {
             count: 0,
             thread_name: "",
             sizing: "",
+            binding: "logical",
         });
         assert_eq!(entry.count, expected(role));
         assert_eq!(entry.thread_name, role.thread_name());
@@ -257,6 +261,7 @@ fn slot_layout_pins_the_merge_sidecar_to_the_last_index() {
 #[test]
 fn slot_layout_of_accepts_the_one_bin_edge() {
     let host = FleetHost::boot(FleetBoot {
+        profile: degenbot_config::FleetProfile::Auto,
         quota_cpus: 6.0,
         overrides: BudgetOverrides {
             solve_headroom: Some(5),
@@ -297,6 +302,7 @@ fn a_dead_station_boot_is_a_loud_invariant() {
         ),
     ] {
         let err = FleetHost::boot(FleetBoot {
+            profile: degenbot_config::FleetProfile::Auto,
             quota_cpus: 8.0,
             overrides,
             posture: policy(),

@@ -129,6 +129,16 @@ fn fnv1a_boot(boot: &FleetBoot) -> u64 {
         state,
         &(boot.posture.sim_intake_floor_override.unwrap_or(0) as u64).to_le_bytes(),
     );
+    // FF-T2 (MEBF4V): the fleet profile folds in as the enum discriminant
+    // (auto | pinned | serial) — a forced profile is a DIFFERENT boot.
+    state = fnv_mix(
+        state,
+        &[match boot.profile {
+            degenbot_config::FleetProfile::Auto => 0_u8,
+            degenbot_config::FleetProfile::Pinned => 1,
+            degenbot_config::FleetProfile::Serial => 2,
+        }],
+    );
     state
 }
 
@@ -244,6 +254,7 @@ mod tests {
 
     fn hermetic_boot() -> FleetBoot {
         FleetBoot {
+            profile: degenbot_config::FleetProfile::Auto,
             quota_cpus: 8.0,
             overrides: BudgetOverrides {
                 sim_slot_cap: Some(4),

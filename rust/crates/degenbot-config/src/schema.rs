@@ -132,6 +132,8 @@ crate::config_schema! {
     runtime RuntimeConfig {
         io_workers [opt usize] = None, env = "DEGENBOT_IO_WORKERS", def = "(unset; derived from the cgroup CPU budget)",
             doc = "Ambient I/O runtime worker count; when unset it is derived from the cgroup CPU budget after the solve bins take theirs (see solve.solve_cpus / solve.solve_headroom). The legacy TOKIO_WORKER_THREADS env name is rejected at load.";
+        fleet_profile [enum FleetProfile Auto Pinned Serial] = FleetProfile::Auto, env = "DEGENBOT_FLEET_PROFILE", def = "auto",
+            doc = "Fleet host-binding profile (FLEETFLOOR FF-T2): auto resolves the host tier from the CPU budget (pinned at/above the pinned-role floor, serial on 2-5 cores, refused below 2); pinned/serial force a binding — a forced pinned binding below the floor runs marked oversubscribed, and forced bindings still need 2 or more cores.";
     }
 
     telemetry TelemetryConfig {

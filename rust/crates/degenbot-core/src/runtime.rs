@@ -72,6 +72,7 @@ fn build_runtime() -> Result<Runtime, std::io::Error> {
         count: workers,
         thread_name: "degenbot-io-rt-{n}",
         sizing: "cpu_budget::ambient_io_worker_count — cgroup budget minus the solve bins, floored at 1 (SMTH6M); override `runtime.io_workers` (env DEGENBOT_IO_WORKERS)",
+        binding: "shared",
     });
     Builder::new_multi_thread()
         .worker_threads(workers)

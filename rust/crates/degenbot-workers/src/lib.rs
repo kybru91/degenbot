@@ -36,6 +36,7 @@ pub mod budget;
 pub mod dispatcher;
 pub mod gauges;
 pub mod lane;
+pub mod plan;
 pub mod posture;
 pub mod quota;
 pub mod role;

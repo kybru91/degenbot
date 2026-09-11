@@ -136,6 +136,7 @@ pub(crate) fn init_subscriber_drainer() {
                     count: 1,
                     thread_name: "subscriber-drainer",
                     sizing: "exactly one (fixed; started once inside the get_or_init)",
+                    binding: "pinned",
                 },
             );
             thread::Builder::new()

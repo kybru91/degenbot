@@ -642,6 +642,7 @@ pub(crate) fn merge_sidecar_census_entry() -> degenbot_core::worker_census::Work
         count: 1,
         thread_name: role.thread_name(),
         sizing: role.census_sizing(),
+        binding: "pinned",
     }
 }
 

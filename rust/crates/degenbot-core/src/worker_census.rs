@@ -66,6 +66,14 @@ pub struct WorkerCensusEntry {
     pub thread_name: &'static str,
     /// Sizing rule in words: what derives the count and which override wins.
     pub sizing: &'static str,
+    /// How this row's work binds to host threads (FF-T2, the closed
+    /// vocabulary): `pinned` = dedicated thread(s) owned by the row (the
+    /// fleet's pinned-binding seats; single-purpose infra threads),
+    /// `shared` = threads shared across concerns (the ambient I/O runtime,
+    /// runtime pools), `logical` = a lane/capacity with no thread of its
+    /// own (hoisted capacities, registry probes; the fleet roles become
+    /// logical lanes under the serial binding, FF-T4).
+    pub binding: &'static str,
 }
 
 static CENSUS: OnceLock<Mutex<Vec<WorkerCensusEntry>>> = OnceLock::new();
@@ -156,6 +164,7 @@ mod tests {
             count: n + 1,
             thread_name: Box::leak(name.to_string().into_boxed_str()),
             sizing: "test sizing rule",
+            binding: "logical",
         }
     }
 
@@ -303,6 +312,7 @@ mod tests {
             count: 3,
             thread_name: THREAD_NAME,
             sizing: "test: exactly 3 threads",
+            binding: "pinned",
         });
 
         let deadline = std::time::Duration::from_secs(5);

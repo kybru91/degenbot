@@ -286,6 +286,7 @@ mod tests {
             return;
         }
         let stamp = crate::arb_engine::boot_stamp::BootStamp::of(FleetBoot {
+            profile: degenbot_config::FleetProfile::Auto,
             quota_cpus: 2.0,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),
@@ -320,6 +321,7 @@ mod tests {
 
     fn hermetic_boot_with_owner(owner: &'static PostureOwner) -> FleetBoot {
         FleetBoot {
+            profile: degenbot_config::FleetProfile::Auto,
             quota_cpus: 8.0,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),

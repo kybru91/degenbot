@@ -1190,6 +1190,7 @@ mod kind_tests {
             count: 3,
             thread_name: "census-roundtrip-{n}",
             sizing: "test sizing rule",
+            binding: "logical",
         });
         export_worker_census_with(&instruments, &degenbot_core::worker_census::snapshot());
         let text = crate::metrics::render(&registry);

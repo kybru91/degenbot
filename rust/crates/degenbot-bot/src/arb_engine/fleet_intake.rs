@@ -93,6 +93,7 @@ mod tests {
     // process global (7KAPBB isolation).
     fn hermetic_boot() -> FleetBoot {
         FleetBoot {
+            profile: degenbot_config::FleetProfile::Auto,
             quota_cpus: 8.0,
             overrides: BudgetOverrides::default(),
             posture: PosturePolicy::doc_defaults(),

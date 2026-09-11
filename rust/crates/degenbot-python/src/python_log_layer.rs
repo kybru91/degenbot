@@ -87,6 +87,7 @@ impl PythonLogLayer {
             count: 1,
             thread_name: "rust-log-drainer",
             sizing: "exactly one (fixed; built with the layer at logging init)",
+            binding: "pinned",
         });
         #[expect(clippy::expect_used)] // invariant-guarded (documented)
         let _drainer = thread::Builder::new()

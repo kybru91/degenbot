@@ -210,6 +210,7 @@ pub fn init_global_metrics_with_addr(addr: SocketAddr) -> Result<(), MetricsInit
         thread_name: "degenbot-metrics",
         sizing:
             "exactly one (fixed; spawn failure degrades to the log — endpoint inactive, no abort)",
+        binding: "pinned",
     });
 
     // Serve on a dedicated std thread — the scrape endpoint must not depend on

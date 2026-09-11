@@ -161,7 +161,7 @@ impl SlotLayout {
     /// boot loudly, never hosts a station nobody can reach), when the
     /// merge sidecar would not land on the LAST index, or when the solver
     /// range drifts from the structural LPT bin count the budget sized.
-    fn of(budget: &FleetBudget) -> Result<Self, BootError> {
+    pub(crate) fn of(budget: &FleetBudget) -> Result<Self, BootError> {
         let solver_len = budget.solver_pin_count;
         let sim_len = budget.sim_slot_cap;
         let resolve_len = usize::try_from(budget.resolve_cpus).unwrap_or(1);
@@ -410,6 +410,11 @@ fn take_solver_unit_for(queue: &mut VecDeque<Unit>, key: PinKey) -> Option<Unit>
 /// the real engines is F3–F5).
 pub struct FleetHost {
     budget: FleetBudget,
+    /// The boot plan (FF-T2, MEBF4V): the tiered authority that resolved
+    /// this boot (id + binding + the oversubscription mark + the detected
+    /// budget). Boot-frozen like the layout; the census rows and
+    /// `runtime_status` read it.
+    plan: crate::plan::FleetPlan,
     /// The boot-frozen slot table geometry (2SIOHJ): derived FIRST at
     /// boot, before any cell/queue/census row; see [`SlotLayout`].
     layout: SlotLayout,
@@ -434,6 +439,7 @@ impl std::fmt::Debug for FleetHost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FleetHost")
             .field("budget", &self.budget)
+            .field("plan", &self.plan.binding)
             .field("layout", &self.layout)
             .field("posture", &self.posture.current())
             .field("slots", &self.slots.len())
@@ -447,6 +453,9 @@ pub struct FleetBoot {
     /// Fractional cgroup quota (cores), from
     /// [`crate::quota::fractional_cpu_budget`].
     pub quota_cpus: f64,
+    /// The fleet host-binding profile (FF-T2, MEBF4V): `auto` resolves
+    /// the tier from the budget; `pinned`/`serial` force a binding.
+    pub profile: degenbot_config::FleetProfile,
     /// Terminal typed overrides.
     pub overrides: BudgetOverrides,
     /// Posture thresholds (typed config).
@@ -467,6 +476,7 @@ impl FleetBoot {
     pub fn from_config(cfg: &degenbot_config::BotConfig) -> Self {
         Self {
             quota_cpus: crate::budget::detected_quota_cpus(&cfg.fleet),
+            profile: cfg.runtime.fleet_profile,
             overrides: BudgetOverrides::from_config(cfg),
             posture: PosturePolicy::from_config(&cfg.fleet),
             owner: None,
@@ -479,6 +489,7 @@ impl PartialEq for FleetBoot {
         // CONFIG equality only (the boot-stamp ledger's key, R2/R3): the
         // owner handle is runtime plumbing, never config.
         self.quota_cpus == other.quota_cpus
+            && self.profile == other.profile
             && self.overrides == other.overrides
             && self.posture == other.posture
     }
@@ -498,7 +509,24 @@ impl FleetHost {
     /// [`BootError::Invariant`] on a dead hosted station or a broken
     /// layout invariant.
     pub fn boot(boot: FleetBoot) -> Result<Self, BootError> {
-        let budget = FleetBudget::derive(boot.quota_cpus, &boot.overrides)?;
+        // FF-T2 (MEBF4V): the PLAN is the first boot step — the tiered
+        // host authority (LW-T4's one floor generalized into ordered tiers).
+        // ONE boot log line names it (id + binding + budget); the serial
+        // tier refuses with its own typed refusal until the arm lands
+        // (FF-T4) — never a silent narrow.
+        let plan = crate::plan::plan(boot.quota_cpus, boot.profile, &boot.overrides)?;
+        tracing::info!(
+            target: "degenbot::fleet",
+            plan = plan.id,
+            binding = %plan.binding,
+            budget_cpus = plan.budget_cpus,
+            oversubscribed = plan.oversubscribed,
+            "[fleet] boot plan resolved"
+        );
+        let budget = match plan.binding {
+            crate::plan::Binding::Pinned => plan.projected_budget(&boot.overrides)?,
+            crate::plan::Binding::Serial => return Err(plan.pending_serial_refusal()),
+        };
         // ONE process-level fleet posture owner (JCI2FW Part A): the
         // boot's policy installs the process owner first-wins; hermetic
         // boots inject their own owner and never touch the global.
@@ -565,6 +593,7 @@ impl FleetHost {
 
         let mut host = Self {
             budget,
+            plan,
             layout,
             posture,
             posture_watch,
@@ -592,6 +621,14 @@ impl FleetHost {
         Ok(host)
     }
 
+    /// The boot plan (FF-T2): the tiered authority that resolved this
+    /// boot — id, binding, the oversubscription mark, and the detected
+    /// budget. Boot-frozen; `runtime_status` and the census read it.
+    #[must_use]
+    pub fn plan(&self) -> &crate::plan::FleetPlan {
+        &self.plan
+    }
+
     /// The merge sidecar's slot: the boot-frozen [`SlotLayout`] merge
     /// index — structurally the LAST slot of the boot table (the pin
     /// itself is claimed T1→T2→T4 immediately after boot construction —
@@ -610,6 +647,11 @@ impl FleetHost {
                 count: self.role_slot_budget(role),
                 thread_name: role.thread_name(),
                 sizing: role.census_sizing(),
+                // FF-T2: how the row's work binds to host threads — the
+                // fleet roles are the pinned binding's dedicated seats
+                // (the serial binding maps them onto shared threads as
+                // logical lanes when it lands, FF-T4).
+                binding: self.plan.binding.label(),
             });
         }
     }

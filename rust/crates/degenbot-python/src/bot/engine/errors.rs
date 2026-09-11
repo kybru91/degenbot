@@ -173,6 +173,16 @@ pub(crate) fn boot_refused(err: degenbot_workers::dispatcher::BootError) -> PyEr
                 "fleet boot refused: declared peak shares {declared} cores exceed floor(quota {quota:.2}) = {floor} — lower the fleet.* share overrides; oversubscription is a configuration bug, refused at boot"
             ))
         }
+        BootError::Budget(BudgetError::BelowHostFloor { quota }) => BootRefused::new_err(
+            format!(
+                "fleet boot refused: detected CPU budget {quota:.2} cores is below the 2-core host floor (one core for I/O work, one core for solve work) — no binding can host the fleet there; give the host at least 2 usable cores (cgroup quota / CPU affinity)"
+            ),
+        ),
+        BootError::Budget(BudgetError::IoWorkersOutOfBounds { requested, binding }) => {
+            BootRefused::new_err(format!(
+                "fleet boot refused: runtime.io_workers override {requested} is out of bounds for the {binding} binding (pinned: A >= 1, the SMTH6M ambient floor; serial: exactly one ambient I/O lane) — fix or drop the override, never a silent clamp"
+            ))
+        }
         BootError::Budget(BudgetError::TooFewSolverCpus { solver, min }) => {
             BootRefused::new_err(format!(
                 "fleet boot refused: the Solver share derives to {solver} cores, below the {min}-core minimum — raise the quota or lower the other fleet.* shares"

@@ -978,6 +978,7 @@ mod tests {
 
         fn boot_with(kind: HostKind, owner: &'static PostureOwner) -> Self {
             let boot = FleetBoot {
+                profile: degenbot_config::FleetProfile::Auto,
                 quota_cpus: 8.0,
                 overrides: BudgetOverrides::default(),
                 posture: PosturePolicy::doc_defaults(),

@@ -58,6 +58,7 @@ fn hermetic_owner() -> &'static PostureOwner {
 
 fn boot() -> FleetBoot {
     FleetBoot {
+        profile: degenbot_config::FleetProfile::Auto,
         quota_cpus: 8.0,
         overrides: BudgetOverrides::default(),
         posture: policy(),
@@ -520,6 +521,7 @@ fn declared_roles_gate_in_dispatch_until_their_migration_step() {
 #[test]
 fn overly_small_quotas_never_boot() {
     let err = FleetHost::boot(FleetBoot {
+        profile: degenbot_config::FleetProfile::Auto,
         quota_cpus: 4.5,
         ..boot()
     })

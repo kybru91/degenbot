@@ -357,6 +357,7 @@ fn build_inline_sim_runtime() -> tokio::runtime::Runtime {
         count: workers,
         thread_name: "degenbot-inline-sim-{n}",
         sizing: "leftover_worker_budget (7LV6VN T5); override `solve.inline_sim_workers` (env DEGENBOT_INLINE_SIM_WORKERS), clamp 1..=32",
+        binding: "shared",
     });
     #[expect(clippy::expect_used)]
     // unreachable in production: multi-thread Builder only fails on allocator OOM or invalid config (worker count is clamped 1..=32)

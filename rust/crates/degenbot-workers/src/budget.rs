@@ -138,6 +138,33 @@ pub enum BudgetError {
         /// [`MIN_SOLVER_CPUS`].
         min: u64,
     },
+    /// Fractional quota below the 2-core host floor (FLEETFLOOR FF-T2: one
+    /// core for I/O work, one core for solve work) — no binding can host
+    /// the fleet there, forced or not.
+    #[error(
+        "fractional quota {quota:.2} below the 2-core host floor (one core for I/O \
+         work, one core for solve work) — no binding can host the fleet there \
+         (raise the host CPU budget / affinity to at least 2 cores)"
+    )]
+    BelowHostFloor {
+        /// The fractional quota (cores).
+        quota: f64,
+    },
+    /// A `runtime.io_workers` override the resolved plan cannot honor
+    /// (FF-T2): below the SMTH6M ambient floor (A >= 1) on the pinned
+    /// binding, or off the serial binding\u0027s exactly-one ambient I/O lane.
+    /// Refused with a hint, never a silent clamp.
+    #[error(
+        "runtime.io_workers override {requested} is out of bounds for the {binding} \
+         binding (pinned: A >= 1, the SMTH6M ambient floor; serial: exactly one \
+         ambient I/O lane) — fix or drop the override, never a silent clamp"
+    )]
+    IoWorkersOutOfBounds {
+        /// The requested override.
+        requested: u64,
+        /// The binding the plan resolved (the label).
+        binding: &'static str,
+    },
 }
 
 /// One consumer row of the boot allocation table (design doc §5) — declared
@@ -881,7 +908,13 @@ mod tests {
                     Err(
                         BudgetError::QuotaTooSmallForPinnedRoles { .. }
                         | BudgetError::Oversubscribed { .. }
-                        | BudgetError::TooFewSolverCpus { .. },
+                        | BudgetError::TooFewSolverCpus { .. }
+                        // FF-T2 (MEBF4V): the plan-tier refusal classes.
+                        // The derive itself never produces them (the plan
+                        // does); listed so the match stays exhaustive and
+                        // a future arm is still a compile error.
+                        | BudgetError::BelowHostFloor { .. }
+                        | BudgetError::IoWorkersOutOfBounds { .. },
                     ) => {
                         // Exhaustive typed refusal classes; the match arms
                         // above make any NEW error variant a compile error.

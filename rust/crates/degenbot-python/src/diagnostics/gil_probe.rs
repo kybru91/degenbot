@@ -128,6 +128,7 @@ fn start_gil_probe(interval_ms: u64, threshold_ms: u64, stuck_ms: u64) -> PyResu
         count: 2,
         thread_name: "gil-probe + gil-probe-watchdog",
         sizing: "exactly two (fixed; started once, guarded by the PROBE_RUNNING swap)",
+        binding: "pinned",
     });
 
     // ── Probe thread: periodic GIL acquire + latency log. ──
