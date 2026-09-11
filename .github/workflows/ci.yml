@@ -279,6 +279,7 @@ jobs:
         # the 3.14 ceiling leg stays auto.
         python-version:
           - "3.12"
+          - "3.13"
           - "3.14"
         fleet-profile:
           - auto
