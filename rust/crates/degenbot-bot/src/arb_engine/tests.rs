@@ -6587,7 +6587,8 @@ mod tests {
         let guard = engine.lock();
         assert_eq!(
             guard
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             3
         );
@@ -6627,7 +6628,8 @@ mod tests {
         assert_eq!(engine.results.len(), 3);
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "flag OFF: no detached merges may occur"
@@ -6689,14 +6691,16 @@ mod tests {
         engine.merge_detached_item(item(stale_result, stale_stamp, stale_pid));
         assert_eq!(
             engine
-                .detached_dropped_stale
+                .detached_cycle
+                .dropped_stale
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the stale straggler must be dropped"
         );
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
@@ -6705,14 +6709,16 @@ mod tests {
         engine.merge_detached_item(item(fresh_result, fresh_stamp, fresh_pid));
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the unchanged straggler must be applied"
         );
         assert_eq!(
             engine
-                .detached_dropped_stale
+                .detached_cycle
+                .dropped_stale
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
@@ -6762,13 +6768,15 @@ mod tests {
 
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the duplicate delivery must not apply a second time"
         );
         assert_eq!(
             engine
+                .detached_cycle
                 .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
@@ -6830,7 +6838,8 @@ mod tests {
         ));
         assert_eq!(
             engine
-                .detached_dropped_deregistered
+                .detached_cycle
+                .dropped_deregistered
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the deregistered straggler must be dropped"
@@ -6838,7 +6847,8 @@ mod tests {
         assert!(!engine.results.contains_key(&pid));
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
@@ -7043,6 +7053,7 @@ mod tests {
 
         assert_eq!(
             engine
+                .detached_cycle
                 .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
@@ -7055,7 +7066,8 @@ mod tests {
         );
         assert_eq!(
             engine
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "merged ledger: the refused duplicate must not count as applied"
@@ -7117,12 +7129,13 @@ mod tests {
         // SURVIVES a later claim, not that it survived the sweep that
         // built the (100, 3333) row.
         engine
+            .detached_cycle
             .outcome_ledger
             .lock()
             .claim((current - 63, 2222))
             .ok();
 
-        let ledger_rows = engine.outcome_ledger.lock();
+        let ledger_rows = engine.detached_cycle.outcome_ledger.lock();
         assert!(
             !ledger_rows.contains((current - 65, 1111)),
             "LEDGER_AGE=64: row (seq-65) must be pruned after the seq-{current} claim"
@@ -7139,7 +7152,7 @@ mod tests {
         // retained row survived them.
         engine.solve_dirty(101, &BlockMetadata::default(), &affected_keys_v2);
         engine.solve_dirty(102, &BlockMetadata::default(), &affected_keys_v2);
-        let ledger_rows_still = engine.outcome_ledger.lock();
+        let ledger_rows_still = engine.detached_cycle.outcome_ledger.lock();
         assert!(
             ledger_rows_still.contains((current - 63, 2222)),
             "in-cycle-only advances must not prune detached-keyed rows (anchor = detached_issued_seq)"
@@ -7194,15 +7207,19 @@ mod tests {
         loop {
             let guard = engine.lock();
             let applied = guard
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed);
             let stale = guard
-                .detached_dropped_stale
+                .detached_cycle
+                .dropped_stale
                 .load(std::sync::atomic::Ordering::Relaxed);
             let dereg = guard
-                .detached_dropped_deregistered
+                .detached_cycle
+                .dropped_deregistered
                 .load(std::sync::atomic::Ordering::Relaxed);
             let dup = guard
+                .detached_cycle
                 .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed);
             drop(guard);
@@ -7244,7 +7261,8 @@ mod tests {
             panic!("path killed mid-bin (43E3H3 red harness)");
         }));
         let g0 = engine
-            .detached_outstanding
+            .detached_cycle
+            .outstanding
             .load(std::sync::atomic::Ordering::Relaxed);
 
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
@@ -7267,19 +7285,24 @@ mod tests {
         loop {
             let guard = engine.lock();
             let applied = guard
-                .detached_applied
+                .detached_cycle
+                .applied
                 .load(std::sync::atomic::Ordering::Relaxed)
                 + guard
-                    .detached_dropped_stale
+                    .detached_cycle
+                    .dropped_stale
                     .load(std::sync::atomic::Ordering::Relaxed)
                 + guard
-                    .detached_dropped_deregistered
+                    .detached_cycle
+                    .dropped_deregistered
                     .load(std::sync::atomic::Ordering::Relaxed)
                 + guard
+                    .detached_cycle
                     .duplicate_outcomes
                     .load(std::sync::atomic::Ordering::Relaxed);
             let gauge = guard
-                .detached_outstanding
+                .detached_cycle
+                .outstanding
                 .load(std::sync::atomic::Ordering::Relaxed);
             drop(guard);
             if applied >= path_ids.len() as u64 || std::time::Instant::now() > deadline {
@@ -7306,7 +7329,8 @@ mod tests {
         engine.set_detached_solving(true);
         // Seed the gauge AT the cap: the gate must refuse detachment.
         engine
-            .detached_outstanding
+            .detached_cycle
+            .outstanding
             .store(8, std::sync::atomic::Ordering::Relaxed); // == DETACHED_INFLIGHT_CAP
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
@@ -7325,7 +7349,8 @@ mod tests {
         let (mut engine, pool_ids, path_ids) = detached_fixture(400);
         engine.set_detached_solving(true);
         engine
-            .detached_outstanding
+            .detached_cycle
+            .outstanding
             .store(7, std::sync::atomic::Ordering::Relaxed); // == CAP-1
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
@@ -7358,7 +7383,8 @@ mod tests {
         let pid = path_ids[0];
         let results_before = engine.results.len();
         let applied_before = engine
-            .detached_applied
+            .detached_cycle
+            .applied
             .load(std::sync::atomic::Ordering::Relaxed);
 
         // A second Solved arrival for the SAME (seq, pid) through the merged
@@ -7383,6 +7409,7 @@ mod tests {
 
         assert_eq!(
             engine
+                .detached_cycle
                 .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,

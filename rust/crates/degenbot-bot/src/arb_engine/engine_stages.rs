@@ -209,25 +209,10 @@ impl EngineStages {
             }
             // SRQEK5 (WV62TX): spawn the detached merge sidecar at the FIRST
             // detached enqueue (rx take + spawn atomic under the held guard).
-            if let Some(merge_rx) = engine.take_detached_merge_rx() {
-                let engine_arc = Arc::clone(&self.engine);
-                // PE4FPM: self-register the pinned merge sidecar (the fleet
-                // Merge role — the only posture since the LW-T9 cutover).
-                degenbot_core::worker_census::register(merge_sidecar_census_entry());
-                if let Err(err) = std::thread::Builder::new()
-                    .name(merge_sidecar_thread_name())
-                    .spawn(move || {
-                        super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
-                    })
-                {
-                    // LOUD abort: a stranded merge pipe would silently orphan
-                    // every detached result.
-                    tracing::error!(
-                        error = %err,
-                        "detached merge sidecar spawn failed — aborting (stranded merge pipe)"
-                    );
-                    std::process::abort();
-                }
+            // P37YJG: THE ONE spawn — the machine owns the census register +
+            // named thread + loud abort; this site only takes the parked rx.
+            if let Some(merge_rx) = engine.detached_cycle.take_merge_rx() {
+                super::detached_cycle::spawn_merge_sidecar(&self.engine, merge_rx);
             }
         }
         if let Some(p) = crate::instruments::pipeline() {
@@ -238,53 +223,20 @@ impl EngineStages {
 
     /// SRQEK5 (WV62TX): if the empty-affected solve path took the parked
     /// Receiver tradeoff, the sidecar spawn happens here instead.
+    /// P37YJG: THE ONE spawn — the machine owns it (the take-once rides the
+    /// machine; the census/thread/abort body is `spawn_merge_sidecar`).
     fn spawn_detached_sidecar_if_pending(&self) {
-        let Some(merge_rx) = self.engine.lock().take_detached_merge_rx() else {
+        let Some(merge_rx) = self.engine.lock().detached_cycle.take_merge_rx() else {
             return;
         };
-        let engine_arc = Arc::clone(&self.engine);
-        // PE4FPM: self-register the pinned merge sidecar (same row as the
-        // first-spawn site above; upsert-idempotent).
-        degenbot_core::worker_census::register(merge_sidecar_census_entry());
-        if let Err(err) = std::thread::Builder::new()
-            .name(merge_sidecar_thread_name())
-            .spawn(move || {
-                super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
-            })
-        {
-            tracing::error!(
-                error = %err,
-                "detached merge sidecar spawn failed — aborting (stranded merge pipe)"
-            );
-            std::process::abort();
-        }
+        super::detached_cycle::spawn_merge_sidecar(&self.engine, merge_rx);
     }
 }
 
-/// The detached merge sidecar's thread name (the sidecar IS the fleet
-/// `Merge` role — the pinned T4 seat's named thread pattern; the historical
-/// legacy name retired at the LW-T9 cutover).
-#[must_use]
-pub(crate) fn merge_sidecar_thread_name() -> String {
-    degenbot_workers::role::WorkerRole::Merge
-        .thread_name()
-        .replace("{n}", "1")
-}
-
-/// The sidecar's worker-census row: the fleet `Merge` role's row (census
-/// resource `fleet_merge_slots`, exactly one pinned seat) — the only
-/// posture since the LW-T9 cutover.
-#[must_use]
-pub(crate) fn merge_sidecar_census_entry() -> degenbot_core::worker_census::WorkerCensusEntry {
-    let role = degenbot_workers::role::WorkerRole::Merge;
-    degenbot_core::worker_census::WorkerCensusEntry {
-        resource: role.census_resource(),
-        kind: role.census_kind(),
-        count: 1,
-        thread_name: role.thread_name(),
-        sizing: role.census_sizing(),
-    }
-}
+// P37YJG: the sidecar's thread name + census row + the ONE spawn moved
+// into the machine — `detached_cycle::{merge_sidecar_thread_name,
+// merge_sidecar_census_entry, spawn_merge_sidecar}` (byte-identical
+// naming and census row).
 
 /// Is the caller inside an ambient multi-thread tokio runtime? `block_in_place`
 /// is only valid there; a current-thread runtime or no runtime runs inline.
@@ -410,7 +362,11 @@ mod fleet_stance_tests {
     //! BCA77G: the merge sidecar hosted as the fleet `Merge` role. LW-T9:
     //! the fleet.stance flip matrix is retired — ONE posture survives.
 
-    use super::{merge_sidecar_census_entry, merge_sidecar_thread_name};
+    // P37YJG: the naming/census fns moved into the machine; the pins
+    // (byte-identical naming + census row) stay right here.
+    use crate::arb_engine::detached_cycle::{
+        merge_sidecar_census_entry, merge_sidecar_thread_name,
+    };
 
     /// Under `fleet.stance=fleet` the sidecar runs as the pinned `Merge`
     /// role: the role's greppable thread-name pattern and the fleet merge

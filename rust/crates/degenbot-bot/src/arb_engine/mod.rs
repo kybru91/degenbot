@@ -36,6 +36,7 @@
 //! | [`delivery_lifecycle`] | Delivery lifecycle: channel open/send/close + the end-of-stream contract (incident 2026-08-20 #2) |
 //! | [`delivery_policy`] | Delivery policy: diff computation, thresholds, delivered-bookkeeping (BI7UZV) |
 //! | [`block_cursor`] | The engine block cursor — one owner of the engine-side block-coordinate residue (6XB6NJ) |
+//! | [`detached_cycle`] | THE one detached/in-cycle solve-arm machine: per-cycle states, the merge pipe, the gauge pair, the seq counters, the ledger door, the disposition counters, the fan-in tripwire, and the ONE sidecar spawn (P37YJG) |
 //! | [`lifecycle`] | Path registration, buffer management, engine accessors |
 //! | [`py_binding`] | PyO3 wrapper (`PyArbitrageEngine`) |
 //! | [`tests`] | Unit tests |
@@ -66,6 +67,12 @@ pub(crate) mod block_cursor;
 // Sub-modules — each contains `impl ArbitrageEngine` or `impl PyArbitrageEngine` blocks.
 mod delivery_lifecycle;
 mod delivery_policy;
+// THE one detached/in-cycle solve-arm machine (P37YJG): the per-cycle
+// states, the merge pipe, the gauge pair, the seq counters, the ledger
+// door, the disposition counters, the fan-in tripwire, and the ONE
+// sidecar spawn — see the module's own doc header.
+pub(crate) mod detached_cycle;
+
 mod diagnostic;
 // SZJUKL seam retirement: the arb engine's StageHandlers implementation —
 // the ONE surface left between the machine driver and the engine. The
@@ -498,58 +505,26 @@ pub struct ArbitrageEngine {
     /// `Arc<Mutex<..>>` so the atomic read is lock-free across the pyo3
     /// wrappers and the pump task.
     phase: std::sync::atomic::AtomicU8,
-    // --- Detached solve cycle (epic SRQEK5, task WV62TX) ------------------
+    // --- Detached solve cycle (epic SRQEK5 WV62TX; P37YJG machine) --------
     /// Construction-time stance: `DEGENBOT_DETACHED_SOLVES` (default ON since
     /// task 2UVG3E — the solve path takes no engine-level Mutex; `0` opts out).
     /// When ON, `rebuild_and_solve_affected`
     /// RETURNS at ENQUEUE end and the solves merge on the sidecar thread.
+    /// NOT machine state: the flag is construction-stamped on the engine and
+    /// reads into [`detached_cycle::DetachedCycle::begin_cycle`].
     detached_solving: bool,
-    /// Monotonic counter bumped per issued SOLVE cycle (43E3H3: BOTH arms —
-    /// the detached arm's enqueue AND the in-cycle arm's entry tick it; it
-    /// is THE ledger's seq half). The sidecar's straggler-age telemetry
-    /// still reads `detached_issued_seq` (detached-only) against it.
-    solve_seq_ctr: u64,
-    /// The seq of the most recently issued detached cycle.
-    detached_issued_seq: u64,
+    /// THE one detached/in-cycle solve-arm machine (P37YJG): the per-cycle
+    /// states (`Unopened → Open → Saturated`), the merge pipe open/take, the
+    /// outstanding-gauge pair, the seq counters, the outcome-ledger door,
+    /// the disposition counters, and the fan-in tally. See the module doc
+    /// ([`detached_cycle`]) — it owns the lifecycle end to end.
+    detached_cycle: detached_cycle::DetachedCycle,
     /// LPEOBI: does the core hold a configured `max_age` for the V3/V4
     /// buffered-event expiry? With the cockpit default (`max_age=None`)
     /// `expire` is a provable no-op, so `solve_dirty` must not take a core
     /// write for it — each one bought a ~2.9s writer-queue slot under the
     /// block-apply stream. Flipped by [`Self::set_event_buffer_max_age`].
     event_buffer_expiry_enabled: bool,
-    /// Sender half of the UNBOUNDED mpsc merge pipe; `Some` from the first
-    /// detached enqueue until teardown. Each enqueue clones it into the
-    /// per-bin bin jobs. Carries the unified [`executor::LaneOutcome`]
-    /// (QR3NUS 43E3H3) — BOTH arms submit through it.
-    detached_merge_tx: Option<std::sync::mpsc::Sender<executor::LaneOutcome>>,
-    /// Receiver parked until `EngineStages::solve_dirty` spawns the merge
-    /// sidecar (taken once via `take_detached_merge_rx`). `Mutex`-wrapped so
-    /// the engine stays `Sync` (the parked Receiver behind the worker-only
-    /// guard is touched exactly once, by the spawner thread).
-    detached_merge_rx: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<executor::LaneOutcome>>>,
-    /// LW-T9 note-(a) carry: the duplicate-outcome fuse counter (the QR3NUS
-    /// exactness assert). 43E3H3: BOTH arms feed it — the in-cycle drain's
-    /// ledger claims and the sidecar's — one process-cumulative count.
-    duplicate_outcomes: std::sync::atomic::AtomicU64,
-    /// THE exactness ledger (LW-T9 note (a) -> QR3NUS 43E3H3: ONE ledger
-    /// for BOTH solve arms): one outcome per (`solve_seq`, path)
-    /// EXACTLY once — keyed (`solve_seq`, pid); the in-cycle drain claims
-    /// under its cycle's seq, the sidecar under the enqueue-stamped
-    /// `cycle_seq`. Held on the ENGINE (`parking_lot` Mutex) — the fuse is
-    /// stateful across sidecar restarts (the pipe outlives any one
-    /// sidecar thread) and shared across arms (ONE key zone, design §3.3).
-    outcome_ledger: parking_lot::Mutex<executor::outcome_ledger::OutcomeLedger>,
-    /// In-flight gauge: detached results SENT but not yet dispositioned.
-    /// `Arc` because the enqueue half's bin threads bump it at send time and
-    /// the sidecar decrements it per terminal disposition. At cycle start a
-    /// count ≥ `DETACHED_INFLIGHT_CAP` degrades that cycle to the in-cycle
-    /// path (backpressure via fallback).
-    detached_outstanding: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Detached straggler outcome counters (applied / stale-dropped /
-    /// deregistered-dropped); T2 wires the `detached.*` metrics from these.
-    detached_applied: std::sync::atomic::AtomicU64,
-    detached_dropped_stale: std::sync::atomic::AtomicU64,
-    detached_dropped_deregistered: std::sync::atomic::AtomicU64,
     /// The inline-sim hook (SIMPIPE2 T1): `degenbot-python` installs the
     /// implementation at engine construction via
     /// [`ArbitrageEngine::set_inline_simulator`]; `None` = stance-relevant
@@ -672,19 +647,10 @@ impl ArbitrageEngine {
             delivery: DeliveryPolicy::default(),
             phase: std::sync::atomic::AtomicU8::new(EnginePhase::Created as u8),
             detached_solving,
-            solve_seq_ctr: 0,
-            detached_issued_seq: 0,
+            // P37YJG: the machine's pre-cycle init lives on the machine
+            // (dormant Unopened, pipe closed, counters at 0).
+            detached_cycle: detached_cycle::DetachedCycle::new(),
             event_buffer_expiry_enabled: false,
-            detached_merge_tx: None,
-            duplicate_outcomes: std::sync::atomic::AtomicU64::new(0),
-            outcome_ledger: parking_lot::Mutex::new(
-                executor::outcome_ledger::OutcomeLedger::default(),
-            ),
-            detached_merge_rx: parking_lot::Mutex::new(None),
-            detached_outstanding: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            detached_applied: std::sync::atomic::AtomicU64::new(0),
-            detached_dropped_stale: std::sync::atomic::AtomicU64::new(0),
-            detached_dropped_deregistered: std::sync::atomic::AtomicU64::new(0),
             inline_sim: None,
             inline_payloads: DashMap::new(),
         }

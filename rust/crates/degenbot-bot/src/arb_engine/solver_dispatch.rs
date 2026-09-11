@@ -27,6 +27,7 @@ use super::{ArbitrageEngine, BlockMetadata, HashMap, HashSet};
 // it: solve-on-quiet is correct by construction under the stage-separated
 // data plane; stale results are dropped by the Q1a merge gate, never applied.
 
+use crate::arb_engine::detached_cycle::{self, Arm, LaneDrainCounts};
 use crate::arb_engine::executor::{run_solve_lane, LaneOutcome, SolveLane, SolveOutcome};
 use crate::arb_engine::fleet_solve_executor::SOLVE_BIN_KEY_BASE;
 use crate::arb_engine::inline_sim::{PendingSim, SimPoll, SimulatedPathResult};
@@ -924,13 +925,8 @@ pub(crate) struct SolveCycleShared {
 // in-process solver-state tripwire retired with task 2UVG3E; only the
 // upstream RPC-disagreement check survives at the Published edge).
 
-/// Design-locked in-flight cap (~8): more than this many un-merged detached
-/// results outstanding degrades the issuing cycle to the pre-epic in-cycle
-/// path (backpressure via fallback — a lagging sidecar must not accumulate
-/// unbounded stragglers). The A/B probe measured healthy detached cycles
-/// draining inside the merge makespan, so the cap is a safety valve, not the
-/// steady-state controller.
-pub(crate) const DETACHED_INFLIGHT_CAP: u64 = 8;
+// P37YJG: the in-flight cap constant moved with the cap consult into the
+// one detached-cycle machine — `detached_cycle::DETACHED_INFLIGHT_CAP`.
 
 // The detached-merge CARRIER is `executor::LaneOutcome` (QR3NUS 43E3H3):
 // the former single-variant enum folded into the unified
@@ -1146,31 +1142,25 @@ impl ArbitrageEngine {
         // The in-flight gauge was bumped at SEND time in the enqueue
         // half and is decremented here exactly once per Solved item,
         // so a bin that dies before sending never leaks a count.
-        let outstanding_now = self
-            .detached_outstanding
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(1);
-        if let Some(p) = crate::instruments::pipeline() {
-            p.set_detached_in_flight(outstanding_now);
-        }
-        hotpath::gauge!("detached_solve_in_flight").set(f64::from(
-            u32::try_from(outstanding_now).unwrap_or(u32::MAX),
-        ));
+        // P37YJG: the machine owns the pair — this is the RECEIPT half
+        // (the decrement + both meter publishes ride with it,
+        // byte-identical).
+        self.detached_cycle.solved_received();
         // MQUKB6-T2: re-enter the enqueue-time cycle span for the
         // whole merge (Q1a drop/apply events + any profit emit
         // parent there). Inert without a subscriber or for
         // `Span::none()` test items.
         let merge_span = solved.solve_span.clone();
         let _merge_ctx = merge_span.enter();
-        let age_cycles = self.detached_issued_seq.saturating_sub(solved.cycle_seq);
+        let age_cycles = self
+            .detached_cycle
+            .issued_seq()
+            .saturating_sub(solved.cycle_seq);
         // Q1a deregister: nothing to merge into — drop, never
         // re-create.
         let Some(registered) = self.path_pools.get(&solved.pid) else {
-            self.detached_dropped_deregistered
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(p) = crate::instruments::pipeline() {
-                p.count_detached_stale_dropped();
-            }
+            self.detached_cycle
+                .disposition(detached_cycle::Disposition::DroppedDeregistered);
             tracing::debug!(
                 target: crate::telemetry::DIAGNOSTIC_TARGET,
                 path_id = solved.pid,
@@ -1191,11 +1181,8 @@ impl ArbitrageEngine {
                 .collect()
         };
         if live_stamp != solved.update_stamp {
-            self.detached_dropped_stale
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(p) = crate::instruments::pipeline() {
-                p.count_detached_stale_dropped();
-            }
+            self.detached_cycle
+                .disposition(detached_cycle::Disposition::DroppedStale);
             tracing::info!(
                 target: crate::telemetry::DIAGNOSTIC_TARGET,
                 path_id = solved.pid,
@@ -1245,11 +1232,8 @@ impl ArbitrageEngine {
         // what reached the merge — a refused duplicate increments only
         // `duplicate_outcomes` (the fuse), never this flag.
         if counts.solved > 0 {
-            self.detached_applied
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if let Some(p) = crate::instruments::pipeline() {
-                p.count_detached_applied();
-            }
+            self.detached_cycle
+                .disposition(detached_cycle::Disposition::Applied);
             tracing::debug!(
                 target: crate::telemetry::DIAGNOSTIC_TARGET,
                 path_id = log_pid,
@@ -1322,7 +1306,10 @@ pub(crate) struct LaneArmPolicy {
     /// 43E3H3): the exact `solve_seq` tick this arm's drain claims
     /// `(seq, pid)` with on the shared ONE ledger for carrier-keyed
     /// outcomes (Solved always; the Suppressed/Failed claim decision is
-    /// `claim_all_lanes` below).
+    /// `claim_all_lanes` below). P37YJG: the seq half is MACHINE-ISSUED —
+    /// the detached arm's `Arm::Detached.cycle_seq`, the in-cycle arm's
+    /// `tick_in_cycle()` return — and the claim itself runs through the
+    /// machine's one ledger door (`DetachedCycle::claim`).
     pub(crate) ledger_seq: u64,
     /// The drain's lock context (contract 3): carried so the two call
     /// paths NAME the hold that covers them. The drain never locks —
@@ -1386,7 +1373,6 @@ impl ArbitrageEngine {
     /// contract-4 block in the module comment and
     /// `detached_suppressed_replay_does_not_trip_the_fuse` in the drain
     /// breaker tests.
-    #[expect(clippy::too_many_lines)]
     // Deliberate: this IS the disposition table (design §4.4) — one match
     // over the three LaneOutcome arms, folded (WNH5OL) from the two former
     // per-arm drain bodies and kept as ONE table so the one-ledger claim
@@ -1403,14 +1389,13 @@ impl ArbitrageEngine {
             match item {
                 LaneOutcome::Solved(o) => {
                     let pid = o.pid;
-                    if self
-                        .outcome_ledger
-                        .lock()
-                        .claim((policy.ledger_seq, pid))
-                        .is_err()
-                    {
-                        self.duplicate_outcomes
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // P37YJG: the claim runs through the machine's one
+                    // ledger door (the KEY policy — the seq half — is
+                    // machine-issued); a refused duplicate lands on the
+                    // machine's fuse counter.
+                    if self.detached_cycle.claim((policy.ledger_seq, pid)).is_err() {
+                        self.detached_cycle
+                            .disposition(detached_cycle::Disposition::Duplicate);
                         tracing::error!(
                             target: crate::telemetry::DIAGNOSTIC_TARGET,
                             path_id = pid,
@@ -1452,14 +1437,10 @@ impl ArbitrageEngine {
                     // with a same-pid Solved of a LATER cycle and either
                     // false-trip the fuse or mask a duplicate).
                     if policy.claim_all_lanes
-                        && self
-                            .outcome_ledger
-                            .lock()
-                            .claim((policy.ledger_seq, pid))
-                            .is_err()
+                        && self.detached_cycle.claim((policy.ledger_seq, pid)).is_err()
                     {
-                        self.duplicate_outcomes
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.detached_cycle
+                            .disposition(detached_cycle::Disposition::Duplicate);
                         tracing::error!(
                             target: crate::telemetry::DIAGNOSTIC_TARGET,
                             path_id = pid,
@@ -1481,14 +1462,10 @@ impl ArbitrageEngine {
                     // CONTRACT 4, same witness rule as Suppressed: the
                     // detached Failed record is keyless (pid-only).
                     if policy.claim_all_lanes
-                        && self
-                            .outcome_ledger
-                            .lock()
-                            .claim((policy.ledger_seq, pid))
-                            .is_err()
+                        && self.detached_cycle.claim((policy.ledger_seq, pid)).is_err()
                     {
-                        self.duplicate_outcomes
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.detached_cycle
+                            .disposition(detached_cycle::Disposition::Duplicate);
                         tracing::error!(
                             target: crate::telemetry::DIAGNOSTIC_TARGET,
                             path_id = pid,
@@ -1502,11 +1479,8 @@ impl ArbitrageEngine {
                     // panic record is a genuine final drop, NOT the stale
                     // bucket, which the Q1a stale gate alone owns); the
                     // in-cycle arm simply never reads this counter.
-                    self.detached_dropped_deregistered
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(p) = crate::instruments::pipeline() {
-                        p.count_detached_stale_dropped();
-                    }
+                    self.detached_cycle
+                        .disposition(detached_cycle::Disposition::DroppedDeregistered);
                     tracing::error!(
                         target: crate::telemetry::DIAGNOSTIC_TARGET,
                         path_id = pid,
@@ -1520,14 +1494,8 @@ impl ArbitrageEngine {
     }
 }
 
-/// The drain's counter aggregate (fold of the in-cycle drain's locals +
-/// the sidecar's per-item consumption).
-#[derive(Default)]
-struct LaneDrainCounts {
-    solved: usize,
-    suppressed: usize,
-    failed: usize,
-}
+// P37YJG: the drain's counter aggregate moved with the disposition
+// counters into the machine — detached_cycle::LaneDrainCounts.
 
 impl ArbitrageEngine {
     /// THE ONE LANE WALK (WNH5OL): the shared body of the two former `run_bin`
@@ -1709,15 +1677,9 @@ fn stamp_outcome(
 }
 
 impl ArbitrageEngine {
-    /// Hand the parked merge-pipe Receiver to the spawner (epic SRQEK5
-    /// WV62TX): `EngineStages::solve_dirty` takes it ONCE, at the FIRST
-    /// detached enqueue, and owns it inside the sidecar thread. `None` = the
-    /// sidecar is already running (or no detached cycle ever enqueued).
-    pub(crate) fn take_detached_merge_rx(
-        &mut self,
-    ) -> Option<std::sync::mpsc::Receiver<LaneOutcome>> {
-        self.detached_merge_rx.lock().take()
-    }
+    // P37YJG: the merge-pipe take moved into the machine
+    // (`DetachedCycle::take_merge_rx`); the spawner is the machine's ONE
+    // spawn (`detached_cycle::spawn_merge_sidecar`).
 
     /// Post-solve, pool-state-aware reconciliation of each CL hop's committed
     /// input against the pool's true max-convertible capacity — the tier-3-
@@ -2620,38 +2582,16 @@ impl ArbitrageEngine {
         // Mutex. The detached arm is INDEPENDENT of the in-cycle dispatch
         // below.
         // -----------------------------------------------------------------
-        if self.detached_solving
-            && self
-                .detached_outstanding
-                .load(std::sync::atomic::Ordering::Relaxed)
-                < DETACHED_INFLIGHT_CAP
+        // P37YJG: the arm decision IS the machine's begin_cycle — the cap
+        // consult, the ONE seq tick, and the merge-pipe open-once + Sender
+        // clone all live on the machine now. The construction-stamped
+        // `detached_solving` stance reads in here.
+        if let Arm::Detached {
+            cycle_seq,
+            merge_tx,
+        } = self.detached_cycle.begin_cycle(self.detached_solving)
         {
             hotpath::measure_block!("arb_solve.detached_enqueue", {
-                self.solve_seq_ctr += 1;
-                let cycle_seq = self.solve_seq_ctr;
-                self.detached_issued_seq = cycle_seq;
-                if self.detached_merge_tx.is_none() {
-                    // First detached cycle: open the merge pipe. The sidecar
-                    // thread is spawned by EngineStages::solve_dirty right
-                    // after this enqueue half returns; the Receiver parks in
-                    // the engine until then.
-                    let (merge_tx, merge_rx) = std::sync::mpsc::channel();
-                    self.detached_merge_tx = Some(merge_tx);
-                    *self.detached_merge_rx.lock() = Some(merge_rx);
-                }
-                // Clone the Sender out so the 'static bin threads never
-                // borrow `self` (they outlive the call).
-                let merge_tx = if let Some(existing) = &self.detached_merge_tx {
-                    existing.clone()
-                } else {
-                    // unreachable-by-construction (opened above); a vanished
-                    // pipe would strand every result, so die loudly.
-                    tracing::error!(
-                        target: crate::telemetry::DIAGNOSTIC_TARGET,
-                        "[detached] merge pipe vanished between open and clone — aborting"
-                    );
-                    std::process::abort();
-                };
                 // The Q1a freshness oracle: each item rides the per-hop
                 // `pool_update_block` snapshot stamped by THIS cycle's
                 // resolve phase (above); the sidecar re-reads the live
@@ -2673,16 +2613,15 @@ impl ArbitrageEngine {
                 // Copy the cycle metadata out: the 'static bin threads
                 // outlive the caller's &BlockMetadata borrow.
                 let cycle_metadata = *metadata;
-                // The gauge is Arc-shared: bin threads bump it at SEND time
-                // (so a bin that dies before sending NEVER leaks a count);
-                // the sidecar decrements after each terminal disposition.
-                let outstanding_in_bins = std::sync::Arc::clone(&self.detached_outstanding);
+                // The gauge is machine-owned: the ISSUE half is the hook
+                // below (bin threads bump it at SEND time — so a bin that
+                // dies before sending NEVER leaks a count); the RECEIPT half
+                // is the sidecar's solved_received.
                 let n_bins = bins.len();
                 for (bin_idx, bin) in bins.into_iter().enumerate() {
                     let shared_bin = std::sync::Arc::clone(&shared);
                     let to_solve_bin = std::sync::Arc::clone(&to_solve);
                     let stamps_bin = std::sync::Arc::clone(&enqueue_stamps);
-                    let outstanding_bin = std::sync::Arc::clone(&outstanding_in_bins);
                     let tx = merge_tx.clone();
                     let solve_span_bin = solve_span.clone();
                     // 43E3H3: the submitted pids (the bin's owed list) are
@@ -2707,11 +2646,10 @@ impl ArbitrageEngine {
                     // for pids already sent (an over-disposition the
                     // detached_undercount breaker caught at 4-vs-3).
                     // The gauge hook is 'static (the lane outlives this
-                    // bin body; an Arc-shared atomic carries the bump):
+                    // bin body; an Arc-shared atomic carries the bump) —
+                    // the machine's ISSUE half:
                     let gauge_bump: std::sync::Arc<dyn Fn() + Send + Sync> =
-                        std::sync::Arc::new(move || {
-                            outstanding_bin.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        });
+                        self.detached_cycle.gauge_hook();
                     // ergo INYMDG: bin jobs ride the fleet executor
                     // (fleet.stance=fleet) or the dedicated tokio solve
                     // executor (persistent warm workers, BXUSGL T1). The body
@@ -2788,19 +2726,7 @@ impl ArbitrageEngine {
                         );
                     }
                 }
-                if let Some(p) = crate::instruments::pipeline() {
-                    p.set_detached_in_flight(
-                        self.detached_outstanding
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    );
-                }
-                hotpath::gauge!("detached_solve_in_flight").set(f64::from(
-                    u32::try_from(
-                        self.detached_outstanding
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    )
-                    .unwrap_or(u32::MAX),
-                ));
+                self.detached_cycle.publish_gauge();
                 tracing::info!(
                     target: "degenbot::solver",
                     block_number = solve_block,
@@ -2832,15 +2758,36 @@ impl ArbitrageEngine {
         // stays detached-only (the sidecar's straggler-age telemetry anchor;
         // in-cycle advances deliberately do NOT move it — design §3.3.1,
         // N3's negative half).
-        self.solve_seq_ctr += 1;
-        let in_cycle_seq = self.solve_seq_ctr;
+        // P37YJG: the tick is a machine transition — the machine refuses a
+        // tick when THIS cycle's begin already issued the detached arm (the
+        // one-arm-per-cycle law; the table's typed rejection). Unreachable
+        // through this driver: the match above fell through on Arm::InCycle,
+        // so the latch is clear. The logged rejection keeps the loud typed
+        // surface the T-table promises; the cycle is skipped (no ledger key
+        // can be drawn for it).
+        let in_cycle_seq = match self.detached_cycle.tick_in_cycle() {
+            Ok(seq) => seq,
+            Err(rejected) => {
+                tracing::error!(
+                    target: crate::telemetry::DIAGNOSTIC_TARGET,
+                    from = ?rejected.from,
+                    transition = ?rejected.transition,
+                    reason = %rejected.reason,
+                    "[detached-cycle] in-cycle seq tick REJECTED — off the machine table; skipping the in-cycle dispatch"
+                );
+                return;
+            }
+        };
         // Copy the cycle metadata out before the 'static bin jobs capture
         // it (the detached arm's `cycle_metadata` twin — same reason).
         let cycle_metadata = *metadata;
         let mut clamp_twin_count: u64 = 0;
-        let mut solved_count: usize = 0;
-        let mut suppressed_count: usize = 0;
-        let mut failed_count: usize = 0;
+        // P37YJG: the fan-in accounting is the machine's tally — the
+        // undercount tripwire asserts exact totals at the drain end.
+        let mut fan_in = detached_cycle::FanInTally::default();
+        // Assigned inside the drain block (the tally is consumed by the
+        // tripwire there); the completion telemetry below reads it.
+        let solved_count;
         hotpath::measure_block!("arb_solve.tokio_solve", {
             // BXUSGL T1: the dedicated executor streams PER-PATH
             // results to the caller result queue - one bin task per
@@ -2966,32 +2913,20 @@ impl ArbitrageEngine {
                 };
                 let mut drain_counts = LaneDrainCounts::default();
                 self.drain_lane_outcomes(std::iter::once(item), &policy, &mut drain_counts);
-                let LaneDrainCounts {
-                    solved: n_solved,
-                    suppressed: n_suppressed,
-                    failed: n_failed,
-                } = drain_counts;
-                clamp_twin_count += u64::try_from(n_solved).unwrap_or(u64::MAX);
-                solved_count += n_solved;
-                suppressed_count += n_suppressed;
-                failed_count += n_failed;
+                clamp_twin_count += u64::try_from(drain_counts.solved).unwrap_or(u64::MAX);
+                fan_in.record(&drain_counts);
             }
             drop(merge_ctx);
+            solved_count = fan_in.solved();
             merge_span.record("merge.paths", solved_count);
             // LW-T7 (Seam F, promotion gate): the merged drain ASSERTS exact
             // totals — outcomes == submissions, failures and all. The assert
             // IS the gate: a mismatch fails the cycle thread loudly (the
             // promoted parity fixture additionally cross-checks its own
             // solved-vs-suspended accounting against its submissions).
-            let drained = solved_count + suppressed_count + failed_count;
-            assert_eq!(
-                drained,
-                to_solve.len(),
-                "[solve-merge] outcome accounting undercount — exactness fuse \
-                 tripped (QR3NUS/LW-T7): solved {solved_count} + suppressed \
-                 {suppressed_count} + failed {failed_count} != submitted {}",
-                to_solve.len()
-            );
+            // P37YJG: the tripwire is the machine's (same message, same
+            // loud failure).
+            fan_in.assert_exact(to_solve.len());
         });
         if let Some(c) = shared.capture.as_ref() {
             tracing::info!(
