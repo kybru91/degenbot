@@ -16,6 +16,7 @@
 //! versus the 24-byte `Edge`, improving cache density for the hot DFS loop.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::time::{Duration, Instant};
 
 /// Discriminant for the three pool-table families.
@@ -78,10 +79,41 @@ pub struct Edge {
 /// A key uniquely identifying a pool within a traversal.
 pub type EdgeKey = (u64, PoolKind);
 
+/// Hasher for `u64` token IDs: single multiply-xor round (FxHash-style).
+/// Token-ID hashing runs ~1.5M times during graph construction; the default
+/// `SipHash` costs several instructions per byte for 8-byte keys with no
+/// security benefit here (keys are internal IDs, not adversarial input).
+#[derive(Default)]
+pub(crate) struct U64Hasher {
+    hash: u64,
+}
+
+impl Hasher for U64Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ n).wrapping_mul(0x517C_C1B7_2722_0A95);
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.hash = (self.hash.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517C_C1B7_2722_0A95);
+        }
+    }
+}
+
+/// Hasher-builder for token-ID maps.
+pub(crate) type U64BuildHasher = BuildHasherDefault<U64Hasher>;
+
 /// Compact internal edge: neighbor is a compact token index, `pool_idx`
 /// identifies the pool in the graph's `pools` table. 8 bytes, cache-dense.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-struct CompactEdge {
+pub(crate) struct CompactEdge {
     /// Compact index of the neighbor token (into `PathGraph::adj`).
     neighbor: u32,
     /// Compact index of the pool (into `PathGraph::pools`).
@@ -100,23 +132,46 @@ struct CompactEdge {
 /// Pools are also remapped to compact indices; the `pools` table maps each
 /// compact pool index back to its `(pool_id, PoolKind)` for yielding, and the
 /// visited set is an O(1) `Vec<bool>` indexed by pool index.
+#[derive(Clone)]
 pub struct PathGraph {
-    /// Adjacency list indexed by compact token index. Each entry is the list
-    /// of outgoing `CompactEdge`s, in insertion order.
-    adj: Vec<Vec<CompactEdge>>,
+    /// CSR adjacency: `adj_flat[adj_offsets[i]..adj_offsets[i + 1]]` is the
+    /// list of outgoing `CompactEdge`s of compact token index `i`, in edge
+    /// insertion order (identical order to the previous `Vec<Vec<_>>`),
+    /// contiguous in memory for cache-dense DFS hops.
+    adj_offsets: Vec<u32>,
+    adj_flat: Vec<CompactEdge>,
     /// External token ID → compact token index.
-    token_index: HashMap<u64, u32>,
+    token_index: HashMap<u64, u32, U64BuildHasher>,
     /// Compact pool index → `(pool_id, PoolKind)` for yielding results.
     pools: Vec<(u64, PoolKind)>,
 }
 
 impl PathGraph {
+    /// Slice of the outgoing edges of a compact node.
+    #[must_use]
+    pub(crate) fn adj_of(&self, node: u32) -> &[CompactEdge] {
+        let start = self.adj_offsets[node as usize] as usize;
+        let end = self.adj_offsets[node as usize + 1] as usize;
+        &self.adj_flat[start..end]
+    }
+
+    /// Compact node count (=`adj_offsets.len() - 1`).
+    fn nodes(&self) -> usize {
+        self.adj_offsets.len() - 1
+    }
+
     /// Build from a flat list of `(token0, token1, pool_id, pool_kind)` edges.
     ///
     /// Each edge is added in both directions (the graph is undirected, like
     /// the `networkx.MultiGraph` it replaces). Edge insertion order within
-    /// each node's adjacency list is preserved for deterministic traversal.
-    /// External token IDs are remapped to compact contiguous indices.
+    /// each node's adjacency list is preserved for deterministic traversal
+    /// (per-node cursor fill over the edge list = insertion order). External
+    /// token IDs are remapped to compact contiguous indices.
+    ///
+    /// Two passes over the edge list into a flat CSR array: no per-node
+    /// `Vec` allocations, no reallocation churn (~1.5M heap operations on a
+    /// 742k-edge graph, down from ~750k edge pushes into growing per-node
+    /// vectors plus map-insert adjacency growth).
     ///
     /// # Panics
     ///
@@ -126,50 +181,74 @@ impl PathGraph {
     #[must_use]
     pub fn from_edges(edges: Vec<(u64, u64, u64, PoolKind)>) -> Self {
         let n = edges.len();
-        let mut token_index: HashMap<u64, u32> = HashMap::with_capacity(n);
+        // Upper bound on distinct tokens: 2 per edge. Saves rehashing.
+        let mut token_index: HashMap<u64, u32, U64BuildHasher> =
+        HashMap::with_capacity_and_hasher(n * 2, U64BuildHasher::default());
         let mut pools: Vec<(u64, PoolKind)> = Vec::with_capacity(n);
-        let mut adj: Vec<Vec<CompactEdge>> = Vec::new();
+        // Pass 1: intern endpoints; arena keeps (compactnode0, node1) per edge.
+        let mut arena: Vec<(u32, u32)> = Vec::with_capacity(n);
 
         for (token0, token1, pool_id, pool_kind) in edges {
-            // u32 compact-index invariant: a graph cannot reach u32::MAX nodes.
-            #[expect(clippy::expect_used)]
-            let pool_idx = u32::try_from(pools.len()).expect("pool count exceeds u32::MAX");
             pools.push((pool_id, pool_kind));
 
-            let idx0 = Self::intern_token(&mut token_index, &mut adj, token0);
-            let idx1 = Self::intern_token(&mut token_index, &mut adj, token1);
+            let idx0 = Self::intern_token(&mut token_index, token0);
+            let idx1 = Self::intern_token(&mut token_index, token1);
 
-            adj[idx0 as usize].push(CompactEdge {
-                neighbor: idx1,
-                pool_idx,
-            });
-            adj[idx1 as usize].push(CompactEdge {
-                neighbor: idx0,
-                pool_idx,
-            });
+            arena.push((idx0, idx1));
+        }
+
+        // Pass 2: degrees → offsets → cursor fill (insertion order per node).
+        let node_count = token_index.len();
+        #[expect(clippy::expect_used)]
+        let node_count_u32 = u32::try_from(node_count).expect("node count exceeds u32::MAX");
+        let mut deg = vec![0u32; node_count];
+        for (a, b) in &arena {
+            deg[*a as usize] += 1;
+            deg[*b as usize] += 1;
+        }
+        let mut adj_offsets: Vec<u32> = Vec::with_capacity(node_count + 1);
+        let mut running: u32 = 0;
+        adj_offsets.push(0);
+        for &d in &deg {
+            running += d;
+            adj_offsets.push(running);
+        }
+        let total = running as usize;
+        let mut adj_flat: Vec<CompactEdge> = vec![
+            CompactEdge {
+                neighbor: node_count_u32,
+                pool_idx: u32::MAX,
+            };
+            total
+        ];
+        let mut cursor: Vec<u32> = adj_offsets[..node_count].to_vec();
+        for (pool_idx_usize, (a, b)) in arena.iter().enumerate() {
+            #[expect(clippy::expect_used)]
+            let pool_idx = u32::try_from(pool_idx_usize).expect("pool index exceeds u32::MAX");
+            let ca = &mut cursor[*a as usize];
+            adj_flat[*ca as usize] = CompactEdge { neighbor: *b, pool_idx };
+            *ca += 1;
+            let cb = &mut cursor[*b as usize];
+            adj_flat[*cb as usize] = CompactEdge { neighbor: *a, pool_idx };
+            *cb += 1;
         }
 
         Self {
-            adj,
+            adj_offsets,
+            adj_flat,
             token_index,
             pools,
         }
     }
 
-    /// Assign (or look up) the compact index for an external token ID, growing
-    /// the adjacency list if the token is new.
-    fn intern_token(
-        token_index: &mut HashMap<u64, u32>,
-        adj: &mut Vec<Vec<CompactEdge>>,
-        token: u64,
-    ) -> u32 {
+    /// Assign (or look up) the compact index for an external token ID.
+    fn intern_token(token_index: &mut HashMap<u64, u32, U64BuildHasher>, token: u64) -> u32 {
         if let Some(&idx) = token_index.get(&token) {
             idx
         } else {
             #[expect(clippy::expect_used)] // u32 compact-index invariant (see `from_edges`)
             let idx = u32::try_from(token_index.len()).expect("token count exceeds u32::MAX");
             token_index.insert(token, idx);
-            adj.push(Vec::new());
             idx
         }
     }
@@ -189,86 +268,95 @@ impl PathGraph {
     /// The number of nodes (tokens) in the graph.
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.adj.len()
+        self.nodes()
     }
 
     /// The number of pool edges incident to a token (its degree).
     #[must_use]
     pub fn degree(&self, token: u64) -> Option<usize> {
         self.compact_index(token)
-            .map(|i| self.adj[i as usize].len())
+            .map(|i| self.adj_of(i).len())
     }
 
     /// Remove nodes with degree ≤ 1, repeating until no such nodes remain.
     ///
-    /// This mirrors the Python `_prepare_graph` dead-end pruning loop:
-    /// `while tokens_to_prune := tuple(t for t, d in graph.degree() if d <= 1):
-    ///     graph.remove_nodes_from(tokens_to_prune)`
+    /// Mirrors Python `_prepare_graph`'s iterative dead-end pruning: pruning a
+    /// node may drop another node's live degree below 2, so peeling continues
+    /// to a fixpoint. Nodes on cycles always retain degree ≥ 2, so the
+    /// surviving subgraph (the 2-core) is identical regardless of peel order.
     ///
-    /// Pruning a node removes all its incident edges, which may reduce other
-    /// nodes' degrees below 2 — hence the iterative fixpoint. Removed nodes
-    /// are dropped from `token_index` (so `contains_node` returns `false`)
-    /// and their adjacencies are cleared. Their compact indices are not
-    /// recycled (would require reindexing), but this only wastes a slot — it
-    /// never affects correctness or the hot DFS path.
+    /// Complexity: O(V + E) — a degree-array work queue visits each edge a
+    /// constant number of times, then one ordered CSR rebuild pass
+    /// (preserving edge insertion order, so DFS enumeration order is
+    /// unchanged).
     ///
     /// # Panics
     ///
-    /// Panics if the number of nodes exceeds `u32::MAX` when mapping a
-    /// compact index (architectural bound of the index type; unreachable in
-    /// practice).
+    /// Panics if the number of surviving edges exceeds `u32::MAX`
+    /// (architectural bound of the CSR offset type; unreachable in practice).
     pub fn prune_dead_ends(&mut self) {
-        let n = self.adj.len();
-        // Track which compact indices have been removed so we don't re-scan
-        // already-pruned (degree-0) nodes forever.
+        let n = self.nodes();
+        // 2-core peel (degree array + work queue): a node is on a pruning
+        // path iff iteratively reducing it drops its live degree to <= 1.
+        // This is the SAME fixpoint the previous round-based implementation
+        // computed (nodes on cycles always retain degree >= 2; a removed
+        // node's edges cannot re-connect anything), but it visits each edge
+        // O(1) times instead of rescanning the whole graph per round
+        // (O(V+E) total; the round-based version was O(rounds * (V+E)) and
+        // took ~55s on a 742k-edge mainnet graph).
+        let node_count_u32 = u32::try_from(self.nodes()).unwrap_or(u32::MAX);
+        let mut degree: Vec<usize> = (0..node_count_u32).map(|i| self.adj_of(i).len()).collect();
         let mut removed = vec![false; n];
-        loop {
-            // Collect live nodes whose current degree (count of surviving
-            // incident edges) is ≤ 1.
-            let to_prune: Vec<u32> = (0..n)
-                .filter(|&i| !removed[i] && self.adj[i].len() <= 1)
-                .map(|i| {
-                    // u32 node-index invariant: a graph cannot reach u32::MAX nodes.
-                    #[expect(clippy::expect_used)]
-                    u32::try_from(i).expect("node index exceeds u32::MAX")
-                })
-                .collect();
-            if to_prune.is_empty() {
-                break;
+
+        // Only degree-1 nodes /* and isolated degree-0 leftovers */ can start
+        let mut queue: Vec<usize> = Vec::with_capacity(n / 8);
+        for (i, &d) in degree.iter().enumerate() {
+            if d <= 1 {
+                queue.push(i);
             }
-            for &node_idx in &to_prune {
-                removed[node_idx as usize] = true;
-            }
-            self.remove_nodes(&to_prune);
         }
+        let mut head = 0usize;
+        while head < queue.len() {
+            let i = queue[head];
+            head += 1;
+            if removed[i] {
+                continue;
+            }
+            removed[i] = true;
+            for e in self.adj_of(u32::try_from(i).unwrap_or(u32::MAX)) {
+                let j = e.neighbor as usize;
+                if removed[j] {
+                    continue;
+                }
+                degree[j] -= 1;
+                if degree[j] <= 1 {
+                    queue.push(j);
+                }
+            }
+        }
+        // Single-pass rebuild of the surviving adjacencies (order kept):
+        // walk the old CSR, writing kept edges into a fresh flat array.
+        let mut new_flat: Vec<CompactEdge> = Vec::with_capacity(self.adj_flat.len());
+        let mut new_offsets: Vec<u32> = Vec::with_capacity(n + 1);
+        new_offsets.push(0);
+        for (i, &start) in self.adj_offsets.iter().enumerate().take(n) {
+            if !removed[i] {
+                let end = self.adj_offsets[i + 1] as usize;
+                for e in &self.adj_flat[start as usize..end] {
+                    if !removed[e.neighbor as usize] {
+                        new_flat.push(*e);
+                    }
+                }
+            }
+            #[expect(clippy::expect_used)]
+            new_offsets.push(u32::try_from(new_flat.len()).expect("edge count exceeds u32::MAX"));
+        }
+        self.adj_flat = new_flat;
+        self.adj_offsets = new_offsets;
         // Drop the external token IDs of all pruned nodes so contains_node
         // reflects the post-prune state.
         self.token_index
             .retain(|_, &mut idx| !removed[idx as usize]);
-    }
-
-    /// Remove a set of nodes and all their incident edges.
-    fn remove_nodes(&mut self, nodes: &[u32]) {
-        // Collect all reverse-edge removals first to avoid borrowing self.adj
-        // as both immutable (reading edges) and mutable (removing from neighbors).
-        let mut reverse_removals: Vec<(u32, u32)> = Vec::new(); // (neighbor, pool_idx)
-        for &node_idx in nodes {
-            for edge in &self.adj[node_idx as usize] {
-                reverse_removals.push((edge.neighbor, edge.pool_idx));
-            }
-        }
-
-        // Apply reverse-edge removals from neighbors.
-        for (neighbor, pool_idx) in reverse_removals {
-            if let Some(neighbor_edges) = self.adj.get_mut(neighbor as usize) {
-                neighbor_edges.retain(|e| e.pool_idx != pool_idx);
-            }
-        }
-
-        // Clear the pruned nodes' adjacencies (compact index retained).
-        for &node_idx in nodes {
-            self.adj[node_idx as usize].clear();
-        }
     }
 
     /// Precompute valid depth positions per node, for lookahead pruning.
@@ -286,8 +374,9 @@ impl PathGraph {
         &self,
         pool_type_per_depth: &[Option<Vec<PoolKind>>],
     ) -> Vec<Vec<bool>> {
-        let mut result = Vec::with_capacity(self.adj.len());
-        for edges in &self.adj {
+        let mut result = Vec::with_capacity(self.nodes());
+        for i in 0..self.nodes() {
+            let edges = self.adj_of(u32::try_from(i).unwrap_or(u32::MAX));
             // Collect all pool kinds this node has edges for (a node can use
             // any pool it touches at any depth).
             let mut kinds = [false; 3];
@@ -380,13 +469,7 @@ impl PathFinder<'_> {
             }
 
             // Find the next valid edge to explore from this node.
-            let neighbors = if let Some(n) = self.graph.adj.get(*node as usize) {
-                n.as_slice()
-            } else {
-                // No edges from this node — backtrack.
-                self.stack.pop();
-                continue;
-            };
+            let neighbors: &[CompactEdge] = self.graph.adj_of(*node);
 
             // If the next hop reaches the maximum depth, only edges that close
             // the cycle (reach `end`) can possibly yield — skip the rest
@@ -622,9 +705,14 @@ impl OwnedPathFinder {
         // this compact list avoids scanning/skipping every non-`end` neighbor
         // of each penultimate node. Insertion order is preserved so traversal
         // order (hence enumeration order) is unchanged.
-        let mut end_edges: Vec<Vec<u32>> = vec![Vec::new(); graph.adj.len()];
-        for (node_idx, edges) in graph.adj.iter().enumerate() {
-            for e in edges {
+        let mut end_edges: Vec<Vec<u32>> = vec![Vec::new(); graph.nodes()];
+        for (node_idx, e_list) in graph
+            .adj_offsets
+            .windows(2)
+            .enumerate()
+        {
+            let seg = &graph.adj_flat[e_list[0] as usize..e_list[1] as usize];
+            for e in seg {
                 if e.neighbor == end_idx {
                     end_edges[node_idx].push(e.pool_idx);
                 }
@@ -815,13 +903,7 @@ impl OwnedPathFinder {
                 }
             } else {
                 // Find the next valid edge to explore from this node.
-                let neighbors = if let Some(n) = self.graph.adj.get(*node as usize) {
-                    n.as_slice()
-                } else {
-                    // No edges from this node — backtrack.
-                    self.stack.pop();
-                    continue;
-                };
+                let neighbors: &[CompactEdge] = self.graph.adj_of(*node);
 
                 while *edge_idx < neighbors.len() {
                     let edge = &neighbors[*edge_idx];
