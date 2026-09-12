@@ -698,6 +698,9 @@ impl LogDispatcher {
         // LXDY4C: the event's hop family must be read BEFORE `apply`
         // consumes the decoded event.
         let event_hop = decoded.hop_type();
+        // 7S4QAG: the ledger buckets by block, so the apply site carries the
+        // decoded event's block into the record (read before `apply` consumes it).
+        let event_block = decoded.block_number();
         let apply_start = std::time::Instant::now();
         let outcome = hotpath::measure_block!("dispatch.apply", decoded.apply(&mut state.write()));
         if let Some(p) = crate::instruments::pipeline() {
@@ -728,7 +731,7 @@ impl LogDispatcher {
                 // subscriber-side dirty write is retired. Event family comes
                 // from the decode (no BotState classification).
                 if let Some(delta) = delta {
-                    delta.record_affected(event_hop, pool_id);
+                    delta.record_affected(event_hop, pool_id, event_block);
                 }
                 hotpath::measure_block!("dispatch.notify", {
                     self.notify(pool_id);

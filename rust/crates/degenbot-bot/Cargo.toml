@@ -21,6 +21,8 @@ async-trait = { version = "^0.1" }
 dashmap = { version = "^6.2" }
 # Hot map type shared with degenbot-pools tick maps (foldhash; workspace note).
 hashbrown.workspace = true
+# Ordered bucket set for the per-block recency ledger (bot_core/epoch_delta.rs).
+indexmap.workspace = true
 degenbot-config.workspace = true
 degenbot-abi.workspace = true
 degenbot-math.workspace = true

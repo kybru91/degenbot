@@ -275,9 +275,16 @@ impl Bot {
     /// notify path `dispatch_log` uses, so the re-restored pool re-enters
     /// the delta + re-solves at the next drain tick with no distinct reorg
     /// path. `hop` is the restored event's family (the coordinator reads it
-    /// off the decoded log — no classification lookup).
-    pub fn notify_pool_state_changed(&self, pool_id: u64, hop: degenbot_solvers::mixed::HopType) {
-        self.delta.record_affected(hop, pool_id);
+    /// off the decoded log — no classification lookup) and `block` is the
+    /// block the recorded dirt pertains to (forward: the decoded log's
+    /// block; reorg: the rewind target) — the ledger buckets by it.
+    pub fn notify_pool_state_changed(
+        &self,
+        pool_id: u64,
+        hop: degenbot_solvers::mixed::HopType,
+        block: u64,
+    ) {
+        self.delta.record_affected(hop, pool_id, block);
         self.dispatcher.notify(pool_id);
     }
 

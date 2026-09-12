@@ -2222,6 +2222,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "hotpath",
  "http",
+ "indexmap 2.14.2",
  "libc",
  "libmimalloc-sys",
  "opentelemetry",

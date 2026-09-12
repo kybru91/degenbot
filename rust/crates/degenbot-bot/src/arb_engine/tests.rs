@@ -5449,7 +5449,7 @@ mod tests {
         let marker_delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
         {
             for pid in &pool_ids {
-                marker_delta.record_affected(HopType::V2, *pid);
+                marker_delta.record_affected(HopType::V2, *pid, 0u64);
             }
         }
 
@@ -5469,7 +5469,7 @@ mod tests {
                 // LXDY4C: the marker records into the shared epoch ledger —
                 // the delta IS what the drain takes (no engine-local intake
                 // remains, so the retired probe<->take window cannot exist).
-                marker_delta_thread.record_affected(HopType::V2, pool_ids[rot % 8]);
+                marker_delta_thread.record_affected(HopType::V2, pool_ids[rot % 8], 0u64);
                 rot = rot.wrapping_add(1);
                 // Bounded pace: enough iterations to hit any probe<->take
                 // window the old gate exposed, without spinning hot and
@@ -6992,7 +6992,7 @@ mod tests {
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
         let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
         for &p in &pool_ids {
-            delta.record_affected(HopType::V2, p);
+            delta.record_affected(HopType::V2, p, 0u64);
         }
         let stages = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
         stages.set_delta(delta);
@@ -7230,7 +7230,7 @@ mod tests {
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
         let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
         for &p in &pool_ids {
-            delta.record_affected(HopType::V2, p);
+            delta.record_affected(HopType::V2, p, 0u64);
         }
         let stages = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
         stages.set_delta(delta);
@@ -7306,7 +7306,7 @@ mod tests {
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
         let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
         for &p in &pool_ids {
-            delta.record_affected(HopType::V2, p);
+            delta.record_affected(HopType::V2, p, 0u64);
         }
         let stages = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
         stages.set_delta(delta);
