@@ -6945,7 +6945,7 @@ mod tests {
             drop(tx);
             // Inline sidecar run (this thread): the merge enters the item's
             // carried span — exactly what the real std-thread would see.
-            detached_merge_sidecar(&engine, rx);
+            detached_merge_sidecar(&engine, rx, None);
             // This outer handle is the LAST reference to the solve span —
             // dropping it closes (exports) the span.
             drop(solve_span);
@@ -6972,6 +6972,46 @@ mod tests {
             merged_event,
             "the sidecar merge-time event must parent under the carried solve span; events: {:?}",
             solve_spans[0].events.events
+        );
+    }
+
+    /// AQV6EF AC2 (red-first): a panic inside `merge_detached_item` must be
+    /// CAUGHT — it becomes a typed drain-death record that trips the SAME
+    /// sticky cordon as a failed send, and the sidecar must return (not
+    /// vanish silently, stranding every later send with no signal). The
+    /// dropped Receiver then makes every later send a COUNTED loss.
+    #[test]
+    fn a_panicking_merge_becomes_a_typed_record_and_a_sticky_cordon() {
+        use crate::arb_engine::executor::LaneOutcome;
+        use crate::arb_engine::solver_dispatch::detached_merge_sidecar;
+
+        let owner: &'static degenbot_workers::posture::PostureOwner = std::boxed::Box::leak(
+            std::boxed::Box::new(degenbot_workers::posture::PostureOwner::new(
+                degenbot_workers::posture::PosturePolicy::doc_defaults(),
+            )),
+        );
+        let engine = std::sync::Arc::new(parking_lot::Mutex::new(ArbitrageEngine::new()));
+        engine
+            .lock()
+            .set_merge_panic_hook(std::sync::Arc::new(|pid| {
+                assert_ne!(pid, 0x5151_5151, "merge boom");
+            }));
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+        tx.send(LaneOutcome::Suppressed { pid: 0x5151_5151 })
+            .expect("rx alive");
+        let tx_after = tx.clone();
+        drop(tx);
+        detached_merge_sidecar(&engine, rx, Some(owner));
+        assert_eq!(
+            owner.current(),
+            degenbot_workers::posture::FleetPosture::Cordoned,
+            "a caught merge panic must trip the sticky drain-death cordon"
+        );
+        assert!(
+            tx_after
+                .send(LaneOutcome::Suppressed { pid: 0x1 })
+                .is_err(),
+            "the panicked sidecar has exited: later sends hit the dead pipe (the send-failure signal)"
         );
     }
 

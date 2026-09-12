@@ -184,6 +184,10 @@ pub mod instruments {
         pub fn count_detached_applied(&self) {}
         /// no-op (cold-start trace: degraded-cycle counter)
         pub fn count_detached_degraded_cycle(&self) {}
+        /// no-op (AQV6EF: detached outcomes lost to a dead merge drain)
+        pub fn count_detached_send_failed(&self) {}
+        /// no-op (AQV6EF: merge-seat panics caught by the sidecar guard)
+        pub fn count_detached_merge_panic(&self) {}
     }
 
     /// Epic FRKBGP close-out: resident set bytes (drift-watch). Default

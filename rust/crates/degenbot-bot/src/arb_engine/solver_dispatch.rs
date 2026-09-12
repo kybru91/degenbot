@@ -999,13 +999,52 @@ pub(crate) struct SolveCycleShared {
 /// delivery emission). Spawned by `EngineStages::solve_dirty` at the FIRST
 /// detached enqueue; runs until every `Sender` drops (engine teardown),
 /// so the pipe never strands items across the engine's lifetime.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the sidecar OWNS the merge Receiver for the engine's whole lifetime (the pipe must never be dropped early or borrowed from a shared slot); owning it is the contract, not an accident"
+)]
 pub(crate) fn detached_merge_sidecar(
     engine: &std::sync::Arc<parking_lot::Mutex<ArbitrageEngine>>,
     merge_rx: std::sync::mpsc::Receiver<LaneOutcome>,
+    owner: Option<&degenbot_workers::posture::PostureOwner>,
 ) {
     hotpath::measure_block!("arb_solve.detached_merge", {
-        for item in merge_rx {
-            engine.lock().merge_detached_item(item);
+        // `recv` (not `for .. in merge_rx`) keeps ownership of the
+        // Receiver so the post-panic stranded-tail drain can `try_iter`.
+        while let Ok(item) = merge_rx.recv() {
+            // AQV6EF: a panicking merge must NEVER silently kill this
+            // thread — that drops the Receiver and strands every later
+            // send with no signal. catch_unwind converts the panic into
+            // the SAME typed drain-death terminal state as a failed send
+            // (sticky cordon + counter + loud log); the process lives.
+            let merged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.lock().merge_detached_item(item);
+            }));
+            if let Err(payload) = merged {
+                let message = if let Some(text) = payload.downcast_ref::<&str>() {
+                    Some((*text).to_owned())
+                } else {
+                    payload.downcast_ref::<String>().cloned()
+                };
+                crate::arb_engine::executor::drain_death_response(
+                    &crate::arb_engine::executor::DrainFailure::MergePanic { message },
+                    owner,
+                );
+                // The drain can never recover in-process. Count every
+                // outcome still queued behind the panicked item before the
+                // Receiver drops (the unbounded-queue tail), then end the
+                // sidecar; later sends hit the dead pipe and fire the SAME
+                // typed signal through the lane hook.
+                for stranded in merge_rx.try_iter() {
+                    crate::arb_engine::executor::drain_death_response(
+                        &crate::arb_engine::executor::DrainFailure::Stranded {
+                            pid: stranded.pid(),
+                        },
+                        owner,
+                    );
+                }
+                return;
+            }
         }
     });
 }
@@ -1178,6 +1217,13 @@ impl ArbitrageEngine {
     // acquisition (contract 3: SidecarPerItemHold; the drain never
     // locks for itself).
     pub(crate) fn merge_detached_item(&mut self, item: LaneOutcome) {
+        // AQV6EF red-first: test-only per-path panic hook — kill this merge
+        // mid-item so the sidecar's catch_unwind guard + caught-panic
+        // disposition (sticky cordon) can be pinned.
+        #[cfg(test)]
+        if let Some(panic_pid) = self.test_merge_panic.as_ref() {
+            panic_pid(item.pid());
+        }
         let LaneOutcome::Solved(solved) = &item else {
             // Keyless Suppressed/Failed witnesses have no envelope work
             // (the gauge never bumped them — REV 2 Defect 1): straight to
@@ -2782,6 +2828,13 @@ impl ArbitrageEngine {
                         // it (REV 2 Defect 1) — the corresponding disposition
                         // arm never decrements.
                         lane.set_on_solved_send(gauge_bump.clone());
+                        // AQV6EF: the same lane carries the drain-death
+                        // hook — a terminal send failure on the merge pipe
+                        // is counted and trips the sticky cordon instead of
+                        // being swallowed.
+                        lane.set_on_send_failed(std::sync::Arc::new(|failure| {
+                            crate::arb_engine::executor::drain_death_response(failure, None);
+                        }));
                         run_solve_lane(&mut lane, &SeatSurvivesPolicy, run_bin);
                     };
                     // LW-T8: both arms submit through the ONE Executor

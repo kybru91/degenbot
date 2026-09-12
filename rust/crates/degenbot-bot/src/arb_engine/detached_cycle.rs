@@ -664,7 +664,8 @@ pub(crate) fn spawn_merge_sidecar(
     if let Err(err) = std::thread::Builder::new()
         .name(merge_sidecar_thread_name())
         .spawn(move || {
-            super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx);
+            // AQV6EF: production uses the process posture owner (None).
+            super::solver_dispatch::detached_merge_sidecar(&engine_arc, merge_rx, None);
         })
     {
         // LOUD abort: a stranded merge pipe would silently orphan

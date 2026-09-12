@@ -487,6 +487,11 @@ pub struct ArbitrageEngine {
     /// executor this happens per-path, before the slowest path completes).
     #[cfg(test)]
     merge_probe: Option<std::sync::Arc<parking_lot::Mutex<Vec<u64>>>>,
+    /// AQV6EF red-first: test-only per-path PANIC hook for the MERGE seat
+    /// (the sidecar guard suite needs `merge_detached_item` to die mid-item
+    /// so the caught-panic disposition + sticky cordon are pinned).
+    #[cfg(test)]
+    test_merge_panic: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
     /// Reuse-eligibility counter for the current solve cycle (probe only;
     /// reset each `solve_dirty` and surfaced on the resolve event).
     paths_same_state_this_cycle: u64,
@@ -649,6 +654,8 @@ impl ArbitrageEngine {
             test_solve_panic: None,
             #[cfg(test)]
             merge_probe: None,
+            #[cfg(test)]
+            test_merge_panic: None,
             walk_memo: std::sync::Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
                 cfg.solve.solver_walk_memo,
                 cfg.solve.solver_walk_memo_stats,
@@ -836,6 +843,10 @@ impl ArbitrageEngine {
 
     pub(crate) fn set_merge_probe(&mut self, probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>>) {
         self.merge_probe = Some(probe);
+    }
+
+    pub(crate) fn set_merge_panic_hook(&mut self, hook: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
+        self.test_merge_panic = Some(hook);
     }
 
     pub(crate) fn set_streaming_delivery(&mut self, on: bool) {

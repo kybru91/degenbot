@@ -184,6 +184,15 @@ pub struct PipelineInstruments {
     /// Cold-start trace: cycles the machine DEGRADED to the in-cycle arm
     /// (`Arm::InCycle` under the detached stance — the in-flight cap verdict).
     detached_degraded_cycles: Counter<u64>,
+    /// AQV6EF: detached outcomes LOST to a DEAD MERGE DRAIN — a
+    /// `LaneOutcome` send failed (the sidecar Receiver is gone) or an
+    /// outcome was drained/counted as the panicked sidecar shut down. This
+    /// is the only silent loss in the shipped posture; the counter makes it
+    /// measurable and (with the sticky posture cordon) impossible to miss.
+    detached_send_failed: Counter<u64>,
+    /// AQV6EF: merge-seat panics caught by the sidecar's `catch_unwind`
+    /// guard (the typed failure record for a dead merge seat).
+    detached_merge_panic: Counter<u64>,
     /// Epic K4ETHF T2: time an acquisition waited for the core `BotState`
     /// lock, labeled by `site` (closed set from
     /// `bot_core::state_lock::site_class_for`) + `mode` (read|write).
@@ -515,6 +524,14 @@ impl PipelineInstruments {
                 .u64_counter("degenbot.detached.degraded_cycles")
                 .with_description("Solve cycles DEGRADED to the in-cycle arm (in-flight cap verdict at begin)")
                 .build(),
+            detached_send_failed: meter
+                .u64_counter("degenbot.detached.send_failed")
+                .with_description("Detached outcomes lost to a dead merge drain (failed send / post-panic drain)")
+                .build(),
+            detached_merge_panic: meter
+                .u64_counter("degenbot.detached.merge_panic")
+                .with_description("Merge-seat panics caught by the sidecar guard (dead merge drain)")
+                .build(),
             state_lock_wait: meter
                 .f64_histogram("degenbot.state_lock.wait")
                 .with_unit("s")
@@ -580,6 +597,10 @@ impl PipelineInstruments {
         // not). This explicit 0 keeps the series always present, making a
         // scraped `0` mean what it says.
         instruments.detached_degraded_cycles.add(0, &[]);
+        // AQV6EF: same zero-init for the dead-drain instruments — a missing
+        // `send_failed_total` series must never read as "no lost outcomes".
+        instruments.detached_send_failed.add(0, &[]);
+        instruments.detached_merge_panic.add(0, &[]);
         instruments
     }
 
@@ -893,6 +914,17 @@ impl PipelineInstruments {
     /// One detached straggler DROPPED by the Q1a stale/deregister gate.
     pub fn count_detached_stale_dropped(&self) {
         self.detached_stale_dropped.add(1, &[]);
+    }
+
+    /// One detached outcome LOST to a dead merge drain (AQV6EF): a failed
+    /// pipe send or an outcome drained as the panicked sidecar shut down.
+    pub fn count_detached_send_failed(&self) {
+        self.detached_send_failed.add(1, &[]);
+    }
+
+    /// One merge-seat panic caught by the sidecar guard (AQV6EF).
+    pub fn count_detached_merge_panic(&self) {
+        self.detached_merge_panic.add(1, &[]);
     }
 
     /// One detached straggler applied to the results map.
@@ -1406,6 +1438,32 @@ mod kind_tests {
         let line = text
             .lines()
             .find(|l| l.starts_with("degenbot_detached_degraded_cycles_total"))
+            .expect("the counter stays exported after firing");
+        assert!(line.ends_with(" 1"), "{line} != 1");
+        drop(provider);
+    }
+
+    /// AQV6EF: the dead-merge-drain counter must render BEFORE it ever
+    /// fires — a missing series would read as "no lost outcomes" while a
+    /// dead pipe silently drops every later result. Mirrors the
+    /// degraded-cycle zero-init contract (9395c481b).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn detached_send_failed_counter_renders_before_any_loss() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_send_failed_zero"));
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("degenbot_detached_send_failed_total"))
+            .expect("the send-failed counter must be exported at 0 (a missing series reads as 'no lost outcomes')");
+        assert!(line.ends_with(" 0"), "{line} != 0");
+        instruments.count_detached_send_failed();
+        let text = crate::metrics::render(&registry);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("degenbot_detached_send_failed_total"))
             .expect("the counter stays exported after firing");
         assert!(line.ends_with(" 1"), "{line} != 1");
         drop(provider);

@@ -155,6 +155,104 @@ pub(crate) enum LaneOutcome {
     Failed { pid: u64, failure: LaneFailure },
 }
 
+impl LaneOutcome {
+    /// The path id this outcome witnesses (every variant carries one).
+    pub(crate) fn pid(&self) -> u64 {
+        match self {
+            Self::Solved(item) => item.pid,
+            Self::Suppressed { pid } | Self::Failed { pid, .. } => *pid,
+        }
+    }
+}
+
+/// One typed terminal record for a DEAD MERGE DRAIN (AQV6EF): the merge
+/// pipe's only consumer is gone, so no later outcome can ever be delivered.
+/// Deliberately NOT a [`LaneFailure`]: a `LaneFailure` rides the (live)
+/// pipe as a typed `Failed` record; this names the death of the pipe
+/// ITSELF, so it can only be surfaced out-of-band — counter + sticky pose
+/// cause + loud log — and must never be fabricated as a pipe delivery (the
+/// exactness ledger is owed deliveries for SUBMITTED paths only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DrainFailure {
+    /// A `LaneOutcome` send failed: the merge seat's Receiver is gone.
+    SendFailed {
+        /// The path whose outcome was lost.
+        pid: u64,
+        /// The submitting unit id.
+        unit: u64,
+        /// The submitting seat (slot).
+        seat: u64,
+    },
+    /// `merge_detached_item` panicked while consuming an item; the
+    /// sidecar's `catch_unwind` guard caught it.
+    MergePanic {
+        /// The panic payload when it is a string.
+        message: Option<String>,
+    },
+    /// An outcome was still queued when the panicked sidecar shut down —
+    /// drained and counted so that class is never a silent loss.
+    Stranded {
+        /// The path whose outcome was lost.
+        pid: u64,
+    },
+}
+
+/// The detached arm's drain-death hook (AQV6EF): `Arc`-shared so every
+/// bin thread clones it; fired with the typed failure so the hook stays a
+/// plain policy function (`drain_death_response`, or a test recorder).
+pub(crate) type DrainDeathHook = std::sync::Arc<dyn Fn(&DrainFailure) + Send + Sync>;
+
+/// The drain-death loud-log cadence (AQV6EF): EVERY loss is counted (the
+/// metric and the posture cause), but the error line is emitted on the
+/// first occurrence and then every `DRAIN_DEATH_LOG_EVERY`th, so a dead
+/// pipe cannot flood the log while the terminal state stays continuously
+/// VISIBLE — a once-only line an operator can miss is not acceptable.
+const DRAIN_DEATH_LOG_EVERY: u64 = 256;
+static DRAIN_DEATH_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The ONE drain-death response (AQV6EF). The merge pipe's only consumer is
+/// the sidecar thread, and `spawn_merge_sidecar` spawns exactly one per
+/// engine lifetime — a dead merge seat can NEVER recover in-process.
+/// CLASSIFICATION: a dead merge seat is NOT a `failure_policy`
+/// Fatal/Exit bucket; it is the FF-T4 LANE-DEATH terminal class — a STICKY
+/// cordon plus a live (loud) process, exactly like a solve-lane death.
+/// `owner` overrides the process posture owner for hermetic tests.
+pub(crate) fn drain_death_response(
+    failure: &DrainFailure,
+    owner: Option<&degenbot_workers::posture::PostureOwner>,
+) {
+    match failure {
+        DrainFailure::SendFailed { .. } | DrainFailure::Stranded { .. } => {
+            if let Some(p) = crate::instruments::pipeline() {
+                p.count_detached_send_failed();
+            }
+        }
+        DrainFailure::MergePanic { .. } => {
+            if let Some(p) = crate::instruments::pipeline() {
+                p.count_detached_merge_panic();
+            }
+        }
+    }
+    match owner {
+        Some(owner) => {
+            owner.observe_cause(degenbot_workers::posture::PostureCause::LaneDeath);
+        }
+        None => {
+            degenbot_workers::posture::process()
+                .observe_cause(degenbot_workers::posture::PostureCause::LaneDeath);
+        }
+    }
+    let occurrence = DRAIN_DEATH_LOGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if occurrence == 1 || occurrence.is_multiple_of(DRAIN_DEATH_LOG_EVERY) {
+        tracing::error!(
+            target: "degenbot::fleet",
+            failure = ?failure,
+            occurrence,
+            "[fleet-solve] merge drain DEAD — outcome lost and counted, sticky posture cordon set (FF-T4 lane death); the process lives, only a fresh process lifts it (AQV6EF)"
+        );
+    }
+}
+
 /// The lane WITNESS for one bin: it owes the pipe exactly one outcome per
 /// submitted pid — delivered ones as they happen, undelivered ones patched
 /// as typed `Failed` records after a panic (the seat survives).
@@ -169,6 +267,13 @@ pub(crate) struct SolveLane {
     /// REV 2 Defect 1: those never bump, so they may never decrement).
     /// `None` on the in-cycle arm (which has no in-flight gauge).
     on_solved_send: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// AQV6EF: the DETACHED arm's drain-death hook, fired on a terminal
+    /// `LaneOutcome` send FAILURE (the merge pipe's Receiver is gone).
+    /// Strictly additive: the failed send is NOT re-delivered and the
+    /// in-flight gauge is NOT bumped — the ledger is owed deliveries for
+    /// SUBMITTED paths only, so this surfaces the DRAIN DEATH instead of
+    /// fabricating a pipe delivery. `None` on the in-cycle arm.
+    on_send_failed: Option<DrainDeathHook>,
 }
 
 impl SolveLane {
@@ -183,6 +288,7 @@ impl SolveLane {
             emitted: BTreeSet::new(),
             tx,
             on_solved_send: None,
+            on_send_failed: None,
         }
     }
 
@@ -195,6 +301,12 @@ impl SolveLane {
         self.on_solved_send = Some(on_solved_send);
     }
 
+    /// Install the detached arm's drain-death hook (fired when a terminal
+    /// send fails). MUST be called before `run_solve_lane` drives the bin.
+    pub(crate) fn set_on_send_failed(&mut self, on_send_failed: DrainDeathHook) {
+        self.on_send_failed = Some(on_send_failed);
+    }
+
     /// Deliver one real arm outcome (the worker's `Some` arm). The lane's
     /// `emitted` set is the DOUBLE-DELIVERY guard: every pid released this
     /// way is excluded from the post-panic patch, so a flushed
@@ -202,24 +314,45 @@ impl SolveLane {
     /// breaker suite catches).
     pub(crate) fn solved(&mut self, item: SolveOutcome) {
         self.emitted.insert(item.pid);
+        let pid = item.pid;
         if self.tx.send(LaneOutcome::Solved(item)).is_ok() {
             if let Some(gauge) = self.on_solved_send.as_ref() {
                 gauge();
             }
+        } else {
+            self.note_send_failed(pid);
         }
     }
 
     /// Deliver the worker's `None` arm — still an outcome (counted).
     pub(crate) fn suppressed(&mut self, pid: u64) {
         self.emitted.insert(pid);
-        let _ = self.tx.send(LaneOutcome::Suppressed { pid });
+        if self.tx.send(LaneOutcome::Suppressed { pid }).is_err() {
+            self.note_send_failed(pid);
+        }
     }
 
     /// Patch one typed per-path failure onto the pipe (decision A):
     /// exactly one outcome for `pid`, carrying unit + seat.
     pub(crate) fn failed(&mut self, pid: u64, failure: LaneFailure) {
         self.emitted.insert(pid);
-        let _ = self.tx.send(LaneOutcome::Failed { pid, failure });
+        if self.tx.send(LaneOutcome::Failed { pid, failure }).is_err() {
+            self.note_send_failed(pid);
+        }
+    }
+
+    /// AQV6EF: surface a terminal send failure that would otherwise be
+    /// swallowed. Strictly additive — no pipe delivery is fabricated (the
+    /// pid is already in `emitted`, the double-delivery guard) and no
+    /// gauge is touched; the hook is the detached arm's drain-death signal.
+    fn note_send_failed(&self, pid: u64) {
+        if let Some(hook) = self.on_send_failed.as_ref() {
+            hook(&DrainFailure::SendFailed {
+                pid,
+                unit: self.unit,
+                seat: self.seat,
+            });
+        }
     }
 
     /// The pids this bin still owed the pipe.
@@ -376,5 +509,102 @@ pub(crate) mod outcome_ledger {
             self.seen
                 .retain(|(seq, _)| *seq >= cycle_seq.saturating_sub(LEDGER_AGE));
         }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use degenbot_solvers::mixed::SolvePathResult;
+    use degenbot_workers::posture::{FleetPosture, PostureOwner, PosturePolicy, ThrottleSample};
+
+    fn solved(pid: u64) -> SolveOutcome {
+        SolveOutcome {
+            pid,
+            result: SolvePathResult::default(),
+            worker_clamp_twins: 0,
+            payload: None,
+            solve_block: 0,
+            metadata: crate::arb_engine::BlockMetadata::default(),
+            cycle_seq: 1,
+            update_stamp: Vec::new(),
+            solve_span: tracing::Span::none(),
+        }
+    }
+
+    fn hermetic_owner() -> &'static PostureOwner {
+        std::boxed::Box::leak(std::boxed::Box::new(PostureOwner::new(
+            PosturePolicy::doc_defaults(),
+        )))
+    }
+
+    /// AQV6EF AC1 (red-first): an outcome send against a DROPPED merge
+    /// Receiver must fire the drain-death hook with the typed failure —
+    /// and must NOT bump the in-flight gauge (the failed send was never a
+    /// delivery).
+    #[test]
+    fn a_send_against_a_dropped_receiver_fires_the_drain_death_hook() {
+        let (tx, rx) = std::sync::mpsc::channel::<LaneOutcome>();
+        drop(rx); // the merge seat is gone
+        let seen: Arc<StdMutex<Vec<DrainFailure>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_hook = Arc::clone(&seen);
+        let gauge_calls = Arc::new(AtomicU64::new(0));
+        let gauge_hook = Arc::clone(&gauge_calls);
+        let mut lane = SolveLane::new(7, 3, vec![11], tx);
+        lane.set_on_solved_send(Arc::new(move || {
+            gauge_hook.fetch_add(1, Ordering::Relaxed);
+        }));
+        lane.set_on_send_failed(Arc::new(move |failure| {
+            seen_hook.lock().expect("hook mutex").push(failure.clone());
+        }));
+        lane.solved(solved(11));
+        let failures = seen.lock().expect("hook mutex");
+        assert_eq!(
+            failures.as_slice(),
+            &[DrainFailure::SendFailed {
+                pid: 11,
+                unit: 7,
+                seat: 3
+            }],
+            "the swallowed send must surface as a typed drain failure"
+        );
+        assert_eq!(
+            gauge_calls.load(Ordering::Relaxed),
+            0,
+            "a FAILED send is not a delivery: the in-flight gauge must not bump"
+        );
+    }
+
+    /// AQV6EF AC1/AC2: the drain-death response trips the FF-T4 STICKY
+    /// cordon (only a fresh process lifts it) and stays loud.
+    #[test]
+    fn a_dead_merge_drain_cordons_the_fleet_stickily() {
+        let owner = hermetic_owner();
+        drain_death_response(
+            &DrainFailure::MergePanic {
+                message: Some("merge boom".to_owned()),
+            },
+            Some(owner),
+        );
+        assert_eq!(owner.current(), FleetPosture::Cordoned);
+        for i in 0..30_u64 {
+            owner.observe_throttle(
+                10_000 + i * 1_000,
+                ThrottleSample {
+                    events: 0,
+                    throttled_usec: 0,
+                    elapsed_usec: 1_000_000,
+                },
+            );
+        }
+        assert_eq!(
+            owner.current(),
+            FleetPosture::Cordoned,
+            "a merge-drain death cordon is sticky across clean windows"
+        );
     }
 }
