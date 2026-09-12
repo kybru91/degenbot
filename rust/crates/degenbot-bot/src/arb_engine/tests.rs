@@ -7505,6 +7505,582 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------
+    // QTZGFL: capacity-modulated admission draw (experiment; flag OFF by
+    // default so the current degrade stays byte-identical).
+    // -------------------------------------------------------------------
+
+    /// Budget arithmetic: `budget = max(0, target − outstanding)` in KEYS,
+    /// `None` while the stance is OFF, and the target is clamped to the
+    /// design-locked safety valve. `Some(0)` is the shed predicate.
+    #[test]
+    fn admission_budget_arithmetic_and_target_clamp() {
+        let (mut engine, _pool_ids, _path_ids) = detached_fixture(0);
+        // Stance OFF: no budget — the caller take-alls (byte-identical).
+        assert_eq!(
+            engine.admission_budget_keys(),
+            None,
+            "flag OFF must yield no budget (the take_keys path)"
+        );
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(3);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(3),
+            "empty pipe: full headroom"
+        );
+        engine
+            .detached_cycle
+            .outstanding
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(2),
+            "one straggler: target − 1"
+        );
+        engine
+            .detached_cycle
+            .outstanding
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(0),
+            "at target: zero budget = the SHED verdict"
+        );
+        engine
+            .detached_cycle
+            .outstanding
+            .store(99, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(0),
+            "an overshoot saturates at zero (no unsigned wrap)"
+        );
+        // The target is clamped to the design-locked safety valve.
+        engine
+            .detached_cycle
+            .outstanding
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        engine.set_admission_target_depth(usize::MAX);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(
+                usize::try_from(crate::arb_engine::detached_cycle::DETACHED_INFLIGHT_CAP)
+                    .expect("cap fits usize")
+            ),
+            "an over-cap target clamps to DETACHED_INFLIGHT_CAP"
+        );
+        engine.set_admission_target_depth(0);
+        assert_eq!(
+            engine.admission_budget_keys(),
+            Some(1),
+            "a zero target clamps up to 1 (a target of 0 would never submit)"
+        );
+    }
+
+    /// Full-path shed: the gauge preloaded AT the target makes the DRAW
+    /// (the single consumption decision, `on_resolve`) return a zero budget,
+    /// so the cycle submits NOTHING, advances the solved-block cursor exactly
+    /// like the `skipped_empty` bookkeeping pass, latches
+    /// `cycle.arm="shed"`, and counts the shed. Driven through the staged
+    /// path (Resolved -> Solved), because the dispatch no longer re-reads the
+    /// gauge — it consumes the draw-time verdict stashed by `on_resolve`.
+    #[test]
+    fn admission_zero_budget_sheds_the_whole_cycle() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, Solve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
+        engine.set_detached_solving(true);
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(8);
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        for &p in &pool_ids {
+            delta.record(
+                degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p),
+                10,
+            );
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        let ctx = BlockContext::new(Epoch::at(100), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(
+            drawn.0.is_empty(),
+            "a zero-budget draw consumes nothing; the keys are RETAINED"
+        );
+        let sheds_before = engine
+            .lock()
+            .detached_cycle
+            .shed_cycles
+            .load(std::sync::atomic::Ordering::Relaxed);
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        let guard = engine.lock();
+        assert_eq!(
+            guard.cycle_arm(),
+            "shed",
+            "a zero-budget cycle must latch the shed arm"
+        );
+        assert!(
+            path_ids.iter().all(|p| !guard.results.contains_key(p)),
+            "a shed cycle SUBMITS NOTHING: no path may be solved or merged"
+        );
+        assert_eq!(
+            guard
+                .detached_cycle
+                .shed_cycles
+                .load(std::sync::atomic::Ordering::Relaxed),
+            sheds_before + 1,
+            "the shed counter must fire exactly once"
+        );
+        assert_eq!(
+            guard.results_block(),
+            100,
+            "a shed cycle advances the solved-block cursor like skipped_empty"
+        );
+    }
+
+    /// F2: a draw-zero shed responds BEFORE the `pending_new_paths` merge, so
+    /// it never consumes the eager-registration protection — the eagerly
+    /// solved path is still merged on the NEXT normal cycle (a post-merge
+    /// shed would clear the pipe and let the next cycle's results replacement
+    /// drop the eager result).
+    #[test]
+    #[expect(clippy::too_many_lines)]
+    fn admission_draw_zero_shed_preserves_pending_new_paths() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, Solve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let mut engine = ArbitrageEngine::new();
+        let a = engine.register_v2_pool(
+            Address::from([0x11u8; 20]),
+            usdc(1_500_000),
+            weth(800),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let b = engine.register_v2_pool(
+            Address::from([0x12u8; 20]),
+            weth(1000),
+            usdc(2_000_000),
+            GAMMA_03,
+            FEE_DENOM_03,
+        );
+        let pid = engine
+            .register_and_solve_path(vec![
+                PoolHop {
+                    pool_id: a,
+                    zero_for_one: true,
+                },
+                PoolHop {
+                    pool_id: b,
+                    zero_for_one: true,
+                },
+            ])
+            .expect("eager path registration succeeds");
+        assert!(
+            engine.pending_new_paths.contains(&pid),
+            "the eager path starts in the merge pipe"
+        );
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(8);
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        delta.record(
+            degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, a),
+            10,
+        );
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        // Cycle 1 (draw-zero): the shed responds before the merge.
+        let ctx = BlockContext::new(Epoch::at(10), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(drawn.0.is_empty(), "zero budget draws nothing");
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        {
+            let guard = engine.lock();
+            assert_eq!(guard.cycle_arm(), "shed");
+            assert!(
+                guard.pending_new_paths.contains(&pid),
+                "a draw-zero shed must NOT consume the eager merge protection"
+            );
+            assert!(
+                guard.results.contains_key(&pid),
+                "the eagerly-solved result survives the shed"
+            );
+        }
+        // Cycle 2 (headroom back): the eager path merges and the pipe clears.
+        engine
+            .lock()
+            .detached_cycle
+            .outstanding
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let ctx = BlockContext::new(Epoch::at(11), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        let guard = engine.lock();
+        assert!(
+            guard.pending_new_paths.is_empty(),
+            "the next normal cycle merges + clears the eager-registration pipe"
+        );
+        assert!(
+            guard.results.contains_key(&pid),
+            "the eager result survives the merge cycle"
+        );
+    }
+
+    /// RACE REGRESSION (F1/F3, red-first): the admission budget is decided
+    /// ONCE, at the DRAW. A cycle that drew a POSITIVE budget owns those keys
+    /// (they are already removed from the ledger); an earlier cycle's bin
+    /// thread bumping in-flight to/over the target between the draw and the
+    /// dispatch must NOT turn that cycle into a shed — the drawn keys would
+    /// be discarded (never submitted, never re-recorded). The transition-edge
+    /// cap verdict is served by the EXISTING in-cycle response.
+    ///
+    /// The test drives both stages explicitly, so it can interleave the
+    /// in-flight bump exactly in the race window (between `on_resolve` and
+    /// `on_solve`) — the shape the stage machine's Resolved -> Solved
+    /// sequencing makes deterministic here. RED on the pre-remediation code
+    /// (the dispatch re-read the gauge fresh and shed, discarding the drawn
+    /// keys); GREEN after the draw-time verdict travels with the cycle.
+    #[test]
+    fn admission_race_positive_draw_never_sheds() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, Solve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let (mut engine, pool_ids, path_ids) = detached_fixture(0);
+        engine.set_detached_solving(true);
+        engine.set_solve_admission(true);
+        engine.set_admission_target_depth(8);
+        // An eager-registration path in the merge pipe: a post-merge race
+        // shed would be the F2 data-loss class.
+        engine.pending_new_paths.insert(path_ids[1]);
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        for &p in &pool_ids {
+            delta.record(
+                degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p),
+                10,
+            );
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        let ctx = BlockContext::new(Epoch::at(10), BlockMetadata::default());
+        // DRAW with an EMPTY pipe: budget = 8 -> positive; every key drawn.
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(
+            !drawn.0.is_empty(),
+            "an empty pipe must draw a positive budget"
+        );
+        assert!(
+            delta.is_empty(),
+            "the draw consumed the ledger keys (a shed would lose them)"
+        );
+        // RACE: the bin thread bumps in-flight to the cap between the draw
+        // and the dispatch.
+        engine
+            .lock()
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let sheds_before = engine
+            .lock()
+            .detached_cycle
+            .shed_cycles
+            .load(std::sync::atomic::Ordering::Relaxed);
+        stages
+            .on_solve(&Solve { ctx, paths: drawn })
+            .expect("solve hook is infallible");
+        let guard = engine.lock();
+        assert_eq!(
+            guard.cycle_arm(),
+            "in_cycle",
+            "the transition-edge cap verdict takes the EXISTING in-cycle response, not a shed"
+        );
+        assert_eq!(
+            guard
+                .detached_cycle
+                .shed_cycles
+                .load(std::sync::atomic::Ordering::Relaxed),
+            sheds_before,
+            "a cycle that drew a POSITIVE budget must NEVER shed at the dispatch"
+        );
+        assert!(
+            path_ids.iter().all(|p| guard.results.contains_key(p)),
+            "the drawn keys must be SUBMITTED, never discarded"
+        );
+        assert!(
+            guard.pending_new_paths.is_empty(),
+            "the race cycle must still merge + clear the eager-registration pipe (F2)"
+        );
+    }
+
+    /// Carry: a shed cycle RETAINS its keys in the ledger; a later cycle with
+    /// headroom draws them again (a fresh solve against current state, not a
+    /// replay). This is the acceptance the whole design turns on.
+    #[test]
+    fn admission_carries_retained_keys_to_a_later_cycle() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let engine = ArbitrageEngine::new();
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        engine.lock().set_solve_admission(true);
+        engine.lock().set_admission_target_depth(2);
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+
+        let keys: Vec<_> = (1..=3u64)
+            .map(|id| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, id))
+            .collect();
+        for key in &keys {
+            delta.record(*key, 10);
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        // Gauge AT the target: zero budget ⇒ shed — nothing drawn, all retained.
+        engine
+            .lock()
+            .detached_cycle
+            .outstanding
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        let ctx = BlockContext::new(Epoch::at(10), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert!(
+            drawn.0.is_empty(),
+            "zero-budget draw takes nothing; the keys are RETAINED"
+        );
+        assert_eq!(
+            delta.snapshot_keys(),
+            keys,
+            "carry: the ledger keeps every key"
+        );
+        // Depth falls: the NEXT cycle draws the carried keys (budget = 2).
+        engine
+            .lock()
+            .detached_cycle
+            .outstanding
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let ctx = BlockContext::new(Epoch::at(11), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(
+            drawn.0,
+            vec![keys[0], keys[1]],
+            "the carried keys are drawn freshest-first in insertion order"
+        );
+        assert_eq!(
+            delta.snapshot_keys(),
+            vec![keys[2]],
+            "the overflow stays retained for the next cycle"
+        );
+        // And the final carry drains on the next empty pipe.
+        let ctx = BlockContext::new(Epoch::at(12), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(drawn.0, vec![keys[2]], "the last carried key drains");
+        assert!(delta.is_empty());
+    }
+
+    /// Retention: on a block advance the ledger prunes carried keys older than
+    /// `head − W` and counts the expiry, so a lead that stays starved
+    /// eventually expires VISIBLY instead of pinning the ledger forever.
+    #[test]
+    fn admission_retention_window_expires_carried_leads() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let engine = ArbitrageEngine::new();
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        engine.lock().set_solve_admission(true);
+        engine.lock().set_admission_target_depth(4);
+        engine.lock().set_admission_retention_blocks(5);
+        let stages = EngineStages::new(Arc::clone(&engine));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+
+        let stale = degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, 1);
+        let fresh = degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, 2);
+        delta.record(stale, 10);
+        delta.record(fresh, 100);
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        // head 100, W 5 ⇒ cutoff 95: the block-10 lead expires; the block-100
+        // lead is drawn.
+        let ctx = BlockContext::new(Epoch::at(100), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(drawn.0, vec![fresh], "only the in-window lead is drawn");
+        assert_eq!(
+            engine
+                .lock()
+                .detached_cycle
+                .leads_expired
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the retention prune must count exactly one expired lead"
+        );
+        assert!(delta.is_empty());
+    }
+
+    /// Flag OFF: byte-identical — `on_resolve` take-alls (even with the gauge
+    /// saturated) and the engine keeps the in-cycle DEGRADE, never a shed.
+    #[test]
+    fn admission_off_keeps_take_all_and_the_cap_degrade() {
+        use crate::arb_engine::EngineStages;
+        use crate::bot_core::stage_handlers::{
+            QuiesceOutcome, QuiesceVerdict, Resolve, StageHandlers,
+        };
+        use crate::bot_core::{BlockContext, Epoch, EpochDelta};
+        use std::sync::Arc;
+
+        let (mut engine, pool_ids, _path_ids) = detached_fixture(0);
+        engine.set_detached_solving(true);
+        // Stance left OFF; the gauge at the cap must NOT shed.
+        engine
+            .detached_cycle
+            .outstanding
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
+            .iter()
+            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
+            .collect();
+        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
+        assert_eq!(
+            engine.cycle_arm(),
+            "in_cycle",
+            "flag OFF: the cap verdict still DEGRADES (byte-identical current behavior)"
+        );
+        assert_eq!(
+            engine
+                .detached_cycle
+                .shed_cycles
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "flag OFF must never shed"
+        );
+        // And the draw path take-alls regardless of the gauge.
+        let engine_arc = Arc::new(parking_lot::Mutex::new(engine));
+        let stages = EngineStages::new(Arc::clone(&engine_arc));
+        let delta = Arc::new(EpochDelta::new(0u64));
+        stages.set_delta(Arc::clone(&delta));
+        for id in 1..=5u64 {
+            delta.record(
+                degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, id),
+                10,
+            );
+        }
+        let quiesced = QuiesceOutcome {
+            verdict: QuiesceVerdict::Settled,
+        };
+        let ctx = BlockContext::new(Epoch::at(10), BlockMetadata::default());
+        let drawn = stages
+            .on_resolve(&Resolve {
+                ctx,
+                quiesced: &quiesced,
+                delta: &delta,
+            })
+            .expect("resolve hook is infallible");
+        assert_eq!(
+            drawn.0.len(),
+            5,
+            "flag OFF: take_keys consumes the whole ledger"
+        );
+        assert!(delta.is_empty());
+    }
+
     /// N1 (in-cycle duplicate policy, tightened): a duplicate
     /// (`solve_seq`, pid) arrival at the in-cycle drain must be REFUSED —
     /// counted and logged, never merged twice. Red at HEAD against the

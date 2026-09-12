@@ -381,6 +381,15 @@ pub(crate) struct DetachedCycle {
     pub(crate) applied: std::sync::atomic::AtomicU64,
     pub(crate) dropped_stale: std::sync::atomic::AtomicU64,
     pub(crate) dropped_deregistered: std::sync::atomic::AtomicU64,
+    /// QTZGFL: cycles SHED by capacity-modulated admission (zero draw
+    /// budget) — the machine's disposition counter behind
+    /// `degenbot.detached.shed_total`. A shed cycle submits nothing and
+    /// claims nothing (no seq tick); this is a pure counter event.
+    pub(crate) shed_cycles: std::sync::atomic::AtomicU64,
+    /// QTZGFL: retained (carried) admission keys pruned by the retention
+    /// window (`head − W`) — the machine's counter behind
+    /// `degenbot.detached.leads_expired_total`.
+    pub(crate) leads_expired: std::sync::atomic::AtomicU64,
 }
 
 impl Default for DetachedCycle {
@@ -406,6 +415,8 @@ impl DetachedCycle {
             applied: std::sync::atomic::AtomicU64::new(0),
             dropped_stale: std::sync::atomic::AtomicU64::new(0),
             dropped_deregistered: std::sync::atomic::AtomicU64::new(0),
+            shed_cycles: std::sync::atomic::AtomicU64::new(0),
+            leads_expired: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -565,6 +576,32 @@ impl DetachedCycle {
         hotpath::gauge!("detached_solve_in_flight").set(f64::from(
             u32::try_from(outstanding_now).unwrap_or(u32::MAX),
         ));
+    }
+
+    /// QTZGFL: one admission SHED cycle (zero draw budget) — the machine
+    /// owns the disposition counter + its pipeline meter, mirroring
+    /// [`Self::disposition`]. A shed cycle takes NO transition beyond the
+    /// begin (the machine is not consulted at all on the deterministic path);
+    /// this is a pure counter event.
+    pub(crate) fn shed(&self) {
+        self.shed_cycles.fetch_add(1, Ordering::Relaxed);
+        if let Some(p) = crate::instruments::pipeline() {
+            p.count_detached_shed();
+        }
+    }
+
+    /// QTZGFL: `n` retained admission keys expired by the retention window
+    /// (`head − W`) on a block advance — the machine counter + its pipeline
+    /// meter. A zero count is a no-op (no spurious series touch).
+    pub(crate) fn note_leads_expired(&self, n: usize) {
+        let expired = u64::try_from(n).unwrap_or(u64::MAX);
+        if expired == 0 {
+            return;
+        }
+        self.leads_expired.fetch_add(expired, Ordering::Relaxed);
+        if let Some(p) = crate::instruments::pipeline() {
+            p.count_detached_leads_expired(expired);
+        }
     }
 
     /// ONE terminal disposition: land it on the machine's counter (+ the

@@ -193,6 +193,12 @@ pub struct PipelineInstruments {
     /// AQV6EF: merge-seat panics caught by the sidecar's `catch_unwind`
     /// guard (the typed failure record for a dead merge seat).
     detached_merge_panic: Counter<u64>,
+    /// QTZGFL: solve cycles SHED by capacity-modulated admission (zero draw
+    /// budget: nothing submitted, cursor advanced, keys retained for carry).
+    detached_shed: Counter<u64>,
+    /// QTZGFL: retained (carried) admission keys pruned by the retention
+    /// window (`head − W`) — a starved lead's visible expiry.
+    detached_leads_expired: Counter<u64>,
     /// Epic K4ETHF T2: time an acquisition waited for the core `BotState`
     /// lock, labeled by `site` (closed set from
     /// `bot_core::state_lock::site_class_for`) + `mode` (read|write).
@@ -532,6 +538,14 @@ impl PipelineInstruments {
                 .u64_counter("degenbot.detached.merge_panic")
                 .with_description("Merge-seat panics caught by the sidecar guard (dead merge drain)")
                 .build(),
+            detached_shed: meter
+                .u64_counter("degenbot.detached.shed_total")
+                .with_description("Solve cycles SHED by capacity-modulated admission (zero draw budget)")
+                .build(),
+            detached_leads_expired: meter
+                .u64_counter("degenbot.detached.leads_expired_total")
+                .with_description("Retained admission keys expired by the retention window (head - W)")
+                .build(),
             state_lock_wait: meter
                 .f64_histogram("degenbot.state_lock.wait")
                 .with_unit("s")
@@ -601,6 +615,11 @@ impl PipelineInstruments {
         // `send_failed_total` series must never read as "no lost outcomes".
         instruments.detached_send_failed.add(0, &[]);
         instruments.detached_merge_panic.add(0, &[]);
+        // QTZGFL: same zero-init contract for the admission counters — a
+        // missing `shed_total`/`leads_expired_total` series must never read
+        // as "nothing shed / nothing expired" (the 9395c481b lesson).
+        instruments.detached_shed.add(0, &[]);
+        instruments.detached_leads_expired.add(0, &[]);
         instruments
     }
 
@@ -758,7 +777,7 @@ impl PipelineInstruments {
 
     /// Engine-`Mutex` hold duration for a dirty solve cycle (T2 instrument).
     /// `arm` is the cycle-span vocabulary (`detached` | `in_cycle` |
-    /// `skipped_empty`); under the detached stance `in_cycle` IS the DEGRADED
+    /// `skipped_empty` | `shed`); under the detached stance `in_cycle` IS the DEGRADED
     /// population (the cap verdict the `degenbot.detached.degraded_cycles`
     /// counter tallies), so its tail is separable from the detached arm's.
     pub fn observe_mutex_hold_duration(&self, secs: f64, arm: &'static str) {
@@ -925,6 +944,16 @@ impl PipelineInstruments {
     /// One merge-seat panic caught by the sidecar guard (AQV6EF).
     pub fn count_detached_merge_panic(&self) {
         self.detached_merge_panic.add(1, &[]);
+    }
+
+    /// QTZGFL: one solve cycle SHED by capacity-modulated admission.
+    pub fn count_detached_shed(&self) {
+        self.detached_shed.add(1, &[]);
+    }
+
+    /// QTZGFL: `n` retained admission keys expired by the retention window.
+    pub fn count_detached_leads_expired(&self, n: u64) {
+        self.detached_leads_expired.add(n, &[]);
     }
 
     /// One detached straggler applied to the results map.
@@ -1469,12 +1498,48 @@ mod kind_tests {
         drop(provider);
     }
 
+    /// QTZGFL: the admission counters must render BEFORE they ever fire — a
+    /// missing `shed_total`/`leads_expired_total` series would read as
+    /// "nothing shed / nothing expired" (the 9395c481b zero-init lesson).
+    #[test]
+    #[expect(clippy::expect_used)]
+    fn detached_admission_counters_render_before_any_event() {
+        let (provider, registry) =
+            crate::metrics::build_prometheus_provider().expect("prometheus provider build");
+        let instruments = PipelineInstruments::new(&provider.meter("test_admission_zero"));
+        let text = crate::metrics::render(&registry);
+        for name in [
+            "degenbot_detached_shed_total",
+            "degenbot_detached_leads_expired_total",
+        ] {
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(name))
+                .expect("the admission counter must be exported at 0");
+            assert!(line.ends_with(" 0"), "{line} != 0");
+        }
+        instruments.count_detached_shed();
+        instruments.count_detached_leads_expired(3);
+        let text = crate::metrics::render(&registry);
+        let shed = text
+            .lines()
+            .find(|l| l.starts_with("degenbot_detached_shed_total"))
+            .expect("the shed series stays exported after firing");
+        assert!(shed.ends_with(" 1"), "{shed} != 1");
+        let expired = text
+            .lines()
+            .find(|l| l.starts_with("degenbot_detached_leads_expired_total"))
+            .expect("the leads-expired series stays exported after firing");
+        assert!(expired.ends_with(" 3"), "{expired} != 3");
+        drop(provider);
+    }
+
     /// Cold-start trace (degraded-state measurement, impact half): the solve
     /// latency histograms carry the dispatch arm, so the DEGRADED population's
     /// tail — `in_cycle` under the detached stance, the cap verdict the
     /// `degenbot.detached.degraded_cycles` counter tallies — is separable from
     /// the detached arm's in Prometheus. Values are the cycle-span vocabulary
-    /// (`detached` | `in_cycle` | `skipped_empty`).
+    /// (`detached` | `in_cycle` | `skipped_empty` | `shed`).
     #[test]
     #[expect(clippy::expect_used)]
     fn solve_latency_histograms_carry_the_arm_label() {

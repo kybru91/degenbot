@@ -406,7 +406,7 @@ pub struct ArbitrageEngine {
     /// instead of looking like duplicate logging.
     solve_entry: &'static str,
     /// Cold-start trace: the CURRENT solve cycle's dispatch arm — `detached`
-    /// | `in_cycle` | `skipped_empty` (the cycle-span vocabulary), latched by
+    /// | `in_cycle` | `skipped_empty` | `shed` (the cycle-span vocabulary), latched by
     /// the dispatch at the machine's begin verdict (the `solve_entry`
     /// precedent). Read AFTER `solve_dirty` returns, where the cycle's
     /// duration and Mutex hold are measurable, so those histograms can be
@@ -527,6 +527,36 @@ pub struct ArbitrageEngine {
     /// NOT machine state: the flag is construction-stamped on the engine and
     /// reads into [`detached_cycle::DetachedCycle::begin_cycle`].
     detached_solving: bool,
+    /// QTZGFL: construction-time admission stance (`DEGENBOT_SOLVE_ADMISSION`,
+    /// default OFF for the experiment). OFF keeps the in-flight cap degrade
+    /// byte-identical; ON replaces it with a capacity-modulated draw
+    /// (`budget = max(0, admission_target_depth − in-flight)`) that SHEDS a
+    /// zero-budget cycle at the draw/cycle level (nothing submitted, arm
+    /// latched `"shed"`, cursor advanced, keys retained for carry).
+    solve_admission: bool,
+    /// QTZGFL: the un-merged-result pipe depth target in KEYS, clamped at
+    /// construction to `1..=detached_cycle::DETACHED_INFLIGHT_CAP` (a target
+    /// above the design-locked safety valve is meaningless; a target of 0
+    /// would never submit).
+    admission_target_depth: u64,
+    /// QTZGFL: the retained (carried) key retention window W in blocks — the
+    /// ledger prunes carried keys older than `head − W` on each block advance
+    /// so a starved lead expires visibly instead of pinning the ledger.
+    admission_retention_blocks: u64,
+    /// QTZGFL: the DRAW's consumption verdict for the cycle currently between
+    /// `on_resolve` and the dispatch — `true` when the admission draw's budget
+    /// was zero (the cycle SHEDS). The DRAW is the SINGLE consumption
+    /// decision; the dispatch consumes AND clears this verdict under the
+    /// engine mutex instead of re-reading the in-flight gauge. Two reads can
+    /// disagree, and every disagreement loses work: the draw already REMOVED
+    /// its keys from the ledger, so a later zero read would discard them
+    /// (never submitted, never re-recorded). Set in
+    /// [`EngineStages::on_resolve`](super::engine_stages::EngineStages::on_resolve)
+    /// under the engine lock, consumed + cleared by
+    /// `rebuild_and_solve_affected` in the same engine-lock scope. The stage
+    /// machine drives Resolved -> Solved sequentially on the driver thread,
+    /// so this stash cannot interleave with another cycle's draw.
+    admission_draw_zero: bool,
     /// THE one detached/in-cycle solve-arm machine (P37YJG): the per-cycle
     /// states (`Unopened → Open → Saturated`), the merge pipe open/take, the
     /// outstanding-gauge pair, the seq counters, the outcome-ledger door,
@@ -615,6 +645,19 @@ impl ArbitrageEngine {
         let streaming_delivery = cfg.pump.streaming_delivery;
         let resolve_par_stance = cfg.solve.solve_resolve_par;
         let detached_solving = !cfg!(test) && cfg.solve.detached_solves;
+        // QTZGFL: the admission stance + its two typed knobs (KAHU5W
+        // construction-stance pattern — packed ONCE here, never re-read).
+        // `DEGENBOT_SOLVE_ADMISSION` parse matrix (supervisor-confirmed
+        // conservative default): unset/0/false ⇒ OFF (current degrade,
+        // byte-identical); 1/true/on ⇒ the capacity-modulated draw; any other
+        // word fails config load loudly (the loader owns the words). The
+        // target is clamped to the design-locked safety valve: it is the SAME
+        // number as the in-flight cap, just made explicit/tunable.
+        let solve_admission = !cfg!(test) && cfg.solve.admission_shed;
+        let admission_target_depth = u64::try_from(cfg.solve.admission_target_depth)
+            .unwrap_or(detached_cycle::DETACHED_INFLIGHT_CAP)
+            .clamp(1, detached_cycle::DETACHED_INFLIGHT_CAP);
+        let admission_retention_blocks = cfg.solve.admission_retention_blocks;
         // YI5NGB: the engine OWNS its fleet boot (KAHU5W) — the stamp is
         // constructed from THIS cfg BEFORE the installer runs, so the
         // construction hand-off carries the caller's value, identified.
@@ -664,6 +707,10 @@ impl ArbitrageEngine {
             delivery: DeliveryPolicy::default(),
             phase: std::sync::atomic::AtomicU8::new(EnginePhase::Created as u8),
             detached_solving,
+            solve_admission,
+            admission_target_depth,
+            admission_retention_blocks,
+            admission_draw_zero: false,
             // P37YJG: the machine's pre-cycle init lives on the machine
             // (dormant Unopened, pipe closed, counters at 0).
             detached_cycle: detached_cycle::DetachedCycle::new(),
@@ -863,6 +910,28 @@ impl ArbitrageEngine {
 
     pub(crate) fn set_detached_solving(&mut self, on: bool) {
         self.detached_solving = on;
+    }
+
+    /// QTZGFL: test seam for the admission stance. Production packs it from
+    /// `cfg.solve.admission_shed` at construction (never re-read).
+    #[cfg(test)]
+    pub(crate) fn set_solve_admission(&mut self, on: bool) {
+        self.solve_admission = on;
+    }
+
+    /// QTZGFL: test seam for the target depth — the clamp mirrors the
+    /// construction clamp exactly.
+    #[cfg(test)]
+    pub(crate) fn set_admission_target_depth(&mut self, depth: usize) {
+        self.admission_target_depth = u64::try_from(depth)
+            .unwrap_or(detached_cycle::DETACHED_INFLIGHT_CAP)
+            .clamp(1, detached_cycle::DETACHED_INFLIGHT_CAP);
+    }
+
+    /// QTZGFL: test seam for the retention window (blocks).
+    #[cfg(test)]
+    pub(crate) fn set_admission_retention_blocks(&mut self, window: u64) {
+        self.admission_retention_blocks = window;
     }
 
     /// YI5NGB: A/B seam (TEST ONLY). The production stance is

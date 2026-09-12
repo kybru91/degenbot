@@ -188,6 +188,10 @@ pub mod instruments {
         pub fn count_detached_send_failed(&self) {}
         /// no-op (AQV6EF: merge-seat panics caught by the sidecar guard)
         pub fn count_detached_merge_panic(&self) {}
+        /// no-op (QTZGFL: admission-shed cycles)
+        pub fn count_detached_shed(&self) {}
+        /// no-op (QTZGFL: retained admission keys expired by the retention window)
+        pub fn count_detached_leads_expired(&self, _n: u64) {}
     }
 
     /// Epic FRKBGP close-out: resident set bytes (drift-watch). Default

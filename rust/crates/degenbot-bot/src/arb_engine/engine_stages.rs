@@ -176,8 +176,9 @@ impl EngineStages {
             "degenbot.arb.solve",
             block.number = block,
             cycle.solve_block = tracing::field::Empty,
-            // Cold-start trace: the dispatch arm ("detached" | "in_cycle"),
-            // recorded at the machine's begin_cycle verdict in solver_dispatch.
+            // Cold-start trace: the dispatch arm ("detached" | "in_cycle" |
+            // "skipped_empty" | "shed"), recorded at the machine's begin_cycle
+            // verdict (or the admission shed) in solver_dispatch.
             cycle.arm = tracing::field::Empty,
         );
         // ZZS6CG: exact-match reparent onto this block's published pump
@@ -267,8 +268,41 @@ impl StageHandlers for EngineStages {
     /// Resolved row: consume the epoch ledger's touched keys ONCE (the
     /// LXDY4C take preserves the retired `DirtySets::take_all` semantics;
     /// keys recorded while this drain runs land in the NEXT cycle).
+    ///
+    /// QTZGFL: under the construction-stamped admission stance this is a
+    /// capacity-modulated DRAW — `budget = max(0, target − in-flight)` KEYS,
+    /// freshest-first, the overflow RETAINED for a later cycle (carry). A zero
+    /// budget draws nothing; the engine's solve cycle then sheds. The same
+    /// site prunes carried keys older than `head − W` (the retention window)
+    /// and counts the expiry. Lock order: the engine mutex is taken first and
+    /// the ledger mutex inside `expire_older_than`/`draw_freshest` is the
+    /// inner lock — never the reverse.
+    ///
+    /// QTZGFL: THIS is the SINGLE consumption decision (F3). The zero-budget
+    /// verdict is stashed on the engine for the same cycle's dispatch — the
+    /// dispatch consumes and clears it under the engine mutex and never
+    /// re-reads the live gauge. The stage machine drives Resolved -> Solved
+    /// sequentially on the driver thread, so no other draw can interleave
+    /// between the stash and the read.
     fn on_resolve(&self, work: &Resolve<'_>) -> Result<AffectedPaths, StageError> {
-        let affected = work.delta.take_keys();
+        let mut engine = self.engine.lock();
+        let admission = engine
+            .admission_budget_keys()
+            .map(|budget| (budget, engine.admission_retention_blocks));
+        let affected = if let Some((budget, retention)) = admission {
+            let cutoff = work.ctx.block().saturating_sub(retention);
+            let expired = work.delta.expire_older_than(cutoff);
+            engine.detached_cycle.note_leads_expired(expired);
+            // Stash the draw-time verdict BEFORE drawing: the drawn keys
+            // leave the ledger, so the dispatch must honor THIS cycle's
+            // decision, not a fresh gauge read.
+            engine.admission_draw_zero = budget == 0;
+            work.delta.draw_freshest(budget)
+        } else {
+            engine.admission_draw_zero = false;
+            work.delta.take_keys()
+        };
+        drop(engine);
         Ok(AffectedPaths(affected))
     }
 

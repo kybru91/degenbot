@@ -55,7 +55,8 @@ static SIM_BOOT_REFUSAL_LOGGED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// THE one arm-attribution wiring site (cold-start trace): the cycle span is
-/// tagged with `cycle.arm` (`detached` | `in_cycle`), and an in-cycle cycle
+/// tagged with `cycle.arm` (`detached` | `in_cycle` | `skipped_empty` |
+/// `shed`), and an in-cycle cycle
 /// under the detached stance — the machine's cap verdict at begin — fires the
 /// `degenbot.detached.degraded_cycles` counter. Pipeline-free by design: a
 /// consumer without the meter installed is a no-op (pure-Rust/test seams).
@@ -78,6 +79,31 @@ pub(crate) fn record_cycle_arm_telemetry(
     }
     // Handed back for the caller's per-cycle latch (see the doc above).
     arm
+}
+
+impl ArbitrageEngine {
+    /// QTZGFL: the capacity-modulated admission budget in KEYS for THIS
+    /// cycle's DRAW, or `None` when the admission stance is OFF (the
+    /// caller's draw is a full `take_keys` — byte-identical).
+    ///
+    /// `budget = max(0, admission_target_depth − in-flight outstanding)`,
+    /// saturating. `Some(0)` IS the SHED verdict: the draw consumes nothing
+    /// and the dispatch submits nothing. This helper is the DRAW-SITE ONLY —
+    /// its `Some(0)` output is stashed on the engine by `on_resolve` and
+    /// consumed there; the dispatch NEVER re-reads the gauge (a fresh read
+    /// could disagree with the draw and discard keys already removed from the
+    /// ledger).
+    #[must_use]
+    pub(crate) fn admission_budget_keys(&self) -> Option<usize> {
+        if !self.solve_admission {
+            return None;
+        }
+        let outstanding = self
+            .detached_cycle
+            .outstanding
+            .load(std::sync::atomic::Ordering::Relaxed);
+        usize::try_from(self.admission_target_depth.saturating_sub(outstanding)).ok()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2117,14 +2143,6 @@ impl ArbitrageEngine {
             }
         });
 
-        // Also re-solve any paths registered via register_and_solve_path that
-        // haven't been through rebuild_and_solve_affected yet. These paths were
-        // eagerly solved at registration time, but the pump's process_block
-        // replaces self.results entirely — so we must include them to avoid
-        // dropping their results.
-        affected_path_ids.extend(&self.pending_new_paths);
-        self.pending_new_paths.clear();
-
         // Solve-block anchor (rule owner + history: `crate::bot_core::solve_anchor`):
         // the batch's `solve_block` (= `results_block`) is the block the pool
         // state actually reflects — the pool-state head, NOT the
@@ -2140,6 +2158,48 @@ impl ArbitrageEngine {
         // per-path probes so a path solved both this block and the previous
         // one reports a hit (the engine-owned WalkMemo handle, SU7MAE T3).
         self.walk_memo.begin_block(solve_block);
+        // -----------------------------------------------------------------
+        // ADMISSION DRAW (QTZGFL): the DRAW already made the SINGLE
+        // consumption decision in `on_resolve`. Consume and clear its verdict
+        // HERE — the dispatch NEVER re-reads the live gauge (two reads could
+        // disagree, and a fresh zero would discard keys the draw already
+        // removed from the ledger). A zero-budget draw consumed nothing, so a
+        // shed is genuine: this cycle submits NOTHING. The response lives at
+        // the draw/cycle level, never the in-cycle dispatch. The machine is
+        // NOT consulted for a shed cycle (no `begin_cycle`, no seq tick, no
+        // submission), so no transition row is exercised and no typed
+        // RejectionReason can trip; the solved-block cursor advances exactly
+        // like the `skipped_empty` bookkeeping pass, and the keys stay in the
+        // ledger for a later cycle (carry). The check precedes the
+        // pending-new-path merge so a shed never clears work it did not do.
+        // -----------------------------------------------------------------
+        let draw_zero = std::mem::take(&mut self.admission_draw_zero);
+        if self.solve_admission && draw_zero {
+            self.cycle_arm = record_cycle_arm_telemetry(&solve_span, "shed", false);
+            self.detached_cycle.shed();
+            tracing::info!(
+                target: "degenbot::solver",
+                block_number = solve_block,
+                paths.affected = affected_path_ids.len(),
+                in_flight = self
+                    .detached_cycle
+                    .outstanding
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                target_depth = self.admission_target_depth,
+                "[admission] SHED: draw-time zero budget — nothing submitted; keys retained for carry"
+            );
+            // 6XB6NJ: monotone advance on the block cursor (the
+            // skipped_empty bookkeeping contract).
+            self.cursor.advance_solved(solve_block);
+            return;
+        }
+        // Also re-solve any paths registered via register_and_solve_path that
+        // haven't been through rebuild_and_solve_affected yet. These paths were
+        // eagerly solved at registration time, but the pump's process_block
+        // replaces self.results entirely — so we must include them to avoid
+        // dropping their results.
+        affected_path_ids.extend(&self.pending_new_paths);
+        self.pending_new_paths.clear();
         // If no paths are affected, just update the block number
         if affected_path_ids.is_empty() {
             // Cold-start trace: keys with NO registered paths reach here as a
@@ -2693,6 +2753,18 @@ impl ArbitrageEngine {
         // clone all live on the machine now. The construction-stamped
         // `detached_solving` stance reads in here.
         let arm = self.detached_cycle.begin_cycle(self.detached_solving);
+        // QTZGFL F3: there is NO post-begin race-shed. The draw made the ONE
+        // consumption decision; a cycle that drew a POSITIVE budget ALWAYS
+        // submits its drawn keys. If `begin_cycle` returns the in-cycle
+        // (cap-saturated) verdict at this transition edge — in-flight crossed
+        // the target after the draw — the EXISTING in-cycle response serves
+        // it: one legal machine row, no claim invented, and no drawn key is
+        // discarded. This is a vanishingly rare boundary case (in-flight is
+        // pinned at 0 in healthy operation; under a sustained stall every
+        // draw is zero-budget so every cycle sheds before `begin_cycle` and
+        // `degraded_cycles` stays 0). Flag-ON contract: shed at a draw-time
+        // zero; otherwise the arms flow unchanged — no new transitions, no
+        // RejectionReason reachable, flag OFF byte-identical.
         // Cold-start trace: attribute the arm on the cycle span + count a
         // degraded verdict BEFORE the arms move ownership (the machine has
         // already latched the begin decision — detached_cycle::transition).
