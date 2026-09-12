@@ -631,3 +631,83 @@ def test_policy_gate_denial_memoizes_the_path() -> None:
 
     # The gate ran exactly once; the second sighting answered from the memo.
     assert len(gate_calls) == 1
+
+
+async def test_trigger_discovery_stops_once_sweep_completes_for_edition() -> None:
+    """Once a full (uncapped, unbounded-cut) sweep completes for a graph
+    edition, later triggers with the SAME edition stop immediately: the
+    unchanged structure can only re-yield already-registered paths.
+    """
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)
+
+    paths = [_closed_v3_cycle_steps() for _ in range(3)]
+    sweep_count = {"n": 0}
+
+    def _sweep() -> AsyncIterator[object]:
+        sweep_count["n"] += 1
+        return _producer(list(paths))
+
+    pipeline.discovery_sweep = _sweep  # type: ignore[method-assign]
+    edition = {"v": (10, 20, 3, 30)}
+    pipeline._graph_edition = lambda: edition["v"]  # type: ignore[method-assign]
+
+    # First sweep runs and registers every path.
+    assert await pipeline.trigger_discovery() == 3
+    assert sweep_count["n"] == 1
+    assert bot.submitted  # units were processed
+
+    # Unchanged edition: the trigger stops before enumerating.
+    bot.submitted.clear()
+    assert await pipeline.trigger_discovery() == 0
+    assert sweep_count["n"] == 1
+    assert bot.submitted == []
+
+    # New edition (pool added): a fresh sweep runs.
+    edition["v"] = (11, 21, 3, 30)
+    assert await pipeline.trigger_discovery() == 3
+    assert sweep_count["n"] == 2
+
+
+async def test_trigger_discovery_bound_truncation_does_not_latch() -> None:
+    """A bound-truncated sweep did NOT see the last path — later triggers
+    must still enumerate."""
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)
+
+    paths = [_closed_v3_cycle_steps() for _ in range(3)]
+    sweep_count = {"n": 0}
+
+    def _sweep() -> AsyncIterator[object]:
+        sweep_count["n"] += 1
+        return _producer(list(paths))
+
+    pipeline.discovery_sweep = _sweep  # type: ignore[method-assign]
+    pipeline._graph_edition = lambda: (10, 20, 3, 30)  # type: ignore[method-assign]
+
+    assert await pipeline.trigger_discovery(bound=2) == 2
+    assert sweep_count["n"] == 1
+
+    # Same edition, but the prior sweep was truncated: it must re-run.
+    assert await pipeline.trigger_discovery() == 3
+    assert sweep_count["n"] == 2
+
+
+async def test_trigger_discovery_no_db_never_latches() -> None:
+    """Without a DB handle the edition probe is None — the latch stays
+    disabled and every trigger enumerates (the pre-existing behavior)."""
+    bot = _FleetBot()
+    pipeline, _bot = _pipeline_with_bot(bot)  # context db=None
+
+    paths = [_closed_v3_cycle_steps() for _ in range(2)]
+    sweep_count = {"n": 0}
+
+    def _sweep() -> AsyncIterator[object]:
+        sweep_count["n"] += 1
+        return _producer(list(paths))
+
+    pipeline.discovery_sweep = _sweep  # type: ignore[method-assign]
+
+    assert await pipeline.trigger_discovery() == 2
+    assert await pipeline.trigger_discovery() == 2
+    assert sweep_count["n"] == 2

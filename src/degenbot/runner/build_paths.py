@@ -21,6 +21,9 @@ from collections.abc import AsyncIterable, AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
 from degenbot import Bot, UniswapV2Pool, UniswapV3Pool, UniswapV4Pool, get_checksum_address
 from degenbot.arbitrage._claims import ThreadEventWake, VerifyClaims
 from degenbot.arbitrage.engine_registry import EngineRegistry
@@ -480,6 +483,12 @@ class PathRegistrationPipeline:
         # PRG-4: the benign registered-path-cap stop witness (the retired
         # DiscoveryCrawlComplete unwind exception became this flag).
         self.capped = False
+        # Structural edition of the DB subgraph for which a discovery sweep
+        # last ran to NATURAL completion (not bound-truncated, not capped):
+        # once latched, a later trigger with the same edition stops BEFORE
+        # enumerating — the unchanged structure can only re-yield paths the
+        # pipeline already saw. See trigger_discovery.
+        self._sweep_completed_edition: tuple[int, int, int, int] | None = None
 
     #: Typed build refusals that are POOL FACTS: a pool refused under one of
     #: these can never appear in a registrable path, so the hop identity goes
@@ -994,14 +1003,73 @@ class PathRegistrationPipeline:
         """Add ONE specific path at any time (NWTUM3 / D1c operator surface)."""
         await self._consume(path_steps, directions=directions)
 
+    def _graph_edition(self) -> tuple[int, int, int, int] | None:
+        """Cheap structural fingerprint of the discovery subgraph.
+
+        The candidate-cycle set is a pure function of the pool-row structure
+        (never of pool state/prices), so the row count + max id of each pool
+        family for this chain suffices to detect structural change. Returns
+        None when no DB handle is attached or the probe fails for any reason
+        (fail-open): the latch stays disabled and every sweep runs — the
+        pre-latch behavior. A failed probe never blocks discovery.
+        """
+        db = self.constr_db
+        if db is None:
+            return None
+        try:
+            chain = self.constr_chain_id
+            with cast("Session", db()) as session:
+                v2v3 = session.execute(
+                    text(
+                        "SELECT count(*), COALESCE(max(id), 0) "
+                        "FROM pools WHERE chain = :chain"
+                    ),
+                    {"chain": chain},
+                ).one()
+                v4 = session.execute(
+                    text(
+                        "SELECT count(*), COALESCE(max(mp.id), 0) "
+                        "FROM managed_pools mp "
+                        "JOIN pool_managers pm ON pm.id = mp.manager_id "
+                        "WHERE pm.chain = :chain"
+                    ),
+                    {"chain": chain},
+                ).one()
+        except Exception:
+            return None
+        return (
+            int(v2v3[0]),
+            int(v2v3[1]),
+            int(v4[0]),
+            int(v4[1]),
+        )
+
     async def trigger_discovery(self, *, bound: int | None = None) -> int:
-        """Trigger a bounded one-shot discovery sweep (NWTUM3 / D1c)."""
+        """Trigger a bounded one-shot discovery sweep (NWTUM3 / D1c).
+
+        A sweep that runs to NATURAL completion (not bound-truncated, not
+        capped) latches the structural graph edition; a later trigger over
+        the same edition stops immediately and returns 0 — the unchanged
+        structure can only re-yield paths the pipeline already processed.
+        The latch re-arms itself when the edition changes (pool added or
+        removed), when the probe is unavailable, and after any truncated
+        sweep.
+        """
+        edition = self._graph_edition()
+        if edition is not None and edition == self._sweep_completed_edition:
+            return 0
+
         count = 0
+        truncated = False
         async for item in self.discovery_sweep():
             if bound is not None and count >= bound:
+                truncated = True
                 break
             await self._consume(item)
             count += 1
+
+        if not truncated and not self.capped and edition is not None:
+            self._sweep_completed_edition = edition
         return count
 
     def discovery_sweep(self) -> AsyncIterator[object]:
