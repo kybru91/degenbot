@@ -325,6 +325,17 @@ pub struct ResultBatch {
     pub payloads: HashMap<u64, inline_sim::SimulatedPathResult>,
 }
 
+/// KJWIK5: the deferred-path re-record hook (the ledger carry). The
+/// dispatch calls it with the deferred paths' hop-pool keys and the cycle's
+/// solve block; `EngineStages::set_delta` installs the
+/// `EpochDelta::record` closure so a deferred path re-enters through the
+/// next draw (same freshness ordering, admission budget, retention window —
+/// one deferral concept). `None` on direct engine drives (unit tests, the
+/// cold-start `solve_all`): the deferral then keeps its pre-fold dropped
+/// behavior.
+pub(crate) type DeferredReRecordHook =
+    std::sync::Arc<dyn Fn(&[degenbot_solvers::affected_keys::AffectedKey], u64) + Send + Sync>;
+
 /// The unified Uniswap engine — owns V2, V3, and V4 pool state and solves
 /// mixed arbitrage paths.
 ///
@@ -484,6 +495,12 @@ pub struct ArbitrageEngine {
     /// witness/gauge behavior through the panic path).
     #[cfg(test)]
     test_solve_panic: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// KJWIK5 test seam: force the future-price deferral for these path ids.
+    /// The real tripwire is unreachable after the solve-anchor head floor
+    /// (only a mid-solve state advance can trip it), so this seam exists to
+    /// exercise the carry deterministically in tests.
+    #[cfg(test)]
+    test_force_deferred: Option<HashSet<u64>>,
     /// Test-only: the drain appends each merged path id here (with the tokio
     /// executor this happens per-path, before the slowest path completes).
     #[cfg(test)]
@@ -566,6 +583,15 @@ pub struct ArbitrageEngine {
     /// machine drives Resolved -> Solved sequentially on the driver thread,
     /// so this stash cannot interleave with another cycle's draw.
     admission_draw_zero: bool,
+    /// KJWIK5: the deferred-path re-record hook (the ledger carry for
+    /// `paths.deferred_future_price` deferrals). Installed by
+    /// `EngineStages::set_delta` alongside the shared ledger — the engine
+    /// holds no ledger of its own (LXDY4C deliberately avoided engine-side
+    /// ownership); the dispatch maps a deferred pid to its hop-pool keys and
+    /// fires this with the cycle's solve block. `None` on a direct engine
+    /// drive (unit tests, `solve_all`), where the deferral falls back to the
+    /// log-driven retry.
+    deferred_re_record: Option<DeferredReRecordHook>,
     /// THE one solve-arm machine (P37YJG; WFF6MM reduced it to the two
     /// detached states): the per-cycle states (`Unopened → Open`), the merge
     /// pipe open/take, the outstanding-gauge pair, the seq counters, the
@@ -704,6 +730,8 @@ impl ArbitrageEngine {
             #[cfg(test)]
             test_solve_panic: None,
             #[cfg(test)]
+            test_force_deferred: None,
+            #[cfg(test)]
             merge_probe: None,
             #[cfg(test)]
             test_merge_panic: None,
@@ -722,6 +750,7 @@ impl ArbitrageEngine {
             admission_target_depth,
             admission_retention_blocks,
             admission_draw_zero: false,
+            deferred_re_record: None,
             // P37YJG: the machine's pre-cycle init lives on the machine
             // (dormant Unopened, pipe closed, counters at 0).
             detached_cycle: detached_cycle::DetachedCycle::new(),
@@ -897,6 +926,13 @@ impl ArbitrageEngine {
 
     pub(crate) fn set_solve_panic_hook(&mut self, hook: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
         self.test_solve_panic = Some(hook);
+    }
+
+    /// KJWIK5 test seam: force the future-price deferral for `pids` (empty
+    /// clears it). The real tripwire is unreachable after the solve-anchor
+    /// head floor, so the carry is exercised through this seam.
+    pub(crate) fn set_force_deferred_for_test(&mut self, pids: HashSet<u64>) {
+        self.test_force_deferred = if pids.is_empty() { None } else { Some(pids) };
     }
 
     pub(crate) fn set_merge_probe(&mut self, probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>>) {

@@ -381,6 +381,16 @@ impl ArbitrageEngine {
         self.cursor.advance_solved(block);
     }
 
+    /// KJWIK5: install the deferred-path re-record hook (the ledger carry).
+    /// `EngineStages::set_delta` is the production installer — it captures
+    /// the shared `EpochDelta` and re-records a deferred path's hop-pool
+    /// keys at the cycle's solve block. Direct engine drives (unit tests, the
+    /// cold-start `solve_all`) leave it unset, and the deferral falls back
+    /// to today's dropped behavior.
+    pub(crate) fn set_deferred_re_record(&mut self, hook: super::DeferredReRecordHook) {
+        self.deferred_re_record = Some(hook);
+    }
+
     /// Whether any forward log applied since the last `finalize_block` (the
     /// pump's forward-log path calls this before the next `finalize_block` so
     /// the empty-block branch sends the advance diff). Owned by the engine

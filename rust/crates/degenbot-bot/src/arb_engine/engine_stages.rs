@@ -84,8 +84,27 @@ impl EngineStages {
 
     /// Hand the stage surface the shared epoch ledger (the wiring layer
     /// passes `Bot::active_delta`).
+    ///
+    /// KJWIK5: this is also the installer for the engine's deferred-path
+    /// re-record hook — the ledger carry for `paths.deferred_future_price`
+    /// deferrals. The engine's dispatch maps a deferred path's pid to its
+    /// hop-pool keys and calls the hook with the cycle's solve block; the
+    /// closure re-records them into THIS shared ledger, so the next draw
+    /// re-includes the path through the same freshness ordering, admission
+    /// budget, and retention window (one deferral concept). This is the ONE
+    /// engine access to the ledger (engine-side ownership was deliberately
+    /// avoided — LXDY4C); lock order stays engine mutex outer, ledger mutex
+    /// inner, matching `on_resolve`.
     pub fn set_delta(&self, delta: Arc<EpochDelta>) {
-        *self.delta.write() = delta;
+        *self.delta.write() = Arc::clone(&delta);
+        let ledger = delta;
+        self.engine
+            .lock()
+            .set_deferred_re_record(Arc::new(move |keys, block| {
+                for &key in keys {
+                    ledger.record(key, block);
+                }
+            }));
     }
 
     /// Attach the block-clock channel sender (the wiring layer creates the

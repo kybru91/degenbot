@@ -2187,6 +2187,10 @@ impl ArbitrageEngine {
         // block below (same content the serial loop used to produce inline).
         let mut deferred_paths: HashSet<u64> = HashSet::new();
         let mut invalid_reasons: HashMap<String, u64> = HashMap::new();
+        // KJWIK5: clone the deferred re-record hook out before the resolve
+        // borrows `self` (Arc bump, cheap); it fires at the deferral site
+        // below with the deferred paths' hop-pool keys.
+        let deferred_re_record = self.deferred_re_record.clone();
         // MQUKB6-T2: phase span for the core-lock re-derive window (the
         // summary event after the block stays on the same node).
         let resolve_ctx = tracing::info_span!(
@@ -2237,6 +2241,16 @@ impl ArbitrageEngine {
                     // same-state comparison AND the future-price check -
                     // the per-path future probe re-walked all pools.
                     let mut update_snapshot: Vec<u64> = Vec::with_capacity(path.pools.len());
+                    // KJWIK5 test seam: the real future-price tripwire is
+                    // unreachable after the solve-anchor head floor, so test
+                    // builds seed the flag from the forced-deferral set to
+                    // exercise the carry.
+                    #[cfg(test)]
+                    let mut future = self
+                        .test_force_deferred
+                        .as_ref()
+                        .is_some_and(|forced| forced.contains(&path_id));
+                    #[cfg(not(test))]
                     let mut future = false;
                     for pool_ref in &path.pools {
                         let ub = core.pool_update_block(pool_ref.pool_key);
@@ -2385,6 +2399,36 @@ impl ArbitrageEngine {
                 self.hop_projection_count += projections_total;
             });
         });
+        // KJWIK5: the ledger carry for deferred paths — re-record EVERY hop
+        // pool of each deferred path into the CURRENT cycle's bucket so the
+        // next draw re-includes it through the same freshness ordering,
+        // admission budget, and retention window. This folds the future-price
+        // deferral onto the one retained-lead mechanism (no second queue, no
+        // cycle-local carry vector). Pids are sorted for a deterministic
+        // payload; keys ride path order. When the hook is unset (direct
+        // engine drives — unit tests, the cold-start `solve_all`), the
+        // deferred path keeps today's dropped behavior and its retry stays
+        // log-driven.
+        if let Some(re_record) = deferred_re_record {
+            if !deferred_paths.is_empty() {
+                let mut deferred_sorted: Vec<u64> = deferred_paths.iter().copied().collect();
+                deferred_sorted.sort_unstable();
+                let mut keys: Vec<degenbot_solvers::affected_keys::AffectedKey> = Vec::new();
+                for path_id in deferred_sorted {
+                    if let Some(path) = self.path_pools.get(&path_id) {
+                        keys.extend(path.pools.iter().map(|pool_ref| {
+                            degenbot_solvers::affected_keys::AffectedKey::new(
+                                pool_ref.hop_type,
+                                pool_ref.pool_key,
+                            )
+                        }));
+                    }
+                }
+                if !keys.is_empty() {
+                    re_record(&keys, solve_block);
+                }
+            }
+        }
         // Per-cycle resolve funnel (hotpath_gauge{key=...}). Reason keys come
         // from the closed HopDeficit-reason set, so the series family stays
         // bounded.
