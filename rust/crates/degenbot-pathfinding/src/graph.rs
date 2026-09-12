@@ -102,7 +102,8 @@ impl Hasher for U64Hasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         for &b in bytes {
-            self.hash = (self.hash.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517C_C1B7_2722_0A95);
+            self.hash =
+                (self.hash.rotate_left(5) ^ u64::from(b)).wrapping_mul(0x517C_C1B7_2722_0A95);
         }
     }
 }
@@ -183,7 +184,7 @@ impl PathGraph {
         let n = edges.len();
         // Upper bound on distinct tokens: 2 per edge. Saves rehashing.
         let mut token_index: HashMap<u64, u32, U64BuildHasher> =
-        HashMap::with_capacity_and_hasher(n * 2, U64BuildHasher::default());
+            HashMap::with_capacity_and_hasher(n * 2, U64BuildHasher::default());
         let mut pools: Vec<(u64, PoolKind)> = Vec::with_capacity(n);
         // Pass 1: intern endpoints; arena keeps (compactnode0, node1) per edge.
         let mut arena: Vec<(u32, u32)> = Vec::with_capacity(n);
@@ -226,10 +227,16 @@ impl PathGraph {
             #[expect(clippy::expect_used)]
             let pool_idx = u32::try_from(pool_idx_usize).expect("pool index exceeds u32::MAX");
             let ca = &mut cursor[*a as usize];
-            adj_flat[*ca as usize] = CompactEdge { neighbor: *b, pool_idx };
+            adj_flat[*ca as usize] = CompactEdge {
+                neighbor: *b,
+                pool_idx,
+            };
             *ca += 1;
             let cb = &mut cursor[*b as usize];
-            adj_flat[*cb as usize] = CompactEdge { neighbor: *a, pool_idx };
+            adj_flat[*cb as usize] = CompactEdge {
+                neighbor: *a,
+                pool_idx,
+            };
             *cb += 1;
         }
 
@@ -274,8 +281,7 @@ impl PathGraph {
     /// The number of pool edges incident to a token (its degree).
     #[must_use]
     pub fn degree(&self, token: u64) -> Option<usize> {
-        self.compact_index(token)
-            .map(|i| self.adj_of(i).len())
+        self.compact_index(token).map(|i| self.adj_of(i).len())
     }
 
     /// Remove nodes with degree ≤ 1, repeating until no such nodes remain.
@@ -706,11 +712,7 @@ impl OwnedPathFinder {
         // of each penultimate node. Insertion order is preserved so traversal
         // order (hence enumeration order) is unchanged.
         let mut end_edges: Vec<Vec<u32>> = vec![Vec::new(); graph.nodes()];
-        for (node_idx, e_list) in graph
-            .adj_offsets
-            .windows(2)
-            .enumerate()
-        {
+        for (node_idx, e_list) in graph.adj_offsets.windows(2).enumerate() {
             let seg = &graph.adj_flat[e_list[0] as usize..e_list[1] as usize];
             for e in seg {
                 if e.neighbor == end_idx {

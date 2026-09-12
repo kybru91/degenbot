@@ -1020,10 +1020,7 @@ class PathRegistrationPipeline:
             chain = self.constr_chain_id
             with cast("Session", db()) as session:
                 v2v3 = session.execute(
-                    text(
-                        "SELECT count(*), COALESCE(max(id), 0) "
-                        "FROM pools WHERE chain = :chain"
-                    ),
+                    text("SELECT count(*), COALESCE(max(id), 0) FROM pools WHERE chain = :chain"),
                     {"chain": chain},
                 ).one()
                 v4 = session.execute(
