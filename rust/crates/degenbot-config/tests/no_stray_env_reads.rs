@@ -114,13 +114,23 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // Skip build/package output trees (`target/` carries vendored
-            // crate copies that mirror crate sources and double-report) and
-            // agent worktrees (`.pi/` holds per-branch checkouts of this
-            // same repo, pre-cutover surfaces included).
+            // Skip non-source trees so a scan of the repo root sees only this
+            // checkout's crate sources:
+            //   - `target/` carries vendored crate copies that mirror crate
+            //     sources and double-report;
+            //   - hidden dirs are tooling/worktree state (`.git/`, and `.pi/`
+            //     per-branch checkouts of this same repo, pre-cutover surfaces
+            //     included);
+            //   - `autoresearch/` is the gitignored agent-harness scratch tree
+            //     holding full repo snapshots (same sources at an older
+            //     revision), which would otherwise double-report every hit.
             let fname = entry.file_name();
             let name = fname.to_str().unwrap_or("");
-            if name == "target" || name == ".pi" {
+            if name == "target"
+                || name == "autoresearch"
+                || name == "node_modules"
+                || name.starts_with('.')
+            {
                 continue;
             }
             collect_rs_files(&path, out);
