@@ -181,8 +181,9 @@ pub struct PipelineInstruments {
     detached_stale_dropped: Counter<u64>,
     /// Epic SRQEK5 T2: detached stragglers applied to the results map.
     detached_applied: Counter<u64>,
-    /// Cold-start trace: cycles the machine DEGRADED to the in-cycle arm
-    /// (`Arm::InCycle` under the detached stance — the in-flight cap verdict).
+    /// Cold-start trace: cycles the machine DEGRADED to the in-cycle arm.
+    /// WFF6MM retired that arm (and its producer): the series is retained so
+    /// dashboards keep a stable zero rather than a missing metric.
     detached_degraded_cycles: Counter<u64>,
     /// AQV6EF: detached outcomes LOST to a DEAD MERGE DRAIN — a
     /// `LaneOutcome` send failed (the sidecar Receiver is gone) or an
@@ -539,11 +540,11 @@ impl PipelineInstruments {
                 .with_description("Merge-seat panics caught by the sidecar guard (dead merge drain)")
                 .build(),
             detached_shed: meter
-                .u64_counter("degenbot.detached.shed_total")
+                .u64_counter("degenbot.detached.shed")
                 .with_description("Solve cycles SHED by capacity-modulated admission (zero draw budget)")
                 .build(),
             detached_leads_expired: meter
-                .u64_counter("degenbot.detached.leads_expired_total")
+                .u64_counter("degenbot.detached.leads_expired")
                 .with_description("Retained admission keys expired by the retention window (head - W)")
                 .build(),
             state_lock_wait: meter
@@ -962,6 +963,8 @@ impl PipelineInstruments {
     }
 
     /// One solve cycle DEGRADED to the in-cycle arm (the cap verdict at begin).
+    /// WFF6MM: no producer remains (the in-cycle arm is deleted); kept so the
+    /// zero-init + broken-pipe it exercises stay tested.
     pub fn count_detached_degraded_cycle(&self) {
         self.detached_degraded_cycles.add(1, &[]);
     }
@@ -1163,6 +1166,16 @@ mod kind_tests {
     use crate::instruments::{export_worker_census_with, PipelineInstruments};
     use crate::telemetry::error_kind;
     use std::collections::HashSet;
+
+    /// True when `line` is the Prometheus sample line for exactly `name` —
+    /// the name followed by a label brace or the value whitespace, never a
+    /// longer family such as `<name>_total` (the doubled-suffix bug this
+    /// predicate was tightened to catch: the old `starts_with` matched
+    /// `name + "_total"` and masked it).
+    fn series_line_matches(line: &str, name: &str) -> bool {
+        line.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+    }
 
     /// The taxonomy is a compile-time closed set: the consts are unique and
     /// are the only values the `kind` label may take.
@@ -1514,7 +1527,7 @@ mod kind_tests {
         ] {
             let line = text
                 .lines()
-                .find(|l| l.starts_with(name))
+                .find(|l| series_line_matches(l, name))
                 .expect("the admission counter must be exported at 0");
             assert!(line.ends_with(" 0"), "{line} != 0");
         }
@@ -1523,12 +1536,12 @@ mod kind_tests {
         let text = crate::metrics::render(&registry);
         let shed = text
             .lines()
-            .find(|l| l.starts_with("degenbot_detached_shed_total"))
+            .find(|l| series_line_matches(l, "degenbot_detached_shed_total"))
             .expect("the shed series stays exported after firing");
         assert!(shed.ends_with(" 1"), "{shed} != 1");
         let expired = text
             .lines()
-            .find(|l| l.starts_with("degenbot_detached_leads_expired_total"))
+            .find(|l| series_line_matches(l, "degenbot_detached_leads_expired_total"))
             .expect("the leads-expired series stays exported after firing");
         assert!(expired.ends_with(" 3"), "{expired} != 3");
         drop(provider);

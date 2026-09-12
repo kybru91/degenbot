@@ -92,7 +92,7 @@ cutover).
 
 ## Telemetry
 
-- `degenbot.detached.shed_total` and `degenbot.detached.leads_expired_total`,
+- `degenbot.detached.shed` and `degenbot.detached.leads_expired`,
   both zero-initialized like `detached_send_failed` (the 9395c481b lesson).
 - Arm vocabulary grew one closed-set value: `cycle.arm="shed"`, riding the same
   `record_cycle_arm_telemetry` helper and the engine's `cycle_arm` latch; the

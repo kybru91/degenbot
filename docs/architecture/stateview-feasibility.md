@@ -152,12 +152,14 @@ Implementation of the cheap-read branch, as landed in this worktree
   (buffered-event lazy expiry) is default-off and documented below as the
   residual pre-machine exception to retire with the stage machine.
 - **Engine `Mutex<ArbitrageEngine>` off the solve path (seam #4).**
-  `DEGENBOT_DETACHED_SOLVES` is now default ON: the drain-driven solve cycle
-  returns at enqueue end, so the `EngineHandle::solve_dirty` engine-Mutex hold
-  collapses to µs (probe + enqueue + bookkeeping), and results merge on the
-  `arb-detached-merge` sidecar under short per-item acquisitions guarded by the
-  Q1a staleness oracle. `DEGENBOT_DETACHED_SOLVES=0` restores the in-cycle hold
-  (the backpressure fallback also degrades to it beyond `DETACHED_INFLIGHT_CAP`).
+  The detached cycle is the ONLY solve arm (WFF6MM hard cutover; the old
+  `DEGENBOT_DETACHED_SOLVES` stance and its in-cycle opt-out are retired): the
+  drain-driven solve cycle returns at enqueue end, so the
+  `EngineHandle::solve_dirty` engine-Mutex hold collapses to µs (probe +
+  enqueue + bookkeeping), and results merge on the `arb-detached-merge`
+  sidecar under short per-item acquisitions guarded by the Q1a staleness
+  oracle. Backpressure is the admission draw (shed+carry) — the old
+  `DETACHED_INFLIGHT_CAP` degrade no longer exists.
 - **StateLock diagnostics retained for registration/FFI** (the slow operator
   paths the 2026-08-21 incident implicated); the solve path's reads are the
   cheap, `#[track_caller]`-diagnosed bare reads.

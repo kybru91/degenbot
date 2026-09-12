@@ -162,6 +162,13 @@ impl EngineStages {
         // ~2µs empty pass, gate + work under ONE mutex acquisition.
         let mut engine =
             hotpath::measure_block!("EngineStages::solve.probe_lock", self.engine.lock());
+        // WFF6MM: this path spawns the merge sidecar AFTER `solve_dirty`
+        // returns (below), and the machine's merge Receiver is take-once —
+        // a direct-call inline drain (the synchronous unit-test harness)
+        // would steal it. Disable the inline drain for every EngineStages-
+        // driven engine; the sidecar owns the pipe here.
+        #[cfg(test)]
+        engine.set_sync_merge_for_test(false);
         if affected.is_empty() {
             // Kept for inner bookkeeping parity (last_processed_block et al);
             // provably cannot consume dirt under this continuous hold.
@@ -176,7 +183,7 @@ impl EngineStages {
             "degenbot.arb.solve",
             block.number = block,
             cycle.solve_block = tracing::field::Empty,
-            // Cold-start trace: the dispatch arm ("detached" | "in_cycle" |
+            // Cold-start trace: the dispatch arm ("detached" |
             // "skipped_empty" | "shed"), recorded at the machine's begin_cycle
             // verdict (or the admission shed) in solver_dispatch.
             cycle.arm = tracing::field::Empty,

@@ -54,6 +54,7 @@ const RETIRED_KEYS: &[&str] = &[
     "DEGENBOT_SOLVE_EXECUTOR",
     "DEGENBOT_FLEET",
     "DEGENBOT_SOLVE_SIM_INFLIGHT",
+    "DEGENBOT_DETACHED_SOLVES",
 ];
 
 /// Real static keys the artifact regex cannot capture (digit-terminated

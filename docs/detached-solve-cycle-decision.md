@@ -38,14 +38,20 @@ and each result flows through an unbounded mpsc to the merge sidecar, a plain
    `solver_dispatch.rs::merge_detached_item`; tests:
    `detached_straggler_with_stale_update_stamp_is_dropped`,
    `detached_straggler_after_deregister_is_dropped`.
-2. **In-flight: cap 8, self-consistent gauge.** Bin threads bump the gauge at
-   SEND time, the sidecar decrements per terminal disposition — a bin that dies
+2. **In-flight: self-consistent gauge.** Bin threads bump the gauge at SEND
+   time, the sidecar decrements per terminal disposition — a bin that dies
    before sending never leaks a count. Code: `detached_outstanding`
-   (`Arc<AtomicU64>`), `DETACHED_INFLIGHT_CAP = 8`.
-3. **Backpressure: degrade, never block.** At cycle start, in-flight >= 8
-   degrades THAT cycle to the pre-epic in-cycle path (the fallback thesis) —
-   the engine mutex is released only at enqueue-end, so waiting on the sidecar
-   while holding it would deadlock by construction; in-cycle fallback instead.
+   (`Arc<AtomicU64>`). WFF6MM: `DETACHED_INFLIGHT_CAP` survives only as the
+   clamp bound for the admission target depth; it is no longer a dispatch
+   gate.
+3. **Backpressure: shed+carry, never block, never re-topologize.** The
+   admission draw (`budget = max(0, target_depth − in-flight)`, taken under
+   the engine lock at `on_resolve`) is the ONE consumption decision: a
+   zero-budget draw SHEDS the whole cycle before any enqueue, retaining the
+   keys in the ledger for a later cycle, and a positive-budget draw ALWAYS
+   submits down the one (detached) arm. WFF6MM retired the cap-based degrade
+   and the in-cycle fallback; with the engine mutex released at enqueue-end
+   there is nothing to re-topologize and no in-cycle hold to block on.
 4. **Observability:** hotpath labels `arb_solve.detached_enqueue` /
    `arb_solve.detached_merge`; metrics `degenbot.detached.in_flight` (gauge),
    `.stale_dropped`, `.applied` (counters; stubbed no-ops in the no-otel
@@ -55,20 +61,22 @@ and each result flows through an unbounded mpsc to the merge sidecar, a plain
    publish's verifier diff covers late merges (pinned by
    `adr021_detached_stragglers_stay_scoped_to_the_publish_verifier`); a
    stale-DROPPED straggler reaches the publish path never.
-5. **Fallback:** `DEGENBOT_DETACHED_SOLVES` unset/0 = byte-identical pre-epic
-   in-cycle code path (the detached arm is skipped entirely);
-   `detached_off_merges_synchronously_inside_the_call` pins the sync merge.
+5. **No fallback (WFF6MM hard cutover).** `DEGENBOT_DETACHED_SOLVES` and its
+   `solve.detached_solves` TOML key retired; a surviving CLI/config override
+   fails the load as an unknown key. The detached arm is unconditional, and
+   the old in-cycle dispatch (and its Saturated machine state, `tick_in_cycle`
+   ledger seq, `FanInTally`, and lock-context duality) is deleted.
 
 ## Policy matrix
 
 | axis | values | shipped default | effect |
 |---|---|---|---|
-| DEGENBOT_DETACHED_SOLVES | 1 / unset | enqueue-and-return sidecar cycle / in-cycle single-hold cycle | epic SRQEK5; default flips with the soaked readout |
+| DEGENBOT_DETACHED_SOLVES / solve.detached_solves | — (retired) | always detached | RETIRED at the WFF6MM cutover: the in-cycle fallback arm is deleted, so there is no stance to set; a surviving CLI/env/TOML key fails the config load (unknown key) |
 | DEGENBOT_STREAMING_DELIVERY | unset / 0 | streaming (per-path micro-batches) / debounce sweep | T3 default flip; A/B opt-out keeps the debounce sweep; the sweep still owns expired/removed + end-of-cycle metadata either way |
 | DEGENBOT_SOLVE_EXECUTOR | — (retired) | fleet | RETIRED at the P6YXA6 hard cutover; the tokio-stance fallback itself retired at LW-T9 (ergo CQLMM2): the fleet is the ONLY solve executor (fleet is the only stance since LW-T9), and the env var fails the config load loudly for one release |
 | DEGENBOT_FLEET / fleet.stance | — (retired) | fleet | RETIRED at the LW-T9 hard cutover: the stance flag is gone with the legacy tokio-stance code path (solve_executor.rs deleted); a surviving env var or TOML key fails the config load loudly for one release |
 | DEGENBOT_SOLVE_SIM_INFLIGHT / solve.solve_sim_inflight | — (retired) | fleet | RETIRED at the LW-T9 hard cutover with the SimSlots semaphore (legacy arb-sim detached threads): SimDriver capacity is `fleet.sim_slot_cap`, inline-sim sizing `solve.inline_sim_workers`; a surviving env var fails the config load loudly for one release |
-| in-flight gauge | 0..8 | >= cap at cycle start degrades that cycle to in-cycle | backpressure thesis |
+| admission draw | `max(0, target_depth − in-flight)` keys | zero-budget draw sheds the cycle; keys carried | shed+carry backpressure (WFF6MM); the gauge is the draw's input |
 | Q1a oracle | stamp vs live clocks | mismatch or deregistered => drop | stale policy thesis |
 
 ## What a detached cycle guarantees
@@ -114,7 +122,27 @@ has no trigger.
 > **Terminology note (epic `MROOY7`):** the seam names this decision record uses —
 > `SolveCoordinator`, `DispatchOwner`, `DrainSink`, `EngineHandle`, `DrainWork` — were
 > retired in `SZJUKL` ([ADR-041](architecture/block-epoch-pipeline.md)). The
-> detached-solve stance itself remains: `DEGENBOT_DETACHED_SOLVES` default ON.
+> detached cycle itself remains, and since the WFF6MM cutover it is the ONLY
+> solve arm: `DEGENBOT_DETACHED_SOLVES` retired with the in-cycle fallback.
+
+## WFF6MM hard cutover (2026-09-12)
+
+Phase A soaked the flag-ON posture (`solve.admission_shed`, `DEGENBOT_SOLVE_ADMISSION=1`)
+live: 95/95 healthy samples held `in_flight` at 0 with `shed_total` flat; a 7 s
+SIGSTOP stall shed exactly one zero-budget cycle (`in_flight=269 >> target_depth=8`)
+and carried the keys; recovery resumed at ~17 merges/s with no further shed or
+degrade (see [docs/tasks/WFF6MM-cutover.md](tasks/WFF6MM-cutover.md) for the full
+evidence table). Phase B then cut over:
+
+- deleted the in-cycle dispatch arm and every construct that existed only to
+  switch to it — the machine's `Saturated` state, `begin_cycle`'s cap/stance
+  verdict (it now takes no argument), `tick_in_cycle`, `FanInTally`,
+  `LaneArmPolicy::lock`/`claim_all_lanes` and `LaneDrainLockContext`;
+- retired the `solve.detached_solves` schema key + `DEGENBOT_DETACHED_SOLVES`
+  env name (unknown key => load failure), keeping
+  `degenbot.detached.degraded_cycles` exported at 0;
+- the ONE drain (`drain_lane_outcomes`) is unchanged except that its only
+  caller is now the detached sidecar; Suppressed/Failed stay keyless (no claim).
 
 ## Watchdog + publish-verifier audit
 

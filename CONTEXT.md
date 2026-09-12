@@ -672,14 +672,15 @@ violation, no behaviour change.
 ## Arb-engine per-cycle machines (2026-09-10 state/transition review)
 
 - **Detached-cycle machine** — the one owner (`arb_engine/detached_cycle.rs`)
-  of the detached/in-cycle solve-arm lifecycle: per-cycle states
-  `Unopened → Open → Saturated` (saturated = the inflight cap is reached; the
-  cycle degrades to in-cycle), the merge pipe open/take, the outstanding gauge
-  pairing, the seq counters, the outcome-ledger key policy, the disposition
-  counters, and the sidecar spawn. One total transition table plus a
-  conformance walk, mirroring `degenbot-workers`' `slot.rs`. The
-  construction-stamped `detached_solving` boot flag reads into
-  `begin_cycle`; it is not machine state.
+  of the solve-cycle arm lifecycle: per-cycle states `Unopened → Open` — the
+  detached arm is the ONLY solve arm since the WFF6MM hard cutover, so a
+  `begin_cycle` always opens (the retired `Saturated` state was the old
+  inflight-cap degrade to the deleted in-cycle arm). It also owns the merge
+  pipe open/take, the outstanding gauge pairing, the seq counters, the
+  outcome-ledger key policy, the disposition counters, and the sidecar spawn.
+  One total transition table plus a conformance walk, mirroring
+  `degenbot-workers`' `slot.rs`. `begin_cycle` takes no stance argument — the
+  retired `detached_solving` boot flag is gone with the in-cycle fallback.
   _Avoid_: "detached arm plumbing", "sidecar state".
 - **Engine block cursor** — the one owner (`arb_engine/block_cursor.rs`) of
   the engine-side block-coordinate residue (`results_block`,

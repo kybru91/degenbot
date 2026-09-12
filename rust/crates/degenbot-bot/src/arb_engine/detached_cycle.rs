@@ -1,36 +1,31 @@
-//! THE one detached/in-cycle solve-arm machine (P37YJG, epic SRQEK5 lineage).
+//! THE one detached solve-arm machine (P37YJG, epic SRQEK5 lineage).
 //!
-//! The detached/in-cycle solve arm of [`crate::arb_engine::ArbitrageEngine`]
-//! is ONE conceptual per-cycle machine. This module is its single owner: the
-//! per-cycle states (`Unopened → Open → Saturated`), the merge pipe
-//! open/take, the outstanding-gauge pair, the seq counters, the
-//! outcome-ledger door, the disposition counters, the fan-in undercount
-//! tripwire, and the ONE sidecar spawn. The construction-stamped
-//! `detached_solving` boot flag is NOT machine state — it reads into
-//! [`DetachedCycle::begin_cycle`] as the stance input.
+//! The detached solve arm of [`crate::arb_engine::ArbitrageEngine`] is ONE
+//! conceptual per-cycle machine. This module is its single owner: the
+//! per-cycle states (`Unopened → Open`), the merge pipe open/take, the
+//! outstanding-gauge pair, the seq counters, the outcome-ledger door, the
+//! disposition counters, and the ONE sidecar spawn. WFF6MM hard cutover:
+//! the in-cycle fallback arm (and its stance input) is GONE — every solve
+//! cycle issues the detached arm.
 //!
 //! # States
 //!
 //! - [`CycleArm::Unopened`] — no detached cycle ever issued; the pipe is
-//!   closed. The stance-off (or never-yet-detached) engine lives here.
-//! - [`CycleArm::Open`] — detached cycles issuing; the merge pipe is open
-//!   and exactly one `Receiver` parks until the sidecar takes it.
-//! - [`CycleArm::Saturated`] — the in-flight cap ([`DETACHED_INFLIGHT_CAP`])
-//!   was reached at the last begin: the cycle DEGRADED to the in-cycle arm
-//!   (backpressure via fallback — a lagging sidecar must not accumulate
-//!   unbounded stragglers). The cap verdict is re-derived from the live
-//!   gauge at every begin; the state records the last verdict.
+//!   closed (the never-yet-detached engine).
+//! - [`CycleArm::Open`] — a detached cycle has issued; the merge pipe is
+//!   open and exactly one `Receiver` parks until the sidecar takes it.
 //!
 //! # Transition discipline
 //!
-//! One total legal-transition table ([`transition`]) + the sized
+//! One legal-transition table ([`transition`]) + the sized
 //! [`ALL_CYCLE_ARMS`] const + the conformance walk in the test module
 //! (house pattern: `degenbot-workers` `slot.rs` T1–T9 +
-//! `bot_core::stage_handlers::ALL_STAGES`). Illegal sequences become typed
-//! rejections ([`RejectedTransition`]) where callers can react; the panics
-//! and aborts that exist today stay verbatim (ADR-042 §10 deadlock-ledger /
-//! loud-stop discipline: stranded merge pipe, vanished pipe — same log
-//! wording, same `std::process::abort`).
+//! `bot_core::stage_handlers::ALL_STAGES`). WFF6MM: every row is total (a
+//! begin always opens; gauge/disposition events are state-transparent), so
+//! the table can no longer reject — the typed-rejection machinery retired
+//! with the in-cycle arm. The panics and aborts that exist today stay
+//! verbatim (ADR-042 §10 deadlock-ledger / loud-stop discipline: stranded
+//! merge pipe, vanished pipe — same log wording, same `std::process::abort`).
 //!
 //! # Lock order (preserved verbatim)
 //!
@@ -51,28 +46,27 @@ use std::sync::Arc;
 use super::executor::outcome_ledger::OutcomeLedger;
 use super::executor::LaneOutcome;
 
-/// Design-locked in-flight cap (~8): more than this many un-merged detached
-/// results outstanding degrades the issuing cycle to the pre-epic in-cycle
-/// path (backpressure via fallback — a lagging sidecar must not accumulate
-/// unbounded stragglers). The A/B probe measured healthy detached cycles
-/// draining inside the merge makespan, so the cap is a safety valve, not the
-/// steady-state controller. (P37YJG: moved verbatim from `solver_dispatch.rs`
-/// — the cap consult is the machine's.)
+/// Design-locked in-flight depth safety valve (~8). WFF6MM: this is NO
+/// longer a runtime cap verdict (the in-cycle degrade it gated is retired);
+/// it survives only as the default + construction clamp for
+/// `solve.admission_target_depth`. The admission draw
+/// (`budget = max(0, admission_target_depth − in-flight)`) is now the sole
+/// backpressure, and `admission_target_depth` is itself clamped to this
+/// value so an operator can never raise the pipe depth past the design cap.
+/// (P37YJG: the cap consult moved into the machine; WFF6MM: the consult
+/// retired with the arm.)
 pub(crate) const DETACHED_INFLIGHT_CAP: u64 = 8;
 
-/// THE persistent machine state (P37YJG). `Saturated` records the LAST
-/// begin's cap verdict — the verdict itself is re-derived from the live
-/// gauge at every [`DetachedCycle::begin_cycle`]; no row ever returns to
+/// THE persistent machine state (P37YJG). WFF6MM: the in-flight-cap
+/// `Saturated` state retired with the in-cycle arm — a begin ALWAYS opens,
+/// so the machine is `Unopened → Open`; no row ever returns to
 /// [`CycleArm::Unopened`] (a pipe, once open, stays open until teardown).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CycleArm {
     /// No detached cycle ever issued; the merge pipe is closed.
     Unopened,
-    /// Detached cycles issuing; the pipe is open (one parked `Receiver`).
+    /// A detached cycle has issued; the pipe is open (one parked `Receiver`).
     Open,
-    /// The in-flight cap was reached at the last begin: the cycle degraded
-    /// to the in-cycle arm (backpressure via fallback).
-    Saturated,
 }
 
 /// Every machine state, in cycle order — the sized ALL-states const the
@@ -86,8 +80,7 @@ pub(crate) enum CycleArm {
         reason = "the ALL-states const is the conformance walk's driver — the walk is test-declared only (house discipline)"
     )
 )]
-pub(crate) const ALL_CYCLE_ARMS: [CycleArm; 3] =
-    [CycleArm::Unopened, CycleArm::Open, CycleArm::Saturated];
+pub(crate) const ALL_CYCLE_ARMS: [CycleArm; 2] = [CycleArm::Unopened, CycleArm::Open];
 
 /// One terminal disposition of ONE detached outcome (the machine's
 /// disposition counters + the pipeline meters they feed).
@@ -106,20 +99,14 @@ pub(crate) enum Disposition {
 }
 
 /// A machine verb — the drivers' complete surface, one row family each in
-/// [`transition`].
+/// [`transition`]. WFF6MM: the in-cycle `TickInCycle` verb retired with the
+/// arm; a begin carries no verdict (the admission draw owns backpressure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Transition {
-    /// [`DetachedCycle::begin_cycle`] — the arm decision. Carries the
-    /// construction stamp and the cap verdict the live gauge supplied.
-    BeginCycle {
-        /// The construction-stamped `detached_solving` stance (NOT machine
-        /// state — the engine owns the flag and reads it in here).
-        detached_stance: bool,
-        /// `outstanding >= DETACHED_INFLIGHT_CAP` at the begin read.
-        cap_saturated: bool,
-    },
-    /// [`DetachedCycle::tick_in_cycle`] — the in-cycle arm's seq tick.
-    TickInCycle,
+    /// [`DetachedCycle::begin_cycle`] — the arm decision. WFF6MM: the
+    /// detached arm is the ONLY arm; a begin always opens the pipe (no
+    /// stance input, no cap verdict — the admission draw owns backpressure).
+    BeginCycle,
     /// [`DetachedCycle::gauge_hook`] fired — one Solved outcome's
     /// send-success bump (the ISSUE half of the gauge pair).
     #[cfg_attr(
@@ -141,140 +128,50 @@ pub(crate) enum Transition {
     Disposition(Disposition),
 }
 
-/// Guards the table consults; the driver supplies them (house pattern:
-/// `slot.rs` `TransitionContext`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CycleCtx {
-    /// THIS cycle's begin decision (the per-cycle latch): true iff the last
-    /// `begin_cycle` issued the detached arm. Guards [`Transition::TickInCycle`].
-    pub(crate) began_detached: bool,
-}
-
-/// A rejected transition: loud by construction, typed for the conformance
-/// walk to assert exactly WHICH row was violated (house wording:
-/// `slot.rs::RejectedTransition`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("rejected transition {from:?} --{transition:?}--> ({reason})")]
-pub(crate) struct RejectedTransition {
-    /// The state the move was attempted from.
-    pub(crate) from: CycleArm,
-    /// The attempted transition.
-    pub(crate) transition: Transition,
-    /// Which part of the table rejected it.
-    pub(crate) reason: RejectionReason,
-}
-
-/// Why a transition left the legal table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum RejectionReason {
-    /// The in-cycle seq tick after THIS cycle's begin already issued the
-    /// detached arm — the one-arm-per-cycle law (the wrong-arm drift).
-    #[error(
-        "this cycle's begin already issued the detached arm — the in-cycle tick is the wrong arm"
-    )]
-    WrongArm,
-}
-/// THE total legal-transition table (P37YJG; house pattern:
-/// `degenbot-workers` `slot.rs::transition`):
+/// THE legal-transition table (P37YJG; house pattern:
+/// `degenbot-workers` `slot.rs::transition`). WFF6MM: with the in-cycle arm
+/// retired every row is TOTAL, so the table is infallible (no typed
+/// rejections remain):
 ///
 /// ```text
-///              Begin{stance off} Begin{on, < cap} Begin{on, >= cap} TickInCycle(began_in_cycle) OutcomeSent / Disposition(k)
-/// Unopened  →  Unopened          Open             Saturated         Unopened                    unchanged
-/// Open      →  Open              Open             Saturated         Open                        unchanged
-/// Saturated →  Saturated         Open             Saturated         Saturated                   unchanged
-///
-/// TickInCycle with began_detached = true: REJECTED (WrongArm) from EVERY
-/// state — the one-arm-per-cycle law.
+///              BeginCycle   OutcomeSent / Disposition(k)
+/// Unopened  →  Open         unchanged
+/// Open      →  Open         unchanged
 /// ```
 ///
-/// Any move not covered by a row is a loud, typed rejection — never a
-/// silent re-wrap. The B-rows are TOTAL over (state, stance, verdict):
-/// every solve cycle begins, from any state. The G/D-rows are
-/// state-transparent ON PURPOSE: the gauge pair (send-success bump ⟺
-/// merge receipt decrement) and the process-cumulative disposition
-/// counters are cross-thread events the persistent state does not gate
-/// (the sidecar lands items in whatever state the engine is in; the
-/// direct-merge test harness drives dispositions on dormant machines).
-///
-/// # Errors
-/// A [`RejectedTransition`] whenever ~(from, t, ctx)~ is off the table.
-#[must_use = "a rejected transition is a conformance event, not a suggestion"]
-#[expect(
-    clippy::match_same_arms,
-    reason = "the rows are DISTINCT semantic families (dormant begin / state-transparent gauge + dispositions / in-cycle tick) whose state effect coincides — merging the patterns would blur the review artifact; the conformance walk pins each family separately"
-)]
-pub(crate) fn transition(
-    from: CycleArm,
-    t: Transition,
-    ctx: CycleCtx,
-) -> Result<CycleArm, RejectedTransition> {
-    let reject = |reason: RejectionReason| {
-        Err::<CycleArm, RejectedTransition>(RejectedTransition {
-            from,
-            transition: t,
-            reason,
-        })
-    };
-    match (from, t) {
-        // B-rows — the arm decision. Total over (state, stance, verdict).
-        (
-            _,
-            Transition::BeginCycle {
-                detached_stance: false,
-                ..
-            },
-        ) => Ok(from),
-        (
-            _,
-            Transition::BeginCycle {
-                detached_stance: true,
-                cap_saturated: false,
-            },
-        ) => Ok(CycleArm::Open),
-        (
-            _,
-            Transition::BeginCycle {
-                detached_stance: true,
-                cap_saturated: true,
-            },
-        ) => Ok(CycleArm::Saturated),
+/// The G/D-rows are state-transparent ON PURPOSE: the gauge pair
+/// (send-success bump ⟺ merge receipt decrement) and the process-cumulative
+/// disposition counters are cross-thread events the persistent state does
+/// not gate (the sidecar lands items in whatever state the engine is in;
+/// the direct-merge test harness drives dispositions on dormant machines).
+#[must_use]
+pub(crate) fn transition(from: CycleArm, t: Transition) -> CycleArm {
+    match t {
+        // B-row — the arm decision. A begin always issues the detached arm.
+        Transition::BeginCycle => CycleArm::Open,
         // G/D-rows — cross-thread gauge + disposition events.
-        (_, Transition::OutcomeSent | Transition::Disposition(_)) => Ok(from),
-        // T-row — the in-cycle seq tick: legal iff THIS cycle's begin went
-        // in-cycle (the driver's Arm match and this guard agree by
-        // construction; a tick after a detached issue is the drift).
-        // Everything else is off the legal table.
-        (_, Transition::TickInCycle) => {
-            if ctx.began_detached {
-                reject(RejectionReason::WrongArm)
-            } else {
-                Ok(from)
-            }
-        }
+        Transition::OutcomeSent | Transition::Disposition(_) => from,
     }
 }
 
-/// The per-cycle begin decision: `Detached` carries the machine-issued seq
-/// (THE ledger key half for this cycle's detached claims — the ONE
-/// `(solve_seq, pid)` key zone) and the merge-pipe `Sender` clone for the
-/// 'static bin threads. `InCycle` keeps/degrades to the synchronous arm;
-/// the caller then draws its seq via [`DetachedCycle::tick_in_cycle`].
+/// The per-cycle begin decision: the machine-issued seq (THE ledger key half
+/// for this cycle's detached claims — the ONE `(solve_seq, pid)` key zone)
+/// and the merge-pipe `Sender` clone for the 'static bin threads. WFF6MM:
+/// the detached arm is the ONLY arm — the in-cycle alternative retired with
+/// its stance and seq-tick verb.
 #[derive(Debug)]
-pub(crate) enum Arm {
-    Detached {
-        /// The seq this detached cycle was stamped with (`solve_seq_ctr`
-        /// after the tick — BOTH arms draw from the ONE counter, 43E3H3).
-        cycle_seq: u64,
-        /// A clone of the merge pipe's `Sender` (opened once, on the first
-        /// detached cycle).
-        merge_tx: std::sync::mpsc::Sender<LaneOutcome>,
-    },
-    InCycle,
+pub(crate) struct DetachedArm {
+    /// The seq this detached cycle was stamped with (`solve_seq_ctr` after
+    /// the tick — the ONE counter).
+    pub(crate) cycle_seq: u64,
+    /// A clone of the merge pipe's `Sender` (opened once, on the first
+    /// detached cycle).
+    pub(crate) merge_tx: std::sync::mpsc::Sender<LaneOutcome>,
 }
 
-/// The drain's counter aggregate (fold of the in-cycle drain's locals +
-/// the sidecar's per-item consumption). P37YJG: the machine owns the
-/// disposition bookkeeping, so the aggregate lives here.
+/// The drain's counter aggregate (the sidecar's per-item consumption).
+/// P37YJG: the machine owns the disposition bookkeeping, so the aggregate
+/// lives here.
 #[derive(Default)]
 pub(crate) struct LaneDrainCounts {
     pub(crate) solved: usize,
@@ -282,73 +179,30 @@ pub(crate) struct LaneDrainCounts {
     pub(crate) failed: usize,
 }
 
-/// The in-cycle drain's fan-in tally (P37YJG fold of the former inline
-/// locals): the machine owns the undercount tripwire — the drain records
-/// per-item dispositions and the cycle asserts exact totals at fan-in end.
-#[derive(Default)]
-pub(crate) struct FanInTally {
-    solved: usize,
-    suppressed: usize,
-    failed: usize,
-}
-
-impl FanInTally {
-    /// Record one drained item's dispositions.
-    pub(crate) fn record(&mut self, counts: &LaneDrainCounts) {
-        self.solved += counts.solved;
-        self.suppressed += counts.suppressed;
-        self.failed += counts.failed;
-    }
-
-    /// The tally's solved count (the merge span's `merge.paths` record).
-    #[must_use]
-    pub(crate) fn solved(&self) -> usize {
-        self.solved
-    }
-
-    /// THE fan-in undercount tripwire (QR3NUS/LW-T7): the merged drain
-    /// ASSERTS exact totals — outcomes == submissions, failures and all.
-    /// The assert IS the gate: a mismatch fails the cycle thread loudly.
-    /// (P37YJG: moved verbatim from the in-cycle drain — same message,
-    /// same loud failure.)
-    pub(crate) fn assert_exact(self, submitted: usize) {
-        let Self {
-            solved,
-            suppressed,
-            failed,
-        } = self;
-        let drained = solved + suppressed + failed;
-        assert_eq!(drained, submitted, "[solve-merge] outcome accounting undercount — exactness fuse tripped (QR3NUS/LW-T7): solved {solved} + suppressed {suppressed} + failed {failed} != submitted {submitted}");
-    }
-}
 // ---------------------------------------------------------------------------
 // THE machine
 // ---------------------------------------------------------------------------
 
-/// THE one detached/in-cycle solve-arm machine (P37YJG): the single owner
-/// of the scattered per-cycle fields this module's doc header names. The
-/// engine holds ONE of these; the construction-stamped `detached_solving`
-/// boot flag stays on the engine and reads into [`Self::begin_cycle`].
-///
+/// THE one detached solve-arm machine (P37YJG): the single owner of the
+/// scattered per-cycle fields this module's doc header names. The engine
+/// holds ONE of these. WFF6MM: the in-cycle stance is gone — every begin
+/// issues the detached arm.
 /// Lock order: the engine mutex (which guards this whole struct) is the
 /// OUTER lock; [`Self::outcome_ledger`]'s mutex is always an inner lock —
 /// never the reverse (no ABBA ordering). The gauge atomics are lock-free.
 pub(crate) struct DetachedCycle {
     /// The persistent state (see [`CycleArm`]).
     state: CycleArm,
-    /// THIS cycle's begin decision latch (see [`CycleCtx::began_detached`]).
-    began_detached: bool,
-    /// Monotonic counter bumped per issued SOLVE cycle (43E3H3: BOTH arms —
-    /// the detached arm's enqueue AND the in-cycle arm's entry tick it; it
-    /// is THE ledger's seq half). The sidecar's straggler-age telemetry
-    /// still reads `detached_issued_seq` (detached-only) against it.
+    /// Monotonic counter bumped per issued detached SOLVE cycle (it is THE
+    /// ledger's seq half). The sidecar's straggler-age telemetry reads
+    /// `detached_issued_seq` against it.
     solve_seq_ctr: u64,
     /// The seq of the most recently issued detached cycle.
     detached_issued_seq: u64,
     /// Sender half of the UNBOUNDED mpsc merge pipe; `Some` from the first
     /// detached enqueue until teardown. Each enqueue clones it into the
     /// per-bin bin jobs. Carries the unified [`executor::LaneOutcome`]
-    /// (QR3NUS 43E3H3) — BOTH arms submit through it.
+    /// (QR3NUS 43E3H3).
     merge_tx: Option<std::sync::mpsc::Sender<LaneOutcome>>,
     /// Receiver parked until `EngineStages::solve_dirty` spawns the merge
     /// sidecar (taken once via [`Self::take_merge_rx`]). `Mutex`-wrapped so
@@ -356,25 +210,23 @@ pub(crate) struct DetachedCycle {
     /// guard is touched exactly once, by the spawner thread).
     merge_rx: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<LaneOutcome>>>,
     /// LW-T9 note-(a) carry: the duplicate-outcome fuse counter (the QR3NUS
-    /// exactness assert). 43E3H3: BOTH arms feed it — the in-cycle drain's
-    /// ledger claims and the sidecar's — one process-cumulative count.
+    /// exactness assert). 43E3H3: the sidecar's ledger claims feed it — one
+    /// process-cumulative count.
     pub(crate) duplicate_outcomes: std::sync::atomic::AtomicU64,
-    /// THE exactness ledger (LW-T9 note (a) -> QR3NUS 43E3H3: ONE ledger
-    /// for BOTH solve arms): one outcome per (`solve_seq`, path)
-    /// EXACTLY once — keyed (`solve_seq`, pid); the in-cycle drain claims
-    /// under its cycle's seq, the sidecar under the enqueue-stamped
-    /// `cycle_seq`. Held on the ENGINE (`parking_lot` Mutex) — the fuse is
-    /// stateful across sidecar restarts (the pipe outlives any one
-    /// sidecar thread) and shared across arms (ONE key zone, design §3.3).
+    /// THE exactness ledger (LW-T9 note (a) -> QR3NUS 43E3H3): one outcome
+    /// per (`solve_seq`, path) EXACTLY once — keyed (`solve_seq`, pid); the
+    /// sidecar claims under the enqueue-stamped `cycle_seq`. Held on the
+    /// ENGINE (`parking_lot` Mutex) — the fuse is stateful across sidecar
+    /// restarts (the pipe outlives any one sidecar thread).
     /// P37YJG: the machine OWNS and drives the field (via [`Self::claim`]);
     /// the TYPE stays `executor::outcome_ledger::OutcomeLedger`.
     pub(crate) outcome_ledger: parking_lot::Mutex<OutcomeLedger>,
     /// In-flight gauge: detached results SENT but not yet dispositioned.
     /// `Arc` because the enqueue half's bin threads bump it at send time
     /// ([`Self::gauge_hook`]) and the sidecar decrements it per Solved
-    /// receipt ([`Self::solved_received`]). At cycle start a count >=
-    /// [`DETACHED_INFLIGHT_CAP`] degrades that cycle to the in-cycle path
-    /// (backpressure via fallback).
+    /// receipt ([`Self::solved_received`]). WFF6MM: the gauge feeds the
+    /// admission draw (`budget = max(0, admission_target_depth − in-flight)`),
+    /// which is the sole backpressure now.
     pub(crate) outstanding: Arc<std::sync::atomic::AtomicU64>,
     /// Detached straggler outcome counters (applied / stale-dropped /
     /// deregistered-dropped); T2 wires the `detached.*` metrics from these.
@@ -383,12 +235,12 @@ pub(crate) struct DetachedCycle {
     pub(crate) dropped_deregistered: std::sync::atomic::AtomicU64,
     /// QTZGFL: cycles SHED by capacity-modulated admission (zero draw
     /// budget) — the machine's disposition counter behind
-    /// `degenbot.detached.shed_total`. A shed cycle submits nothing and
+    /// `degenbot.detached.shed`. A shed cycle submits nothing and
     /// claims nothing (no seq tick); this is a pure counter event.
     pub(crate) shed_cycles: std::sync::atomic::AtomicU64,
     /// QTZGFL: retained (carried) admission keys pruned by the retention
     /// window (`head − W`) — the machine's counter behind
-    /// `degenbot.detached.leads_expired_total`.
+    /// `degenbot.detached.leads_expired`.
     pub(crate) leads_expired: std::sync::atomic::AtomicU64,
 }
 
@@ -404,7 +256,6 @@ impl DetachedCycle {
     pub(crate) fn new() -> Self {
         Self {
             state: CycleArm::Unopened,
-            began_detached: false,
             solve_seq_ctr: 0,
             detached_issued_seq: 0,
             merge_tx: None,
@@ -434,58 +285,25 @@ impl DetachedCycle {
     }
 
     /// The most recently issued detached cycle's seq — the sidecar's
-    /// straggler-age telemetry anchor (`detached_issued_seq`): in-cycle
-    /// advances deliberately do NOT move it (design §3.3.1, N3's negative
-    /// half).
+    /// straggler-age telemetry anchor (`detached_issued_seq`).
     #[must_use]
     pub(crate) fn issued_seq(&self) -> u64 {
         self.detached_issued_seq
     }
 
-    /// THE arm decision (one machine verb): consult the construction stamp
-    /// and the live in-flight gauge against [`DETACHED_INFLIGHT_CAP`], tick
-    /// the ONE seq counter on a detached issue, open the merge pipe once,
-    /// and hand back the `Sender` clone for the 'static bin threads.
+    /// THE arm decision (one machine verb): tick the ONE seq counter, open
+    /// the merge pipe once (if not already open), and hand back the `Sender`
+    /// clone for the 'static bin threads. WFF6MM: this ALWAYS issues the
+    /// detached arm — the stance input, the live-gauge cap verdict, and the
+    /// in-cycle fallback retired; the admission draw owns backpressure.
     ///
-    /// The B-rows are total over (state, stance, verdict) — the table
-    /// cannot reject this; the `Err` arm is the unreachable-guard against
-    /// a lost row (log + conservative in-cycle degrade).
-    pub(crate) fn begin_cycle(&mut self, detached_stance: bool) -> Arm {
-        let cap_saturated = self.outstanding.load(Ordering::Relaxed) >= DETACHED_INFLIGHT_CAP;
-        match transition(
-            self.state,
-            Transition::BeginCycle {
-                detached_stance,
-                cap_saturated,
-            },
-            CycleCtx {
-                began_detached: self.began_detached,
-            },
-        ) {
-            Ok(to) => self.state = to,
-            Err(rejected) => {
-                // Unreachable: the B-rows cover every (state, stance,
-                // verdict) cell — the conformance walk pins all of them.
-                tracing::error!(
-                    target: crate::telemetry::DIAGNOSTIC_TARGET,
-                    from = ?rejected.from,
-                    transition = ?rejected.transition,
-                    reason = %rejected.reason,
-                    "[detached-cycle] begin_cycle REJECTED — off the machine table; degrading to in-cycle"
-                );
-                self.began_detached = false;
-                return Arm::InCycle;
-            }
-        }
-        if !detached_stance || cap_saturated {
-            self.began_detached = false;
-            return Arm::InCycle;
-        }
-        // THE DETACHED ISSUE: tick the ONE counter (both arms draw from it)
-        // and stamp the detached-only telemetry anchor.
+    /// The row is total — the table cannot reject this.
+    pub(crate) fn begin_cycle(&mut self) -> DetachedArm {
+        self.state = transition(self.state, Transition::BeginCycle);
+        // THE DETACHED ISSUE: tick the ONE counter and stamp the
+        // detached-only telemetry anchor.
         self.solve_seq_ctr += 1;
         self.detached_issued_seq = self.solve_seq_ctr;
-        self.began_detached = true;
         // The merge pipe: open ONCE (the first detached cycle). The sidecar
         // thread is spawned by EngineStages::solve_dirty right after this
         // enqueue half returns; the Receiver parks in the machine until
@@ -509,30 +327,10 @@ impl DetachedCycle {
             );
             std::process::abort();
         };
-        Arm::Detached {
+        DetachedArm {
             cycle_seq: self.detached_issued_seq,
             merge_tx,
         }
-    }
-
-    /// THE in-cycle arm's seq tick (one machine verb): legal iff THIS
-    /// cycle's begin went in-cycle (the per-cycle latch guard). A tick
-    /// after a detached issue is the wrong-arm drift — the typed rejection;
-    /// the caller logs it and skips the in-cycle dispatch (the driver
-    /// structure makes this unreachable — see the conformance walk).
-    ///
-    /// In-cycle advances deliberately do NOT move `detached_issued_seq`
-    /// (design §3.3.1, N3's negative half).
-    pub(crate) fn tick_in_cycle(&mut self) -> Result<u64, RejectedTransition> {
-        transition(
-            self.state,
-            Transition::TickInCycle,
-            CycleCtx {
-                began_detached: self.began_detached,
-            },
-        )?;
-        self.solve_seq_ctr += 1;
-        Ok(self.solve_seq_ctr)
     }
 
     /// The ISSUE half of the gauge pair (contract 1, REV 2 Defect 1): ONE
@@ -716,17 +514,10 @@ pub(crate) fn spawn_merge_sidecar(
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::panic)]
+#[expect(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::arb_engine::executor;
-
-    const CTX_IN_CYCLE: CycleCtx = CycleCtx {
-        began_detached: false,
-    };
-    const CTX_AFTER_DETACHED: CycleCtx = CycleCtx {
-        began_detached: true,
-    };
 
     /// The sized ALL-states const is exhaustive and duplicate-free; adding
     /// a `CycleArm` variant without extending the table + this walk fails
@@ -734,7 +525,7 @@ mod tests {
     /// `stage_handlers::ALL_STAGES` / `slot.rs` `ALL_ROLES`).
     #[test]
     fn all_cycle_arms_covers_every_state_exactly_once() {
-        assert_eq!(ALL_CYCLE_ARMS.len(), 3, "the machine declares 3 states");
+        assert_eq!(ALL_CYCLE_ARMS.len(), 2, "the machine declares 2 states");
         for (i, s) in ALL_CYCLE_ARMS.iter().enumerate() {
             assert!(
                 !ALL_CYCLE_ARMS[i + 1..].contains(s),
@@ -744,108 +535,47 @@ mod tests {
         for s in ALL_CYCLE_ARMS {
             // Exhaustive: a new variant breaks this match at compile time.
             match s {
-                CycleArm::Unopened | CycleArm::Open | CycleArm::Saturated => {}
+                CycleArm::Unopened | CycleArm::Open => {}
             }
         }
-        assert_eq!(
-            ALL_CYCLE_ARMS,
-            [CycleArm::Unopened, CycleArm::Open, CycleArm::Saturated]
-        );
+        assert_eq!(ALL_CYCLE_ARMS, [CycleArm::Unopened, CycleArm::Open]);
     }
 
-    /// THE CONFORMANCE WALK (P37YJG): every legal (state × transition ×
-    /// ctx) cell lands on its table successor, and every illegal cell is a
-    /// typed rejection carrying the exact violated row. Mirrors the
-    /// `degenbot-workers` slot T-table conformance harness.
+    /// THE CONFORMANCE WALK (P37YJG): every legal (state × transition) cell
+    /// lands on its table successor. WFF6MM: with the in-cycle arm retired
+    /// every row is total — there is no illegal cell and therefore no typed
+    /// rejection left to pin.
     #[test]
-    fn conformance_walks_every_legal_transition_and_rejects_every_illegal_one() {
+    fn conformance_walks_every_legal_transition() {
         for from in ALL_CYCLE_ARMS {
-            // BeginCycle — the arm decision. Total over (state, stance,
-            // verdict): every solve cycle begins, from any state.
-            for cap_saturated in [false, true] {
-                for ctx in [CTX_IN_CYCLE, CTX_AFTER_DETACHED] {
-                    assert_eq!(
-                        transition(
-                            from,
-                            Transition::BeginCycle {
-                                detached_stance: false,
-                                cap_saturated,
-                            },
-                            ctx,
-                        ),
-                        Ok(from),
-                        "B-row (stance off) from {from:?}: dormant/degraded arm, no state move"
-                    );
-                    assert_eq!(
-                        transition(
-                            from,
-                            Transition::BeginCycle {
-                                detached_stance: true,
-                                cap_saturated: false,
-                            },
-                            ctx,
-                        ),
-                        Ok(CycleArm::Open),
-                        "B-row (stance on, below cap) from {from:?}: the detached issue opens"
-                    );
-                    assert_eq!(
-                        transition(
-                            from,
-                            Transition::BeginCycle {
-                                detached_stance: true,
-                                cap_saturated: true,
-                            },
-                            ctx,
-                        ),
-                        Ok(CycleArm::Saturated),
-                        "B-row (stance on, at cap) from {from:?}: degradation records the verdict"
-                    );
-                }
-            }
-            // TickInCycle — legal iff THIS cycle's begin went in-cycle.
+            // BeginCycle — the arm decision. Total: every solve cycle
+            // begins, from any state, and opens the pipe.
             assert_eq!(
-                transition(from, Transition::TickInCycle, CTX_IN_CYCLE),
-                Ok(from),
-                "T-row from {from:?}: the in-cycle tick after an in-cycle begin"
+                transition(from, Transition::BeginCycle),
+                CycleArm::Open,
+                "B-row from {from:?}: the detached issue opens"
             );
             // Cross-thread gauge + disposition events: state-transparent
             // (the pair — bump ⟺ receipt — and the process-cumulative
             // counters are NOT gated by the persistent state; the sidecar
             // lands items in whatever state the engine is in).
-            for ctx in [CTX_IN_CYCLE, CTX_AFTER_DETACHED] {
+            assert_eq!(
+                transition(from, Transition::OutcomeSent),
+                from,
+                "G-row from {from:?}: the send-success bump is state-transparent"
+            );
+            for kind in [
+                Disposition::Applied,
+                Disposition::DroppedStale,
+                Disposition::DroppedDeregistered,
+                Disposition::Duplicate,
+            ] {
                 assert_eq!(
-                    transition(from, Transition::OutcomeSent, ctx),
-                    Ok(from),
-                    "G-row from {from:?}: the send-success bump is state-transparent"
+                    transition(from, Transition::Disposition(kind)),
+                    from,
+                    "D-row {kind:?} from {from:?}: dispositions are state-transparent"
                 );
-                for kind in [
-                    Disposition::Applied,
-                    Disposition::DroppedStale,
-                    Disposition::DroppedDeregistered,
-                    Disposition::Duplicate,
-                ] {
-                    assert_eq!(
-                        transition(from, Transition::Disposition(kind), ctx),
-                        Ok(from),
-                        "D-row {kind:?} from {from:?}: dispositions are state-transparent"
-                    );
-                }
             }
-            // THE illegal row family: the in-cycle tick after THIS cycle's
-            // begin already issued the detached arm — the one-arm-per-cycle
-            // law (the wrong-arm drift).
-            let rejected = transition(from, Transition::TickInCycle, CTX_AFTER_DETACHED)
-                .expect_err("a tick after a detached issue is the wrong-arm drift");
-            assert_eq!(
-                rejected.from, from,
-                "the rejection names the violated from-state"
-            );
-            assert_eq!(
-                rejected.transition,
-                Transition::TickInCycle,
-                "the rejection names the violated transition"
-            );
-            assert_eq!(rejected.reason, RejectionReason::WrongArm);
         }
     }
 
@@ -855,13 +585,10 @@ mod tests {
     fn machine_opens_the_pipe_once_and_takes_it_once() {
         let mut m = DetachedCycle::new();
         assert_eq!(m.state(), CycleArm::Unopened);
-        let Arm::Detached {
+        let DetachedArm {
             cycle_seq,
             merge_tx,
-        } = m.begin_cycle(true)
-        else {
-            panic!("first below-cap begin with the stance ON must issue detached");
-        };
+        } = m.begin_cycle();
         assert_eq!(cycle_seq, 1, "the ONE counter ticks on the detached issue");
         assert_eq!(m.state(), CycleArm::Open, "Unopened → Open");
         assert!(
@@ -870,12 +597,9 @@ mod tests {
         );
         assert!(m.take_merge_rx().is_none(), "the receiver is take-ONCE");
         // Consecutive detached cycles: same pipe (no re-open), seq advances.
-        let Arm::Detached {
+        let DetachedArm {
             cycle_seq: seq2, ..
-        } = m.begin_cycle(true)
-        else {
-            panic!("an Open machine below cap keeps issuing detached");
-        };
+        } = m.begin_cycle();
         assert_eq!(seq2, 2);
         assert_eq!(
             m.state(),
@@ -885,73 +609,17 @@ mod tests {
         drop(merge_tx);
     }
 
+    /// WFF6MM: the begin ALWAYS issues the detached arm — a cycle whose
+    /// in-flight gauge sits at/over the design depth safety valve still
+    /// detaches (the admission draw, not a cap verdict, owns backpressure).
     #[test]
-    fn machine_degrades_at_the_cap_and_recovers_below_it() {
+    fn machine_begins_detached_even_at_or_over_the_depth_safety_valve() {
         let mut m = DetachedCycle::new();
-        m.outstanding
-            .store(DETACHED_INFLIGHT_CAP, Ordering::Relaxed);
-        assert!(
-            matches!(m.begin_cycle(true), Arm::InCycle),
-            "at-cap cycles must degrade to the in-cycle arm"
-        );
-        assert_eq!(m.state(), CycleArm::Saturated, "Unopened → Saturated");
-        assert!(
-            m.take_merge_rx().is_none(),
-            "no pipe was opened — no receiver parked"
-        );
-        // The in-cycle tick is legal from Saturated and ticks the ONE counter.
-        assert_eq!(
-            m.tick_in_cycle().expect("the tick is legal from Saturated"),
-            1
-        );
-        // The cap verdict re-derives from the LIVE gauge: drain below the
-        // cap and the machine re-opens.
-        m.outstanding
-            .store(DETACHED_INFLIGHT_CAP - 1, Ordering::Relaxed);
-        assert!(matches!(m.begin_cycle(true), Arm::Detached { .. }));
-        assert_eq!(m.state(), CycleArm::Open, "Saturated → Open (below cap)");
-    }
-
-    #[test]
-    fn machine_stance_off_never_opens_and_ticks_in_cycle() {
-        let mut m = DetachedCycle::new();
-        assert!(matches!(m.begin_cycle(false), Arm::InCycle));
-        assert_eq!(
-            m.state(),
-            CycleArm::Unopened,
-            "stance OFF: the machine is dormant"
-        );
-        assert_eq!(
-            m.tick_in_cycle()
-                .expect("the stance-off arm ticks in-cycle"),
-            1
-        );
-        // Even at/above the cap the stance-off machine never opens...
-        m.outstanding
-            .store(DETACHED_INFLIGHT_CAP + 5, Ordering::Relaxed);
-        assert!(matches!(m.begin_cycle(false), Arm::InCycle));
-        assert_eq!(m.state(), CycleArm::Unopened);
-        // ...and the in-cycle tick stays legal.
-        assert_eq!(m.tick_in_cycle().expect("legal"), 2);
-    }
-
-    #[test]
-    fn machine_rejects_the_in_cycle_tick_after_a_detached_issue() {
-        let mut m = DetachedCycle::new();
-        assert!(matches!(
-            m.begin_cycle(true),
-            Arm::Detached { cycle_seq: 1, .. }
-        ));
-        let rejected = m
-            .tick_in_cycle()
-            .expect_err("tick after a detached issue is the wrong-arm drift");
-        assert_eq!(rejected.reason, RejectionReason::WrongArm);
-        assert_eq!(rejected.from, CycleArm::Open);
-        // The REFUSED tick never moved the counter — no key-zone corruption.
-        // A fresh begin resets the per-cycle latch; the next legal tick
-        // draws the next seq.
-        assert!(matches!(m.begin_cycle(false), Arm::InCycle));
-        assert_eq!(m.tick_in_cycle().expect("fresh cycle ticks"), 2);
+        for outstanding in [0, DETACHED_INFLIGHT_CAP, DETACHED_INFLIGHT_CAP + 5] {
+            m.outstanding.store(outstanding, Ordering::Relaxed);
+            let DetachedArm { .. } = m.begin_cycle();
+            assert_eq!(m.state(), CycleArm::Open);
+        }
     }
 
     #[test]
@@ -993,34 +661,5 @@ mod tests {
             !m.outcome_ledger.lock().contains((5, 1)),
             "rows past LEDGER_AGE prune on the next claim"
         );
-    }
-
-    #[test]
-    fn fan_in_tally_asserts_exact_totals() {
-        let mut tally = FanInTally::default();
-        tally.record(&LaneDrainCounts {
-            solved: 2,
-            suppressed: 1,
-            failed: 0,
-        });
-        tally.record(&LaneDrainCounts {
-            solved: 0,
-            suppressed: 0,
-            failed: 1,
-        });
-        assert_eq!(tally.solved(), 2);
-        tally.assert_exact(4);
-    }
-
-    #[test]
-    #[should_panic(expected = "outcome accounting undercount")]
-    fn fan_in_tally_trips_loud_on_an_undercount() {
-        let mut tally = FanInTally::default();
-        tally.record(&LaneDrainCounts {
-            solved: 1,
-            suppressed: 0,
-            failed: 0,
-        });
-        tally.assert_exact(3);
     }
 }

@@ -275,6 +275,32 @@ fn loader_fails_closed_on_bad_values_and_unknown_keys() {
         "the retired key is rejected: {err}"
     );
 
+    // WFF6MM hard cutover: the RETIRED detached-solve stance key is not a
+    // schema key anymore — a CLI override naming it is rejected as unknown
+    // (fail-closed), and a surviving TOML key fails with the generic
+    // unknown-key error (the one-release pointed refusal was removed at
+    // d5c450c84; ADR-012 deletion, not a flag).
+    let err = must_err(
+        &BotConfigLoader::new()
+            .without_env()
+            .with_cli("DEGENBOT_DETACHED_SOLVES", "0"),
+    );
+    assert!(
+        format!("{err}").contains("DEGENBOT_DETACHED_SOLVES"),
+        "the retired detached-solve key is rejected: {err}"
+    );
+    let retired_toml = temp_toml("detached_solves", "[solve]\ndetached_solves = true\n");
+    let err = must_err(
+        &BotConfigLoader::new()
+            .without_env()
+            .with_config_path(&retired_toml),
+    );
+    assert!(
+        format!("{err}").contains("unknown key detached_solves"),
+        "a surviving solve.detached_solves TOML key must fail closed: {err}"
+    );
+    cleanup(&retired_toml);
+
     // Unknown TOML key -> error.
     let path = temp_toml("unknown", "[nope]\nflag = true\n");
     let err = must_err(&BotConfigLoader::new().without_env().with_config_path(&path));
@@ -367,6 +393,7 @@ fn retired_env_shims_are_ignored() {
             ("DEGENBOT_FLEET", "fleet"),
             ("DEGENBOT_SOLVE_SIM_INFLIGHT", "8"),
             ("DEGENBOT_LPT_PARTITION", "4"),
+            ("DEGENBOT_DETACHED_SOLVES", "0"),
         ]))
         .load();
     assert!(ok.is_ok(), "retired env names are ignored: {ok:?}");

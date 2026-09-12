@@ -239,14 +239,12 @@ crate::config_schema! {
             doc = "Chunked parallel resolve stance; `0`/`off`/`false`/`disabled` disables.";
         inline_sim_workers [opt usize] = None, env = "DEGENBOT_INLINE_SIM_WORKERS", def = "(unset; derived from CPU budget)",
             doc = "Inline-sim worker count (clamped 1..=32; unparsable falls back to derived default at the site).";
-        detached_solves [bool] = true, env = "DEGENBOT_DETACHED_SOLVES", def = "true",
-            doc = "Route solve arms through detached (out-of-cycle) workers; `0`/`false` opts back into the in-cycle engine-Mutex hold. Default ON: the solve path takes no engine-level Mutex (epic MROOY7 task 2UVG3E, seam #4).";
-        admission_shed [bool] = false, env = "DEGENBOT_SOLVE_ADMISSION", def = "false",
-            doc = "QTZGFL capacity-modulated admission stance (request-draw experiment): `1`/`true`/`on` replaces the in-flight cap degrade with budget = max(0, admission_target_depth - in-flight) and SHEDS zero-budget cycles; unset/`0`/`false` keeps the current degrade byte-identical (default OFF for the experiment).";
+        admission_shed [bool] = true, env = "DEGENBOT_SOLVE_ADMISSION", def = "true",
+            doc = "QTZGFL capacity-modulated admission stance: unset/`1`/`true`/`on` (default) replaces the retired in-flight cap degrade with budget = max(0, admission_target_depth - in-flight) and SHEDS zero-budget cycles; `0`/`false`/`off` is the intentional take-all no-shed operator stance (A/B).";
         admission_target_depth [usize] = 8, env = "DEGENBOT_SOLVE_ADMISSION_TARGET_DEPTH", def = "8",
-            doc = "QTZGFL: un-merged-result pipe depth target in KEYS (pools) — the draw budget headroom. Clamped at engine construction to 1..=DETACHED_INFLIGHT_CAP (the design-locked safety valve); default 8 = DETACHED_INFLIGHT_CAP.";
+            doc = "QTZGFL: un-merged-result pipe depth target in KEYS (pools) — the draw budget headroom. Clamped at engine construction to 1..=DETACHED_INFLIGHT_CAP (DETACHED_INFLIGHT_CAP is only the default/clamp for this key now, no longer a runtime cap verdict); default 8 = DETACHED_INFLIGHT_CAP.";
         admission_retention_blocks [u64] = 50, env = "DEGENBOT_SOLVE_ADMISSION_RETENTION", def = "50",
-            doc = "QTZGFL: retained (carried) key retention window W in blocks — on each block advance the ledger prunes buckets older than head - W and counts degenbot.detached.leads_expired_total. Default 50.";
+            doc = "QTZGFL: retained (carried) key retention window W in blocks — on each block advance the ledger prunes buckets older than head - W and counts degenbot.detached.leads_expired. Default 50.";
         min_profit_wei [u128] = 0, env = "DEGENBOT_MIN_PROFIT_WEI", def = "0",
             doc = "Minimum path profit floor in wei (decimal text; TOML: quoted string).";
         walk_event_solver_legacy [bool_not] = false, env = "DEGENBOT_WALK_EVENT_SOLVER", def = "false",
@@ -462,6 +460,27 @@ mod tests {
         assert!(
             !SCHEMA.iter().any(|k| k.env == "DEGENBOT_FLEET"),
             "DEGENBOT_FLEET must be retired from the schema"
+        );
+    }
+
+    #[test]
+    fn retired_solve_stance_keys_are_not_declared() {
+        // WFF6MM hard cutover: the detached-solve stance key is RETIRED with
+        // the in-cycle fallback arm — detached is the only solve arm now.
+        // The key must not be declared; a surviving TOML key fails the load
+        // with the generic unknown-key error (fail-closed) and a CLI
+        // override naming it is rejected (mirror of the fleet.stance
+        // retirement; the one-release pointed refusals were themselves
+        // removed at d5c450c84 — ADR-012 deletion, not a flag).
+        assert!(
+            !SCHEMA
+                .iter()
+                .any(|k| k.toml_path == "solve.detached_solves"),
+            "solve.detached_solves must be retired from the schema"
+        );
+        assert!(
+            !SCHEMA.iter().any(|k| k.env == "DEGENBOT_DETACHED_SOLVES"),
+            "DEGENBOT_DETACHED_SOLVES must be retired from the schema"
         );
     }
 }

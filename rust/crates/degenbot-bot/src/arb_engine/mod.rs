@@ -334,7 +334,7 @@ pub struct ResultBatch {
 /// [`ArbitrageEngine::with_core`]; `new()` standalone sugar allocates its own)
 /// and reads/writes pool state through it. Lock ordering when nested is
 /// **engine-then-core** — no code path ever nests core-then-engine.
-#[expect(clippy::struct_excessive_bools)] // 4th bool (detached_solving) added by epic SRQEK5 — each bool is a distinct construction-time stance, not flag soup
+#[expect(clippy::struct_excessive_bools)] // construction-time stances (streaming, admission, resolve-par, event expiry) — each a distinct stance, not flag soup
 pub struct ArbitrageEngine {
     /// KAHU5W: the owner-loaded typed bot config (one loader process-wide;
     /// never re-read from the environment). Construction stances + capture
@@ -406,12 +406,13 @@ pub struct ArbitrageEngine {
     /// instead of looking like duplicate logging.
     solve_entry: &'static str,
     /// Cold-start trace: the CURRENT solve cycle's dispatch arm — `detached`
-    /// | `in_cycle` | `skipped_empty` | `shed` (the cycle-span vocabulary), latched by
-    /// the dispatch at the machine's begin verdict (the `solve_entry`
-    /// precedent). Read AFTER `solve_dirty` returns, where the cycle's
-    /// duration and Mutex hold are measurable, so those histograms can be
-    /// attributed by arm. `unset` = no cycle dispatched yet (a bug signal,
-    /// deliberately visible rather than folded into `skipped_empty`).
+    /// | `skipped_empty` | `shed` (the cycle-span vocabulary; WFF6MM retired
+    /// the `in_cycle` arm), latched by the dispatch at the machine's begin
+    /// verdict (the `solve_entry` precedent). Read AFTER `solve_dirty`
+    /// returns, where the cycle's duration and Mutex hold are measurable, so
+    /// those histograms can be attributed by arm. `unset` = no cycle
+    /// dispatched yet (a bug signal, deliberately visible rather than folded
+    /// into `skipped_empty`).
     cycle_arm: &'static str,
     /// Paths registered via `register_and_solve_path` that have been eagerly
     /// solved and appended to `results`. Tracked so `rebuild_and_solve_affected`
@@ -492,6 +493,21 @@ pub struct ArbitrageEngine {
     /// so the caught-panic disposition + sticky cordon are pinned).
     #[cfg(test)]
     test_merge_panic: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// WFF6MM test harness: when ON (default), a DIRECT
+    /// `rebuild_and_solve_affected` / `solve_dirty` call merges its own
+    /// just-enqueued detached pipe INLINE (`drain_merge_inline`) so the
+    /// synchronous unit tests keep reading results. `EngineStages::solve_dirty`
+    /// turns this OFF before driving the engine — there the sidecar owns the
+    /// pipe (the spawn happens AFTER the engine call returns, so an inline
+    /// drain would steal the Receiver from it).
+    #[cfg(test)]
+    test_sync_merge: bool,
+    /// WFF6MM test harness: the inline drain's cached handle on the merge
+    /// pipe. Taken once on the first direct-call drain (the production
+    /// sidecar is never spawned for direct-call tests) and kept so repeated
+    /// drains reuse it — the machine's `take_merge_rx` is take-ONCE.
+    #[cfg(test)]
+    test_merge_rx: Option<std::sync::mpsc::Receiver<crate::arb_engine::executor::LaneOutcome>>,
     /// Reuse-eligibility counter for the current solve cycle (probe only;
     /// reset each `solve_dirty` and surfaced on the resolve event).
     paths_same_state_this_cycle: u64,
@@ -520,13 +536,6 @@ pub struct ArbitrageEngine {
     /// wrappers and the pump task.
     phase: std::sync::atomic::AtomicU8,
     // --- Detached solve cycle (epic SRQEK5 WV62TX; P37YJG machine) --------
-    /// Construction-time stance: `DEGENBOT_DETACHED_SOLVES` (default ON since
-    /// task 2UVG3E — the solve path takes no engine-level Mutex; `0` opts out).
-    /// When ON, `rebuild_and_solve_affected`
-    /// RETURNS at ENQUEUE end and the solves merge on the sidecar thread.
-    /// NOT machine state: the flag is construction-stamped on the engine and
-    /// reads into [`detached_cycle::DetachedCycle::begin_cycle`].
-    detached_solving: bool,
     /// QTZGFL: construction-time admission stance (`DEGENBOT_SOLVE_ADMISSION`,
     /// default OFF for the experiment). OFF keeps the in-flight cap degrade
     /// byte-identical; ON replaces it with a capacity-modulated draw
@@ -557,10 +566,10 @@ pub struct ArbitrageEngine {
     /// machine drives Resolved -> Solved sequentially on the driver thread,
     /// so this stash cannot interleave with another cycle's draw.
     admission_draw_zero: bool,
-    /// THE one detached/in-cycle solve-arm machine (P37YJG): the per-cycle
-    /// states (`Unopened → Open → Saturated`), the merge pipe open/take, the
-    /// outstanding-gauge pair, the seq counters, the outcome-ledger door,
-    /// the disposition counters, and the fan-in tally. See the module doc
+    /// THE one solve-arm machine (P37YJG; WFF6MM reduced it to the two
+    /// detached states): the per-cycle states (`Unopened → Open`), the merge
+    /// pipe open/take, the outstanding-gauge pair, the seq counters, the
+    /// outcome-ledger door, and the disposition counters. See the module doc
     /// ([`detached_cycle`]) — it owns the lifecycle end to end.
     detached_cycle: detached_cycle::DetachedCycle,
     /// LPEOBI: does the core hold a configured `max_age` for the V3/V4
@@ -644,7 +653,6 @@ impl ArbitrageEngine {
         // behavior.
         let streaming_delivery = cfg.pump.streaming_delivery;
         let resolve_par_stance = cfg.solve.solve_resolve_par;
-        let detached_solving = !cfg!(test) && cfg.solve.detached_solves;
         // QTZGFL: the admission stance + its two typed knobs (KAHU5W
         // construction-stance pattern — packed ONCE here, never re-read).
         // `DEGENBOT_SOLVE_ADMISSION` parse matrix (supervisor-confirmed
@@ -699,6 +707,10 @@ impl ArbitrageEngine {
             merge_probe: None,
             #[cfg(test)]
             test_merge_panic: None,
+            #[cfg(test)]
+            test_sync_merge: true,
+            #[cfg(test)]
+            test_merge_rx: None,
             walk_memo: std::sync::Arc::new(::degenbot_solvers::mobius_v3_int::WalkMemo::new(
                 cfg.solve.solver_walk_memo,
                 cfg.solve.solver_walk_memo_stats,
@@ -706,7 +718,6 @@ impl ArbitrageEngine {
             paths_same_state_this_cycle: 0,
             delivery: DeliveryPolicy::default(),
             phase: std::sync::atomic::AtomicU8::new(EnginePhase::Created as u8),
-            detached_solving,
             solve_admission,
             admission_target_depth,
             admission_retention_blocks,
@@ -896,6 +907,34 @@ impl ArbitrageEngine {
         self.test_merge_panic = Some(hook);
     }
 
+    /// WFF6MM test harness: toggle the inline merge drain. `EngineStages`
+    /// turns it OFF before driving the engine (the sidecar owns the pipe
+    /// there — see the field doc).
+    pub(crate) fn set_sync_merge_for_test(&mut self, on: bool) {
+        self.test_sync_merge = on;
+    }
+
+    /// WFF6MM test harness: drain up to `expected` items from the merge pipe
+    /// INLINE through the sidecar's own per-item merge path
+    /// (`merge_detached_item`), so a direct `solve_dirty` /
+    /// `rebuild_and_solve_affected` caller reads its results synchronously.
+    /// The Receiver is taken once and cached on the engine; the machine's
+    /// `take_merge_rx` is take-ONCE, so the sidecar is never spawned for
+    /// these engines.
+    pub(crate) fn drain_merge_inline(&mut self, expected: usize) {
+        if self.test_merge_rx.is_none() {
+            self.test_merge_rx = self.detached_cycle.take_merge_rx();
+        }
+        let Some(rx) = self.test_merge_rx.take() else {
+            return;
+        };
+        for _ in 0..expected {
+            let Ok(item) = rx.recv() else { break };
+            self.merge_detached_item(item);
+        }
+        self.test_merge_rx = Some(rx);
+    }
+
     pub(crate) fn set_streaming_delivery(&mut self, on: bool) {
         self.streaming_delivery = on;
     }
@@ -906,10 +945,6 @@ impl ArbitrageEngine {
     #[cfg(test)]
     pub(crate) fn fleet_boot_stamp(&self) -> &BootStamp {
         &self.fleet_boot_stamp
-    }
-
-    pub(crate) fn set_detached_solving(&mut self, on: bool) {
-        self.detached_solving = on;
     }
 
     /// QTZGFL: test seam for the admission stance. Production packs it from

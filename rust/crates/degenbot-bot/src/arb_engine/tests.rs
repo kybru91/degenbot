@@ -6281,110 +6281,6 @@ mod tests {
              barrier order puts the marker first (probe = {observed:?})"
         );
     }
-    /// T2 (epic BXZBWY) acceptance: a slowened `solve_dirty` holding the engine
-    /// Mutex must NOT starve other tasks on the shared multi-thread runtime
-    /// (the production pump runtime hosts the block clock + `WS` tasks on the
-    /// same pool). RED before the `block_in_place` seam: the slowened solve
-    /// occupied the ONLY worker and the heartbeat task starved.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn solve_dirty_hold_does_not_starve_runtime_tasks() {
-        // The stage surface provides the solve hooks on the engine
-        // (`EngineStages`; the retired `Engine` trait is gone — SZJUKL).
-        use std::time::Duration;
-
-        let mut oracle = crate::arb_engine::tests::test_keys::DirtyKeys::new();
-
-        let probe: std::sync::Arc<parking_lot::Mutex<Vec<u64>>> =
-            std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let mut engine = ArbitrageEngine::new();
-
-        // One profitable V2->V2 pair, plus an injected 600ms delay, so the
-        // solve carries real work and holds the Mutex across that window.
-        let fwd = engine.register_v2_pool(
-            Address::from([0x60u8; 20]),
-            usdc(1_500_000),
-            weth(800),
-            GAMMA_03,
-            FEE_DENOM_03,
-        );
-        let back = engine.register_v2_pool(
-            Address::from([0x61u8; 20]),
-            weth(800),
-            usdc(1_600_000),
-            GAMMA_03,
-            FEE_DENOM_03,
-        );
-        engine
-            .register_path(vec![
-                PoolHop {
-                    pool_id: fwd,
-                    zero_for_one: true,
-                },
-                PoolHop {
-                    pool_id: back,
-                    zero_for_one: true,
-                },
-            ])
-            .unwrap();
-        // Prod: the subscriber routes pool events into the dirty set; here we
-        // drive it directly so solve_dirty carries real work.
-        oracle.insert(fwd, HopType::V2);
-        oracle.insert(back, HopType::V2);
-        engine.set_solve_delay_hook(std::sync::Arc::new(|_pid: u64| {
-            std::thread::sleep(Duration::from_millis(600));
-        }));
-        engine.set_merge_probe(probe.clone());
-
-        let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
-        let handle = crate::arb_engine::EngineStages::new(std::sync::Arc::clone(&engine));
-
-        // Heartbeat task on the same runtime: with the seam, the scheduler
-        // marks the solve-holding worker blocking and spawns a replacement,
-        // so the heartbeat keeps ticking; RED, the only worker runs the
-        // blocking solve inline and the heartbeat starves.
-        let (beat_tx, beat_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let heartbeats = tokio::spawn(async move {
-            let mut beats = 0usize;
-            loop {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                if beat_tx.send(()).is_err() {
-                    break;
-                }
-                beats += 1;
-            }
-            beats
-        });
-
-        let solve_task = tokio::spawn(async move {
-            let t0 = std::time::Instant::now();
-            handle.solve_dirty(&oracle.to_affected_keys(), 100, &BlockMetadata::default());
-            t0.elapsed()
-        });
-
-        // Let the solve complete its injected delay before closing the
-        // heartbeat channel (early close would under-count beats).
-        let solve_elapsed = solve_task.await.unwrap_or_default();
-        drop(beat_rx);
-        let beats = heartbeats.await.unwrap_or(0);
-
-        let guard = engine.lock();
-        let (results, _block) = guard.latest_results();
-        drop(guard);
-
-        assert!(
-            results.iter().any(|(_, r)| !r.profit.is_zero()),
-            "the solve must have produced a profitable result"
-        );
-        assert!(
-            solve_elapsed >= Duration::from_millis(500),
-            "premise: the injected delay actually ran ({solve_elapsed:?})"
-        );
-        assert!(
-            beats >= 5,
-            "runtime tasks must keep progressing while solve_dirty holds the \
-             engine Mutex (T2 seam); heartbeats in 600ms = {beats}"
-        );
-    }
     /// T3 (epic BXUSGL) acceptance: with `DEGENBOT_STREAMING_DELIVERY` the drain
     /// emits each clamp-passed above-threshold result as an immediate single
     /// -entry batch — a fast path's batch must arrive on the channel while the
@@ -6563,7 +6459,7 @@ mod tests {
         (engine, pool_ids, path_ids)
     }
 
-    /// Structural acceptance (red/green): with `detached_solving=ON` and an
+    /// Structural acceptance (red/green): with the one (detached) arm and an
     /// injected 400ms slow path, `rebuild_and_solve_affected` — driven via
     /// the production `EngineStages` solve seam, which also spawns the
     /// merge sidecar — RETURNS before the merge lands, and the sidecar
@@ -6574,8 +6470,7 @@ mod tests {
             eprintln!("skipping: detached-cycle structural test requires >=2 cores");
             return;
         }
-        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        engine.set_detached_solving(true);
+        let (engine, pool_ids, path_ids) = detached_fixture(400);
         let slow_pid = path_ids[0];
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
@@ -6628,48 +6523,6 @@ mod tests {
         );
     }
 
-    /// Structural acceptance, flag OFF (default): the results are merged
-    /// SYNCHRONOUSLY inside the call (pre-epic behaviour) — at return every
-    /// path's result is already in the map, after the injected slow solve.
-    #[test]
-    fn detached_off_merges_synchronously_inside_the_call() {
-        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        // Default construction stance (DEGENBOT_DETACHED_SOLVES unset → OFF);
-        // set explicitly to make the stance under test unmistakable.
-        engine.set_detached_solving(false);
-        let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
-            .iter()
-            .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
-            .collect();
-        let _ = &engine;
-        let slow_pid = path_ids[0];
-
-        let t0 = std::time::Instant::now();
-        engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
-        let returned = t0.elapsed();
-
-        // The whole cycle — INCLUDING the 400ms slow solve + clamp merge —
-        // ran inside the call.
-        assert!(
-            returned >= std::time::Duration::from_millis(390),
-            "flag OFF must merge synchronously inside the call (slow solve \
-             included); took {returned:?}"
-        );
-        assert!(
-            engine.results.contains_key(&slow_pid),
-            "flag OFF: the slow path's result is merged before return"
-        );
-        assert_eq!(engine.results.len(), 3);
-        assert_eq!(
-            engine
-                .detached_cycle
-                .applied
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "flag OFF: no detached merges may occur"
-        );
-    }
-
     /// Q1a stale policy (red/green): a straggler whose resolved-update stamp
     /// is stale (a pool ticked during the solve → its `update_block` moved)
     /// is DROPPED, not applied. A fresh-stamp straggler applies
@@ -6694,8 +6547,14 @@ mod tests {
         let fresh_pid = path_ids[1];
         assert!(
             engine.results.contains_key(&stale_pid) && engine.results.contains_key(&fresh_pid),
-            "precondition: fresh results merged in-cycle"
+            "precondition: fresh results merged by the inline drain"
         );
+        // WFF6MM: the baseline cycle's own merges counted here — the straggler
+        // assertions below are DELTAS against this snapshot.
+        let applied_before = engine
+            .detached_cycle
+            .applied
+            .load(std::sync::atomic::Ordering::Relaxed);
         let stale_stamp: Vec<u64> = engine.resolved_update_snapshot[&stale_pid]
             .clone()
             .iter()
@@ -6736,7 +6595,7 @@ mod tests {
                 .detached_cycle
                 .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0
+            applied_before
         );
 
         // The unchanged-intake twin APPLIES (apply-if-unchanged).
@@ -6746,7 +6605,7 @@ mod tests {
                 .detached_cycle
                 .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1,
+            applied_before + 1,
             "the unchanged straggler must be applied"
         );
         assert_eq!(
@@ -6779,6 +6638,10 @@ mod tests {
             .collect();
         engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
         let pid = path_ids[0];
+        let applied_before = engine
+            .detached_cycle
+            .applied
+            .load(std::sync::atomic::Ordering::Relaxed);
         let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
         let fresh_result = engine.results.get(&pid).unwrap().clone();
 
@@ -6805,7 +6668,7 @@ mod tests {
                 .detached_cycle
                 .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
-            1,
+            applied_before + 1,
             "the duplicate delivery must not apply a second time"
         );
         assert_eq!(
@@ -6884,7 +6747,8 @@ mod tests {
                 .detached_cycle
                 .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0
+            3,
+            "the baseline inline-drain merges, and the dropped straggler adds none"
         );
     }
     /// MQUKB6-T2: the detached-merge sidecar thread has NO ambient span
@@ -7027,8 +6891,7 @@ mod tests {
     /// (enqueue-end, not apply-end), and the stragglers must still land.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn detached_stragglers_do_not_block_inline_stage_work() {
-        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        engine.set_detached_solving(true);
+        let (engine, pool_ids, path_ids) = detached_fixture(400);
         let engine = std::sync::Arc::new(parking_lot::Mutex::new(engine));
         let delta = std::sync::Arc::new(crate::bot_core::EpochDelta::new(0u64));
         for &p in &pool_ids {
@@ -7081,16 +6944,14 @@ mod tests {
     // the detached arm's lane witness). They GREEN in commit 2.
     // =================================================================
 
-    /// N2 (cross-arm replay): an in-cycle result and a sidecar straggler
-    /// naming the SAME (`cycle_seq`, pid) must collide on the ONE merged
+    /// N2 (same-seq replay, WFF6MM single-arm): a merged result and a later
+    /// carrier naming the SAME (`cycle_seq`, pid) must collide on the ONE
     /// ledger — the fuse refuses the second arrival instead of merging
-    /// twice. Red at HEAD: no shared key space exists across the arms
-    /// today (the sidecar keeps its own (`cycle_seq`, pid) set; the
-    /// in-cycle drain has no seq at all).
+    /// twice.
     // 43E3H3 red-first: pins the (solve_seq, pid) key half the merged
-    // ledger must share across BOTH arms (design §3.3).
+    // ledger owns (design §3.3).
     #[test]
-    fn merged_ledger_rejects_cross_arm_pid_replay() {
+    fn merged_ledger_rejects_same_seq_pid_replay() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
@@ -7106,15 +6967,19 @@ mod tests {
         let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
         let fresh_result = engine.results.get(&pid).unwrap().clone();
         let results_before = engine.results.len();
+        let applied_before = engine
+            .detached_cycle
+            .applied
+            .load(std::sync::atomic::Ordering::Relaxed);
 
-        // The straggler claims the cycle_seq the in-cycle cycle consumed:
-        // under the merged ledger this is the SAME (solve_seq, pid) key and
-        // the fuse must refuse it.
+        // The replay claims the cycle_seq the merged cycle consumed: under
+        // the one ledger this is the SAME (solve_seq, pid) key and the fuse
+        // must refuse it.
         let item = crate::arb_engine::executor::LaneOutcome::Solved(
             crate::arb_engine::executor::SolveOutcome {
                 payload: None,
                 worker_clamp_twins: 0,
-                cycle_seq: 1, // the first cycle's seq (the in-cycle run consumed 1)
+                cycle_seq: engine.detached_cycle.issued_seq(), // the merged cycle's seq
                 solve_block: 100,
                 metadata: BlockMetadata::default(),
                 pid,
@@ -7131,7 +6996,7 @@ mod tests {
                 .duplicate_outcomes
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
-            "merged ledger: the cross-arm replay must trip the fuse exactly once"
+            "merged ledger: the same-seq replay must trip the fuse exactly once"
         );
         assert_eq!(
             engine.results.len(),
@@ -7143,7 +7008,7 @@ mod tests {
                 .detached_cycle
                 .applied
                 .load(std::sync::atomic::Ordering::Relaxed),
-            0,
+            applied_before,
             "merged ledger: the refused duplicate must not count as applied"
         );
     }
@@ -7254,7 +7119,6 @@ mod tests {
         // counters, which today stay short (the undelivered pids never
         // arrive at all: SILENT UNDERCOUNT).
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
-        engine.set_detached_solving(true);
         let kill = path_ids[1];
         engine.set_solve_panic_hook(std::sync::Arc::new(move |pid: u64| {
             if pid != kill {
@@ -7326,7 +7190,6 @@ mod tests {
             return;
         }
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
-        engine.set_detached_solving(true);
         let kill = path_ids[2];
         engine.set_solve_panic_hook(std::sync::Arc::new(move |pid: u64| {
             if pid != kill {
@@ -7390,18 +7253,14 @@ mod tests {
         }
     }
 
-    /// N6+N7 (constraint (b), the cap conjunction): a cycle whose
-    /// un-dispositioned count sits AT the cap must degrade to the
-    /// in-cycle arm (results present AT RETURN), and one below the cap
-    /// must still detach (results ABSENT at return). Red at HEAD: no test
-    /// pins either half (verified by grep — `DETACHED_INFLIGHT_CAP` appears
-    // only at its definition and the gate).
-    // 43E3H3 red-first: pins the gate's exact conjunction (design §5.4).
+    /// WFF6MM cutover: the in-flight cap gate is RETIRED — a cycle whose
+    /// un-dispositioned count sits AT the old cap STILL detaches (the
+    /// admission draw, not the cap, owns backpressure now; there is no
+    /// in-cycle fallback left to degrade to).
     #[test]
-    fn detached_inflight_cap_degrades_full_cycles_to_in_cycle() {
-        let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        engine.set_detached_solving(true);
-        // Seed the gauge AT the cap: the gate must refuse detachment.
+    fn retired_inflight_cap_no_longer_degrades() {
+        let (mut engine, pool_ids, _path_ids) = detached_fixture(0);
+        // Seed the gauge AT the old cap: it must be ignored.
         engine
             .detached_cycle
             .outstanding
@@ -7410,11 +7269,11 @@ mod tests {
             .iter()
             .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
             .collect();
-        // In-cycle path: solve_dirty runs synchronously through the drain.
         engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
-        assert!(
-            path_ids.iter().all(|p| engine.results.contains_key(p)),
-            "at-cap cycles must degrade to the in-cycle arm: results present AT return"
+        assert_eq!(
+            engine.cycle_arm(),
+            "detached",
+            "the retired cap must no longer degrade a cycle to an in-cycle arm"
         );
     }
 
@@ -7434,7 +7293,6 @@ mod tests {
             "no cycle has been dispatched yet"
         );
         // Sub-cap under the detached stance: the detached arm.
-        engine.set_detached_solving(true);
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
             .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
@@ -7445,8 +7303,8 @@ mod tests {
             "detached",
             "a sub-cap cycle under the detached stance must latch the detached arm"
         );
-        // At the in-flight cap: the DEGRADED arm — the population the
-        // counter tallies and the histogram tail must belong to.
+        // At the (retired) in-flight cap: STILL detached (WFF6MM — the
+        // cap gate is gone; every dispatched cycle takes the one arm).
         engine
             .detached_cycle
             .outstanding
@@ -7454,8 +7312,8 @@ mod tests {
         engine.solve_dirty(101, &BlockMetadata::default(), &affected_keys_v2);
         assert_eq!(
             engine.cycle_arm(),
-            "in_cycle",
-            "a cap-degraded cycle must latch in_cycle: under the detached stance in_cycle IS the degraded set"
+            "detached",
+            "the retired cap gate must not divert a cycle off the one dispatch arm"
         );
         // A dirty key with NO registered paths: the bookkeeping-only pass.
         engine
@@ -7485,23 +7343,23 @@ mod tests {
     }
 
     #[test]
-    fn detached_inflight_below_cap_still_detaches() {
+    fn detached_solve_returns_at_enqueue_end_when_sync_drain_is_off() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        engine.set_detached_solving(true);
-        engine
-            .detached_cycle
-            .outstanding
-            .store(7, std::sync::atomic::Ordering::Relaxed); // == CAP-1
+        // WFF6MM: direct-call engines merge inline (synchronous harness); turn
+        // that OFF so this pins the PRODUCTION return semantics — enqueue end,
+        // results ABSENT until the sidecar (or a later drain) lands them.
+        engine.set_sync_merge_for_test(false);
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
             .map(|&p| degenbot_solvers::affected_keys::AffectedKey::new(HopType::V2, p))
             .collect();
         engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
-        // Below-cap cycles detach: with a 400ms slow path the results land
-        // AFTER return (T2's read) — at least the slow pid is absent.
+        assert_eq!(engine.cycle_arm(), "detached");
+        // With a 400ms slow path the results land AFTER return (T2's read) —
+        // at least the slow pid is absent.
         assert!(
             !engine.results.contains_key(&path_ids[0]),
-            "below-cap cycles must take the detached arm: the slow pid is absent AT return"
+            "the detached arm must return at enqueue end: the slow pid is absent AT return"
         );
     }
 
@@ -7595,7 +7453,6 @@ mod tests {
         use std::sync::Arc;
 
         let (mut engine, pool_ids, path_ids) = detached_fixture(400);
-        engine.set_detached_solving(true);
         engine.set_solve_admission(true);
         engine.set_admission_target_depth(8);
         engine
@@ -7765,6 +7622,22 @@ mod tests {
         stages
             .on_solve(&Solve { ctx, paths: drawn })
             .expect("solve hook is infallible");
+        // WFF6MM: the cycle enqueues and returns; wait for the sidecar merge.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        loop {
+            let merged = {
+                let guard = engine.lock();
+                guard.pending_new_paths.is_empty() && guard.results.contains_key(&pid)
+            };
+            if merged {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the next normal cycle must merge + clear the eager-registration pipe"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let guard = engine.lock();
         assert!(
             guard.pending_new_paths.is_empty(),
@@ -7781,8 +7654,8 @@ mod tests {
     /// (they are already removed from the ledger); an earlier cycle's bin
     /// thread bumping in-flight to/over the target between the draw and the
     /// dispatch must NOT turn that cycle into a shed — the drawn keys would
-    /// be discarded (never submitted, never re-recorded). The transition-edge
-    /// cap verdict is served by the EXISTING in-cycle response.
+    /// be discarded (never submitted, never re-recorded). WFF6MM: the drawn
+    /// keys submit down the one (detached) arm regardless of the gauge.
     ///
     /// The test drives both stages explicitly, so it can interleave the
     /// in-flight bump exactly in the race window (between `on_resolve` and
@@ -7800,7 +7673,6 @@ mod tests {
         use std::sync::Arc;
 
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
-        engine.set_detached_solving(true);
         engine.set_solve_admission(true);
         engine.set_admission_target_depth(8);
         // An eager-registration path in the merge pipe: a post-merge race
@@ -7851,11 +7723,29 @@ mod tests {
         stages
             .on_solve(&Solve { ctx, paths: drawn })
             .expect("solve hook is infallible");
+        // WFF6MM: the dispatch enqueues and returns; the sidecar merges. Wait
+        // for the merge before reading the results/pending pipe.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
+        loop {
+            let merged = {
+                let guard = engine.lock();
+                path_ids.iter().all(|p| guard.results.contains_key(p))
+                    && guard.pending_new_paths.is_empty()
+            };
+            if merged {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the sidecar must merge the drawn keys after the detached enqueue"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let guard = engine.lock();
         assert_eq!(
             guard.cycle_arm(),
-            "in_cycle",
-            "the transition-edge cap verdict takes the EXISTING in-cycle response, not a shed"
+            "detached",
+            "a positive-budget draw always detaches — there is no in-cycle response left"
         );
         assert_eq!(
             guard
@@ -8015,10 +7905,11 @@ mod tests {
         assert!(delta.is_empty());
     }
 
-    /// Flag OFF: byte-identical — `on_resolve` take-alls (even with the gauge
-    /// saturated) and the engine keeps the in-cycle DEGRADE, never a shed.
+    /// Flag OFF: `on_resolve` take-alls (even with the gauge saturated) and
+    /// the engine DETACHES every cycle — never a shed, and (WFF6MM) never any
+    /// in-cycle degrade either.
     #[test]
-    fn admission_off_keeps_take_all_and_the_cap_degrade() {
+    fn admission_off_keeps_take_all_and_never_sheds() {
         use crate::arb_engine::EngineStages;
         use crate::bot_core::stage_handlers::{
             QuiesceOutcome, QuiesceVerdict, Resolve, StageHandlers,
@@ -8027,7 +7918,6 @@ mod tests {
         use std::sync::Arc;
 
         let (mut engine, pool_ids, _path_ids) = detached_fixture(0);
-        engine.set_detached_solving(true);
         // Stance left OFF; the gauge at the cap must NOT shed.
         engine
             .detached_cycle
@@ -8040,8 +7930,8 @@ mod tests {
         engine.solve_dirty(100, &BlockMetadata::default(), &affected_keys_v2);
         assert_eq!(
             engine.cycle_arm(),
-            "in_cycle",
-            "flag OFF: the cap verdict still DEGRADES (byte-identical current behavior)"
+            "detached",
+            "flag OFF: the cycle still takes the one dispatch arm (WFF6MM)"
         );
         assert_eq!(
             engine
@@ -8089,7 +7979,7 @@ mod tests {
     // 43E3H3 red-first: pins the tightened refuse-the-merge policy
     // (design §4.4 REV 2 decision, Risk 5 option 1).
     #[test]
-    fn in_cycle_duplicate_lane_outcome_does_not_double_apply() {
+    fn duplicate_lane_outcome_does_not_double_apply() {
         let (mut engine, pool_ids, path_ids) = detached_fixture(0);
         let affected_keys_v2: Vec<degenbot_solvers::affected_keys::AffectedKey> = pool_ids
             .iter()
@@ -8102,8 +7992,11 @@ mod tests {
             .detached_cycle
             .applied
             .load(std::sync::atomic::Ordering::Relaxed);
+        // WFF6MM: the machine issues the seq (no in-cycle counter) — read
+        // back the tick the cycle actually claimed so the replay collides.
+        let cycle_seq = engine.detached_cycle.issued_seq();
 
-        // A second Solved arrival for the SAME (seq, pid) through the merged
+        // A second Solved arrival for the SAME (seq, pid) through the merge
         // disposition must be refused: no second results write, no applied
         // count for the duplicate.
         let fresh_stamp = engine.resolved_update_snapshot[&pid].clone();
@@ -8112,7 +8005,7 @@ mod tests {
             crate::arb_engine::executor::SolveOutcome {
                 payload: None,
                 worker_clamp_twins: 0,
-                cycle_seq: 1, // the in-cycle run's seq under the shared counter
+                cycle_seq,
                 solve_block: 100,
                 metadata: BlockMetadata::default(),
                 pid,
@@ -8361,13 +8254,13 @@ pub(crate) mod test_keys {
     }
 
     // Cold-start trace (detached-cycle arm attribution): the cycle span must
-    // carry `cycle.arm` for BOTH arms, and the degraded-in-cycle stamp must be
-    // derivable WITHOUT log archaeology. The helper below is the ONE wiring
-    // site (solver_dispatch, at the machine's begin_cycle verdict).
+    // carry `cycle.arm`, derivable WITHOUT log archaeology. The helper below
+    // is the ONE wiring site (solver_dispatch, at the machine's begin_cycle
+    // verdict). WFF6MM: one arm remains, so one stamp.
     #[cfg(feature = "otel")]
     #[test]
     #[expect(clippy::expect_used)]
-    fn cycle_arm_span_field_stamps_both_arms() {
+    fn cycle_arm_span_field_stamps_the_arm() {
         use crate::arb_engine::solver_dispatch::record_cycle_arm_telemetry;
         use opentelemetry_sdk::trace::InMemorySpanExporter;
         use tracing_subscriber::layer::SubscriberExt;
@@ -8381,19 +8274,9 @@ pub(crate) mod test_keys {
                 tracing::info_span!("degenbot.arb.solve", cycle.arm = tracing::field::Empty,);
             let guard = detached.enter();
             assert_eq!(
-                record_cycle_arm_telemetry(&detached, "detached", false),
+                record_cycle_arm_telemetry(&detached, "detached"),
                 "detached",
                 "the helper returns the label the caller latches on the engine"
-            );
-            drop(guard);
-
-            let degraded =
-                tracing::info_span!("degenbot.arb.solve", cycle.arm = tracing::field::Empty,);
-            let guard = degraded.enter();
-            assert_eq!(
-                record_cycle_arm_telemetry(&degraded, "in_cycle", true),
-                "in_cycle",
-                "the degraded arm's label is the latch value read back by EngineStages"
             );
             drop(guard);
         });
@@ -8406,11 +8289,9 @@ pub(crate) mod test_keys {
             .collect();
         assert_eq!(
             solve_spans.len(),
-            2,
-            "expected exactly the two stamped cycle spans; got {spans:?}"
+            1,
+            "expected exactly the one stamped cycle span; got {spans:?}"
         );
-        // Completion order is not send order (the exporter drains LIFO) —
-        // assert the VALUE SET, one span per arm stamp.
         let arm_values: Vec<String> = solve_spans
             .iter()
             .filter_map(|sp| {
@@ -8424,9 +8305,8 @@ pub(crate) mod test_keys {
             })
             .collect();
         assert!(
-            arm_values.contains(&"detached".to_string())
-                && arm_values.contains(&"in_cycle".to_string()),
-            "both arms must stamp cycle.arm exactly once each; got {arm_values:?}"
+            arm_values == vec!["detached".to_string()],
+            "the one dispatch arm must stamp cycle.arm exactly once; got {arm_values:?}"
         );
     }
 }

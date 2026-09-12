@@ -241,9 +241,10 @@ machine). Source: `rust/crates/degenbot-ingestion/src/`
   collapsed into one. Owns the two genuine-async-boundary channels retained from
   ADR-006/027: the block clock (`BlockClockPipe`, header ticks, never queued behind
   solver work) and the result batch written at the Published edge.
-- `arb_engine/solver_dispatch.rs` — `DETACHED_SOLVES_ENABLED`
-  (`DEGENBOT_DETACHED_SOLVES`, default ON since 2UVG3E): the solve cycle enqueues
-  and returns, collapsing the engine-`Mutex` hold on the solve path to enqueue-end.
+- `arb_engine/solver_dispatch.rs` — the detached solve cycle (unconditional
+  since the WFF6MM cutover; the `DEGENBOT_DETACHED_SOLVES` stance retired with
+  the in-cycle arm): the solve cycle enqueues and returns, collapsing the
+  engine-`Mutex` hold on the solve path to enqueue-end.
 
 **`degenbot-config` — typed config (KAHU5W).** `BotConfig` is declared exactly once
 in `schema::SCHEMA` (one declaration ⇒ the typed field, the `DEGENBOT_*` env
@@ -293,8 +294,8 @@ bridges `PoolStateSubscriber` callbacks. No raw WS stream reaches Python.
 
 Writers to `StateLock<RwLock<BotState>>` exist **only** in the Streaming stage of
 the active epoch; Quiesced..Simulated read through cheap snapshots (spike
-`KWKEVV`). With `DEGENBOT_DETACHED_SOLVES` default-ON, engine-`Mutex` holds on the
-solve path collapse to enqueue-length, so the solve is uncontended by construction
+`KWKEVV`). With the detached cycle unconditional (WFF6MM cutover), engine-`Mutex`
+holds on the solve path collapse to enqueue-length, so the solve is uncontended by construction
 — there is no `drain_lock` and no FIFO, and the
 `drain_lock → engine Mutex → BotState RwLock` lock-order narration of
 [ADR-037](../adr/ADR-037-engine-mutex-sharding.md) is historical.
